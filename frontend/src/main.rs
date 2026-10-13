@@ -1,19 +1,17 @@
-//! Minimal Yew application entry point for Rustab.
+//! Yew application entry point for Rustab.
 //!
-//! This is a scaffold-only shell (task T1): it renders a single heading to
-//! prove the Trunk + Yew + Tailwind build pipeline works end to end. The
-//! real component tree (entries table, add/edit form, diff view, etc.) is
-//! built in later tasks (T9/T10/T11/T12) per `docs/SPEC.md` §9.
+//! T1 scaffolded a single "Rustab" heading just to prove the Trunk + Yew +
+//! Tailwind build pipeline. This task (T10) builds the real component tree
+//! on top of that scaffold: `AppShell` and everything under it, rendered
+//! with mock/static data only — zero Tauri calls. Real data wiring for the
+//! entries table / add-edit form is T11; diff view, backup panel, and the
+//! live target indicator are T12 (see `docs/UI_DESIGN.md` §9).
 
-use yew::prelude::*;
+mod components;
+mod mock;
 
-#[function_component(App)]
-fn app() -> Html {
-    html! {
-        <h1 class="text-3xl font-bold text-slate-100">{ "Rustab" }</h1>
-    }
-}
+use components::app_shell::AppShell;
 
 fn main() {
-    yew::Renderer::<App>::new().render();
+    yew::Renderer::<AppShell>::new().render();
 }

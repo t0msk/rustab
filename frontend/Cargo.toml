@@ -16,3 +16,8 @@ publish = false
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+  "HtmlInputElement",
+  "HtmlSelectElement",
+  "HtmlTextAreaElement",
+] }
