@@ -1,25 +1,55 @@
 //! `EntriesTable` — main entry list (§3), rows are `EntryRow` (parsed) or
-//! `UnparsedEntryRow` (malformed). Renders from a small hardcoded
-//! `Vec<MockEntry>` for this task; T11 replaces this with real data.
+//! `UnparsedEntryRow` (malformed). Renders from the app's in-memory
+//! candidate document (see `crate::candidate`) rather than mock data (T11).
 
 use yew::prelude::*;
 
 use crate::components::empty_state::EmptyState;
-use crate::mock::{MockEntry, MockParsedEntry};
+use crate::dto::{EntryDto, OptionDto, SourceKind};
+
+/// One table row's content, independent of `candidate::CandidateDocument`
+/// so this component only depends on the plain DTOs it needs to render.
+#[derive(Clone, PartialEq)]
+pub enum RowEntry {
+    Parsed(EntryDto),
+    Unparsed(String),
+}
 
 #[derive(Properties, PartialEq)]
 pub struct EntriesTableProps {
-    pub entries: Vec<MockEntry>,
-    /// Emits the row index to edit. The caller decides structured vs. raw
-    /// edit mode by inspecting that entry's kind.
+    /// `(candidate_index, row)` pairs, in document order. `candidate_index`
+    /// is the row's identity in the app's `CandidateDocument` — the same
+    /// value is reported back via `on_edit`/`on_delete`.
+    pub rows: Vec<(usize, RowEntry)>,
     pub on_edit: Callback<usize>,
     pub on_delete: Callback<usize>,
     pub on_add_entry: Callback<()>,
 }
 
+/// Also reused by `AppShell` for `DeleteConfirmDialog`'s read-only summary.
+pub(crate) fn source_badge(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Path => "PATH",
+        SourceKind::Uuid => "UUID",
+        SourceKind::Label => "LABEL",
+        SourceKind::PartUuid => "PARTUUID",
+        SourceKind::PartLabel => "PARTLABEL",
+        SourceKind::Network => "NET",
+        SourceKind::None => "NONE",
+        SourceKind::Other => "OTHER",
+    }
+}
+
+fn format_option(option: &OptionDto) -> String {
+    match &option.value {
+        Some(value) => format!("{}={}", option.key, value),
+        None => option.key.clone(),
+    }
+}
+
 #[function_component(EntriesTable)]
 pub fn entries_table(props: &EntriesTableProps) -> Html {
-    if props.entries.is_empty() {
+    if props.rows.is_empty() {
         let on_add = {
             let cb = props.on_add_entry.clone();
             Callback::from(move |_: MouseEvent| cb.emit(()))
@@ -58,21 +88,22 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                     </tr>
                 </thead>
                 <tbody>
-                    { for props.entries.iter().enumerate().map(|(idx, entry)| {
+                    { for props.rows.iter().map(|(candidate_index, row)| {
+                        let candidate_index = *candidate_index;
                         let on_edit = {
                             let cb = props.on_edit.clone();
-                            Callback::from(move |_: MouseEvent| cb.emit(idx))
+                            Callback::from(move |_: MouseEvent| cb.emit(candidate_index))
                         };
                         let on_delete = {
                             let cb = props.on_delete.clone();
-                            Callback::from(move |_: MouseEvent| cb.emit(idx))
+                            Callback::from(move |_: MouseEvent| cb.emit(candidate_index))
                         };
-                        match entry {
-                            MockEntry::Parsed(entry) => html! {
-                                <EntryRow key={idx} entry={entry.clone()} on_edit={on_edit} on_delete={on_delete} />
+                        match row {
+                            RowEntry::Parsed(entry) => html! {
+                                <EntryRow key={candidate_index} entry={entry.clone()} on_edit={on_edit} on_delete={on_delete} />
                             },
-                            MockEntry::Unparsed { raw_line } => html! {
-                                <UnparsedEntryRow key={idx} raw_line={AttrValue::from(*raw_line)} on_edit={on_edit} on_delete={on_delete} />
+                            RowEntry::Unparsed(raw_line) => html! {
+                                <UnparsedEntryRow key={candidate_index} raw_line={AttrValue::from(raw_line.clone())} on_edit={on_edit} on_delete={on_delete} />
                             },
                         }
                     }) }
@@ -84,7 +115,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
 
 #[derive(Properties, PartialEq)]
 pub struct EntryRowProps {
-    pub entry: MockParsedEntry,
+    pub entry: EntryDto,
     pub on_edit: Callback<MouseEvent>,
     pub on_delete: Callback<MouseEvent>,
 }
@@ -92,28 +123,29 @@ pub struct EntryRowProps {
 #[function_component(EntryRow)]
 pub fn entry_row(props: &EntryRowProps) -> Html {
     let entry = &props.entry;
-    let shown_options: Vec<&str> = entry.options.iter().take(3).copied().collect();
-    let overflow = entry.options.len().saturating_sub(3);
-    let full_list = entry.options.join(", ");
+    let options: Vec<String> = entry.options.iter().map(format_option).collect();
+    let shown_options: Vec<&String> = options.iter().take(3).collect();
+    let overflow = options.len().saturating_sub(3);
+    let full_list = options.join(", ");
 
     html! {
         <tr class="h-11 odd:bg-slate-50 dark:odd:bg-slate-800/60 hover:bg-sky-50 dark:hover:bg-slate-700/60 border-b border-slate-200 dark:border-slate-700">
             <td class="px-4 py-2 font-mono text-sm whitespace-nowrap">
                 <span class="inline-block rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-medium px-2 py-0.5 mr-2">
-                    { entry.source_type }
+                    { source_badge(entry.source.kind) }
                 </span>
-                { entry.source_value }
+                { entry.source.value.clone() }
             </td>
-            <td class="px-4 py-2 font-mono text-sm">{ entry.mount_point }</td>
+            <td class="px-4 py-2 font-mono text-sm">{ entry.mount_point.clone() }</td>
             <td class="px-4 py-2 text-sm">
                 <span class="rounded-md bg-slate-100 dark:bg-slate-700 px-2 py-0.5 text-slate-600 dark:text-slate-300">
-                    { entry.fs_type }
+                    { entry.fs_type.clone() }
                 </span>
             </td>
             <td class="px-4 py-2 text-sm" title={full_list}>
                 { for shown_options.iter().map(|opt| html! {
                     <span class="inline-block rounded-full bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300 text-xs font-medium px-3 py-1 mr-1">
-                        { *opt }
+                        { (*opt).clone() }
                     </span>
                 }) }
                 if overflow > 0 {

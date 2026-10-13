@@ -1,21 +1,28 @@
-//! `ValidationMessage` — generic per-field error/warning renderer (§5).
+//! `ValidationMessage` — generic error/warning finding renderer (§5).
 //!
 //! The severity classification (which checks are hard-blocking vs.
-//! advisory) is a backend/validator decision (T5) wired up in T11 — this
-//! component only renders whatever severity it is given. Not actively
-//! triggered with mock error data in this task's shipped shell, since the
-//! static placeholder fields have nothing to validate yet.
+//! advisory) is a backend/validator decision (`fstab_core::validate`,
+//! surfaced via `validate_candidate`) — this component only renders
+//! whatever severity it is given. Wired up in T11 to render
+//! `ValidationReportDto` findings in `EntryDetailDrawer`.
 //!
-//! Deliberately deferred: not wired to any field in this task's shell (no
-//! real validation results exist until T11), so nothing in this crate
-//! calls it yet — allowed here rather than deleted, since the component
-//! itself is part of the required §9 inventory.
-#![allow(dead_code)]
+//! Note: `FindingDto` (API_CONTRACT.md §7) carries only `{severity,
+//! message}`, no field identifier — the per-field `ring-2`/`ring-1`
+//! highlighting `docs/UI_DESIGN.md` §5 describes is therefore not wireable
+//! to specific inputs with the real contract, only to the drawer-level
+//! `ValidationSummary`/warning list. `severity_ring_classes` is kept for
+//! API completeness (and in case a future contract version adds a `field`)
+//! but genuinely has no caller today.
 
 use yew::prelude::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
+    // `EntryDetailDrawer` routes blocking findings through
+    // `ValidationSummary` (a plain message list) instead, so nothing
+    // constructs this variant yet — kept for this component's own
+    // completeness as a generic two-severity renderer.
+    #[allow(dead_code)]
     Error,
     Warning,
 }
@@ -43,7 +50,10 @@ pub fn validation_message(props: &ValidationMessageProps) -> Html {
 
 /// The matching field-level input ring class for a given severity, for
 /// callers that need to highlight the input itself (§5: `ring-2
-/// ring-red-500` for errors, `ring-1 ring-amber-400` for warnings).
+/// ring-red-500` for errors, `ring-1 ring-amber-400` for warnings). See the
+/// module doc comment: unused today because `FindingDto` carries no field
+/// identifier to attach this to.
+#[allow(dead_code)]
 pub fn severity_ring_classes(severity: Severity) -> Classes {
     match severity {
         Severity::Error => classes!("ring-2", "ring-red-500"),

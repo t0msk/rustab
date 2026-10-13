@@ -3,6 +3,8 @@
 use web_sys::HtmlSelectElement;
 use yew::prelude::*;
 
+use crate::dto::SourceKind;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SourceType {
     DevicePath,
@@ -68,6 +70,39 @@ impl SourceType {
             self,
             SourceType::Uuid | SourceType::Label | SourceType::PartUuid | SourceType::PartLabel
         )
+    }
+
+    /// Maps to the `EntryDto::source.kind` this UI type represents, for
+    /// building the candidate entry sent to `validate_candidate`/staged
+    /// into the candidate document.
+    pub fn to_dto_kind(self) -> SourceKind {
+        match self {
+            SourceType::DevicePath => SourceKind::Path,
+            SourceType::Uuid => SourceKind::Uuid,
+            SourceType::Label => SourceKind::Label,
+            SourceType::PartUuid => SourceKind::PartUuid,
+            SourceType::PartLabel => SourceKind::PartLabel,
+            SourceType::Network => SourceKind::Network,
+            SourceType::None => SourceKind::None,
+        }
+    }
+
+    /// The reverse of `to_dto_kind`, for prefilling the dropdown when
+    /// editing an existing entry. `SourceKind::Other` (a kind this UI has
+    /// no dedicated option for) falls back to `DevicePath` so the field at
+    /// least stays editable as free text rather than the drawer failing to
+    /// open.
+    pub fn from_dto_kind(kind: SourceKind) -> SourceType {
+        match kind {
+            SourceKind::Path => SourceType::DevicePath,
+            SourceKind::Uuid => SourceType::Uuid,
+            SourceKind::Label => SourceType::Label,
+            SourceKind::PartUuid => SourceType::PartUuid,
+            SourceKind::PartLabel => SourceType::PartLabel,
+            SourceKind::Network => SourceType::Network,
+            SourceKind::None => SourceType::None,
+            SourceKind::Other => SourceType::DevicePath,
+        }
     }
 }
 

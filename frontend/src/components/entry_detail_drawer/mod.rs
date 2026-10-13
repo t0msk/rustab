@@ -1,15 +1,19 @@
 //! `EntryDetailDrawer` — add/edit form container (§4).
 //!
 //! Slides in from the right, fixed width 520px, backdrop dismissible by
-//! click (unlike `DiffView`/`BackupRestoreConfirmDialog`), since this only
+//! click (unlike `DiffView`/`BackupRestoreConfirmDialog`), since it only
 //! ever stages a non-destructive in-progress edit.
 //!
-//! Field *values* here are local, in-memory scratch state only: this
-//! component does not read from or write to the mock entries table, the
-//! `PendingChangesBar` count, or any backend — that data wiring is T11's
-//! job. The interactivity that does exist (source-type switching, options
-//! chip toggles, etc.) exists purely to prove each field's visual
-//! structure and behavior per §4/§8, not to persist anything.
+//! Wired (T11): prefilled from the real entry being edited, device
+//! discovery for `DevicePicker`, and inline validation via
+//! `validate_candidate` run against the *whole* candidate document (this
+//! draft entry plus every other line already staged), per
+//! `docs/API_CONTRACT.md` §3.3 — duplicate-mount-point-style checks need
+//! the full document, not just this one entry. Clicking "Save entry" never
+//! calls a write command: it emits the finished `EntryDto`/raw text back
+//! to `AppShell`, which stages it into the in-memory candidate document
+//! (see `crate::candidate`). Disk writes only ever happen through T12's
+//! diff-confirm flow.
 
 mod device_picker;
 mod directory_picker_button;
@@ -26,11 +30,6 @@ pub use form_action_bar::FormActionBar;
 pub use source_type_select::SourceType;
 pub use validation_summary::ValidationSummary;
 
-// `validation_message` (`ValidationMessage`/`Severity`) is intentionally not
-// re-exported yet: nothing in this T10 shell has real validation results to
-// render per-field (that's T11's job, see docs/UI_DESIGN.md §5). The module
-// itself carries `#![allow(dead_code)]` for the same reason.
-
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
@@ -40,44 +39,220 @@ use fs_type_field::FsTypeField;
 use mount_point_field::MountPointField;
 use options_tag_input::OptionsTagInput;
 use source_type_select::SourceTypeSelect;
+use validation_message::{Severity, ValidationMessage};
 
-use crate::mock::mock_devices;
+use crate::api;
+use crate::dto::{
+    DeviceInfoDto, DocumentDto, EntryDto, FindingSeverity, LineDto, OptionDto, SourceDto,
+    ValidationReportDto,
+};
 
 /// Which mode the drawer is open in. Owned by `AppShell`.
 #[derive(Clone, PartialEq)]
 pub enum DrawerMode {
     Add,
-    /// Edit an existing, successfully-parsed entry.
-    EditStructured,
+    /// Edit an existing, successfully-parsed entry. Carries the entry so
+    /// the form can be prefilled with its real current values.
+    EditStructured(EntryDto),
     /// Edit a line the parser couldn't fully understand: a single raw-text
     /// field instead of the normal structured form (§3).
     EditRaw(AttrValue),
 }
 
+/// What the drawer hands back to `AppShell` once the user confirms Save
+/// and validation allows proceeding. `AppShell` is the one that knows
+/// *where* (which candidate-document index, or append) this belongs.
+#[derive(Clone, PartialEq)]
+pub enum DrawerSaveResult {
+    Entry(EntryDto),
+    Raw(String),
+}
+
 #[derive(Properties, PartialEq)]
 pub struct EntryDetailDrawerProps {
     pub mode: DrawerMode,
+    /// Every other line in the current candidate document (i.e. the whole
+    /// document minus the one line this drawer is adding/editing), used to
+    /// build the full candidate `validate_candidate` checks against.
+    pub other_lines: Vec<LineDto>,
     pub on_close: Callback<()>,
-    pub on_save: Callback<()>,
+    pub on_save: Callback<DrawerSaveResult>,
+}
+
+fn chips_to_options(chips: &[String]) -> Vec<OptionDto> {
+    chips
+        .iter()
+        .map(|chip| match chip.find('=') {
+            Some(pos) => OptionDto {
+                key: chip[..pos].to_string(),
+                value: Some(chip[pos + 1..].to_string()),
+            },
+            None => OptionDto {
+                key: chip.clone(),
+                value: None,
+            },
+        })
+        .collect()
+}
+
+fn options_to_chips(options: &[OptionDto]) -> Vec<String> {
+    options
+        .iter()
+        .map(|option| match &option.value {
+            Some(value) => format!("{}={}", option.key, value),
+            None => option.key.clone(),
+        })
+        .collect()
 }
 
 #[function_component(EntryDetailDrawer)]
 pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
-    let source_type = use_state(|| SourceType::Uuid);
-    let source_value = use_state(String::new);
-    let mount_point = use_state(String::new);
-    let fs_type = use_state(String::new);
-    let chips = use_state(|| vec!["defaults".to_string(), "noatime".to_string()]);
-    let dump = use_state(|| 0u8);
-    let pass = use_state(|| 0u8);
+    let editing_entry: Option<EntryDto> = match &props.mode {
+        DrawerMode::EditStructured(entry) => Some(entry.clone()),
+        _ => None,
+    };
+
+    let source_type = use_state(|| {
+        editing_entry
+            .as_ref()
+            .map(|e| SourceType::from_dto_kind(e.source.kind))
+            .unwrap_or(SourceType::Uuid)
+    });
+    let source_value = use_state(|| {
+        editing_entry
+            .as_ref()
+            .map(|e| e.source.value.clone())
+            .unwrap_or_default()
+    });
+    let mount_point = use_state(|| {
+        editing_entry
+            .as_ref()
+            .map(|e| e.mount_point.clone())
+            .unwrap_or_default()
+    });
+    let fs_type = use_state(|| {
+        editing_entry
+            .as_ref()
+            .map(|e| e.fs_type.clone())
+            .unwrap_or_default()
+    });
+    let chips = use_state(|| {
+        editing_entry
+            .as_ref()
+            .map(|e| options_to_chips(&e.options))
+            .unwrap_or_else(|| vec!["defaults".to_string(), "noatime".to_string()])
+    });
+    let dump = use_state(|| editing_entry.as_ref().map(|e| e.dump).unwrap_or(0));
+    let pass = use_state(|| editing_entry.as_ref().map(|e| e.pass).unwrap_or(0));
+    // Preserved losslessly but not user-editable in this form (no field
+    // for it in `docs/UI_DESIGN.md` §4) — carried through unchanged.
+    let trailing_comment = use_state(|| {
+        editing_entry
+            .as_ref()
+            .and_then(|e| e.trailing_comment.clone())
+    });
     let raw_text = use_state(|| match &props.mode {
         DrawerMode::EditRaw(raw) => raw.to_string(),
         _ => String::new(),
     });
 
+    let is_raw_mode = matches!(props.mode, DrawerMode::EditRaw(_));
+
+    // Discovered devices for `DevicePicker`, loaded once per drawer open.
+    // `lsblk_available` defaults to `true` so the brief window before the
+    // response arrives reads as "no devices discovered yet", not a false
+    // "unavailable" (API_CONTRACT.md §3.8 / docs/SPEC.md §8).
+    let devices = use_state(Vec::<DeviceInfoDto>::new);
+    let lsblk_available = use_state(|| true);
+    {
+        let devices = devices.clone();
+        let lsblk_available = lsblk_available.clone();
+        use_effect_with((), move |_| {
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::discover_devices().await {
+                    Ok(discovery) => {
+                        devices.set(discovery.devices);
+                        lsblk_available.set(discovery.lsblk_available);
+                    }
+                    Err(_) => lsblk_available.set(false),
+                }
+            });
+            || ()
+        });
+    }
+
+    // Inline validation (§5), debounced (API_CONTRACT.md §3.3: "findmnt is
+    // an external process... don't call it per keystroke") and run against
+    // the whole candidate document, not just this entry.
+    let validation = use_state(|| Option::<ValidationReportDto>::None);
+    let validation_request = use_mut_ref(|| 0u64);
+    {
+        // Hooks must run unconditionally every render (Yew tracks them by
+        // call order) — `is_raw_mode` is folded into the dependency tuple
+        // and checked *inside* the effect instead of guarding the
+        // `use_effect_with` call itself.
+        let validation = validation.clone();
+        let validation_request = validation_request.clone();
+        let other_lines = props.other_lines.clone();
+        let draft = build_entry(
+            &source_type,
+            &source_value,
+            &mount_point,
+            &fs_type,
+            &chips,
+            *dump,
+            *pass,
+            &trailing_comment,
+        );
+        use_effect_with(
+            (
+                is_raw_mode,
+                *source_type,
+                (*source_value).clone(),
+                (*mount_point).clone(),
+                (*fs_type).clone(),
+                (*chips).clone(),
+                *dump,
+                *pass,
+                other_lines.clone(),
+            ),
+            move |_| {
+                if !is_raw_mode {
+                    let request_id = {
+                        let mut counter = validation_request.borrow_mut();
+                        *counter += 1;
+                        *counter
+                    };
+                    let document = DocumentDto {
+                        lines: other_lines
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(LineDto::Entry { entry: draft }))
+                            .collect(),
+                    };
+                    wasm_bindgen_futures::spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(400).await;
+                        if *validation_request.borrow() != request_id {
+                            return;
+                        }
+                        if let Ok(report) = api::validate_candidate(&document).await {
+                            if *validation_request.borrow() == request_id {
+                                validation.set(Some(report));
+                            }
+                        }
+                    });
+                }
+                || ()
+            },
+        );
+    }
+
+    let has_blocking_errors = validation.as_ref().map(|r| r.has_errors).unwrap_or(false);
+    let saving = use_state(|| false);
+
     let title = match &props.mode {
         DrawerMode::Add => "Add entry",
-        DrawerMode::EditStructured => "Edit entry",
+        DrawerMode::EditStructured(_) => "Edit entry",
         DrawerMode::EditRaw(_) => "Edit raw entry",
     };
 
@@ -86,6 +261,114 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
         Callback::from(move |_: MouseEvent| cb.emit(()))
     };
     let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
+
+    let on_save_click = {
+        let on_save = props.on_save.clone();
+        let other_lines = props.other_lines.clone();
+        let source_type = source_type.clone();
+        let source_value = source_value.clone();
+        let mount_point = mount_point.clone();
+        let fs_type = fs_type.clone();
+        let chips = chips.clone();
+        let dump = dump.clone();
+        let pass = pass.clone();
+        let trailing_comment = trailing_comment.clone();
+        let raw_text = raw_text.clone();
+        let validation = validation.clone();
+        let validation_request = validation_request.clone();
+        let saving = saving.clone();
+        Callback::from(move |()| {
+            if is_raw_mode {
+                on_save.emit(DrawerSaveResult::Raw((*raw_text).clone()));
+                return;
+            }
+
+            let draft = build_entry(
+                &source_type,
+                &source_value,
+                &mount_point,
+                &fs_type,
+                &chips,
+                *dump,
+                *pass,
+                &trailing_comment,
+            );
+            let document = DocumentDto {
+                lines: other_lines
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(LineDto::Entry {
+                        entry: draft.clone(),
+                    }))
+                    .collect(),
+            };
+
+            let on_save = on_save.clone();
+            let validation = validation.clone();
+            let validation_request = validation_request.clone();
+            let saving = saving.clone();
+            saving.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                // Authoritative re-check at the moment of Save click (§5:
+                // "every attempted Save click"), independent of whether
+                // the debounced background check has caught up yet.
+                let request_id = {
+                    let mut counter = validation_request.borrow_mut();
+                    *counter += 1;
+                    *counter
+                };
+                match api::validate_candidate(&document).await {
+                    Ok(report) => {
+                        let has_errors = report.has_errors;
+                        if *validation_request.borrow() == request_id {
+                            validation.set(Some(report));
+                        }
+                        saving.set(false);
+                        if !has_errors {
+                            on_save.emit(DrawerSaveResult::Entry(draft));
+                        }
+                    }
+                    Err(message) => {
+                        // A rejection here is a frontend bug per the
+                        // contract ("does not reject") — fail closed
+                        // rather than silently staging an unvalidated
+                        // entry.
+                        if *validation_request.borrow() == request_id {
+                            validation.set(Some(ValidationReportDto {
+                                findings: vec![crate::dto::FindingDto {
+                                    severity: FindingSeverity::Error,
+                                    message: format!("Could not validate this entry: {message}"),
+                                }],
+                                has_errors: true,
+                            }));
+                        }
+                        saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+
+    let error_messages: Vec<AttrValue> = validation
+        .as_ref()
+        .map(|r| {
+            r.findings
+                .iter()
+                .filter(|f| f.severity == FindingSeverity::Error)
+                .map(|f| AttrValue::from(f.message.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let warning_messages: Vec<AttrValue> = validation
+        .as_ref()
+        .map(|r| {
+            r.findings
+                .iter()
+                .filter(|f| f.severity == FindingSeverity::Warning)
+                .map(|f| AttrValue::from(f.message.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     html! {
         <div class="fixed inset-0 z-50 flex justify-end bg-black/40" onclick={on_backdrop_click}>
@@ -112,7 +395,12 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 </div>
 
                 <div class="flex-1 overflow-y-auto px-6 py-6">
-                    <ValidationSummary errors={Vec::<AttrValue>::new()} />
+                    if !is_raw_mode {
+                        <ValidationSummary errors={error_messages} />
+                        { for warning_messages.iter().map(|message| html! {
+                            <ValidationMessage message={message.clone()} severity={Severity::Warning} />
+                        }) }
+                    }
 
                     if let DrawerMode::EditRaw(_) = &props.mode {
                         <div>
@@ -147,7 +435,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 }}
                             />
 
-                            { render_source_value_field(&source_type, &source_value) }
+                            { render_source_value_field(&source_type, &source_value, &devices, *lsblk_available) }
 
                             <MountPointField
                                 value={AttrValue::from((*mount_point).clone())}
@@ -178,26 +466,57 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 pass={*pass}
                                 on_dump_change={{
                                     let dump = dump.clone();
-                                    Callback::from(move |value: u8| dump.set(value))
+                                    Callback::from(move |value: u32| dump.set(value))
                                 }}
                                 on_pass_change={{
                                     let pass = pass.clone();
-                                    Callback::from(move |value: u8| pass.set(value))
+                                    Callback::from(move |value: u32| pass.set(value))
                                 }}
                             />
                         </div>
                     }
                 </div>
 
-                <FormActionBar on_cancel={props.on_close.clone()} on_save={props.on_save.clone()} />
+                <FormActionBar
+                    save_disabled={!is_raw_mode && (has_blocking_errors || *saving)}
+                    on_cancel={props.on_close.clone()}
+                    on_save={on_save_click}
+                />
             </div>
         </div>
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_entry(
+    source_type: &UseStateHandle<SourceType>,
+    source_value: &UseStateHandle<String>,
+    mount_point: &UseStateHandle<String>,
+    fs_type: &UseStateHandle<String>,
+    chips: &UseStateHandle<Vec<String>>,
+    dump: u32,
+    pass: u32,
+    trailing_comment: &UseStateHandle<Option<String>>,
+) -> EntryDto {
+    EntryDto {
+        source: SourceDto {
+            kind: source_type.to_dto_kind(),
+            value: (**source_value).clone(),
+        },
+        mount_point: (**mount_point).clone(),
+        fs_type: (**fs_type).clone(),
+        options: chips_to_options(chips),
+        dump,
+        pass,
+        trailing_comment: (**trailing_comment).clone(),
     }
 }
 
 fn render_source_value_field(
     source_type: &UseStateHandle<SourceType>,
     source_value: &UseStateHandle<String>,
+    devices: &UseStateHandle<Vec<DeviceInfoDto>>,
+    lsblk_available: bool,
 ) -> Html {
     let on_input = {
         let source_value = source_value.clone();
@@ -231,6 +550,26 @@ fn render_source_value_field(
         "Source value"
     };
 
+    let current_type = **source_type;
+    let on_pick = {
+        let source_value = source_value.clone();
+        Callback::from(move |device: DeviceInfoDto| {
+            let picked = match current_type {
+                SourceType::Uuid => device.uuid.clone(),
+                SourceType::Label => device.label.clone(),
+                SourceType::PartUuid => device.partuuid.clone(),
+                SourceType::PartLabel => device.partlabel.clone(),
+                SourceType::DevicePath | SourceType::Network => Some(device.path.clone()),
+                SourceType::None => None,
+            }
+            // Fall back to the device path if this device doesn't carry
+            // the identifier kind currently selected, so a click is never
+            // silently a no-op.
+            .unwrap_or(device.path);
+            source_value.set(picked);
+        })
+    };
+
     html! {
         <div>
             <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1" for="source-value-input">
@@ -246,11 +585,9 @@ fn render_source_value_field(
                 />
             </div>
             <DevicePicker
-                devices={mock_devices()}
-                on_pick={{
-                    let source_value = source_value.clone();
-                    Callback::from(move |value: String| source_value.set(value))
-                }}
+                devices={(**devices).clone()}
+                lsblk_available={lsblk_available}
+                on_pick={on_pick}
             />
         </div>
     }

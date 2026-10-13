@@ -5,10 +5,14 @@ use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct DumpPassFieldsProps {
-    pub dump: u8,
-    pub pass: u8,
-    pub on_dump_change: Callback<u8>,
-    pub on_pass_change: Callback<u8>,
+    // `u32` to match `EntryDto::dump`/`pass` exactly (API_CONTRACT.md §5:
+    // "unsigned integers... fstab imposes no tighter range, so neither
+    // does this contract") — narrowing to `u8` would silently corrupt an
+    // edit of an entry whose existing value exceeds 255.
+    pub dump: u32,
+    pub pass: u32,
+    pub on_dump_change: Callback<u32>,
+    pub on_pass_change: Callback<u32>,
 }
 
 #[function_component(DumpPassFields)]
