@@ -1,0 +1,23 @@
+# Trunk build configuration for the Rustab frontend.
+#
+# Tailwind CSS is generated at build time only, via the Tailwind CLI run
+# through `npx` against the local `node_modules` dev dependency declared in
+# `package.json` (devDependencies only). Nothing from `node_modules` is
+# bundled into the compiled `dist/` output or required at application
+# runtime — Tailwind is purely a dev-time CSS-generation step; Node is never
+# needed to run the built app.
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[[hooks]]
+stage = "pre_build"
+command = "npx"
+command_arguments = [
+  "tailwindcss",
+  "-i",
+  "styles/input.css",
+  "-o",
+  "styles/tailwind.css",
+]

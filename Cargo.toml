@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/fstab-core", "src-tauri"]
+
+# NOTE: `frontend/` is intentionally NOT a workspace member. It compiles to
+# wasm32-unknown-unknown and is built independently via `trunk`; including it
+# here would pull wasm32-only dependency resolution into the native
+# workspace's default build graph and risk feature/target conflicts with the
+# native members above.

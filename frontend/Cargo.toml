@@ -1,0 +1,18 @@
+[package]
+name = "rustab-frontend"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Yew + Trunk + Tailwind frontend for Rustab."
+publish = false
+
+# This crate is intentionally its own workspace root (empty [workspace] table
+# below) rather than a member of the repo's root Cargo workspace. It targets
+# wasm32-unknown-unknown and is built independently via `trunk`, which keeps
+# its dependency/feature resolution isolated from the native workspace
+# members (`crates/fstab-core`, `src-tauri`).
+[workspace]
+
+[dependencies]
+yew = { version = "0.21", features = ["csr"] }
+wasm-bindgen = "0.2"
