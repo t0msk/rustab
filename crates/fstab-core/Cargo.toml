@@ -7,3 +7,4 @@ description = "GUI-free core library for parsing, validating, and atomically wri
 publish = false
 
 [dependencies]
+serde_json = "1.0"
