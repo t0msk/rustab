@@ -1,0 +1,14 @@
+#rustab synthetic fixture: bind mount, swap, systemd-mount-generator options,
+#and an escaped-space mount point. All paths and identifiers are fake.
+
+#Bind mount: re-expose /srv/data at a second mount point
+/srv/data /mnt/data-bind none bind 0 0
+
+#Swap on a fake UUID-identified partition
+UUID=cccc1111-dddd-2222-eeee-333344445555 none swap sw 0 0
+
+#Encrypted example volume, mounted on demand via systemd automount
+/dev/mapper/example-vault /mnt/vault ext4 noauto,x-systemd.automount,x-systemd.idle-timeout=30,x-systemd.device-timeout=10,nofail 0 2
+
+#Removable backup drive whose label contains an escaped space
+/dev/disk/by-label/EXAMPLE /mnt/My\040Backup\040Drive ntfs3 defaults,uid=1000,gid=1000 0 0

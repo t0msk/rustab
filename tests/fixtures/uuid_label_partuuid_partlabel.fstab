@@ -1,0 +1,14 @@
+#rustab synthetic fixture: UUID, LABEL, PARTUUID, and PARTLABEL sources
+#All values below are fake placeholders invented for testing only.
+
+#Root filesystem identified by UUID
+UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee / ext4 defaults,noatime 0 1
+
+#Boot partition identified by PARTUUID, with vfat-specific options
+PARTUUID=11111111-2222-3333-4444-555555555555 /boot vfat defaults,fmask=0022,dmask=0022,iocharset=utf8,errors=remount-ro 0 2
+
+#Data volume identified by LABEL
+LABEL=example-data /srv/data xfs defaults 0 2
+
+#Extra storage identified by PARTLABEL
+PARTLABEL=example-extra /mnt/extra btrfs defaults,noatime 0 2
