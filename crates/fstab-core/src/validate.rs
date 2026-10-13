@@ -392,10 +392,27 @@ fn semantic_findings(doc: &Document) -> Vec<Finding> {
 ///   (structural checks only), never silently treated as success, per
 ///   `docs/SPEC.md` §6.
 /// - `Ok(run)` with `run.success == true` → no findings.
-/// - `Ok(run)` with `run.success == false` → one [`Severity::Error`] finding
-///   that includes `findmnt`'s own output text, so the caller sees the
-///   actual message `findmnt` produced rather than just "verification
-///   failed".
+/// - `Ok(run)` with `run.success == false` → `findmnt --verify` prints a
+///   final summary line shaped like
+///   `"<N> parse error(s), <M> error(s), <K> warning(s)"` and exits
+///   non-zero whenever `N > 0` *or* `M > 0` — i.e. it conflates "a line
+///   could not be parsed" (`N`; `findmnt` itself logs `parse error at line
+///   X -- ignored` and keeps analyzing the rest of the file, so this is not
+///   fatal) with "the file parsed fine but has a real mount/boot-reachability
+///   problem" (`M`). [`parse_findmnt_summary`] extracts `N`/`M`/`K` from that
+///   line so the two cases are not conflated here:
+///     - If the summary line parses and `M == 0` (regardless of `N`, and
+///       regardless of the non-zero exit code that `N > 0` alone causes),
+///       this is a non-blocking [`Severity::Warning`] — findmnt did not
+///       find any real semantic problem.
+///     - If the summary line parses and `M > 0`, this is still a blocking
+///       [`Severity::Error`], and the finding still includes `findmnt`'s own
+///       output text.
+///     - If the summary line cannot be found/parsed at all (output shape
+///       `findmnt` produced does not match what this function expects),
+///       this falls back to the original conservative behavior — a
+///       blocking [`Severity::Error`] — rather than ever silently treating
+///       an unrecognized failure as a pass.
 fn interpret_findmnt_result(result: &io::Result<FindmntRunResult>) -> Vec<Finding> {
     match result {
         Err(err) => vec![Finding::warning(format!(
@@ -407,15 +424,95 @@ fn interpret_findmnt_result(result: &io::Result<FindmntRunResult>) -> Vec<Findin
         Ok(run) if run.success => Vec::new(),
         Ok(run) => {
             let detail = run.combined_output.trim();
-            let message = if detail.is_empty() {
-                "findmnt --verify reported this fstab as invalid, but produced no further \
-                 output."
-                    .to_string()
-            } else {
-                format!("findmnt --verify reported a problem with this fstab:\n{detail}")
-            };
-            vec![Finding::error(message)]
+            match parse_findmnt_summary(&run.combined_output) {
+                Some(summary) if summary.errors == 0 => {
+                    vec![Finding::warning(format!(
+                        "findmnt --verify found {} parse error(s) in this fstab, which findmnt \
+                         itself treats as non-fatal (it logs \"parse error ... -- ignored\" for \
+                         each one and keeps analyzing the rest of the file); no real mount/boot \
+                         errors were found, so this does not block saving. findmnt's full \
+                         output:\n{detail}",
+                        summary.parse_errors
+                    ))]
+                }
+                Some(_) | None => {
+                    let message = if detail.is_empty() {
+                        "findmnt --verify reported this fstab as invalid, but produced no \
+                         further output."
+                            .to_string()
+                    } else {
+                        format!("findmnt --verify reported a problem with this fstab:\n{detail}")
+                    };
+                    vec![Finding::error(message)]
+                }
+            }
         }
+    }
+}
+
+/// The three counts `findmnt --verify` reports in its final summary line
+/// (see [`parse_findmnt_summary`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FindmntSummary {
+    /// `N`: lines `findmnt` could not parse at all (logged as `parse error
+    /// at line X -- ignored` and otherwise non-fatal).
+    parse_errors: u32,
+    /// `M`: real semantic/mount/boot-reachability problems found in lines
+    /// that did parse successfully.
+    errors: u32,
+    /// `K`: advisory warnings (e.g. a boot-required source that is merely
+    /// unreachable right now, downgraded from an error by `noauto`).
+    #[allow(dead_code)] // part of the parsed shape; not currently read by any caller.
+    warnings: u32,
+}
+
+/// Parses `findmnt --verify`'s final summary line out of its combined
+/// stdout+stderr text, tolerating both the singular ("1 error") and plural
+/// ("2 errors", and also "0 errors") wording `findmnt` uses for each of the
+/// three counts, and either "parse error(s)" or plain "error(s)" for the
+/// respective counts.
+///
+/// Confirmed against real `findmnt` (util-linux 2.42.2) output such as:
+/// - `"1 parse error, 2 errors, 0 warnings"`
+/// - `"1 parse error, 0 errors, 2 warnings"`
+/// - `"0 parse errors, 0 errors, 2 warnings"`
+/// - `"0 parse errors, 1 error, 0 warnings"`
+///
+/// Returns `None` if no line in `text` matches the expected
+/// `"<N> parse error(s), <M> error(s), <K> warning(s)"` shape at all (e.g. a
+/// future `findmnt` version changes the wording) — callers must treat `None`
+/// conservatively (today's "non-zero exit = Error" behavior), never as a
+/// free pass, since this function has no way to tell the two cases apart
+/// once the shape is unrecognized.
+fn parse_findmnt_summary(text: &str) -> Option<FindmntSummary> {
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.trim().split(", ").collect();
+        let [parse_field, error_field, warning_field] = fields.as_slice() else {
+            return None;
+        };
+        Some(FindmntSummary {
+            parse_errors: parse_count_field(parse_field, "parse error", "parse errors")?,
+            errors: parse_count_field(error_field, "error", "errors")?,
+            warnings: parse_count_field(warning_field, "warning", "warnings")?,
+        })
+    })
+}
+
+/// Parses one comma-separated field of a `findmnt --verify` summary line
+/// (e.g. `"1 parse error"` or `"2 errors"`) into its leading count, provided
+/// the remainder of the field matches `singular` or `plural` exactly
+/// (whichever one `findmnt` chose does not need to agree with the count
+/// itself — e.g. real `findmnt` prints `"0 parse errors"`, plural despite
+/// the zero count — this function only checks the wording is one of the two
+/// known forms).
+fn parse_count_field(field: &str, singular: &str, plural: &str) -> Option<u32> {
+    let field = field.trim();
+    let (count_str, label) = field.split_once(char::is_whitespace)?;
+    let count: u32 = count_str.parse().ok()?;
+    if label.trim() == singular || label.trim() == plural {
+        Some(count)
+    } else {
+        None
     }
 }
 
@@ -759,6 +856,128 @@ mod tests {
             .contains("unreachable on boot required source"));
     }
 
+    // --- Semantic: parse-error (N) vs real-error (M) summary-line split (T5b) ---
+
+    /// Real `findmnt` (util-linux 2.42.2) output, captured by hand to confirm
+    /// the exact summary-line shape before writing the parser against it —
+    /// see this module's "T5b" fix. `findmnt --verify --tab-file t.fstab`
+    /// against a two-line file (one unparseable line, one entry with
+    /// `UUID=deadbeef-...` and `defaults`, i.e. auto-mounted and
+    /// unreachable, a real error):
+    /// ```text
+    /// findmnt: t.fstab: parse error at line 1 -- ignored
+    ///
+    /// 1 parse error, 2 errors, 0 warnings
+    /// /mnt/unreachable
+    ///    [E] unreachable on boot required target: No such file or directory
+    ///    [E] unreachable on boot required source: UUID=deadbeef-0000-0000-0000-000000000000
+    /// ```
+    /// exit code 1. The same file but with `noauto` instead of `defaults`
+    /// (so the unreachable source is merely a warning, not a real error)
+    /// produces `"1 parse error, 0 errors, 2 warnings"`, still exit code 1.
+    #[test]
+    fn parse_findmnt_summary_handles_real_findmnt_output_shapes() {
+        assert_eq!(
+            parse_findmnt_summary("1 parse error, 2 errors, 0 warnings"),
+            Some(FindmntSummary {
+                parse_errors: 1,
+                errors: 2,
+                warnings: 0
+            })
+        );
+        assert_eq!(
+            parse_findmnt_summary("1 parse error, 0 errors, 2 warnings"),
+            Some(FindmntSummary {
+                parse_errors: 1,
+                errors: 0,
+                warnings: 2
+            })
+        );
+        // Real findmnt uses the plural "errors"/"warnings" wording even for
+        // a zero count (e.g. "0 parse errors", not "0 parse error").
+        assert_eq!(
+            parse_findmnt_summary("0 parse errors, 0 errors, 2 warnings"),
+            Some(FindmntSummary {
+                parse_errors: 0,
+                errors: 0,
+                warnings: 2
+            })
+        );
+        assert_eq!(
+            parse_findmnt_summary("0 parse errors, 1 error, 0 warnings"),
+            Some(FindmntSummary {
+                parse_errors: 0,
+                errors: 1,
+                warnings: 0
+            })
+        );
+        // The summary line is typically preceded by `parse error ... --
+        // ignored` lines and/or a blank line, and followed by the detail
+        // block; the parser must find it regardless of surrounding text.
+        let full_output = "findmnt: t.fstab: parse error at line 1 -- ignored\n\n\
+                            1 parse error, 2 errors, 0 warnings\n\
+                            /mnt/unreachable\n\
+                            \u{20}\u{20}\u{20}[E] unreachable on boot required target: \
+                            No such file or directory";
+        assert_eq!(
+            parse_findmnt_summary(full_output),
+            Some(FindmntSummary {
+                parse_errors: 1,
+                errors: 2,
+                warnings: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_findmnt_summary_returns_none_for_unrecognized_shapes() {
+        assert_eq!(parse_findmnt_summary(""), None);
+        assert_eq!(
+            parse_findmnt_summary("/data\n   [E] unreachable on boot required source: UUID=dead"),
+            None
+        );
+        assert_eq!(
+            parse_findmnt_summary("findmnt: some future wording we did not anticipate"),
+            None
+        );
+    }
+
+    #[test]
+    fn findmnt_failure_with_only_parse_errors_is_a_warning_not_an_error() {
+        let result: io::Result<FindmntRunResult> = Ok(FindmntRunResult {
+            success: false,
+            combined_output: "findmnt: t.fstab: parse error at line 1 -- ignored\n\n\
+                              1 parse error, 0 errors, 2 warnings\n\
+                              /mnt/unreachable\n\
+                              \u{20}\u{20}\u{20}[W] unreachable target: No such file or \
+                              directory"
+                .to_string(),
+        });
+        let findings = interpret_findmnt_result(&result);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].message.contains("parse error"));
+    }
+
+    #[test]
+    fn findmnt_failure_with_real_errors_alongside_parse_errors_is_still_an_error() {
+        let result: io::Result<FindmntRunResult> = Ok(FindmntRunResult {
+            success: false,
+            combined_output: "findmnt: t.fstab: parse error at line 1 -- ignored\n\n\
+                              1 parse error, 2 errors, 0 warnings\n\
+                              /mnt/unreachable\n\
+                              \u{20}\u{20}\u{20}[E] unreachable on boot required source: \
+                              UUID=deadbeef-0000-0000-0000-000000000000"
+                .to_string(),
+        });
+        let findings = interpret_findmnt_result(&result);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0]
+            .message
+            .contains("unreachable on boot required source"));
+    }
+
     // --- Top-level `validate()` ---
 
     #[test]
@@ -864,5 +1083,106 @@ mod tests {
         assert!(report
             .warnings()
             .any(|f| f.message.contains("does not currently exist on disk")));
+    }
+
+    /// `true` if `findmnt` is actually runnable on this machine. Mirrors the
+    /// identically-named helper in `writer.rs`'s test module (not reused
+    /// across modules since both are private `#[cfg(test)]` items).
+    fn is_findmnt_available() -> bool {
+        Command::new("findmnt")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// Regression test for T5b: a document with one [`Line::Malformed`] line
+    /// *and* an otherwise fully-resolvable entry that `findmnt --verify`
+    /// would, at most, warn about (not error on) — `noauto` on a
+    /// nonexistent-but-well-formed UUID, the same pattern `writer.rs`'s own
+    /// tests use to avoid tripping a real `findmnt` error. Before the T5b
+    /// fix, `findmnt --verify`'s non-zero exit (caused solely by the
+    /// malformed line being an unparseable `N > 0`, not a real `M > 0`
+    /// error) was mapped unconditionally to a blocking [`Severity::Error`],
+    /// making this document permanently unsavable — contradicting
+    /// `docs/SPEC.md` §5's requirement that a malformed line be tolerated as
+    /// a visible warning, not treated as fatal.
+    #[test]
+    fn malformed_line_alongside_an_otherwise_valid_entry_is_not_a_blocking_error() {
+        let doc = Document::from_lines(vec![
+            Line::Malformed("this line is garbage and cannot be parsed".to_string()),
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+                "/mnt/data",
+                "ext4",
+                Options::from_vec(vec![crate::model::FstabOption::Flag("noauto".into())]),
+                0,
+                2,
+            )),
+        ]);
+
+        let report = validate(&doc);
+        assert!(
+            !report.has_errors(),
+            "a malformed line must not permanently block saving the rest of the document, \
+             got errors: {:?}",
+            report.errors().collect::<Vec<_>>()
+        );
+        // The malformed line itself is still surfaced, just as a warning.
+        assert!(report
+            .warnings()
+            .any(|f| f.message.contains("could not be understood")));
+        if is_findmnt_available() {
+            // Confirm the fix is actually being exercised against real
+            // findmnt here, not just passing because findmnt happens to be
+            // unavailable (which would degrade to a warning regardless).
+            assert!(
+                report.warnings().any(|f| f.message.contains("parse error")),
+                "expected findmnt's own parse-error warning when findmnt is available, got: {:?}",
+                report.findings
+            );
+        } else {
+            eprintln!(
+                "note: findmnt is not available on this machine; this test still passed via \
+                 the degraded-mode warning path, not the parse-error/real-error split"
+            );
+        }
+    }
+
+    /// Companion regression test: the malformed line alone must not mask a
+    /// *real* semantic error findmnt finds elsewhere in the same document
+    /// (`M > 0`) — that must still be a blocking [`Severity::Error`],
+    /// confirming T5b only changes the `M == 0` case. Skipped when `findmnt`
+    /// is unavailable, since without it this check degrades to a
+    /// non-blocking warning regardless (covered by this module's other
+    /// degraded-mode tests).
+    #[test]
+    fn malformed_line_does_not_mask_a_real_semantic_error_elsewhere() {
+        if !is_findmnt_available() {
+            eprintln!("skipping: findmnt is not available on this machine");
+            return;
+        }
+
+        let doc = Document::from_lines(vec![
+            Line::Malformed("this line is garbage and cannot be parsed".to_string()),
+            // Auto-mounted (no `noauto`) with a UUID no device has: `findmnt
+            // --verify` reports this as a real error, same pattern as
+            // `writer.rs`'s `semantic_validation_failure_leaves_target_untouched`.
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("deadbeef-0000-0000-0000-000000000000".into()),
+                "/mnt/unreachable",
+                "ext4",
+                Options::from_vec(vec![crate::model::FstabOption::Flag("defaults".into())]),
+                0,
+                2,
+            )),
+        ]);
+
+        let report = validate(&doc);
+        assert!(
+            report.has_errors(),
+            "a real semantic error must still block saving even alongside a malformed line, \
+             report: {:?}",
+            report.findings
+        );
     }
 }
