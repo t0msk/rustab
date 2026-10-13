@@ -216,6 +216,19 @@ manual text entry must still work if these tools are missing.
   run instructions (`trunk`, `cargo tauri dev`/`build`, the Tailwind CLI
   step), the dual-license note, and a clear safety note about the
   dev-sandbox-by-default behavior from §7.
+- **README must also include an explicit, public "AI use" disclosure
+  section.** Required content (the maintainer's own words, adapt phrasing
+  but keep every point — this is a deliberate transparency statement, not
+  boilerplate):
+  - Yes, AI assistance (Claude Code) was used during development.
+  - The maintainer is a senior software developer with 10+ years of
+    experience, who personally code-reviewed and tested every change.
+  - An automated test suite backs the codebase (link/mention the test
+    counts if it reads naturally), in addition to manual review.
+  - Tone: confident and matter-of-fact, not apologetic or defensive —
+    stating a development practice, not making an excuse.
+  - Contact email for the project throughout README/CONTRIBUTORS/issue
+    templates is `rustab@tomsk.dev` (not a personal address).
 - `CONTRIBUTING.md`: how to set up the dev environment, how to run tests,
   code style expectations (fmt/clippy gates), PR process, and a note that
   contributors should add themselves to `CONTRIBUTORS.md` in their PR.
@@ -224,6 +237,87 @@ manual text entry must still work if these tools are missing.
   set `license = "MIT OR Apache-2.0"` in each crate's `Cargo.toml`).
 - `.env.example` only if any env var is actually needed (e.g. overriding
   the dev target path from §7) — never commit a real `.env`.
+- **Commit/PR authorship**: see the repo-root `CLAUDE.md` — no AI
+  co-author trailer in commits or PR descriptions in this repository, by
+  the maintainer's explicit request. AI use is disclosed once, clearly, in
+  README instead of on every commit.
+
+## 12. Versioning
+
+- Every crate (`fstab-core`, the `src-tauri` app, `frontend`) and
+  `src-tauri/tauri.conf.json` start at **`0.0.0`**, not Cargo's default
+  `0.1.0`. Keep all of them in lockstep at the same version — this is a
+  single-product release, not independently versioned libraries.
+- Follow semver (`MAJOR.MINOR.PATCH`). The maintainer decides, per release,
+  which part bumps — see §13; don't infer it automatically from commit
+  messages or diff size.
+
+## 13. Release & packaging CI/CD
+
+Two distinct GitHub Actions concerns, kept separate so a routine merge
+never silently cuts a version the maintainer didn't ask for:
+
+1. **Continuous build on the `release` branch** (separate from the
+   existing `ci.yml`, which already gates every push/PR with
+   fmt/clippy/test/build). Add a workflow triggered on push to the
+   `release` branch that builds installable packages from the current
+   `release` HEAD every time something is merged into it:
+   - `.deb` via `cargo-deb` (or an equivalent Tauri bundler step —
+     `cargo tauri build` already produces `.deb` and `.AppImage` bundles
+     out of the box for a Tauri 2 app; check whether that covers it
+     before adding a separate `cargo-deb` step).
+   - `.rpm` via `cargo tauri build` targeting rpm (Tauri's bundler
+     supports rpm) or `cargo-generate-rpm` if the Tauri bundler output
+     isn't sufficient.
+   - `.AppImage` via the Tauri bundler's AppImage target.
+   - Upload all three as workflow artifacts on every push to `release`,
+     so there's always a downloadable build from the latest `release`
+     state, independent of whether a version bump happens.
+2. **Explicit, maintainer-triggered version bump + GitHub Release**, kept
+   separate from (1) so the bump level is always a deliberate choice, not
+   inferred: a `workflow_dispatch`-triggered workflow (run manually from
+   the `release` branch, after merging) with a **required choice input**
+   `bump` restricted to `patch` / `minor` / `major`. On run, it should:
+   - Read the current version (from `src-tauri/tauri.conf.json` or any
+     one crate — they're kept in lockstep per §12), compute the new
+     semver value for the chosen bump level.
+   - Update the version field in every workspace crate's `Cargo.toml` and
+     in `tauri.conf.json`, commit that as `chore(release): vX.Y.Z`
+     (respecting the no-AI-attribution policy), and create an annotated
+     git tag `vX.Y.Z`.
+   - Re-run the packaging step from (1) against that exact commit and
+     attach the resulting `.deb`/`.rpm`/`.AppImage` to a new GitHub
+     Release for tag `vX.Y.Z`, using the tag as the release title.
+   - This is the *only* thing that advances the version — a plain push to
+     `release` (point 1) must never bump it on its own.
+
+## 14. Flatpak / Flathub — documentation only (not implemented in v1)
+
+Add `docs/FLATPAK.md`: a self-contained, step-by-step guide for a future
+contributor (or the maintainer later) to package Rustab as a Flatpak and
+submit it to Flathub. Cover, concretely for *this* project's stack:
+- Why Flatpak packaging for a Tauri app has extra considerations (WebKitGTK
+  runtime dependency, needing the `org.freedesktop.Platform`/`Sdk` plus the
+  GNOME or similar runtime that provides WebKitGTK, and that Tauri's own
+  docs have Linux-packaging guidance worth cross-referencing).
+- How to write the Flatpak manifest (`dev.tomsk.Rustab.yml` or similar
+  reverse-DNS app ID — note the app will need a reverse-DNS id distinct
+  from the GitHub repo name) using `flatpak-builder`, and how a Rust/Cargo
+  build integrates (e.g. `flatpak-cargo-generator` for vendoring
+  dependencies offline, since Flathub's build sandbox has no network
+  access).
+- Why `pkexec`/polkit-based privilege escalation needs special handling
+  under Flatpak's sandbox (portals, or documenting that the Flatpak build
+  may need `--filesystem=/etc/fstab:rw` or a host-system D-Bus/portal
+  approach instead of a bare `pkexec` call) — flag this as something that
+  needs real testing on a Flatpak build before submission, not something
+  to assume works unchanged.
+- The actual Flathub submission process: forking `flathub/flathub`,
+  opening a PR with the manifest, their review/CI bot, and ongoing
+  maintenance expectations (keeping the manifest's dependency versions
+  updated).
+- This is guidance for a reader to follow later — do not actually build or
+  submit a Flatpak package as part of this task.
 
 ## 11. Explicit non-goals (for v1)
 
