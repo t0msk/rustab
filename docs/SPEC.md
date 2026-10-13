@@ -229,6 +229,11 @@ manual text entry must still work if these tools are missing.
     stating a development practice, not making an excuse.
   - Contact email for the project throughout README/CONTRIBUTORS/issue
     templates is `rustab@tomsk.dev` (not a personal address).
+  - README must also include a Discord badge/link to the maintainer's dev
+    server, `https://discord.gg/vymDkeQnpj`, with a Discord icon (e.g. a
+    shields.io badge: `https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white`
+    linking to that invite), placed near the other contact info so people
+    who want to reach the maintainer can find it easily.
 - `CONTRIBUTING.md`: how to set up the dev environment, how to run tests,
   code style expectations (fmt/clippy gates), PR process, and a note that
   contributors should add themselves to `CONTRIBUTORS.md` in their PR.
