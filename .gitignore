@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+
+# Trunk / wasm frontend build output
+/frontend/dist/
+/frontend/.trunk/
+
+# Tauri bundle output
+/src-tauri/target/
+
+# Node (Tailwind CLI is a dev-only build dependency, no JS ships at runtime)
+node_modules/
+
+# Local developer data - NEVER commit real system files here.
+# This holds a private, untracked copy of a real /etc/fstab for manual
+# sandbox testing. It is machine-specific and may contain personal paths
+# (usernames, encrypted vault locations, hardware UUIDs) that must not
+# end up in the public repository.
+/dev-data/
+
+# Editors / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+.DS_Store
+
+# Env files (see CONTRIBUTING.md for the .env.example convention)
+.env
