@@ -234,6 +234,13 @@ manual text entry must still work if these tools are missing.
     shields.io badge: `https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white`
     linking to that invite), placed near the other contact info so people
     who want to reach the maintainer can find it easily.
+  - README must also include a GitHub Sponsors support badge/button
+    linking to `https://github.com/sponsors/t0msk` (e.g. a shields.io
+    badge: `https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white`),
+    placed alongside the Discord/contact badges. Also add a
+    `.github/FUNDING.yml` with `github: [t0msk]` — this is a one-line,
+    low-effort addition that makes GitHub render its own native "Sponsor"
+    button on the repo's main page too, on top of the README badge.
 - `CONTRIBUTING.md`: how to set up the dev environment, how to run tests,
   code style expectations (fmt/clippy gates), PR process, and a note that
   contributors should add themselves to `CONTRIBUTORS.md` in their PR.
