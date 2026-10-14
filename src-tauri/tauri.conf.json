@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:8080",
-    "beforeDevCommand": "cd ../frontend && trunk serve",
-    "beforeBuildCommand": "cd ../frontend && trunk build --release"
+    "beforeDevCommand": "cd frontend && trunk serve",
+    "beforeBuildCommand": "cd frontend && trunk build --release"
   },
   "app": {
     "windows": [
