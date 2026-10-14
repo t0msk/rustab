@@ -105,10 +105,22 @@ pub enum FindingSeverity {
     Warning,
 }
 
+/// Which of an entry's fields a [`FindingDto`] is about, when it is about
+/// exactly one (§7). Mirrors the backend's `ValidationFieldDto`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationField {
+    MountPoint,
+    Source,
+    FsType,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FindingDto {
     pub severity: FindingSeverity,
     pub message: String,
+    pub field: Option<ValidationField>,
+    pub line_index: Option<usize>,
 }
 
 /// `CommandErrorDto` (§8), the rejection shape of the read-side commands

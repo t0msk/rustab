@@ -253,11 +253,18 @@ severity looks and behaves:
 - **warning** (non-blocking): field border `ring-1 ring-amber-400`, message in
   `text-amber-600 dark:text-amber-400 text-xs` with a caution icon. Does not disable
   Save.
-- If ≥1 error exists anywhere in the form, a **ValidationSummary** banner appears
-  pinned at the top of the drawer body: `bg-red-50 dark:bg-red-900/20 border
-  border-red-300 dark:border-red-800 text-red-800 dark:text-red-300`, text
-  `"N issues must be fixed before saving"` listing each error with a jump-to-field
-  link.
+- A warning that is specifically about the mount point of the entry currently being
+  edited (the backend's `field`/`line_index` tagging on the finding, matched against
+  this draft's own position in the document) renders inline, directly below the
+  mount point input, using the same `ValidationMessage` styling (`text-amber-600
+  dark:text-amber-400 text-xs` with a caution icon). Every other warning — including
+  a mount-point-tagged one about a *different* entry elsewhere in the document —
+  still renders in the flat warning stack described below, not next to any field.
+- If ≥1 error exists anywhere in the form, a **ValidationSummary** banner appears at
+  the bottom of the drawer body, immediately above the Save/Cancel bar: `bg-red-50
+  dark:bg-red-900/20 border border-red-300 dark:border-red-800 text-red-800
+  dark:text-red-300`, text `"N issues must be fixed before saving"` listing each
+  error with a jump-to-field link.
 - Validation runs on field blur and on every attempted Save click (not only at the
   end), so errors surface as early as possible, never only after a failed save attempt.
 

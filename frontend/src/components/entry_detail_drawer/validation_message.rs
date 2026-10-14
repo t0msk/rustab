@@ -6,13 +6,13 @@
 //! whatever severity it is given. Wired up in T11 to render
 //! `ValidationReportDto` findings in `EntryDetailDrawer`.
 //!
-//! Note: `FindingDto` (API_CONTRACT.md §7) carries only `{severity,
-//! message}`, no field identifier — the per-field `ring-2`/`ring-1`
-//! highlighting `docs/UI_DESIGN.md` §5 describes is therefore not wireable
-//! to specific inputs with the real contract, only to the drawer-level
-//! `ValidationSummary`/warning list. `severity_ring_classes` is kept for
-//! API completeness (and in case a future contract version adds a `field`)
-//! but genuinely has no caller today.
+//! Note: `FindingDto` (API_CONTRACT.md §7) now also carries `field`/
+//! `line_index` (T21.3), which `EntryDetailDrawer` uses to route a warning
+//! about this draft's own mount point into `MountPointField` (rendered via
+//! this component, directly below the input) instead of the flat warning
+//! list. `severity_ring_classes` is still unused today — the per-field
+//! `ring-2`/`ring-1` input-border highlighting `docs/UI_DESIGN.md` §5
+//! describes has no caller yet, kept for API completeness.
 
 use yew::prelude::*;
 
@@ -51,8 +51,8 @@ pub fn validation_message(props: &ValidationMessageProps) -> Html {
 /// The matching field-level input ring class for a given severity, for
 /// callers that need to highlight the input itself (§5: `ring-2
 /// ring-red-500` for errors, `ring-1 ring-amber-400` for warnings). See the
-/// module doc comment: unused today because `FindingDto` carries no field
-/// identifier to attach this to.
+/// module doc comment: no caller applies this to an input's border yet
+/// (`MountPointField`'s inline warnings render the message only).
 #[allow(dead_code)]
 pub fn severity_ring_classes(severity: Severity) -> Classes {
     match severity {

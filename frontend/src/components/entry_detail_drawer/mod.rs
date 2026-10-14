@@ -44,7 +44,7 @@ use validation_message::{Severity, ValidationMessage};
 use crate::api;
 use crate::dto::{
     DeviceInfoDto, DocumentDto, EntryDto, FindingSeverity, LineDto, OptionDto, SourceDto,
-    ValidationReportDto,
+    ValidationField, ValidationReportDto,
 };
 
 /// Which mode the drawer is open in. Owned by `AppShell`.
@@ -338,6 +338,8 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 findings: vec![crate::dto::FindingDto {
                                     severity: FindingSeverity::Error,
                                     message: format!("Could not validate this entry: {message}"),
+                                    field: None,
+                                    line_index: None,
                                 }],
                                 has_errors: true,
                             }));
@@ -359,12 +361,33 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 .collect()
         })
         .unwrap_or_default();
+    // The draft entry being edited is always appended last to the document
+    // sent to `validate_candidate` (see the `use_effect_with` above), so its
+    // own findings are unambiguously those tagged with this index.
+    let draft_line_index = props.other_lines.len();
+    let is_own_mount_point_warning = |f: &crate::dto::FindingDto| {
+        f.severity == FindingSeverity::Warning
+            && f.field == Some(ValidationField::MountPoint)
+            && f.line_index == Some(draft_line_index)
+    };
+    let mount_point_warnings: Vec<AttrValue> = validation
+        .as_ref()
+        .map(|r| {
+            r.findings
+                .iter()
+                .filter(|f| is_own_mount_point_warning(f))
+                .map(|f| AttrValue::from(f.message.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let warning_messages: Vec<AttrValue> = validation
         .as_ref()
         .map(|r| {
             r.findings
                 .iter()
-                .filter(|f| f.severity == FindingSeverity::Warning)
+                .filter(|f| {
+                    f.severity == FindingSeverity::Warning && !is_own_mount_point_warning(f)
+                })
                 .map(|f| AttrValue::from(f.message.clone()))
                 .collect()
         })
@@ -396,7 +419,6 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
 
                 <div class="flex-1 overflow-y-auto px-6 py-6">
                     if !is_raw_mode {
-                        <ValidationSummary errors={error_messages} />
                         { for warning_messages.iter().map(|message| html! {
                             <ValidationMessage message={message.clone()} severity={Severity::Warning} />
                         }) }
@@ -443,6 +465,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                     let mount_point = mount_point.clone();
                                     Callback::from(move |value: String| mount_point.set(value))
                                 }}
+                                warnings={mount_point_warnings.clone()}
                             />
 
                             <FsTypeField
@@ -474,6 +497,10 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 }}
                             />
                         </div>
+                    }
+
+                    if !is_raw_mode {
+                        <ValidationSummary errors={error_messages} />
                     }
                 </div>
 

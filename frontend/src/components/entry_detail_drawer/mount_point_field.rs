@@ -4,11 +4,18 @@ use web_sys::HtmlInputElement;
 use yew::prelude::*;
 
 use super::directory_picker_button::DirectoryPickerButton;
+use super::validation_message::{Severity, ValidationMessage};
 
 #[derive(Properties, PartialEq)]
 pub struct MountPointFieldProps {
     pub value: AttrValue,
     pub on_change: Callback<String>,
+    /// Warnings about *this* draft's mount point specifically (§5/T21.3) —
+    /// i.e. already filtered and attributed by the caller, not every
+    /// mount-point-related warning in the document. Rendered directly below
+    /// the input.
+    #[prop_or_default]
+    pub warnings: Vec<AttrValue>,
 }
 
 #[function_component(MountPointField)]
@@ -37,6 +44,9 @@ pub fn mount_point_field(props: &MountPointFieldProps) -> Html {
                 />
                 <DirectoryPickerButton />
             </div>
+            { for props.warnings.iter().map(|message| html! {
+                <ValidationMessage message={message.clone()} severity={Severity::Warning} />
+            }) }
         </div>
     }
 }
