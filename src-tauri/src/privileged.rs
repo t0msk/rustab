@@ -2,27 +2,31 @@
 //! internal subcommand on the elevated side — see `docs/SPEC.md` §6 step 6
 //! and `docs/API_CONTRACT.md` §4.
 //!
-//! ## The two operations, and why there is still only one flag
+//! ## The three operations, and why there is still only one flag
 //!
-//! Two things in Rustab need root, and only when the active target is the real
-//! `/etc/fstab`: **writing the target** (a save or a restore) and **deleting
-//! one of the target's own backups** (they live in `/etc/`, next to the
-//! target, which an unprivileged process cannot unlink).
+//! Three things in Rustab need root, and only when the active target is the
+//! real `/etc/fstab`: **writing the target** (a save or a restore),
+//! **deleting one of the target's own backups**, and **creating a manual
+//! backup** of it. The latter two are about files in `/etc/`, next to the
+//! target, which an unprivileged process can neither unlink nor create.
 //!
 //! They share one dispatch point. The request on stdin is a union tagged by
 //! `op`, so [`run_internal_if_requested`] still checks exactly one hidden
 //! argument, still reads stdin to EOF exactly once, still writes exactly one
-//! JSON object to stdout and still returns one exit code — for either
-//! operation. That matters because the security property this module claims is
+//! JSON object to stdout and still returns one exit code — for any of the
+//! three. That matters because the security property this module claims is
 //! "when the flag is present, no Tauri runtime, webview, plugin or logger is
 //! ever initialized", and that claim is only as auditable as the number of
 //! places that can turn this process into a root process. There is one. A
-//! second flag would have made it two.
+//! second flag would have made it two, and a third would have made it three.
 //!
-//! Everything below about the write operation is unchanged; the delete
-//! operation is deliberately tiny by comparison (resolve, `remove_file`),
-//! because unlinking a backup is not writing the target and none of
-//! [`writer::write_document`]'s guarantees apply to it or are needed for it.
+//! Everything below about the write operation is unchanged; the other two are
+//! deliberately tiny by comparison (resolve then `remove_file`; resolve then
+//! copy), because neither writes the target and none of
+//! [`writer::write_document`]'s guarantees apply to them or are needed for
+//! them. In particular [`writer::create_backup`] never opens the target for
+//! writing at all — it only reads it — so the elevated backup operation
+//! cannot damage `/etc/fstab` even in principle.
 //!
 //! ## The requirement, restated
 //!
@@ -109,11 +113,17 @@
 //! unprivileged side cannot turn the elevated delete into "unlink an arbitrary
 //! root-owned path" — not `/etc/shadow`, not a different target's backup, not
 //! the target itself.
+//!
+//! The create-backup operation carries only a `target`, and that single
+//! identity check is the whole of its authority: the path it writes is chosen
+//! by [`writer::create_backup`] from the verified target's own name, never by
+//! anything in the request, so there is no second string for the unprivileged
+//! side to get wrong or to lie about.
 
 use crate::backups;
 use crate::dto::{
-    DeleteBackupErrorDto, DeleteBackupErrorKindDto, DocumentDto, WriteErrorDto, WriteErrorKindDto,
-    WriteOutcomeDto,
+    CreateBackupErrorDto, CreateBackupErrorKindDto, CreateBackupOutcomeDto, DeleteBackupErrorDto,
+    DeleteBackupErrorKindDto, DocumentDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
 use crate::target;
 use fstab_core::model::Document;
@@ -128,11 +138,12 @@ use std::process::{Command, Output, Stdio};
 ///
 /// Not a public CLI: it is an implementation detail of the escalation
 /// mechanism, its stdin/stdout protocol is unstable, and nothing but
-/// [`save_elevated`] and [`delete_backup_elevated`] is expected to pass it.
+/// [`save_elevated`], [`delete_backup_elevated`] and [`create_backup_elevated`]
+/// is expected to pass it.
 ///
-/// The name and the spelling are historical — the flag predates the delete
-/// operation and now carries either [`PrivilegedRequest`] variant. It is kept
-/// as-is on purpose: changing it buys nothing and the whole point of this
+/// The name and the spelling are historical — the flag predates the two
+/// backup operations and now carries any [`PrivilegedRequest`] variant. It is
+/// kept as-is on purpose: changing it buys nothing and the whole point of this
 /// module is that there is exactly *one* string that can turn this process
 /// into a root process.
 pub const INTERNAL_WRITE_FLAG: &str = "--internal-privileged-write";
@@ -191,6 +202,16 @@ pub enum PrivilegedRequest {
         /// elevated process*, to one of `target`'s real backups.
         backup_path: String,
     },
+    /// Copy `target` to a fresh *manual* backup beside it, leaving `target`
+    /// itself untouched.
+    ///
+    /// Carries no path but the target on purpose: the backup's name is chosen
+    /// by [`writer::create_backup`] inside the elevated process, so there is
+    /// nothing here for a caller to point somewhere else.
+    CreateBackup {
+        /// The target to back up. Must be the real `/etc/fstab`.
+        target: String,
+    },
 }
 
 /// The single JSON object the elevated helper prints to stdout before
@@ -224,6 +245,18 @@ pub enum PrivilegedResponse {
     BackupDeleteFailed {
         /// Why.
         error: DeleteBackupErrorDto,
+    },
+    /// A `create_backup` completed: a new manual backup exists beside the
+    /// target, which was only read.
+    BackupCreated {
+        /// What it did, including which backup it created.
+        outcome: CreateBackupOutcomeDto,
+    },
+    /// A `create_backup` did not complete. No backup was created; the target
+    /// was never opened for writing in any case.
+    BackupCreateFailed {
+        /// Why.
+        error: CreateBackupErrorDto,
     },
 }
 
@@ -320,6 +353,9 @@ pub fn handle_privileged_request<R: Read, W: Write>(
             target,
             backup_path,
         } => handle_delete_backup(output, allowed_target, &target, &backup_path),
+        PrivilegedRequest::CreateBackup { target } => {
+            handle_create_backup(output, allowed_target, &target)
+        }
     }
 }
 
@@ -449,6 +485,60 @@ fn handle_delete_backup<W: Write>(
                     DeleteBackupErrorKindDto::Delete,
                     format!("could not delete the backup {}: {err}", backup.display()),
                 ),
+            },
+            EXIT_OPERATION_ERROR,
+        ),
+    }
+}
+
+/// The elevated manual backup, in full: refuse any target but
+/// `allowed_target`, then call [`writer::create_backup`] on it.
+///
+/// One check, then one function call — the same shape, and the same "nothing
+/// happens before the check passes" guarantee, as [`handle_write`] and
+/// [`handle_delete_backup`]. The identity test is the identical
+/// [`target::is_same_file`] call those two use, so "which file is the real
+/// `/etc/fstab`" is still decided in exactly one place for every operation.
+///
+/// There is nothing else to check, because there is nothing else in the
+/// request: [`writer::create_backup`] derives the backup's path from the
+/// verified target's own name, in the target's own directory, so this
+/// operation cannot be pointed at another file the way an operation taking a
+/// destination path could be. And it never opens the target for writing —
+/// only for reading — so unlike [`handle_write`] it has no atomicity
+/// ceremony to perform and no way to leave `/etc/fstab` in a state nobody
+/// planned.
+fn handle_create_backup<W: Write>(output: &mut W, allowed_target: &Path, target: &str) -> i32 {
+    let target_path = PathBuf::from(target);
+    if !target::is_same_file(&target_path, allowed_target) {
+        return respond(
+            output,
+            PrivilegedResponse::BackupCreateFailed {
+                error: CreateBackupErrorDto::new(
+                    CreateBackupErrorKindDto::InvalidTarget,
+                    format!(
+                        "the elevated helper only backs up {}; it refused to back up {}",
+                        allowed_target.display(),
+                        target_path.display()
+                    ),
+                ),
+            },
+            EXIT_OPERATION_ERROR,
+        );
+    }
+
+    match writer::create_backup(&target_path) {
+        Ok(outcome) => respond(
+            output,
+            PrivilegedResponse::BackupCreated {
+                outcome: CreateBackupOutcomeDto::from_outcome(&outcome),
+            },
+            EXIT_OK,
+        ),
+        Err(err) => respond(
+            output,
+            PrivilegedResponse::BackupCreateFailed {
+                error: CreateBackupErrorDto::from(&err),
             },
             EXIT_OPERATION_ERROR,
         ),
@@ -722,11 +812,16 @@ fn interpret_write_output(
             })
         }
         Ok(PrivilegedResponse::Error { error }) => return Err(error),
-        // Only a `delete_backup` request can provoke these, and this function
-        // is only ever reached for a `write` one. Treated as "no usable
-        // response" rather than trusted, because a response that does not
-        // answer the question asked is not an account of this operation.
-        Ok(PrivilegedResponse::BackupDeleted | PrivilegedResponse::BackupDeleteFailed { .. })
+        // Only a backup request can provoke these, and this function is only
+        // ever reached for a `write` one. Treated as "no usable response"
+        // rather than trusted, because a response that does not answer the
+        // question asked is not an account of this operation.
+        Ok(
+            PrivilegedResponse::BackupDeleted
+            | PrivilegedResponse::BackupDeleteFailed { .. }
+            | PrivilegedResponse::BackupCreated { .. }
+            | PrivilegedResponse::BackupCreateFailed { .. },
+        )
         | Err(_) => {}
     }
 
@@ -875,9 +970,15 @@ fn interpret_delete_output(
                 ),
             ))
         }
-        // Only a `write` request can provoke this; a response that does not
-        // answer the question asked is not an account of this operation.
-        Ok(PrivilegedResponse::Ok { .. }) | Err(_) => {}
+        // Only a `write` or a `create_backup` request can provoke these; a
+        // response that does not answer the question asked is not an account
+        // of this operation.
+        Ok(
+            PrivilegedResponse::Ok { .. }
+            | PrivilegedResponse::BackupCreated { .. }
+            | PrivilegedResponse::BackupCreateFailed { .. },
+        )
+        | Err(_) => {}
     }
 
     let detail = stderr_excerpt(stderr);
@@ -899,6 +1000,140 @@ fn interpret_delete_output(
     };
     Err(DeleteBackupErrorDto::new(
         DeleteBackupErrorKindDto::PrivilegeEscalation,
+        message,
+    ))
+}
+
+// -- the manual backup-creation operation ------------------------------------
+
+/// Creates a manual backup of `target` as root, by re-executing this binary
+/// under `pkexec` with [`INTERNAL_WRITE_FLAG`].
+///
+/// Needed at all because a backup of the real `/etc/fstab` has to be created
+/// *in* `/etc/`, which an unprivileged process cannot write to — the mirror
+/// image of why [`delete_backup_elevated`] exists. A non-real target's backups
+/// live in a user-owned directory and never come through here.
+///
+/// This function performs **no filesystem changes of its own**, and the
+/// elevated half it starts chooses the backup's path itself from the target it
+/// has verified, so there is no path in this request that could point the
+/// elevated copy at the wrong file.
+///
+/// # Errors
+///
+/// Returns a [`CreateBackupErrorDto`] whose `kind` is
+/// [`CreateBackupErrorKindDto::PrivilegeEscalation`] if the helper could not be
+/// launched, the authorization was refused or dismissed, or the helper produced
+/// no usable response; otherwise the error the helper itself reported,
+/// forwarded unchanged.
+pub fn create_backup_elevated(
+    target: &Path,
+) -> Result<CreateBackupOutcomeDto, CreateBackupErrorDto> {
+    let request = PrivilegedRequest::CreateBackup {
+        target: target.to_string_lossy().into_owned(),
+    };
+    let output = run_elevated(&request).map_err(|failure| create_launch_error(target, &failure))?;
+
+    interpret_create_backup_output(target, output.status.code(), &output.stdout, &output.stderr)
+}
+
+/// Words a [`LaunchFailure`] as a backup-creation failure.
+///
+/// Every variant lands on [`CreateBackupErrorKindDto::PrivilegeEscalation`],
+/// for the same reason [`delete_launch_error`]'s do: from the frontend's point
+/// of view these are one situation — the elevated helper never got to do the
+/// job — and the message says which it was. (A serialization failure is a bug
+/// rather than an escalation problem, but a request of one `String` cannot fail
+/// to serialize, and inventing a kind the frontend must handle for an
+/// unreachable case is not worth it.)
+fn create_launch_error(target: &Path, failure: &LaunchFailure) -> CreateBackupErrorDto {
+    let target = target.display();
+    let message = match failure {
+        LaunchFailure::NoExePath(err) => format!(
+            "could not determine Rustab's own executable path, so the elevated helper could not \
+             be started ({err}); no backup of {target} was created"
+        ),
+        LaunchFailure::Serialize(err) => format!(
+            "could not serialize the backup request ({err}); no backup of {target} was created"
+        ),
+        LaunchFailure::Spawn(err) => format!(
+            "could not run pkexec to obtain the privileges needed to back up {target} ({err}); \
+             no backup was created. Is polkit installed?"
+        ),
+        LaunchFailure::SendRequest(err) => format!(
+            "could not hand the backup request to the elevated helper ({err}); no backup of \
+             {target} was created"
+        ),
+        LaunchFailure::Wait(err) => format!(
+            "the elevated helper could not be waited for ({err}), so it is not known whether a \
+             backup of {target} was created; refresh the backup list to see"
+        ),
+    };
+    CreateBackupErrorDto::new(CreateBackupErrorKindDto::PrivilegeEscalation, message)
+}
+
+/// Maps the elevated helper's exit status, stdout and stderr onto a
+/// backup-creation result.
+///
+/// Pure, for the same reason [`interpret_write_output`] is, and it follows the
+/// same rule: a parsable JSON response wins over the exit code, and only when
+/// there is none does the exit code decide — through the same
+/// [`NoResponseReason`], so no operation can disagree with another about what
+/// `pkexec`'s codes mean.
+fn interpret_create_backup_output(
+    target: &Path,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<CreateBackupOutcomeDto, CreateBackupErrorDto> {
+    let text = String::from_utf8_lossy(stdout);
+    match serde_json::from_str::<PrivilegedResponse>(text.trim()) {
+        Ok(PrivilegedResponse::BackupCreated { outcome }) => return Ok(outcome),
+        Ok(PrivilegedResponse::BackupCreateFailed { error }) => return Err(error),
+        // The helper answers in this shape when it could not read or parse the
+        // request at all — at that point it does not yet know which operation
+        // was asked for, so it cannot answer in the create-specific shape.
+        // Nothing was created: it never got as far as a target.
+        Ok(PrivilegedResponse::Error { error }) => {
+            return Err(CreateBackupErrorDto::new(
+                CreateBackupErrorKindDto::PrivilegeEscalation,
+                format!(
+                    "the elevated helper rejected the backup request ({}), so no backup of {} \
+                     was created",
+                    error.message,
+                    target.display()
+                ),
+            ))
+        }
+        // Only another operation can provoke these; a response that does not
+        // answer the question asked is not an account of this one.
+        Ok(
+            PrivilegedResponse::Ok { .. }
+            | PrivilegedResponse::BackupDeleted
+            | PrivilegedResponse::BackupDeleteFailed { .. },
+        )
+        | Err(_) => {}
+    }
+
+    let detail = stderr_excerpt(stderr);
+    let reason = NoResponseReason::classify(code);
+    let target = target.display();
+    let message = match reason {
+        NoResponseReason::Dismissed => {
+            format!("the authorization request was dismissed, so no backup of {target} was created")
+        }
+        NoResponseReason::NotAuthorized => format!(
+            "authorization to back up {target} was not granted (or the elevated helper could not \
+             be executed), so no backup was created{detail}"
+        ),
+        NoResponseReason::Unexplained(_) => format!(
+            "the elevated helper exited {} without a usable result, so it is not known whether a \
+             backup of {target} was created; refresh the backup list to see{detail}",
+            reason.how_it_exited()
+        ),
+    };
+    Err(CreateBackupErrorDto::new(
+        CreateBackupErrorKindDto::PrivilegeEscalation,
         message,
     ))
 }
@@ -1141,9 +1376,9 @@ mod tests {
     }
 
     /// The tagged union: each operation is discriminated by `op`, so the one
-    /// hidden flag can carry either and neither can be mistaken for the other.
+    /// hidden flag can carry any of them and none can be mistaken for another.
     #[test]
-    fn both_operations_are_discriminated_by_the_op_tag() {
+    fn all_operations_are_discriminated_by_the_op_tag() {
         let write = PrivilegedRequest::Write {
             target: "/etc/fstab".to_string(),
             candidate: DocumentDto::from(&valid_candidate("/mnt/d")),
@@ -1152,6 +1387,9 @@ mod tests {
             target: "/etc/fstab".to_string(),
             backup_path: "/etc/fstab.rustab-backup.0000000001.000000002".to_string(),
         };
+        let create = PrivilegedRequest::CreateBackup {
+            target: "/etc/fstab".to_string(),
+        };
 
         let write_json = serde_json::to_string(&write).expect("serialize");
         assert!(write_json.starts_with(r#"{"op":"write","#), "{write_json}");
@@ -1159,8 +1397,12 @@ mod tests {
             serde_json::to_string(&delete).expect("serialize"),
             r#"{"op":"delete_backup","target":"/etc/fstab","backup_path":"/etc/fstab.rustab-backup.0000000001.000000002"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&create).expect("serialize"),
+            r#"{"op":"create_backup","target":"/etc/fstab"}"#
+        );
 
-        for request in [write, delete] {
+        for request in [write, delete, create] {
             let json = serde_json::to_string(&request).expect("serialize");
             let back: PrivilegedRequest = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, request);
@@ -1281,7 +1523,11 @@ mod tests {
 
     /// The paths `writer::list_backups` reports for `target`, newest last.
     fn backup_paths(target: &Path) -> Vec<PathBuf> {
-        writer::list_backups(target).expect("listing the backups must succeed")
+        writer::list_backups(target)
+            .expect("listing the backups must succeed")
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
     }
 
     /// Runs the elevated *deleter* exactly as `main` does, but with an
@@ -1618,6 +1864,239 @@ mod tests {
         );
     }
 
+    // -- the elevated manual backup -----------------------------------------
+
+    /// Runs the elevated *backup creator* exactly as `main` does, but with an
+    /// in-memory stdin/stdout and a temp file standing in for `/etc/fstab`.
+    fn run_create_helper(target: &Path, allowed_target: &Path) -> (i32, PrivilegedResponse) {
+        let request = PrivilegedRequest::CreateBackup {
+            target: target.to_string_lossy().into_owned(),
+        };
+        let payload = serde_json::to_vec(&request).expect("the request must serialize");
+        let mut stdin = payload.as_slice();
+        let mut stdout: Vec<u8> = Vec::new();
+        let code = handle_privileged_request(&mut stdin, &mut stdout, allowed_target);
+        let text = String::from_utf8(stdout).expect("the response must be UTF-8");
+        let response =
+            serde_json::from_str(text.trim()).expect("the response must be a single JSON object");
+        (code, response)
+    }
+
+    /// The core claim of the create operation: a manual backup of the target's
+    /// current content appears beside it, and the target itself is not written
+    /// to at all — no new content, no temp file, no rename.
+    #[test]
+    fn helper_creates_a_manual_backup_and_never_writes_the_target() {
+        let dir = TempDir::new("helper-create-backup");
+        let target = dir.join("fstab");
+        fs::write(&target, ORIGINAL).expect("seed the target");
+
+        let (code, response) = run_create_helper(&target, &target);
+
+        assert_eq!(code, EXIT_OK);
+        let PrivilegedResponse::BackupCreated { outcome } = response else {
+            panic!("the backup should have been created: {response:?}");
+        };
+        assert_eq!(outcome.target, target.to_string_lossy());
+        assert!(
+            outcome.backup.ends_with(".manual"),
+            "an explicitly requested backup is a manual one: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outcome.backup).expect("read the backup"),
+            ORIGINAL
+        );
+        assert!(outcome.pruned_backups.is_empty());
+
+        // The target is byte-for-byte what it was.
+        assert_eq!(
+            fs::read_to_string(&target).expect("read the target"),
+            ORIGINAL
+        );
+        // And nothing else was created — in particular no temp file.
+        let mut leftovers: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the temp dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        leftovers.sort();
+        let mut expected = vec![
+            "fstab".to_string(),
+            Path::new(&outcome.backup)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        expected.sort();
+        assert_eq!(leftovers, expected);
+    }
+
+    /// The target arrives as data for this operation too, so the helper
+    /// re-checks it: a request naming anything but its one allowed target is
+    /// refused, and nothing is created anywhere.
+    #[test]
+    fn helper_refuses_a_create_backup_for_a_target_other_than_the_allowed_one() {
+        let dir = TempDir::new("helper-create-wrong-target");
+        let decoy = dir.join("somewhere-else");
+        fs::write(&decoy, "# must not be copied\n").expect("seed the decoy");
+        let allowed = dir.join("fstab");
+        fs::write(&allowed, ORIGINAL).expect("seed the allowed target");
+
+        let (code, response) = run_create_helper(&decoy, &allowed);
+
+        assert_eq!(code, EXIT_OPERATION_ERROR);
+        let PrivilegedResponse::BackupCreateFailed { error } = response else {
+            panic!("the backup should have been refused: {response:?}");
+        };
+        assert_eq!(error.kind, CreateBackupErrorKindDto::InvalidTarget);
+        assert!(
+            error
+                .message
+                .contains(&allowed.to_string_lossy().to_string()),
+            "the message must name the one target it does manage: {error:?}"
+        );
+        // Neither file gained a backup, and the decoy is untouched.
+        assert!(backup_paths(&decoy).is_empty());
+        assert!(backup_paths(&allowed).is_empty());
+        assert_eq!(
+            fs::read_to_string(&decoy).expect("read the decoy"),
+            "# must not be copied\n"
+        );
+    }
+
+    /// "There is nothing to back up yet" survives the protocol as its own
+    /// kind, rather than arriving at the UI as a generic I/O failure.
+    #[test]
+    fn helper_reports_a_missing_target_as_target_missing() {
+        let dir = TempDir::new("helper-create-missing");
+        let target = dir.join("fstab");
+
+        let (code, response) = run_create_helper(&target, &target);
+
+        assert_eq!(code, EXIT_OPERATION_ERROR);
+        let PrivilegedResponse::BackupCreateFailed { error } = response else {
+            panic!("a missing target must be an error: {response:?}");
+        };
+        assert_eq!(error.kind, CreateBackupErrorKindDto::TargetMissing);
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("read the temp dir")
+                .next()
+                .is_none(),
+            "nothing may have been created"
+        );
+    }
+
+    // -- interpretation of the child's output, create-backup path ------------
+
+    #[test]
+    fn a_json_create_backup_response_is_trusted_over_the_exit_code() {
+        let reported = CreateBackupOutcomeDto {
+            target: "/etc/fstab".to_string(),
+            backup: "/etc/fstab.rustab-backup.0000000001.000000002.manual".to_string(),
+            pruned_backups: Vec::new(),
+            notes: Vec::new(),
+        };
+        let created = serde_json::to_vec(&PrivilegedResponse::BackupCreated {
+            outcome: reported.clone(),
+        })
+        .expect("json");
+        // Even with a nonsense exit code, the helper's own account wins.
+        let outcome =
+            interpret_create_backup_output(Path::new("/etc/fstab"), Some(42), &created, b"")
+                .expect("the response says the backup exists");
+        assert_eq!(outcome, reported);
+
+        let failure = CreateBackupErrorDto::new(
+            CreateBackupErrorKindDto::Backup,
+            "could not create a backup at /etc/fstab.rustab-backup.x: No space left on device",
+        );
+        let failed = serde_json::to_vec(&PrivilegedResponse::BackupCreateFailed {
+            error: failure.clone(),
+        })
+        .expect("json");
+        let error =
+            interpret_create_backup_output(Path::new("/etc/fstab"), Some(EXIT_OK), &failed, b"")
+                .expect_err("an error response is an error");
+        assert_eq!(error, failure, "a reported error is forwarded verbatim");
+    }
+
+    #[test]
+    fn a_dismissed_authorization_for_a_create_backup_says_nothing_was_created() {
+        let error = interpret_create_backup_output(
+            Path::new("/etc/fstab"),
+            Some(PKEXEC_DISMISSED),
+            b"",
+            b"Error executing command as another user: Not authorized",
+        )
+        .expect_err("a dismissed prompt is a failure");
+
+        assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+        assert!(error.message.contains("no backup"));
+        assert!(error.message.contains("/etc/fstab"));
+    }
+
+    #[test]
+    fn a_refused_authorization_for_a_create_backup_includes_the_stderr_detail() {
+        let error = interpret_create_backup_output(
+            Path::new("/etc/fstab"),
+            Some(PKEXEC_NOT_AUTHORIZED),
+            b"",
+            b"polkit-agent-helper-1: authentication failure",
+        )
+        .expect_err("a refused prompt is a failure");
+
+        assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+        assert!(error.message.contains("no backup was created"));
+        assert!(error.message.contains("authentication failure"));
+    }
+
+    /// The honest case: the helper died without reporting, so this side does
+    /// not know whether a backup was created and must not pretend either way.
+    #[test]
+    fn an_unexplained_exit_for_a_create_backup_does_not_claim_an_outcome() {
+        for code in [None, Some(42)] {
+            let error = interpret_create_backup_output(Path::new("/etc/fstab"), code, b"", b"")
+                .expect_err("no response is a failure");
+            assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+            assert!(
+                error.message.contains("not known whether"),
+                "unexpected message: {}",
+                error.message
+            );
+        }
+    }
+
+    /// A framing error (the helper could not even parse the request) is
+    /// answered in the write-shaped `Error` variant, because at that point the
+    /// helper does not yet know which operation it was asked for. The create
+    /// side must read that rather than fall through to "no usable response",
+    /// and must report it as "no backup was created".
+    #[test]
+    fn a_protocol_error_reaches_the_create_side_as_an_escalation_failure() {
+        let mut stdin = &b"not json at all"[..];
+        let mut stdout: Vec<u8> = Vec::new();
+        let code = handle_privileged_request(&mut stdin, &mut stdout, Path::new("/etc/fstab"));
+        assert_eq!(code, EXIT_PROTOCOL_ERROR);
+
+        let error =
+            interpret_create_backup_output(Path::new("/etc/fstab"), Some(code), &stdout, b"")
+                .expect_err("a protocol error is a failure");
+        assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+        assert!(error.message.contains("no backup"));
+        assert!(
+            error.message.contains("could not parse its request"),
+            "the helper's own account must be carried through: {}",
+            error.message
+        );
+    }
+
     /// A response that answers the *other* operation is not an account of this
     /// one, so it is treated as "no usable response" rather than trusted.
     #[test]
@@ -1646,14 +2125,39 @@ mod tests {
             interpret_delete_output("/etc/fstab.rustab-backup.1.2", Some(EXIT_OK), &wrote, b"")
                 .expect_err("a write response cannot substantiate a delete");
         assert_eq!(error.kind, DeleteBackupErrorKindDto::PrivilegeEscalation);
+
+        // ...and the third operation is no different in either direction.
+        let created = serde_json::to_vec(&PrivilegedResponse::BackupCreated {
+            outcome: CreateBackupOutcomeDto {
+                target: "/etc/fstab".to_string(),
+                backup: "/etc/fstab.rustab-backup.0000000001.000000002.manual".to_string(),
+                pruned_backups: Vec::new(),
+                notes: Vec::new(),
+            },
+        })
+        .expect("json");
+        let error =
+            interpret_delete_output("/etc/fstab.rustab-backup.1.2", Some(EXIT_OK), &created, b"")
+                .expect_err("a create response cannot substantiate a delete");
+        assert_eq!(error.kind, DeleteBackupErrorKindDto::PrivilegeEscalation);
+
+        let error =
+            interpret_create_backup_output(Path::new("/etc/fstab"), Some(EXIT_OK), &deleted, b"")
+                .expect_err("a delete response cannot substantiate a create");
+        assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+
+        let error = interpret_write_output(Path::new("/etc/fstab"), Some(EXIT_OK), &created, b"")
+            .expect_err("a create response cannot substantiate a write");
+        assert_eq!(error.kind, WriteErrorKindDto::PrivilegeEscalation);
+        assert!(!error.target_unchanged);
     }
 
-    /// The two operations must never disagree about what `pkexec`'s own exit
+    /// The operations must never disagree about what `pkexec`'s own exit
     /// codes mean. They cannot, because they classify through one shared
     /// [`NoResponseReason`] — asserted here directly, and cross-checked
     /// against the `target_unchanged` the write path derives from it.
     #[test]
-    fn both_operations_agree_on_what_pkexecs_exit_codes_mean() {
+    fn all_operations_agree_on_what_pkexecs_exit_codes_mean() {
         let cases = [
             (Some(PKEXEC_DISMISSED), NoResponseReason::Dismissed, true),
             (
@@ -1695,11 +2199,22 @@ mod tests {
                 "the delete path must only hedge where the shared classification does: {}",
                 error.message
             );
+
+            // ...and the create path's.
+            let error = interpret_create_backup_output(Path::new("/etc/fstab"), code, b"", b"")
+                .expect_err("no response is a failure");
+            assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+            assert_eq!(
+                error.message.contains("not known whether"),
+                !nothing_happened,
+                "the create path must only hedge where the shared classification does: {}",
+                error.message
+            );
         }
     }
 
     /// Every [`LaunchFailure`] variant except `Wait` provably happens before
-    /// the helper could act, and both operations must say so.
+    /// the helper could act, and every operation must say so.
     #[test]
     fn only_a_failed_wait_leaves_the_outcome_unknown() {
         let io_error = || io::Error::from(io::ErrorKind::PermissionDenied);
@@ -1722,12 +2237,22 @@ mod tests {
                 "{failure:?}: {}",
                 error.message
             );
+            let error = create_launch_error(Path::new("/etc/fstab"), failure);
+            assert_eq!(error.kind, CreateBackupErrorKindDto::PrivilegeEscalation);
+            assert!(
+                error.message.contains("no backup"),
+                "{failure:?}: {}",
+                error.message
+            );
         }
 
         let unknown = LaunchFailure::Wait(io_error());
         assert!(!unknown.nothing_happened());
         assert!(!write_launch_error(Path::new("/etc/fstab"), &unknown).target_unchanged);
         assert!(delete_launch_error("/b", &unknown)
+            .message
+            .contains("not known whether"));
+        assert!(create_launch_error(Path::new("/etc/fstab"), &unknown)
             .message
             .contains("not known whether"));
     }

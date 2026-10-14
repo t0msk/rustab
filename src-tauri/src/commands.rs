@@ -48,7 +48,8 @@
 
 use crate::backups;
 use crate::dto::{
-    BackupInfoDto, CommandErrorDto, CommandErrorKindDto, DeleteBackupErrorDto,
+    BackupInfoDto, CommandErrorDto, CommandErrorKindDto, CreateBackupErrorDto,
+    CreateBackupErrorKindDto, CreateBackupOutcomeDto, DeleteBackupErrorDto,
     DeleteBackupErrorKindDto, DeviceDiscoveryDto, DocumentDto, DocumentViewDto, TargetInfoDto,
     ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
@@ -287,6 +288,40 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
     delete_backup_from(&target, &backup_path)
 }
 
+/// Creates a backup of the active target right now, without changing it.
+///
+/// The explicit counterpart of the backup a [`save`] takes on its own: it
+/// copies the target's *current* content to a new **manual** backup beside it
+/// and returns that backup as a [`BackupInfoDto`] — the same row shape
+/// [`list_backups`] produces, so the frontend can prepend it or simply
+/// re-list. A manual backup is exempt from the retention bound that prunes
+/// automatic ones (`fstab_core::writer::MAX_BACKUPS`); only an explicit
+/// [`delete_backup`] ever removes it.
+///
+/// Takes no arguments: like every other command here, *which* file it acts on
+/// is resolved server-side and never supplied by the frontend. Dispatches on
+/// [`ActiveTarget::is_real`] exactly like [`save`] and [`delete_backup`] do —
+/// a non-real target is copied in-process, the real `/etc/fstab` through a
+/// single elevated re-exec, because its backups have to be created in
+/// root-owned `/etc/`.
+///
+/// This never opens, renames or writes the target file; it only reads it.
+/// That is why it rejects with a [`CreateBackupErrorDto`] rather than a
+/// [`WriteErrorDto`], for the same reason [`delete_backup`] does: there is no
+/// `target_unchanged` question to answer.
+///
+/// # Errors
+///
+/// A [`CreateBackupErrorDto`]; see [`CreateBackupErrorKindDto`] for the kinds.
+/// Notably [`CreateBackupErrorKindDto::TargetMissing`] when the target does
+/// not exist yet — an explicit "back this up now" reports that rather than
+/// succeeding with nothing to show.
+#[tauri::command(async)]
+pub fn create_backup() -> Result<BackupInfoDto, CreateBackupErrorDto> {
+    let target = resolve_target_for_create_backup()?;
+    create_backup_of(&target)
+}
+
 /// Lists block devices for the source picker.
 ///
 /// Never fails: a system where `lsblk` is missing or unusable yields an empty
@@ -417,6 +452,66 @@ fn delete_backup_with(
     }
 }
 
+/// The body of [`create_backup`], with the target passed in (see
+/// [`read_backup_of`] for why).
+fn create_backup_of(target: &ActiveTarget) -> Result<BackupInfoDto, CreateBackupErrorDto> {
+    create_backup_with(target, privileged::create_backup_elevated)
+}
+
+/// The one dispatch point between the two backup-creation paths, with the
+/// elevated half injectable.
+///
+/// Mirrors [`save_document_with`] and [`delete_backup_with`] exactly, and for
+/// the same reason: the dispatch decision ("a real target is never copied by
+/// this process") has to be *asserted*, and asserting it against the
+/// production [`privileged::create_backup_elevated`] would mean a unit test
+/// that launches `pkexec` and waits on an authentication prompt.
+///
+/// Both branches end in the same `fstab_core::writer::create_backup` — the
+/// in-process branch calls it directly, the elevated branch calls it inside a
+/// root process that does nothing else. Neither branch is given a path to
+/// write to: `create_backup` derives the backup's name from the target it was
+/// handed.
+///
+/// The resulting path is turned back into a [`BackupInfoDto`] by
+/// [`backups::describe_one`], the same helper [`backups::list`] builds its
+/// rows with, so a freshly created backup is described exactly the way the
+/// next `list_backups` will describe it — including its `is_manual` flag,
+/// which is read back from the naming scheme rather than assumed here.
+fn create_backup_with(
+    target: &ActiveTarget,
+    elevate: impl Fn(&Path) -> Result<CreateBackupOutcomeDto, CreateBackupErrorDto>,
+) -> Result<BackupInfoDto, CreateBackupErrorDto> {
+    let outcome = if target.is_real {
+        elevate(&target.path)?
+    } else {
+        writer::create_backup(&target.path)
+            .map(|outcome| CreateBackupOutcomeDto::from_outcome(&outcome))
+            .map_err(|err| CreateBackupErrorDto::from(&err))?
+    };
+
+    let created = Path::new(&outcome.backup);
+    backups::describe_one(&target.path, created)
+        .map_err(|err| {
+            CreateBackupErrorDto::new(CreateBackupErrorKindDto::Backup, err.to_string())
+        })?
+        .ok_or_else(|| {
+            // Reachable only if the backup disappeared (or was never where it
+            // said it was) between being created and being described. Reported
+            // rather than papered over with a synthesized row: the frontend
+            // would otherwise show a restore point that is not there.
+            CreateBackupErrorDto::new(
+                CreateBackupErrorKindDto::Backup,
+                format!(
+                    "the backup {} was created but is no longer among {}'s backups; \
+                     refresh the backup list to see what exists",
+                    created.display(),
+                    target.path.display()
+                ),
+            )
+        })
+}
+
 /// Resolves the active target for a read-side command.
 fn resolve_target() -> Result<ActiveTarget, CommandErrorDto> {
     target::active_target()
@@ -442,6 +537,17 @@ fn resolve_target_for_delete() -> Result<ActiveTarget, DeleteBackupErrorDto> {
         DeleteBackupErrorDto::new(
             DeleteBackupErrorKindDto::TargetResolution,
             format!("{err}; nothing was deleted"),
+        )
+    })
+}
+
+/// Resolves the active target for [`create_backup`], reporting failure in its
+/// own error shape.
+fn resolve_target_for_create_backup() -> Result<ActiveTarget, CreateBackupErrorDto> {
+    target::active_target().map_err(|err| {
+        CreateBackupErrorDto::new(
+            CreateBackupErrorKindDto::TargetResolution,
+            format!("{err}; no backup was created"),
         )
     })
 }
@@ -941,6 +1047,200 @@ mod tests {
         })
         .expect_err("an arbitrary path must be refused");
         assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
+    }
+
+    // -- create_backup ------------------------------------------------------
+
+    /// A manual backup of a sandbox target: the backup holds the target's
+    /// *current* content, the target is untouched, and the row that comes back
+    /// is the same row `list_backups` now reports, flagged manual.
+    #[test]
+    fn creating_a_sandbox_backup_copies_the_target_without_changing_it() {
+        let dir = TempDir::new("create-backup");
+        let path = dir.join("fstab.sandbox");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = sandbox_target(path.clone());
+
+        let info = create_backup_of(&target).expect("creating a backup must succeed");
+
+        assert!(
+            info.is_manual,
+            "an explicit backup is a manual one: {info:?}"
+        );
+        assert_eq!(info.target_path, path.to_string_lossy());
+        assert_eq!(
+            fs::read_to_string(&info.path).expect("read the backup"),
+            ORIGINAL,
+            "the backup must hold the target's current content"
+        );
+        assert!(info.size_bytes > 0);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the target"),
+            ORIGINAL,
+            "creating a backup must not touch the target file"
+        );
+
+        // The listing agrees, field for field.
+        let listed = backups::list(&path).expect("listing must succeed");
+        assert_eq!(listed, vec![info]);
+    }
+
+    /// Two manual backups in a row are two distinct restore points, and each
+    /// captures the content as it was at the time.
+    #[test]
+    fn creating_two_backups_yields_two_distinct_restore_points() {
+        let dir = TempDir::new("create-backup-twice");
+        let path = dir.join("fstab.sandbox");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = sandbox_target(path.clone());
+
+        let first = create_backup_of(&target).expect("first backup");
+        fs::write(&path, "# changed by hand\n").expect("change the target");
+        let second = create_backup_of(&target).expect("second backup");
+
+        assert_ne!(first.path, second.path);
+        assert_eq!(fs::read_to_string(&first.path).unwrap(), ORIGINAL);
+        assert_eq!(
+            fs::read_to_string(&second.path).unwrap(),
+            "# changed by hand\n"
+        );
+        let listed = backups::list(&path).expect("listing");
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|info| info.is_manual));
+        // Newest first.
+        assert_eq!(listed[0].path, second.path);
+    }
+
+    /// A target that does not exist yet is reported as its own kind, so the UI
+    /// can say "save the file once first" instead of showing an I/O error for
+    /// an ordinary first-run state.
+    #[test]
+    fn creating_a_backup_of_a_missing_target_is_reported_as_target_missing() {
+        let dir = TempDir::new("create-backup-missing");
+        let path = dir.join("fstab.sandbox");
+        let target = sandbox_target(path.clone());
+
+        let error = create_backup_of(&target).expect_err("there is nothing to back up");
+
+        assert_eq!(error.kind, CreateBackupErrorKindDto::TargetMissing);
+        assert!(!path.exists(), "nothing may have been created");
+        assert!(backups::list(&path).expect("listing").is_empty());
+    }
+
+    /// Manual backups are exempt from the automatic retention bound, end to
+    /// end through the command layer: a manual backup taken before a long run
+    /// of saves is still there afterwards.
+    #[test]
+    fn a_manual_backup_survives_saves_that_prune_automatic_ones() {
+        let dir = TempDir::new("create-backup-retention");
+        let path = dir.join("fstab.sandbox");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = sandbox_target(path.clone());
+
+        let manual = create_backup_of(&target).expect("a manual backup");
+        for i in 0..(writer::MAX_BACKUPS + 3) {
+            save_document(&target, &valid_candidate(&format!("/mnt/n{i}")))
+                .unwrap_or_else(|err| panic!("save {i} failed: {err:?}"));
+        }
+
+        let listed = backups::list(&path).expect("listing");
+        assert!(
+            listed.iter().any(|info| info.path == manual.path),
+            "the manual backup must still be listed after {} saves",
+            writer::MAX_BACKUPS + 3
+        );
+        assert_eq!(
+            fs::read_to_string(&manual.path).expect("read the manual backup"),
+            ORIGINAL,
+            "and must still hold the content it captured"
+        );
+        assert_eq!(
+            listed.iter().filter(|info| !info.is_manual).count(),
+            writer::MAX_BACKUPS,
+            "while the automatic backups are still bounded"
+        );
+    }
+
+    /// The dispatch guarantee for the create path, mirroring the save and
+    /// delete ones: a target flagged real goes to the elevated helper and
+    /// **nothing** is written by this process. Asserted with a recording
+    /// stand-in, so the test neither launches `pkexec` nor waits on a prompt.
+    #[test]
+    fn a_real_target_backup_is_dispatched_to_the_elevated_helper_and_never_copied_in_process() {
+        let dir = TempDir::new("real-create-dispatch");
+        let path = dir.join("fstab");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = ActiveTarget {
+            path: path.clone(),
+            is_real: true,
+            source: TargetSource::Environment,
+        };
+
+        // The stand-in reports a backup it did not actually create, so this
+        // also pins what the command does with an outcome it cannot verify:
+        // it refuses rather than inventing a row.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let error = create_backup_with(&target, |elevated_target| {
+            calls.borrow_mut().push(elevated_target.to_path_buf());
+            Ok(CreateBackupOutcomeDto {
+                target: elevated_target.to_string_lossy().into_owned(),
+                backup: format!(
+                    "{}.rustab-backup.0000000001.000000002.manual",
+                    path.display()
+                ),
+                pruned_backups: Vec::new(),
+                notes: Vec::new(),
+            })
+        })
+        .expect_err("a backup that is not on disk must not be reported as a row");
+        assert_eq!(error.kind, CreateBackupErrorKindDto::Backup);
+
+        let calls = calls.into_inner();
+        assert_eq!(calls, vec![path.clone()], "exactly one elevated call");
+        assert!(
+            backups::list(&path).expect("listing").is_empty(),
+            "the in-process copier must not have touched a real target"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the target"),
+            ORIGINAL
+        );
+    }
+
+    /// The other half of the dispatch guarantee: a non-real target is copied
+    /// in-process and must never escalate (no password prompt for a sandbox
+    /// file).
+    #[test]
+    fn a_sandbox_backup_never_reaches_the_elevated_helper() {
+        let dir = TempDir::new("sandbox-create-dispatch");
+        let path = dir.join("fstab.sandbox");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = sandbox_target(path.clone());
+
+        let info = create_backup_with(&target, |_| {
+            panic!("a sandbox backup must never escalate");
+        })
+        .expect("the backup should succeed");
+
+        assert!(info.is_manual);
+        assert!(Path::new(&info.path).exists());
+    }
+
+    /// A manual backup is deletable like any other: the kinds differ in how
+    /// they are *pruned*, not in whether the user may remove them.
+    #[test]
+    fn a_manual_backup_can_be_deleted_like_any_other() {
+        let dir = TempDir::new("create-then-delete");
+        let path = dir.join("fstab.sandbox");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = sandbox_target(path.clone());
+
+        let manual = create_backup_of(&target).expect("a manual backup");
+        delete_backup_from(&target, &manual.path).expect("deleting a manual backup must succeed");
+
+        assert!(!Path::new(&manual.path).exists());
+        assert!(backups::list(&path).expect("listing").is_empty());
+        assert!(path.exists(), "the target itself is untouched");
     }
 
     // -- read-side commands -------------------------------------------------

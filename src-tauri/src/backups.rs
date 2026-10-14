@@ -1,5 +1,5 @@
-//! Listing the active target's auto-backups, and resolving a
-//! frontend-supplied backup path against that list.
+//! Listing the active target's backups — automatic and manual alike — and
+//! resolving a frontend-supplied backup path against that list.
 //!
 //! ## Why a frontend-supplied path is safe here
 //!
@@ -108,33 +108,79 @@ impl std::error::Error for BackupError {
 /// (or get wrong) which end is which. A backup that vanishes between the
 /// listing and the `stat` is skipped rather than failing the whole command.
 ///
+/// Both kinds are listed together, in one chronological order, each row
+/// carrying [`BackupInfoDto::is_manual`] — the kind is a label on a backup,
+/// not a separate list.
+///
 /// # Errors
 ///
 /// Returns [`BackupError::List`] if the target's directory cannot be read.
 pub fn list(target: &Path) -> Result<Vec<BackupInfoDto>, BackupError> {
-    let mut paths = writer::list_backups(target).map_err(|source| BackupError::List {
+    let mut entries = writer::list_backups(target).map_err(|source| BackupError::List {
         path: containing_dir(target),
         source,
     })?;
-    paths.reverse();
+    entries.reverse();
 
-    Ok(paths
+    Ok(entries
         .into_iter()
-        .filter_map(|path| {
-            let metadata = fs::metadata(&path).ok()?;
-            Some(BackupInfoDto {
-                file_name: path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                target_path: target.to_string_lossy().into_owned(),
-                size_bytes: metadata.len(),
-                created_unix_secs: modified_unix_secs(&metadata),
-                path: path.to_string_lossy().into_owned(),
-            })
-        })
+        .filter_map(|entry| describe(target, &entry.path, entry.manual))
         .collect())
+}
+
+/// Builds the [`BackupInfoDto`] for one backup of `target`, `stat`-ing it on
+/// the spot.
+///
+/// `None` if the file cannot be `stat`ed — for [`list`] that means a backup
+/// that vanished between the listing and the `stat`, which is a skipped row
+/// rather than a failed command.
+///
+/// `manual` is passed in rather than re-derived from the path, because
+/// [`writer::list_backups`] is the one place that owns the naming scheme and
+/// re-parsing the name here would create a second answer that could disagree
+/// with it (see the module docs).
+fn describe(target: &Path, backup: &Path, manual: bool) -> Option<BackupInfoDto> {
+    let metadata = fs::metadata(backup).ok()?;
+    Some(BackupInfoDto {
+        file_name: backup
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        target_path: target.to_string_lossy().into_owned(),
+        size_bytes: metadata.len(),
+        created_unix_secs: modified_unix_secs(&metadata),
+        path: backup.to_string_lossy().into_owned(),
+        is_manual: manual,
+    })
+}
+
+/// Describes a single backup of `target` that has *just* been created, for a
+/// caller that already knows its path (currently
+/// [`crate::commands::create_backup`]).
+///
+/// Goes back through [`writer::list_backups`] rather than taking the caller's
+/// word for the kind, so the row handed to the frontend is built from the same
+/// source of truth as every row [`list`] produces — including when the backup
+/// was created inside the elevated helper, where this process never saw it
+/// being made. A path that is not (or is no longer) one of `target`'s backups
+/// yields `None`.
+///
+/// # Errors
+///
+/// [`BackupError::List`] if the target's directory cannot be read.
+pub fn describe_one(target: &Path, backup: &Path) -> Result<Option<BackupInfoDto>, BackupError> {
+    let entries = writer::list_backups(target).map_err(|source| BackupError::List {
+        path: containing_dir(target),
+        source,
+    })?;
+    let Some(entry) = entries
+        .into_iter()
+        .find(|entry| crate::target::is_same_file(&entry.path, backup))
+    else {
+        return Ok(None);
+    };
+    Ok(describe(target, &entry.path, entry.manual))
 }
 
 /// Resolves `requested` to one of `target`'s actual backups.
@@ -154,7 +200,8 @@ pub fn resolve_requested(target: &Path, requested: &str) -> Result<PathBuf, Back
             source,
         })?
         .into_iter()
-        .find(|candidate| crate::target::is_same_file(candidate, requested_path))
+        .find(|candidate| crate::target::is_same_file(&candidate.path, requested_path))
+        .map(|candidate| candidate.path)
         .ok_or_else(|| BackupError::NotABackupOfTarget {
             requested: requested.to_string(),
             target: target.to_path_buf(),
@@ -254,12 +301,80 @@ mod tests {
 
         let oldest_first = writer::list_backups(&target).expect("list_backups");
         let newest = oldest_first.last().expect("there is at least one");
-        assert_eq!(backups[0].path, newest.to_string_lossy());
+        assert_eq!(backups[0].path, newest.path.to_string_lossy());
         for info in &backups {
             assert_eq!(info.target_path, target.to_string_lossy());
             assert!(info.size_bytes > 0);
             assert!(info.created_unix_secs.is_some());
             assert!(info.file_name.starts_with("fstab.rustab-backup."));
+            assert!(
+                !info.is_manual,
+                "a backup a save took is automatic: {info:?}"
+            );
+        }
+    }
+
+    /// The two kinds appear in one list, each flagged, and the flag comes from
+    /// `fstab-core`'s own reading of the name rather than from anything this
+    /// layer guesses.
+    #[test]
+    fn list_flags_manual_backups_and_leaves_automatic_ones_unflagged() {
+        let dir = TempDir::new("backups-kinds");
+        let target = dir.join("fstab");
+        seed_backups(&target, 1);
+        let manual = writer::create_backup(&target).expect("a manual backup");
+
+        let listed = list(&target).expect("listing must succeed");
+        assert_eq!(listed.len(), 2);
+
+        let (manual_rows, automatic_rows): (Vec<_>, Vec<_>) =
+            listed.iter().partition(|info| info.is_manual);
+        assert_eq!(
+            manual_rows.len(),
+            1,
+            "exactly one manual backup: {listed:?}"
+        );
+        assert_eq!(manual_rows[0].path, manual.backup.to_string_lossy());
+        assert!(manual_rows[0].file_name.ends_with(".manual"));
+        assert_eq!(automatic_rows.len(), 1);
+        assert!(!automatic_rows[0].file_name.ends_with(".manual"));
+    }
+
+    /// `describe_one` is how a just-created backup becomes a list row; it must
+    /// agree with `list` field for field, and must refuse a path that is not
+    /// one of this target's backups rather than describing it.
+    #[test]
+    fn describe_one_matches_the_row_list_would_produce() {
+        let dir = TempDir::new("backups-describe");
+        let target = dir.join("fstab");
+        seed_backups(&target, 1);
+        let manual = writer::create_backup(&target).expect("a manual backup");
+
+        let described = describe_one(&target, &manual.backup)
+            .expect("the directory is readable")
+            .expect("a backup that exists is describable");
+        let listed = list(&target).expect("listing");
+        let same = listed
+            .iter()
+            .find(|info| info.path == described.path)
+            .expect("the same backup must be in the list");
+        assert_eq!(&described, same);
+        assert!(described.is_manual);
+
+        // Anything that is not one of this target's backups yields `None`,
+        // through the same list-based check every other path-taking entry
+        // point uses — it is never described from the path alone.
+        for not_a_backup in [
+            target.clone(),
+            dir.join("fstab.bak"),
+            PathBuf::from("/etc/shadow"),
+        ] {
+            assert_eq!(
+                describe_one(&target, &not_a_backup).expect("the directory is readable"),
+                None,
+                "{} must not be describable as a backup",
+                not_a_backup.display()
+            );
         }
     }
 

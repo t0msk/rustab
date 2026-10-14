@@ -7,7 +7,9 @@
 //! written, or interleaved mixture of the two — no matter where a failure
 //! (I/O error, full disk, permission error, process death) occurs.
 //!
-//! [`write_document`] is the only entry point. It performs, in exactly this
+//! [`write_document`] is the primary entry point ([`create_backup`] is the
+//! other one, and is described further down — it shares this module's backup
+//! machinery but never touches the target file). It performs, in exactly this
 //! order:
 //!
 //! 1. **Validate in memory.** [`crate::validate::validate`] runs both the
@@ -26,10 +28,11 @@
 //! 3. **Back up.** If the effective target exists, it is copied to
 //!    `<target>.rustab-backup.<secs>.<nanos>` in the same directory and the
 //!    copy is `fsync`ed, *before* anything else touches the target or its
-//!    directory. Then retention is enforced: at most [`MAX_BACKUPS`] backups
-//!    are kept for that target and the oldest are deleted beyond that bound.
-//!    If the target does not exist (first-ever save) the whole step is
-//!    skipped — there is nothing to back up.
+//!    directory. Then retention is enforced: at most [`MAX_BACKUPS`]
+//!    *automatic* backups are kept for that target and the oldest are deleted
+//!    beyond that bound (see "the two kinds of backup" below). If the target
+//!    does not exist (first-ever save) the whole step is skipped — there is
+//!    nothing to back up.
 //! 4. **Write a temp file in the same directory** as the target, named
 //!    `.<target-file-name>.rustab.tmp.<pid>`.
 //! 5. **`fsync` the temp file, `fsync` the directory, `rename` onto the
@@ -96,6 +99,41 @@
 //! happens to be someone else would be worse than saving it with the writing
 //! user's ownership.
 //!
+//! ## The two kinds of backup, and why pruning only counts one of them
+//!
+//! A backup is either **automatic** (the side effect of a save, step 3 above)
+//! or **manual** (the user explicitly asked for a snapshot right now, via
+//! [`create_backup`]). Which one a backup is lives in its file name and
+//! nowhere else:
+//!
+//! - automatic: `<target-file-name>.rustab-backup.<secs>.<nanos>`
+//! - manual: `<target-file-name>.rustab-backup.<secs>.<nanos>.manual`
+//!
+//! That is exactly one new optional trailing literal suffix on the scheme
+//! that already existed; [`backup_name_of`] accepts those two shapes and
+//! nothing else, so every near miss the strict parser rejected before is still
+//! rejected (that is what keeps [`prune_backups`] from ever touching a file it
+//! did not create — see its docs).
+//!
+//! The file name is the only record because the project already treats "the
+//! name, in the target's own directory, *is* the identity" as load-bearing
+//! (see `src-tauri/src/backups.rs`). A sidecar file or a database would be a
+//! second place that has to agree with the filesystem, and keeping those two
+//! in agreement across crashes is precisely the class of problem this module
+//! exists to avoid — for no benefit, since the name can carry the one bit.
+//!
+//! **Manual backups are exempt from pruning.** [`prune_backups`] counts and
+//! deletes among *automatic* backups only: [`MAX_BACKUPS`] bounds how many
+//! automatic backups a target keeps, and a manual backup neither occupies one
+//! of those slots nor is ever deleted to free one, however many of either kind
+//! exist. The point of "snapshot this now" is "keep it regardless of what I do
+//! next", so letting a later flurry of saves silently evict it would defeat
+//! the feature; the exemption also protects the inverse case, where several
+//! manual snapshots would otherwise push a user's entire automatic safety net
+//! out of the window. The only thing that ever removes a manual backup is the
+//! user deleting it explicitly (`delete_backup` in `src-tauri`), which is
+//! deliberately indifferent to the kind.
+//!
 //! ## Testability seam
 //!
 //! All of the above runs through a small crate-private `FileSystemOps`
@@ -119,16 +157,26 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// How many timestamped backups are kept per target file.
+/// How many **automatic** timestamped backups are kept per target file.
 ///
-/// After each successful backup, backups belonging to the same target beyond
-/// this bound are deleted oldest-first, so backups never grow without limit
-/// (`docs/SPEC.md` §6 step 5). Tune here; nothing else encodes this number.
+/// After each successful backup, *automatic* backups belonging to the same
+/// target beyond this bound are deleted oldest-first, so backups never grow
+/// without limit (`docs/SPEC.md` §6 step 5). Manual backups are exempt: they
+/// are neither counted against this bound nor deleted to honour it (see the
+/// module docs and [`prune_backups`]). Tune here; nothing else encodes this
+/// number.
 pub const MAX_BACKUPS: usize = 10;
 
 /// The fixed infix separating a target's file name from a backup's timestamp,
 /// i.e. `fstab` + `.rustab-backup.` + `<secs>.<nanos>`.
 const BACKUP_INFIX: &str = ".rustab-backup.";
+
+/// The one optional trailing literal suffix that marks a backup as manual,
+/// i.e. `fstab.rustab-backup.<secs>.<nanos>` + `.manual`.
+///
+/// Matched exactly — no other spelling, casing or repetition of it is
+/// recognized as anything but an unrelated file (see [`backup_name_of`]).
+const MANUAL_SUFFIX: &str = ".manual";
 
 /// Zero-padded width of the seconds component of a backup timestamp. Fixed
 /// width keeps backup names sortable as plain text in a file manager, in
@@ -454,23 +502,43 @@ pub fn write_document(target: &Path, candidate: &Document) -> Result<WriteOutcom
     write_document_with(target, candidate, &RealFs)
 }
 
-/// Lists the backups [`write_document`] has created for `target`, oldest
-/// first.
+/// One backup of a target, as [`list_backups`] reports it.
+///
+/// Carries the kind alongside the path on purpose: this module owns the
+/// naming scheme, so it is also the only place that can say what a given name
+/// *means*. A caller that wanted to know "was this one manual?" from the path
+/// alone would have to re-implement the grammar — and the moment two parsers
+/// exist, they can disagree about which files are backups at all, which is the
+/// disagreement [`prune_backups`]'s safety rests on not happening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupEntry {
+    /// Full path to the backup file, in the target's own directory.
+    pub path: PathBuf,
+    /// `true` for a backup a user explicitly asked for via [`create_backup`],
+    /// `false` for one a save made on its own. Manual backups are exempt from
+    /// [`MAX_BACKUPS`] pruning (see the module docs).
+    pub manual: bool,
+}
+
+/// Lists the backups this module has created for `target`, oldest first,
+/// automatic and manual alike.
 ///
 /// Only files whose names match the exact
-/// `<target-file-name>.rustab-backup.<10-digit secs>.<9-digit nanos>` scheme
-/// in the target's own directory are returned, so unrelated files — including
-/// a user's own `fstab.bak` or a backup belonging to a *different* target in
-/// the same directory — are never reported (and, by the same token, never
-/// pruned). Exposed so a restore UI does not have to re-implement, and risk
-/// disagreeing with, this naming scheme.
+/// `<target-file-name>.rustab-backup.<10-digit secs>.<9-digit nanos>` scheme —
+/// optionally followed by the literal `.manual` — in the target's own
+/// directory are returned, so unrelated files — including a user's own
+/// `fstab.bak` or a backup belonging to a *different* target in the same
+/// directory — are never reported (and, by the same token, never pruned).
+/// Exposed so a restore UI does not have to re-implement, and risk disagreeing
+/// with, this naming scheme; [`BackupEntry::manual`] is part of that same
+/// answer rather than something a caller is expected to derive itself.
 ///
 /// # Errors
 ///
 /// Returns the underlying [`io::Error`] if the target's directory cannot be
 /// read. A `target` with no final file-name component yields an empty list
 /// rather than an error, since no backup could ever belong to it.
-pub fn list_backups(target: &Path) -> io::Result<Vec<PathBuf>> {
+pub fn list_backups(target: &Path) -> io::Result<Vec<BackupEntry>> {
     let Some(file_name) = target.file_name() else {
         return Ok(Vec::new());
     };
@@ -478,8 +546,152 @@ pub fn list_backups(target: &Path) -> io::Result<Vec<PathBuf>> {
     let names = RealFs.list_dir_file_names(&dir)?;
     Ok(sorted_backups(&dir, &names, file_name)
         .into_iter()
-        .map(|(_, path)| path)
+        .map(|(name, path)| BackupEntry {
+            path,
+            manual: name.manual,
+        })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Manual backups
+// ---------------------------------------------------------------------------
+
+/// What a successful [`create_backup`] did.
+///
+/// Shaped like [`WriteOutcome`] minus everything that only makes sense for a
+/// save: there is no `validation_warnings` (nothing was validated, because
+/// nothing is being written) and `backup` is not an `Option` (a run that
+/// created no backup is an `Err`, never a quiet success).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateBackupOutcome {
+    /// The file that was backed up. Differs from the `target` argument only
+    /// when that argument was a symlink, in which case this is its resolved
+    /// destination — the same resolution a save performs.
+    pub target: PathBuf,
+
+    /// The backup that was created. Always a *manual* backup, so it carries
+    /// the `.manual` suffix and is exempt from [`MAX_BACKUPS`] pruning.
+    pub backup: PathBuf,
+
+    /// *Automatic* backups deleted to honour [`MAX_BACKUPS`], oldest first.
+    /// Normally empty: taking a manual backup does not add to the automatic
+    /// count, so this is non-empty only when the target was already over the
+    /// bound.
+    pub pruned_backups: Vec<PathBuf>,
+
+    /// Human-readable notes about non-fatal deviations: a symlinked target
+    /// having been resolved, or an old automatic backup that could not be
+    /// pruned. Same meaning, and same deliberate "surfaced, not swallowed"
+    /// policy, as [`WriteOutcome::notes`].
+    pub notes: Vec<String>,
+}
+
+/// Everything that can go wrong in [`create_backup`].
+///
+/// Deliberately *not* [`WriteError`]: this operation never opens, renames or
+/// writes the target, so most of that type's variants are unreachable here and
+/// its central "did the target change?" question has no meaning. Every variant
+/// below leaves the target file byte-for-byte untouched — there is no variant
+/// that does not, because nothing in this operation can touch it.
+#[derive(Debug)]
+pub enum CreateBackupError {
+    /// The target path cannot be backed up for a structural reason: it has no
+    /// final file-name component, it is a directory, or it is a symlink that
+    /// could not be resolved. The same check [`write_document`] applies, via
+    /// the same code.
+    InvalidTarget {
+        /// The path as given to [`create_backup`].
+        path: PathBuf,
+        /// Why it cannot be used as a target.
+        reason: String,
+    },
+
+    /// There is nothing on disk at the target yet, so there is nothing to copy
+    /// (a first-ever-save state). Its own variant rather than a silent no-op
+    /// or a generic I/O error: the caller asked to take a snapshot *now*, and
+    /// quietly reporting success for a snapshot that does not exist would be
+    /// the one answer the user cannot act on.
+    TargetMissing {
+        /// The resolved target that does not exist.
+        path: PathBuf,
+    },
+
+    /// Inspecting the target, reserving a backup name, copying the target to
+    /// it, or `fsync`ing that copy failed. Nothing else was attempted; pruning
+    /// old automatic backups is deliberately not part of this variant, for the
+    /// same reason it is not part of [`WriteError::Backup`] — see
+    /// [`CreateBackupOutcome::notes`].
+    Backup {
+        /// The path being inspected or written when the failure occurred.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for CreateBackupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreateBackupError::InvalidTarget { path, reason } => write!(
+                f,
+                "cannot back up {}: {reason}; no backup was created",
+                path.display()
+            ),
+            CreateBackupError::TargetMissing { path } => write!(
+                f,
+                "{} does not exist yet, so there is nothing to back up; \
+                 save the file once first",
+                path.display()
+            ),
+            CreateBackupError::Backup { path, source } => write!(
+                f,
+                "could not create a backup at {}: {source}; the original file is unchanged",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CreateBackupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CreateBackupError::Backup { source, .. } => Some(source),
+            CreateBackupError::InvalidTarget { .. } | CreateBackupError::TargetMissing { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// Copies `target`'s current content to a fresh **manual** backup beside it,
+/// without touching `target` itself.
+///
+/// This is the "snapshot it now" entry point, and it is deliberately the only
+/// thing it sounds like: resolve the target (following a symlink exactly as
+/// [`write_document`] does), reserve an unused manual backup name, copy and
+/// `fsync` the copy, then enforce the automatic-backup retention bound. No
+/// temp file is created, nothing is renamed, nothing is validated, and
+/// [`write_document`] is not called — the target file is only ever *read*.
+///
+/// The backup it creates is exempt from [`MAX_BACKUPS`] pruning for as long as
+/// it exists; see the module docs for why that is the right policy and
+/// [`prune_backups`] for how it is enforced.
+///
+/// Privilege escalation is out of scope here for the same reason it is for
+/// [`write_document`]: this function assumes it already has whatever
+/// permissions it needs and behaves identically whether it is called directly
+/// against a sandbox file or from inside an elevated helper acting on the real
+/// `/etc/fstab`.
+///
+/// # Errors
+///
+/// [`CreateBackupError::TargetMissing`] if there is nothing on disk to copy,
+/// [`CreateBackupError::InvalidTarget`] if the path cannot be a target at all,
+/// [`CreateBackupError::Backup`] for any I/O failure while taking the copy.
+/// The target file is untouched in every case.
+pub fn create_backup(target: &Path) -> Result<CreateBackupOutcome, CreateBackupError> {
+    create_backup_with(target, &RealFs)
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +720,8 @@ fn write_document_with<F: FileSystemOps>(
     let mut notes: Vec<String> = Vec::new();
 
     // Step 2': resolve a symlinked target to the file it points at.
-    let (effective_target, existing) = resolve_target(target, fsops, &mut notes)?;
+    let (effective_target, existing) =
+        resolve_target(target, fsops, &mut notes).map_err(WriteError::from)?;
 
     let file_name = effective_target
         .file_name()
@@ -524,12 +737,10 @@ fn write_document_with<F: FileSystemOps>(
     let backup = match &existing {
         None => None,
         Some(_) => {
-            let backup_path = reserve_backup_path(fsops, &dir, &file_name)?;
-            fsops
-                .copy_durably(&effective_target, &backup_path)
-                .map_err(|source| WriteError::Backup {
-                    path: backup_path.clone(),
-                    source,
+            let backup_path = take_backup(fsops, &effective_target, &dir, &file_name, false)
+                .map_err(|failure| WriteError::Backup {
+                    path: failure.path,
+                    source: failure.source,
                 })?;
             prune_backups(fsops, &dir, &file_name, &mut pruned_backups, &mut notes);
             Some(backup_path)
@@ -581,6 +792,68 @@ fn write_document_with<F: FileSystemOps>(
         backup,
         pruned_backups,
         validation_warnings,
+        notes,
+    })
+}
+
+/// The [`FileSystemOps`]-generic implementation behind [`create_backup`].
+///
+/// Crate-private for the same reason [`write_document_with`] is: production
+/// callers get the concrete, `std::fs`-backed [`create_backup`], and the
+/// generic parameter exists only so unit tests can inject an I/O failure at
+/// one specific syscall.
+///
+/// Every step here is shared code with the save path — the same
+/// [`resolve_target`], the same [`take_backup`], the same [`prune_backups`] —
+/// so the two can never disagree about which file is the target, what a backup
+/// is called, or which backups are excess. What is *not* shared is everything
+/// after the copy: this function has no temp file, no rename and no read-back,
+/// because it never writes the target.
+fn create_backup_with<F: FileSystemOps>(
+    target: &Path,
+    fsops: &F,
+) -> Result<CreateBackupOutcome, CreateBackupError> {
+    let mut notes: Vec<String> = Vec::new();
+    let (effective_target, existing) =
+        resolve_target(target, fsops, &mut notes).map_err(CreateBackupError::from)?;
+
+    // A target that does not exist is a normal state for a save (it creates
+    // the file) but the whole point of this operation, so it is reported as
+    // its own error instead of being folded into an I/O failure.
+    if existing.is_none() {
+        return Err(CreateBackupError::TargetMissing {
+            path: effective_target,
+        });
+    }
+
+    let file_name = effective_target
+        .file_name()
+        .ok_or_else(|| CreateBackupError::InvalidTarget {
+            path: effective_target.clone(),
+            reason: "the path has no final file-name component".to_string(),
+        })?
+        .to_os_string();
+    let dir = containing_dir(&effective_target);
+
+    let backup =
+        take_backup(fsops, &effective_target, &dir, &file_name, true).map_err(|failure| {
+            CreateBackupError::Backup {
+                path: failure.path,
+                source: failure.source,
+            }
+        })?;
+
+    // Retention still runs, even though the backup just taken is exempt from
+    // it: a target that was already over the automatic bound (because an
+    // earlier prune failed, say) should not stay over it forever just because
+    // the next backup happened to be a manual one.
+    let mut pruned_backups = Vec::new();
+    prune_backups(fsops, &dir, &file_name, &mut pruned_backups, &mut notes);
+
+    Ok(CreateBackupOutcome {
+        target: effective_target,
+        backup,
+        pruned_backups,
         notes,
     })
 }
@@ -668,43 +941,106 @@ fn write_temp_and_swap<F: FileSystemOps>(
         })
 }
 
-/// Determines the file that will actually be written and stats it.
+/// Why a path could not be turned into "the file to act on".
+///
+/// Its own type rather than a [`WriteError`] because both entry points share
+/// [`resolve_target`] but report in their own error shapes; each maps these
+/// two cases onto its own variants, which keeps the resolution logic — the
+/// symlink walk in particular — written exactly once.
+enum TargetFailure {
+    /// An `lstat` of the path, or of a symlink's destination, failed.
+    Stat {
+        /// The path that could not be inspected.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// The path is structurally unusable as a target: a directory, or a
+    /// symlink that could not be resolved.
+    Invalid {
+        /// The offending path.
+        path: PathBuf,
+        /// Why it cannot be used.
+        reason: String,
+    },
+}
+
+impl From<TargetFailure> for WriteError {
+    fn from(failure: TargetFailure) -> Self {
+        match failure {
+            // Historically (and still) reported as a backup-stage failure:
+            // this `lstat` is the first thing the backup step needs, and the
+            // target is provably untouched either way.
+            TargetFailure::Stat { path, source } => WriteError::Backup { path, source },
+            TargetFailure::Invalid { path, reason } => WriteError::InvalidTarget { path, reason },
+        }
+    }
+}
+
+impl From<TargetFailure> for CreateBackupError {
+    fn from(failure: TargetFailure) -> Self {
+        match failure {
+            TargetFailure::Stat { path, source } => CreateBackupError::Backup { path, source },
+            TargetFailure::Invalid { path, reason } => {
+                CreateBackupError::InvalidTarget { path, reason }
+            }
+        }
+    }
+}
+
+/// A failed attempt to reserve or write a backup copy: which path was being
+/// worked on, and why it failed.
+///
+/// Shared by both entry points for the same reason [`TargetFailure`] is —
+/// [`take_backup`] is written once and each caller words the failure in its
+/// own error type.
+struct BackupFailure {
+    /// The backup path being reserved or written.
+    path: PathBuf,
+    /// The underlying I/O error.
+    source: io::Error,
+}
+
+/// Determines the file that will actually be acted on and stats it.
 ///
 /// Returns the effective target path together with its current [`FileStat`],
 /// or `None` for a target that does not exist yet. A symlinked target is
 /// resolved to its destination (see the module docs for why); a directory, or
 /// a symlink that cannot be resolved (e.g. a dangling one), is rejected as
-/// [`WriteError::InvalidTarget`].
+/// [`TargetFailure::Invalid`].
 fn resolve_target<F: FileSystemOps>(
     target: &Path,
     fsops: &F,
     notes: &mut Vec<String>,
-) -> Result<(PathBuf, Option<FileStat>), WriteError> {
+) -> Result<(PathBuf, Option<FileStat>), TargetFailure> {
     let stat = fsops
         .symlink_stat(target)
-        .map_err(|source| WriteError::Backup {
+        .map_err(|source| TargetFailure::Stat {
             path: target.to_path_buf(),
             source,
         })?;
 
     let (path, stat) = match stat {
         Some(stat) if stat.is_symlink => {
-            let resolved =
-                fsops
-                    .canonicalize(target)
-                    .map_err(|source| WriteError::InvalidTarget {
-                        path: target.to_path_buf(),
-                        reason: format!("it is a symlink that could not be resolved ({source})"),
-                    })?;
+            let resolved = fsops
+                .canonicalize(target)
+                .map_err(|source| TargetFailure::Invalid {
+                    path: target.to_path_buf(),
+                    reason: format!("it is a symlink that could not be resolved ({source})"),
+                })?;
+            // Worded for both entry points: a save writes through the link, a
+            // manual backup copies through it, and in both cases the fact the
+            // user needs is *which file was actually acted on*.
             notes.push(format!(
-                "{} is a symlink; the new content was written through to {}",
+                "{} is a symlink; it was followed through to {}, which is the file that was \
+                 acted on",
                 target.display(),
                 resolved.display()
             ));
             let resolved_stat =
                 fsops
                     .symlink_stat(&resolved)
-                    .map_err(|source| WriteError::Backup {
+                    .map_err(|source| TargetFailure::Stat {
                         path: resolved.clone(),
                         source,
                     })?;
@@ -714,12 +1050,39 @@ fn resolve_target<F: FileSystemOps>(
     };
 
     if stat.as_ref().is_some_and(|stat| stat.is_dir) {
-        return Err(WriteError::InvalidTarget {
+        return Err(TargetFailure::Invalid {
             path,
             reason: "it is a directory".to_string(),
         });
     }
     Ok((path, stat))
+}
+
+/// Reserves a fresh backup name for `file_name` in `dir` and copies `source`
+/// into it durably, returning the backup's path.
+///
+/// The single place a backup copy is ever made, by either entry point: the
+/// name reservation and the copy-then-`fsync` belong together (a reserved name
+/// that is never filled is a name another process could take), and the
+/// durability argument in the module docs has to hold for a manual snapshot
+/// exactly as it does for a save's automatic one.
+///
+/// `manual` picks which of the two recognized name shapes is reserved.
+fn take_backup<F: FileSystemOps>(
+    fsops: &F,
+    source: &Path,
+    dir: &Path,
+    file_name: &OsStr,
+    manual: bool,
+) -> Result<PathBuf, BackupFailure> {
+    let backup_path = reserve_backup_path(fsops, dir, file_name, manual)?;
+    fsops
+        .copy_durably(source, &backup_path)
+        .map_err(|source| BackupFailure {
+            path: backup_path.clone(),
+            source,
+        })?;
+    Ok(backup_path)
 }
 
 /// Returns the directory containing `path`, mapping both "no parent" and the
@@ -746,33 +1109,78 @@ fn temp_file_name(file_name: &OsStr) -> OsString {
     name
 }
 
+/// Everything a backup's file name encodes: when it was taken, and whether a
+/// user asked for it explicitly.
+///
+/// The parsed counterpart of [`backup_file_name`]; the two are inverses, and
+/// keeping them adjacent is the whole defence against the written and the
+/// recognized shapes drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackupName {
+    /// Whole seconds since the Unix epoch, from the name's first component.
+    secs: u64,
+    /// Nanoseconds within that second, from the name's second component.
+    nanos: u32,
+    /// `true` if the name carries the [`MANUAL_SUFFIX`].
+    manual: bool,
+}
+
+impl BackupName {
+    /// The chronological sort key, deliberately excluding `manual`: both kinds
+    /// of backup live in one list ordered purely by when they were taken.
+    fn when(&self) -> (u64, u32) {
+        (self.secs, self.nanos)
+    }
+}
+
 /// Builds the backup file name for `file_name` at the given timestamp:
 /// `<file_name>.rustab-backup.<secs>.<nanos>`, both components zero-padded to
-/// a fixed width so names sort chronologically as text as well as numerically.
-fn backup_file_name(file_name: &OsStr, secs: u64, nanos: u32) -> OsString {
+/// a fixed width so names sort chronologically as text as well as numerically,
+/// plus a trailing [`MANUAL_SUFFIX`] when `manual` is set.
+///
+/// The suffix goes *after* the timestamp rather than before it precisely so
+/// the fixed-width chronological text sort is unaffected by a backup's kind.
+fn backup_file_name(file_name: &OsStr, secs: u64, nanos: u32, manual: bool) -> OsString {
     let mut name = OsString::from(file_name);
     name.push(format!(
         "{BACKUP_INFIX}{secs:0secs_width$}.{nanos:0nanos_width$}",
         secs_width = BACKUP_SECS_DIGITS,
         nanos_width = BACKUP_NANOS_DIGITS,
     ));
+    if manual {
+        name.push(MANUAL_SUFFIX);
+    }
     name
 }
 
-/// Parses a directory entry name as a backup of `target_name`, returning its
-/// `(secs, nanos)` timestamp, or `None` if the name is not *exactly* a
-/// Rustab backup of that specific target.
+/// Parses a directory entry name as a backup of `target_name`, returning what
+/// the name encodes, or `None` if it is not *exactly* a Rustab backup of that
+/// specific target.
 ///
 /// Strict on purpose: this predicate is the only thing standing between
 /// [`prune_backups`] and a user's unrelated files, so anything that is not an
-/// exact `<target_name>.rustab-backup.<10 digits>.<9 digits>` — a different
-/// target's backup, a hand-made `fstab.bak`, a backup name with extra
-/// suffixes, or a non-numeric timestamp — must be rejected and left alone.
-fn backup_timestamp_of(name: &OsStr, target_name: &OsStr) -> Option<(u64, u32)> {
+/// exact `<target_name>.rustab-backup.<10 digits>.<9 digits>`, optionally
+/// followed by exactly `.manual` — a different target's backup, a hand-made
+/// `fstab.bak`, a backup name with any *other* extra suffix, a doubled or
+/// differently-cased `.manual`, or a non-numeric timestamp — must be rejected
+/// and left alone.
+///
+/// The manual suffix is stripped *before* the timestamp is parsed, and the
+/// timestamp checks are unchanged, so adding the suffix widened the accepted
+/// set by exactly one shape and could not loosen any existing check: anything
+/// that was rejected for its timestamp is still rejected with or without the
+/// suffix (asserted by the strictness tests).
+fn backup_name_of(name: &OsStr, target_name: &OsStr) -> Option<BackupName> {
     let rest = name.as_bytes().strip_prefix(target_name.as_bytes())?;
     let rest = rest.strip_prefix(BACKUP_INFIX.as_bytes())?;
     let rest = std::str::from_utf8(rest).ok()?;
-    let (secs, nanos) = rest.split_once('.')?;
+
+    let (stamp, manual) = match rest.strip_suffix(MANUAL_SUFFIX) {
+        Some(stamp) => (stamp, true),
+        None => (rest, false),
+    };
+
+    let (secs, nanos) = stamp.split_once('.')?;
     if secs.len() != BACKUP_SECS_DIGITS || nanos.len() != BACKUP_NANOS_DIGITS {
         return None;
     }
@@ -783,53 +1191,58 @@ fn backup_timestamp_of(name: &OsStr, target_name: &OsStr) -> Option<(u64, u32)> 
     {
         return None;
     }
-    Some((secs.parse().ok()?, nanos.parse().ok()?))
+    Some(BackupName {
+        secs: secs.parse().ok()?,
+        nanos: nanos.parse().ok()?,
+        manual,
+    })
 }
 
-/// Filters `names` down to backups of `target_name` and returns them paired
-/// with their timestamps, oldest first. The path is a secondary sort key
-/// purely so the order is total and deterministic.
+/// Filters `names` down to backups of `target_name` — automatic and manual
+/// alike — and returns them paired with their parsed names, oldest first. The
+/// path is a secondary sort key purely so the order is total and
+/// deterministic.
 fn sorted_backups(
     dir: &Path,
     names: &[OsString],
     target_name: &OsStr,
-) -> Vec<((u64, u32), PathBuf)> {
-    let mut backups: Vec<((u64, u32), PathBuf)> = names
+) -> Vec<(BackupName, PathBuf)> {
+    let mut backups: Vec<(BackupName, PathBuf)> = names
         .iter()
-        .filter_map(|name| {
-            backup_timestamp_of(name, target_name).map(|stamp| (stamp, dir.join(name)))
-        })
+        .filter_map(|name| backup_name_of(name, target_name).map(|parsed| (parsed, dir.join(name))))
         .collect();
-    backups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    backups.sort_by(|a, b| a.0.when().cmp(&b.0.when()).then_with(|| a.1.cmp(&b.1)));
     backups
 }
 
-/// Picks an unused timestamped backup path in `dir` for `file_name`.
+/// Picks an unused timestamped backup path in `dir` for `file_name`, of the
+/// kind `manual` selects.
 ///
 /// Retries with a fresh timestamp if the name is somehow already taken, so a
 /// backup never silently overwrites an older one. Failing to find a free name
-/// is reported as [`WriteError::Backup`], which aborts the save with the
+/// is reported as a [`BackupFailure`], which aborts the operation with the
 /// target untouched — the safe direction to fail in.
 fn reserve_backup_path<F: FileSystemOps>(
     fsops: &F,
     dir: &Path,
     file_name: &OsStr,
-) -> Result<PathBuf, WriteError> {
+    manual: bool,
+) -> Result<PathBuf, BackupFailure> {
     for _ in 0..MAX_BACKUP_NAME_ATTEMPTS {
         let (secs, nanos) = unix_timestamp_parts();
-        let candidate = dir.join(backup_file_name(file_name, secs, nanos));
+        let candidate = dir.join(backup_file_name(file_name, secs, nanos, manual));
         match fsops.symlink_stat(&candidate) {
             Ok(None) => return Ok(candidate),
             Ok(Some(_)) => continue,
             Err(source) => {
-                return Err(WriteError::Backup {
+                return Err(BackupFailure {
                     path: candidate,
                     source,
                 })
             }
         }
     }
-    Err(WriteError::Backup {
+    Err(BackupFailure {
         path: dir.join(file_name),
         source: io::Error::other(format!(
             "no unused timestamped backup name was available after {MAX_BACKUP_NAME_ATTEMPTS} \
@@ -838,15 +1251,22 @@ fn reserve_backup_path<F: FileSystemOps>(
     })
 }
 
-/// Deletes backups of `file_name` in `dir` beyond [`MAX_BACKUPS`], oldest
-/// first, recording what it deleted in `pruned`.
+/// Deletes **automatic** backups of `file_name` in `dir` beyond
+/// [`MAX_BACKUPS`], oldest first, recording what it deleted in `pruned`.
+///
+/// Manual backups are invisible to this function in both directions: they are
+/// not counted when deciding how many automatic backups are excess, and they
+/// are never deleted to make room. See the module docs for why that is the
+/// policy; the short version is that a user-requested snapshot must not be
+/// evicted by unrelated later saves, and manual snapshots must not be able to
+/// evict the automatic safety net either.
 ///
 /// Deliberately infallible: pruning happens *after* the new backup exists and
 /// *before* the swap, and a stale extra backup is harmless, so neither an
-/// unreadable directory nor an undeletable old backup is allowed to abort a
-/// save that is otherwise safe to perform. Such failures are not silent
+/// unreadable directory nor an undeletable old backup is allowed to abort an
+/// operation that is otherwise safe to perform. Such failures are not silent
 /// either — each one is recorded in `notes` and surfaced via
-/// [`WriteOutcome::notes`].
+/// [`WriteOutcome::notes`] or [`CreateBackupOutcome::notes`].
 fn prune_backups<F: FileSystemOps>(
     fsops: &F,
     dir: &Path,
@@ -866,11 +1286,17 @@ fn prune_backups<F: FileSystemOps>(
         }
     };
 
-    let backups = sorted_backups(dir, &names, file_name);
-    let Some(excess) = backups.len().checked_sub(MAX_BACKUPS) else {
+    // Manual backups are filtered out *before* the count, so they neither
+    // occupy a slot nor can be chosen for deletion.
+    let automatic: Vec<PathBuf> = sorted_backups(dir, &names, file_name)
+        .into_iter()
+        .filter(|(name, _)| !name.manual)
+        .map(|(_, path)| path)
+        .collect();
+    let Some(excess) = automatic.len().checked_sub(MAX_BACKUPS) else {
         return;
     };
-    for (_, path) in backups.into_iter().take(excess) {
+    for path in automatic.into_iter().take(excess) {
         match fsops.remove_file(&path) {
             Ok(()) => pruned.push(path),
             Err(err) => notes.push(format!(
@@ -1356,6 +1782,30 @@ mod tests {
 
     fn write_original(path: &Path) {
         fs::write(path, ORIGINAL).expect("could not seed the test target file");
+    }
+
+    /// Writes a hand-made backup of `fstab` into `dir` at a controlled
+    /// timestamp, of the kind `manual` selects, and returns its path.
+    ///
+    /// Built through [`backup_file_name`] rather than by formatting a name
+    /// here, so a test can never accidentally assert against a name shape the
+    /// production code does not actually produce.
+    fn seed_backup_file(dir: &TempDir, secs: u64, manual: bool) -> PathBuf {
+        let path = dir
+            .path
+            .join(backup_file_name(OsStr::new("fstab"), secs, 0, manual));
+        let kind = if manual { "manual" } else { "automatic" };
+        fs::write(&path, format!("old {kind} backup {secs}\n")).expect("seed a backup file");
+        path
+    }
+
+    /// Just the paths [`list_backups`] reports for `target`, oldest first.
+    fn backup_paths(target: &Path) -> Vec<PathBuf> {
+        list_backups(target)
+            .expect("listing backups")
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
     }
 
     /// The assertion at the heart of this module's acceptance criteria.
@@ -1895,16 +2345,12 @@ mod tests {
 
         // Hand-made backups with controlled, strictly increasing timestamps.
         let preexisting: Vec<PathBuf> = (1..=(MAX_BACKUPS as u64 + 2))
-            .map(|i| {
-                let path = dir.path.join(backup_file_name(OsStr::new("fstab"), i, 0));
-                fs::write(&path, format!("old backup {i}\n")).unwrap();
-                path
-            })
+            .map(|i| seed_backup_file(&dir, i, false))
             .collect();
 
         let outcome = write_document(&target, &valid_candidate("/mnt/retained")).expect("save");
 
-        let remaining = list_backups(&target).expect("listing backups");
+        let remaining = backup_paths(&target);
         assert_eq!(
             remaining.len(),
             MAX_BACKUPS,
@@ -1950,6 +2396,100 @@ mod tests {
         assert_eq!(list_backups(&target).unwrap().len(), MAX_BACKUPS);
     }
 
+    /// **The retention policy's product decision, asserted.**
+    ///
+    /// A manual backup — here, the *oldest* file of either kind, so a
+    /// kind-blind prune would delete it first — survives a save that prunes
+    /// automatic backups past the bound. If this ever regresses, a user's
+    /// deliberate "snapshot now" would be silently thrown away by unrelated
+    /// later saves, which is exactly what the exemption exists to prevent.
+    #[test]
+    fn a_manual_backup_is_never_pruned_by_a_save() {
+        let dir = TempDir::new("retention-manual");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        // Timestamp 1: older than every automatic backup below.
+        let manual = seed_backup_file(&dir, 1, true);
+        let automatic: Vec<PathBuf> = (2..=(MAX_BACKUPS as u64 + 3))
+            .map(|i| seed_backup_file(&dir, i, false))
+            .collect();
+
+        let outcome = write_document(&target, &valid_candidate("/mnt/kept")).expect("save");
+
+        assert!(
+            manual.exists(),
+            "the manual backup must survive, however much pruning happens"
+        );
+        assert_eq!(
+            fs::read_to_string(&manual).unwrap(),
+            "old manual backup 1\n",
+            "and its content must be untouched"
+        );
+        assert!(
+            !outcome.pruned_backups.contains(&manual),
+            "a manual backup must never even be reported as pruned: {:?}",
+            outcome.pruned_backups
+        );
+        // MAX+2 automatics existed and the save added one, so exactly three
+        // automatics are excess — the manual one is not part of that count.
+        assert_eq!(outcome.pruned_backups.len(), 3);
+        assert_eq!(outcome.pruned_backups, automatic[..3].to_vec());
+
+        let remaining = list_backups(&target).expect("listing backups");
+        assert_eq!(
+            remaining.iter().filter(|entry| !entry.manual).count(),
+            MAX_BACKUPS,
+            "the automatic bound still holds exactly"
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|entry| entry.manual)
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![manual],
+            "and the manual backup is still listed, still flagged manual"
+        );
+    }
+
+    /// The other half of the exemption: manual backups are not *counted*
+    /// either, so a target holding many of them still keeps its full
+    /// complement of automatic backups instead of having them evicted.
+    ///
+    /// Without this, a user taking a few snapshots would quietly destroy their
+    /// own automatic safety net.
+    #[test]
+    fn manual_backups_do_not_count_towards_the_automatic_bound() {
+        let dir = TempDir::new("retention-manual-count");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        // Far more manual backups than the bound, plus one automatic short of
+        // it, so a kind-blind prune would delete several automatics.
+        let manual: Vec<PathBuf> = (1..=(MAX_BACKUPS as u64 * 2))
+            .map(|i| seed_backup_file(&dir, i, true))
+            .collect();
+        let automatic: Vec<PathBuf> = (100..100 + (MAX_BACKUPS as u64 - 1))
+            .map(|i| seed_backup_file(&dir, i, false))
+            .collect();
+
+        let outcome = write_document(&target, &valid_candidate("/mnt/counted")).expect("save");
+
+        assert!(
+            outcome.pruned_backups.is_empty(),
+            "the save's own backup brings the automatic count to exactly \
+             MAX_BACKUPS, so nothing is excess: {:?}",
+            outcome.pruned_backups
+        );
+        for path in manual.iter().chain(automatic.iter()) {
+            assert!(path.exists(), "{} must still exist", path.display());
+        }
+        let remaining = list_backups(&target).expect("listing backups");
+        assert_eq!(remaining.iter().filter(|e| e.manual).count(), manual.len());
+        assert_eq!(remaining.iter().filter(|e| !e.manual).count(), MAX_BACKUPS);
+    }
+
     /// Proves pruning can only ever delete Rustab's own backups *for this
     /// exact target*: decoy files that merely resemble a backup name — a
     /// different target's backup, a non-numeric timestamp, a wrong-width
@@ -1974,11 +2514,7 @@ mod tests {
         }
         // Enough real backups that this save must prune.
         for i in 1..=(MAX_BACKUPS as u64 + 2) {
-            fs::write(
-                dir.path.join(backup_file_name(OsStr::new("fstab"), i, 0)),
-                format!("old {i}\n"),
-            )
-            .unwrap();
+            seed_backup_file(&dir, i, false);
         }
 
         let outcome = write_document(&target, &valid_candidate("/mnt/decoy")).expect("save");
@@ -1997,11 +2533,15 @@ mod tests {
     fn backup_timestamp_parsing_is_strict() {
         let target = OsStr::new("fstab");
         assert_eq!(
-            backup_timestamp_of(
+            backup_name_of(
                 OsStr::new("fstab.rustab-backup.0000000012.000000034"),
                 target
             ),
-            Some((12, 34))
+            Some(BackupName {
+                secs: 12,
+                nanos: 34,
+                manual: false,
+            })
         );
         for bad in [
             "fstab",
@@ -2015,11 +2555,109 @@ mod tests {
             "xfstab.rustab-backup.0000000012.000000034",
         ] {
             assert_eq!(
-                backup_timestamp_of(OsStr::new(bad), target),
+                backup_name_of(OsStr::new(bad), target),
                 None,
                 "{bad} must not be treated as a backup of fstab"
             );
         }
+    }
+
+    /// The companion of `backup_timestamp_parsing_is_strict` for the one new
+    /// shape the grammar gained: `.manual` is accepted **only** spelled
+    /// exactly that way, exactly once, directly after an otherwise-valid
+    /// timestamp.
+    ///
+    /// This is the test that keeps the grammar extension from quietly becoming
+    /// "anything after the nanoseconds is fine": every rejected case below is
+    /// a file `prune_backups` and `list_backups` must continue to treat as
+    /// somebody else's, exactly as they did before `.manual` existed.
+    #[test]
+    fn manual_suffix_is_the_only_accepted_name_extension() {
+        let target = OsStr::new("fstab");
+
+        // The one new accepted shape, and the old one, side by side.
+        assert_eq!(
+            backup_name_of(
+                OsStr::new("fstab.rustab-backup.0000000012.000000034.manual"),
+                target
+            ),
+            Some(BackupName {
+                secs: 12,
+                nanos: 34,
+                manual: true,
+            })
+        );
+        assert_eq!(
+            backup_name_of(
+                OsStr::new("fstab.rustab-backup.0000000012.000000034"),
+                target
+            )
+            .map(|name| name.manual),
+            Some(false),
+            "an automatic backup's name is unchanged, byte for byte"
+        );
+
+        for bad in [
+            // Wrong case, in each of the plausible spellings.
+            "fstab.rustab-backup.0000000012.000000034.Manual",
+            "fstab.rustab-backup.0000000012.000000034.MANUAL",
+            // Doubled, or glued to another suffix.
+            "fstab.rustab-backup.0000000012.000000034.manual.manual",
+            "fstab.rustab-backup.0000000012.000000034.manual.gz",
+            "fstab.rustab-backup.0000000012.000000034.gz.manual",
+            // Extra characters on either side of the suffix itself.
+            "fstab.rustab-backup.0000000012.000000034.manually",
+            "fstab.rustab-backup.0000000012.000000034.manual ",
+            "fstab.rustab-backup.0000000012.000000034manual",
+            "fstab.rustab-backup.0000000012.000000034..manual",
+            "fstab.rustab-backup.0000000012.000000034.-manual",
+            // The suffix cannot rescue a timestamp that was never valid:
+            // wrong widths, non-numeric components, a missing component.
+            "fstab.rustab-backup.0000000012.00000003.manual",
+            "fstab.rustab-backup.12.34.manual",
+            "fstab.rustab-backup.000000001x.000000034.manual",
+            "fstab.rustab-backup.aaaaaaaaaa.bbbbbbbbb.manual",
+            "fstab.rustab-backup.0000000012.manual",
+            "fstab.rustab-backup..manual",
+            "fstab.rustab-backup.manual",
+            // ...nor a prefix belonging to a different target.
+            "fstab2.rustab-backup.0000000012.000000034.manual",
+            "xfstab.rustab-backup.0000000012.000000034.manual",
+            // ...nor the suffix in the wrong position.
+            "fstab.manual.rustab-backup.0000000012.000000034",
+            "fstab.rustab-backup.manual.0000000012.000000034",
+        ] {
+            assert_eq!(
+                backup_name_of(OsStr::new(bad), target),
+                None,
+                "{bad} must not be treated as a backup of fstab"
+            );
+        }
+    }
+
+    /// Proves [`backup_file_name`] and [`backup_name_of`] are inverses for
+    /// both kinds — the property that keeps a backup Rustab just wrote from
+    /// being unrecognizable to the code that lists and prunes it.
+    #[test]
+    fn written_backup_names_parse_back_to_what_was_written() {
+        let target = OsStr::new("fstab");
+        for manual in [false, true] {
+            let name = backup_file_name(target, 12, 34, manual);
+            assert_eq!(
+                backup_name_of(&name, target),
+                Some(BackupName {
+                    secs: 12,
+                    nanos: 34,
+                    manual,
+                }),
+                "{name:?} must parse back to the name it was built from"
+            );
+        }
+        assert_eq!(
+            backup_file_name(target, 12, 34, true).to_string_lossy(),
+            "fstab.rustab-backup.0000000012.000000034.manual",
+            "the manual shape is exactly the automatic one plus one suffix"
+        );
     }
 
     // -- target path handling -----------------------------------------------
@@ -2111,8 +2749,9 @@ mod tests {
     }
 
     /// Proves `list_backups` reports only this target's backups, oldest
-    /// first, and reports an empty list (not an error) for a target that has
-    /// none.
+    /// first, reports both kinds in one chronological list with the kind
+    /// attached, and reports an empty list (not an error) for a target that
+    /// has none.
     #[test]
     fn list_backups_is_sorted_and_scoped_to_the_target() {
         let dir = TempDir::new("list");
@@ -2120,32 +2759,63 @@ mod tests {
         write_original(&target);
         assert!(list_backups(&target).unwrap().is_empty());
 
-        for (secs, nanos) in [(3u64, 0u32), (1, 500), (1, 100), (2, 0)] {
+        // Deliberately out of order, and deliberately mixing the two kinds so
+        // the manual one is neither first nor last: the order is by timestamp
+        // alone, never by kind.
+        for (secs, nanos, manual) in [
+            (3u64, 0u32, false),
+            (1, 500, false),
+            (1, 100, false),
+            (2, 0, true),
+        ] {
             fs::write(
                 dir.path
-                    .join(backup_file_name(OsStr::new("fstab"), secs, nanos)),
+                    .join(backup_file_name(OsStr::new("fstab"), secs, nanos, manual)),
                 "x",
             )
             .unwrap();
         }
         fs::write(
-            dir.path.join(backup_file_name(OsStr::new("other"), 9, 0)),
+            dir.path
+                .join(backup_file_name(OsStr::new("other"), 9, 0, false)),
             "x",
         )
         .unwrap();
 
-        let listed: Vec<String> = list_backups(&target)
+        let listed: Vec<(String, bool)> = list_backups(&target)
             .unwrap()
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|entry| {
+                (
+                    entry
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    entry.manual,
+                )
+            })
             .collect();
         assert_eq!(
             listed,
             vec![
-                "fstab.rustab-backup.0000000001.000000100".to_string(),
-                "fstab.rustab-backup.0000000001.000000500".to_string(),
-                "fstab.rustab-backup.0000000002.000000000".to_string(),
-                "fstab.rustab-backup.0000000003.000000000".to_string(),
+                (
+                    "fstab.rustab-backup.0000000001.000000100".to_string(),
+                    false
+                ),
+                (
+                    "fstab.rustab-backup.0000000001.000000500".to_string(),
+                    false
+                ),
+                (
+                    "fstab.rustab-backup.0000000002.000000000.manual".to_string(),
+                    true
+                ),
+                (
+                    "fstab.rustab-backup.0000000003.000000000".to_string(),
+                    false
+                ),
             ]
         );
     }
@@ -2179,6 +2849,233 @@ mod tests {
         assert_eq!(
             fs::read_to_string(outcome.backup.unwrap()).unwrap(),
             ORIGINAL
+        );
+    }
+
+    // -- manual backups (`create_backup`) -----------------------------------
+
+    /// The core claim of [`create_backup`]: the target's current content is
+    /// copied to a *manual* backup beside it, and the target itself is never
+    /// written — no temp file, no rename, not even a mode change.
+    #[test]
+    fn create_backup_copies_the_target_and_never_touches_it() {
+        let dir = TempDir::new("manual-ok");
+        let target = dir.join("fstab");
+        write_original(&target);
+        let before = fs::metadata(&target).expect("stat the target");
+
+        let outcome = create_backup(&target).expect("a manual backup of an existing target");
+
+        assert_eq!(outcome.target, target);
+        assert_eq!(fs::read_to_string(&outcome.backup).unwrap(), ORIGINAL);
+        assert!(
+            outcome
+                .backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("fstab.rustab-backup."),
+            "the backup belongs to this target: {:?}",
+            outcome.backup
+        );
+        assert!(
+            outcome.backup.to_string_lossy().ends_with(".manual"),
+            "a backup taken through create_backup is manual: {:?}",
+            outcome.backup
+        );
+        assert!(outcome.pruned_backups.is_empty());
+
+        // The target is byte-for-byte what it was, and so is its mtime: this
+        // operation only ever *reads* it.
+        assert_target_untouched(&target);
+        assert_eq!(
+            fs::metadata(&target).unwrap().modified().unwrap(),
+            before.modified().unwrap(),
+            "the target must not even have been opened for writing"
+        );
+        // Nothing else was created — in particular no temp file.
+        assert_eq!(
+            dir.entry_names(),
+            vec![
+                "fstab".to_string(),
+                outcome
+                    .backup
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+
+        // And the module's own listing agrees about what it just made.
+        let listed = list_backups(&target).expect("listing");
+        assert_eq!(
+            listed,
+            vec![BackupEntry {
+                path: outcome.backup.clone(),
+                manual: true,
+            }]
+        );
+    }
+
+    /// Repeated manual backups never collide and never overwrite each other —
+    /// the same guarantee repeated saves get, through the same reservation.
+    #[test]
+    fn repeated_manual_backups_get_distinct_names() {
+        let dir = TempDir::new("manual-repeat");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        let first = create_backup(&target).expect("first").backup;
+        fs::write(&target, "# changed\n").expect("change the target");
+        let second = create_backup(&target).expect("second").backup;
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), ORIGINAL);
+        assert_eq!(fs::read_to_string(&second).unwrap(), "# changed\n");
+        let listed = list_backups(&target).expect("listing");
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|entry| entry.manual));
+    }
+
+    /// A target that does not exist yet is its own, explicit error: an
+    /// explicit "back this up now" must never resolve as a success that
+    /// produced nothing.
+    #[test]
+    fn create_backup_refuses_a_target_that_does_not_exist() {
+        let dir = TempDir::new("manual-missing");
+        let target = dir.join("fstab");
+
+        let err = create_backup(&target).expect_err("there is nothing to back up");
+
+        assert!(
+            matches!(err, CreateBackupError::TargetMissing { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("nothing to back up"),
+            "the message must say why: {err}"
+        );
+        assert!(
+            dir.entry_names().is_empty(),
+            "nothing may be created on this path: {:?}",
+            dir.entry_names()
+        );
+    }
+
+    /// A symlinked target is followed through exactly as a save follows it:
+    /// the backup is made next to the *real* file, the link is untouched, and
+    /// the redirection is reported as a note.
+    #[test]
+    fn create_backup_follows_a_symlinked_target() {
+        let dir = TempDir::new("manual-symlink");
+        let real = dir.join("fstab.real");
+        let link = dir.join("fstab");
+        write_original(&real);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let outcome = create_backup(&link).expect("a manual backup through the symlink");
+
+        assert_eq!(outcome.target, fs::canonicalize(&real).unwrap());
+        assert!(outcome
+            .backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("fstab.real.rustab-backup."));
+        assert_eq!(fs::read_to_string(&outcome.backup).unwrap(), ORIGINAL);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must still be a symlink"
+        );
+        assert!(outcome.notes.iter().any(|note| note.contains("symlink")));
+    }
+
+    /// A directory (or any path that cannot be a target) is rejected up front,
+    /// through the same check a save applies.
+    #[test]
+    fn create_backup_rejects_a_directory_target() {
+        let dir = TempDir::new("manual-dir");
+        let err = create_backup(&dir.path).expect_err("a directory cannot be backed up");
+        assert!(
+            matches!(err, CreateBackupError::InvalidTarget { .. }),
+            "got {err:?}"
+        );
+        assert!(dir.entry_names().is_empty());
+    }
+
+    /// Taking a manual backup still enforces the *automatic* bound (a target
+    /// already over it does not stay over it forever), while the manual backup
+    /// it just created is itself exempt.
+    #[test]
+    fn create_backup_prunes_only_automatic_backups() {
+        let dir = TempDir::new("manual-prune");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        let automatic: Vec<PathBuf> = (1..=(MAX_BACKUPS as u64 + 2))
+            .map(|i| seed_backup_file(&dir, i, false))
+            .collect();
+
+        let outcome = create_backup(&target).expect("a manual backup");
+
+        // Two automatics too many existed; the new manual backup does not add
+        // to that count, so exactly two are pruned.
+        assert_eq!(outcome.pruned_backups, automatic[..2].to_vec());
+        assert!(outcome.backup.exists(), "the new manual backup survives");
+        let remaining = list_backups(&target).expect("listing");
+        assert_eq!(remaining.iter().filter(|e| !e.manual).count(), MAX_BACKUPS);
+        assert_eq!(remaining.iter().filter(|e| e.manual).count(), 1);
+    }
+
+    /// An I/O failure while copying is reported as `Backup`, and the target is
+    /// provably untouched — the same failure-injection standard the save path
+    /// is held to.
+    #[test]
+    fn an_injected_copy_failure_fails_the_manual_backup_cleanly() {
+        let dir = TempDir::new("manual-copy-fail");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        let spy = SpyFs::failing_at(Op::CopyBackup);
+        let err = create_backup_with(&target, &spy).expect_err("the copy fails");
+
+        assert!(
+            matches!(err, CreateBackupError::Backup { .. }),
+            "got {err:?}"
+        );
+        assert_target_untouched(&target);
+        assert!(
+            list_backups(&target).expect("listing").is_empty(),
+            "a failed copy must not leave a backup behind"
+        );
+    }
+
+    /// A pruning problem is a note, never a failure: the snapshot the user
+    /// asked for exists, and an extra stale automatic backup is harmless.
+    #[test]
+    fn a_prune_failure_does_not_fail_a_manual_backup() {
+        let dir = TempDir::new("manual-prune-fail");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        // `ListDir` is only reached by the pruning step here — the copy itself
+        // does not list the directory.
+        let spy = SpyFs::failing_at(Op::ListDir);
+        let outcome =
+            create_backup_with(&target, &spy).expect("a pruning problem must not fail the backup");
+
+        assert_eq!(fs::read_to_string(&outcome.backup).unwrap(), ORIGINAL);
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| note.contains("prune old backups")),
+            "the pruning failure must be surfaced, notes: {:?}",
+            outcome.notes
         );
     }
 }

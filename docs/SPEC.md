@@ -135,6 +135,16 @@ guarantees):
    (e.g. `/etc/fstab.rustab-backup.<timestamp>`, or a configurable backup
    directory) so the user always has a one-click restore path. Keep a
    bounded number of recent backups (don't grow unbounded).
+   Alongside these **automatic** backups, the user can also take a
+   **manual** one at any time without saving (an explicit "back up now"
+   action, which copies the target and never writes it); such a backup is
+   named with one extra trailing `.manual` suffix
+   (`<target>.rustab-backup.<secs>.<nanos>.manual`) and is **exempt** from
+   the automatic bound — it is neither counted towards it nor pruned to
+   honour it, and only an explicit user deletion removes it. The rationale:
+   a snapshot the user deliberately asked to keep must not be evicted by
+   unrelated later saves, and manual snapshots must not be able to evict the
+   automatic safety net either.
 6. If writing to a privileged path like the real `/etc/fstab`, do the
    privilege escalation (`pkexec`) around a single helper invocation that
    performs steps 3-5 atomically as root — do not do an unprivileged

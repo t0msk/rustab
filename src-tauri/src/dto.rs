@@ -45,7 +45,9 @@
 use fstab_core::discovery::{DeviceInfo, DiscoveryResult};
 use fstab_core::model::{Document, FstabEntry, FstabOption, Line, Options, SourceId};
 use fstab_core::validate::{Finding, Severity, ValidationReport};
-use fstab_core::writer::{FsyncStage, WriteError, WriteOutcome};
+use fstab_core::writer::{
+    CreateBackupError, CreateBackupOutcome, FsyncStage, WriteError, WriteOutcome,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -732,7 +734,7 @@ impl DeleteBackupErrorDto {
 // Backups
 // ---------------------------------------------------------------------------
 
-/// One auto-backup of the active target.
+/// One backup of the active target, automatic or manual.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupInfoDto {
     /// Full path, and the exact string [`crate::commands::restore_backup`],
@@ -749,6 +751,125 @@ pub struct BackupInfoDto {
     /// epoch — i.e. when the backup was taken. `null` if the platform could
     /// not report it.
     pub created_unix_secs: Option<u64>,
+    /// `true` if a user asked for this backup explicitly
+    /// ([`crate::commands::create_backup`]), `false` if a save made it on its
+    /// own. Reported by `fstab-core`, which owns the naming scheme the
+    /// distinction is encoded in — the frontend must not try to infer it from
+    /// `file_name`.
+    ///
+    /// Worth surfacing because the two kinds behave differently: automatic
+    /// backups are pruned once there are more than ten of them, manual ones
+    /// are kept until the user deletes them.
+    pub is_manual: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Manual backup creation
+// ---------------------------------------------------------------------------
+
+/// What a successful [`crate::commands::create_backup`] did, as the elevated
+/// helper reports it.
+///
+/// Internal to the escalation protocol rather than part of the command's own
+/// return shape: the command resolves this into a [`BackupInfoDto`] so the
+/// frontend gets a row in exactly the shape
+/// [`crate::commands::list_backups`] already hands it, with no second backup
+/// shape to mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateBackupOutcomeDto {
+    /// The file that was backed up — the active target, or its destination if
+    /// the target is a symlink.
+    pub target: String,
+    /// The backup that was created. Always a manual one.
+    pub backup: String,
+    /// *Automatic* backups deleted to honour the retention bound, oldest
+    /// first. Normally empty: a manual backup does not count towards that
+    /// bound, so this is non-empty only if the target was already over it.
+    pub pruned_backups: Vec<String>,
+    /// Non-fatal notes (a symlink that was followed, an old automatic backup
+    /// that could not be pruned). None of these affect the backup that was
+    /// taken.
+    pub notes: Vec<String>,
+}
+
+impl CreateBackupOutcomeDto {
+    /// Converts a [`CreateBackupOutcome`].
+    pub fn from_outcome(outcome: &CreateBackupOutcome) -> Self {
+        CreateBackupOutcomeDto {
+            target: path_to_wire(&outcome.target),
+            backup: path_to_wire(&outcome.backup),
+            pruned_backups: outcome
+                .pruned_backups
+                .iter()
+                .map(|path| path_to_wire(path))
+                .collect(),
+            notes: outcome.notes.clone(),
+        }
+    }
+}
+
+/// Why creating a backup of the active target failed.
+///
+/// Deliberately *not* [`WriteErrorKindDto`], for the same reason
+/// [`DeleteBackupErrorKindDto`] is not: creating a backup never opens, renames
+/// or writes the active target, so `target_unchanged` would be trivially
+/// `true` for every variant and would invite the frontend to read significance
+/// into it. Either a new backup exists, or it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateBackupErrorKindDto {
+    /// The active target could not be determined, so there was nothing to back
+    /// up. No backup was created.
+    TargetResolution,
+    /// The target does not exist on disk yet (a first-ever-save state), so
+    /// there is nothing to copy. Its own kind rather than a generic failure:
+    /// the user clicked "back this up now", and the honest answer is "there is
+    /// no file yet — save once first", not a silent success.
+    TargetMissing,
+    /// The target path cannot be backed up at all (it is a directory, a
+    /// dangling symlink, or has no file-name component).
+    InvalidTarget,
+    /// Copying the target to its new backup, or flushing that copy to disk,
+    /// failed. The target itself is untouched — it was only ever read.
+    Backup,
+    /// Real-target only: `pkexec` is missing, the prompt was dismissed or
+    /// refused, or the elevated helper produced no usable response.
+    PrivilegeEscalation,
+}
+
+/// A failed [`crate::commands::create_backup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateBackupErrorDto {
+    /// Which part failed.
+    pub kind: CreateBackupErrorKindDto,
+    /// Human-readable message, safe to show verbatim.
+    pub message: String,
+}
+
+impl CreateBackupErrorDto {
+    /// Builds an error of `kind` with `message`.
+    pub fn new(kind: CreateBackupErrorKindDto, message: impl Into<String>) -> Self {
+        CreateBackupErrorDto {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<&CreateBackupError> for CreateBackupErrorDto {
+    fn from(error: &CreateBackupError) -> Self {
+        // `Display` already words the consequence for a user ("no backup was
+        // created", "save the file once first"), so the message is taken
+        // verbatim rather than re-worded here — the same policy
+        // [`WriteErrorDto::from`] follows.
+        let message = error.to_string();
+        let kind = match error {
+            CreateBackupError::InvalidTarget { .. } => CreateBackupErrorKindDto::InvalidTarget,
+            CreateBackupError::TargetMissing { .. } => CreateBackupErrorKindDto::TargetMissing,
+            CreateBackupError::Backup { .. } => CreateBackupErrorKindDto::Backup,
+        };
+        CreateBackupErrorDto::new(kind, message)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -920,10 +1041,28 @@ mod tests {
             target_path: "/p".to_string(),
             size_bytes: 12,
             created_unix_secs: Some(1_760_000_000),
+            is_manual: true,
         };
         assert_eq!(
             serde_json::to_string(&backup).expect("serialize"),
-            r#"{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000}"#
+            r#"{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true}"#
+        );
+
+        let create_outcome = CreateBackupOutcomeDto {
+            target: "/p".to_string(),
+            backup: "/p.b".to_string(),
+            pruned_backups: Vec::new(),
+            notes: vec!["n".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_string(&create_outcome).expect("serialize"),
+            r#"{"target":"/p","backup":"/p.b","pruned_backups":[],"notes":["n"]}"#
+        );
+
+        let create_error = CreateBackupErrorDto::new(CreateBackupErrorKindDto::TargetMissing, "m");
+        assert_eq!(
+            serde_json::to_string(&create_error).expect("serialize"),
+            r#"{"kind":"target_missing","message":"m"}"#
         );
 
         let devices = DeviceDiscoveryDto {
@@ -943,7 +1082,7 @@ mod tests {
         );
     }
 
-    /// Every `kind` spelling of the two error enums the frontend matches on
+    /// Every `kind` spelling of the three error enums the frontend matches on
     /// by string, pinned individually.
     ///
     /// `remaining_wire_formats_are_exactly_as_documented` pins one instance of
@@ -986,6 +1125,71 @@ mod tests {
                 format!("\"{spelling}\"")
             );
         }
+
+        let create_kinds = [
+            (
+                CreateBackupErrorKindDto::TargetResolution,
+                "target_resolution",
+            ),
+            (CreateBackupErrorKindDto::TargetMissing, "target_missing"),
+            (CreateBackupErrorKindDto::InvalidTarget, "invalid_target"),
+            (CreateBackupErrorKindDto::Backup, "backup"),
+            (
+                CreateBackupErrorKindDto::PrivilegeEscalation,
+                "privilege_escalation",
+            ),
+        ];
+        for (kind, spelling) in create_kinds {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{spelling}\"")
+            );
+        }
+    }
+
+    /// Each `fstab-core` backup-creation failure maps to the kind the
+    /// contract promises, and carries the message `Display` already worded.
+    ///
+    /// `target_missing` is the one that matters most: it is the difference
+    /// between the UI saying "there is no file yet — save once first" and the
+    /// UI showing a generic I/O failure for a perfectly ordinary state.
+    #[test]
+    fn create_backup_errors_map_to_their_documented_kinds() {
+        let path = PathBuf::from("/etc/fstab");
+        let cases: Vec<(CreateBackupError, CreateBackupErrorKindDto)> = vec![
+            (
+                CreateBackupError::TargetMissing { path: path.clone() },
+                CreateBackupErrorKindDto::TargetMissing,
+            ),
+            (
+                CreateBackupError::InvalidTarget {
+                    path: path.clone(),
+                    reason: "it is a directory".to_string(),
+                },
+                CreateBackupErrorKindDto::InvalidTarget,
+            ),
+            (
+                CreateBackupError::Backup {
+                    path: path.clone(),
+                    source: io::Error::from(io::ErrorKind::PermissionDenied),
+                },
+                CreateBackupErrorKindDto::Backup,
+            ),
+        ];
+
+        for (error, expected) in &cases {
+            let dto = CreateBackupErrorDto::from(error);
+            assert_eq!(dto.kind, *expected, "{error:?}");
+            assert_eq!(dto.message, error.to_string());
+            assert!(!dto.message.is_empty());
+        }
+
+        // And the shape survives the trip through the elevated helper's
+        // stdout, like the other two error DTOs.
+        let dto = CreateBackupErrorDto::from(&cases[0].0);
+        let json = serde_json::to_string(&dto).expect("serialize");
+        let back: CreateBackupErrorDto = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, dto);
     }
 
     /// Every source syntax survives the trip, with the `KEY=` prefix living
