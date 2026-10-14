@@ -6,6 +6,7 @@ use wasm_bindgen::JsValue;
 use yew::prelude::*;
 
 use crate::components::empty_state::EmptyState;
+use crate::components::loading_spinner::LoadingSpinner;
 use crate::dto::BackupInfoDto;
 
 /// Formats a backup's `created_unix_secs` into `(relative, iso)` strings
@@ -50,12 +51,53 @@ pub struct BackupPanelProps {
     pub on_restore: Callback<usize>,
     pub on_view_diff: Callback<usize>,
     pub on_delete: Callback<usize>,
+    /// Fired when the "Create backup" button is clicked. Not tied to a row
+    /// — it always acts on the active target's current content
+    /// (`docs/API_CONTRACT.md` §3.11).
+    pub on_create: Callback<()>,
+    /// Set by `AppShell` while the `create_backup` call is in flight. No
+    /// confirm dialog gates this action — it is treated as safe/additive/
+    /// reversible (it only ever adds a file, which Delete can remove), so
+    /// this is the only in-flight state the button needs.
+    #[prop_or(false)]
+    pub create_saving: bool,
+    /// The last `create_backup` failure's message, shown inline beneath
+    /// the button (no dialog).
+    #[prop_or_default]
+    pub create_error: Option<AttrValue>,
 }
 
 #[function_component(BackupPanel)]
 pub fn backup_panel(props: &BackupPanelProps) -> Html {
+    let on_create_click = {
+        let cb = props.on_create.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+
     html! {
         <div class="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700">
+                <div>
+                    <button
+                        type="button"
+                        disabled={props.create_saving}
+                        class="px-4 py-2 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-sm font-medium inline-flex items-center gap-2 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                        onclick={on_create_click}
+                    >
+                        if props.create_saving {
+                            <LoadingSpinner />
+                            { "Creating…" }
+                        } else {
+                            { "Create backup" }
+                        }
+                    </button>
+                    if let Some(error) = &props.create_error {
+                        <p class="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
+                            { error.clone() }
+                        </p>
+                    }
+                </div>
+            </div>
             if props.backups.is_empty() {
                 <EmptyState
                     icon="🗄"
@@ -114,6 +156,15 @@ pub fn backup_list_item(props: &BackupListItemProps) -> Html {
             <div>
                 <p class="text-sm text-slate-900 dark:text-slate-100" title={iso}>
                     { relative }
+                    if backup.is_manual {
+                        <span class="inline-block rounded-full bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300 text-xs font-medium px-2 py-0.5 ml-2">
+                            { "Manual" }
+                        </span>
+                    } else {
+                        <span class="inline-block rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-medium px-2 py-0.5 ml-2">
+                            { "Automatic" }
+                        </span>
+                    }
                 </p>
                 <p class="text-xs text-slate-500 dark:text-slate-400 font-mono">
                     { backup.target_path.clone() }{ " · " }{ size_kb }

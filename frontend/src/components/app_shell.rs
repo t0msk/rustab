@@ -110,6 +110,12 @@ pub fn app_shell() -> Html {
     let backup_delete_saving = use_state(|| false);
     let backup_delete_error: UseStateHandle<Option<String>> = use_state(|| None);
 
+    // Backup-create flow state (T21.1): not tied to a row and has no
+    // confirm step — the button itself is the whole flow, so there's no
+    // target/confirm-checked pair to mirror from the delete flow above.
+    let backup_create_saving = use_state(|| false);
+    let backup_create_error: UseStateHandle<Option<String>> = use_state(|| None);
+
     // View-diff flow state: which backup's diff overlay is open, its
     // fetched raw text (`None` = loading or not open), and the last
     // `read_backup` failure, if any (`docs/UI_DESIGN.md` §7).
@@ -547,6 +553,42 @@ pub fn app_shell() -> Html {
         })
     };
 
+    let on_create_backup = {
+        let backup_create_saving = backup_create_saving.clone();
+        let backup_create_error = backup_create_error.clone();
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
+        let show_toast = show_toast.clone();
+        Callback::from(move |()| {
+            if *backup_create_saving {
+                return;
+            }
+            let backup_create_saving = backup_create_saving.clone();
+            let backup_create_error = backup_create_error.clone();
+            let backups = backups.clone();
+            let backups_error = backups_error.clone();
+            let show_toast = show_toast.clone();
+            backup_create_saving.set(true);
+            backup_create_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::create_backup().await {
+                    Ok(_backup) => {
+                        // A backup creation never touches the live target,
+                        // so `reload_entries` is deliberately not called
+                        // here — only the backup list changed.
+                        reload_backups(backups, backups_error).await;
+                        backup_create_saving.set(false);
+                        show_toast.emit((ToastKind::Success, "Backup created.".to_string()));
+                    }
+                    Err(create_error) => {
+                        backup_create_error.set(Some(create_error.message()));
+                        backup_create_saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+
     let on_view_diff = {
         let view_diff_target = view_diff_target.clone();
         let view_diff_text = view_diff_text.clone();
@@ -707,6 +749,9 @@ pub fn app_shell() -> Html {
                         on_restore={on_restore}
                         on_view_diff={on_view_diff}
                         on_delete={on_backup_delete}
+                        on_create={on_create_backup}
+                        create_saving={*backup_create_saving}
+                        create_error={(*backup_create_error).clone().map(AttrValue::from)}
                     />
                 }
             </main>

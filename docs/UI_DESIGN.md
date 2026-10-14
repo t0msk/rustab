@@ -329,14 +329,29 @@ user restore one")
 
 Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
+- **"Create backup" button**, rendered above the list (not a row action — it is not
+  tied to an existing backup, it acts on the active target's current content,
+  `docs/API_CONTRACT.md` §3.11). Primary-ish but not alarming styling
+  (`bg-sky-600 hover:bg-sky-700 text-white`, the same non-destructive-primary treatment
+  used elsewhere in the app), label `"Create backup"` while idle, `"Creating…"` with the
+  same inline spinner treatment as `BackupDeleteConfirmDialog`'s `"Deleting…"` state
+  while in flight, disabled while in flight. Deliberately **no confirm dialog**: this
+  action is safe/additive/reversible — it only ever adds a new file next to the existing
+  backups, and the existing `Delete` action can always clean it up afterward — so a
+  loading state and an inline error are the whole of its UI. On failure, the message is
+  shown as a small red error line directly beneath the button (no dialog, no toast); on
+  success, a success toast (`"Backup created."`) and the list reloads.
 - **BackupListItem** rows, newest first: human-readable relative timestamp (e.g. `"2
-  hours ago"`, exact ISO timestamp on hover tooltip), file size, which target path it
-  was backed up from, and three row-level actions: `Restore` (secondary styling, not
-  primary — restoring is not the app's main action), `View diff` (secondary styling,
-  identical treatment to `Restore`), and `Delete` (destructive but still a row-level
-  secondary button — red text, `text-red-600 hover:bg-red-50 dark:text-red-400
-  dark:hover:bg-red-900/20` — the giant red confirm button lives in the dialog below,
-  not in the row).
+  hours ago"`, exact ISO timestamp on hover tooltip), a pill badge showing whether the
+  backup is automatic or manual (same rounded-pill shape as `EntriesTable`'s source-kind
+  badge: `"Automatic"` in the same neutral slate styling, `"Manual"` in the sky tones
+  used elsewhere for non-destructive emphasis — distinct but not alarming), file size,
+  which target path it was backed up from, and three row-level actions: `Restore`
+  (secondary styling, not primary — restoring is not the app's main action), `View diff`
+  (secondary styling, identical treatment to `Restore`), and `Delete` (destructive but
+  still a row-level secondary button — red text, `text-red-600 hover:bg-red-50
+  dark:text-red-400 dark:hover:bg-red-900/20` — the giant red confirm button lives in
+  the dialog below, not in the row).
 - `EmptyState` if no backups exist yet: `"No backups yet — one will be created
   automatically the first time you save."`
 - **BackupRestoreConfirmDialog**: centered modal, same non-click-outside-dismiss

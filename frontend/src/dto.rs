@@ -182,4 +182,19 @@ pub struct BackupInfoDto {
     pub target_path: String,
     pub size_bytes: u64,
     pub created_unix_secs: Option<i64>,
+    /// `true` for a backup the user asked for with `create_backup` (§3.11),
+    /// `false` for one a `save` took on its own. Never inferred from
+    /// `file_name` — the backend owns the naming scheme and reports the
+    /// answer here.
+    pub is_manual: bool,
+}
+
+/// `CreateBackupErrorDto` (§8), the rejection shape of `create_backup`.
+/// Same two-field shape as `DeleteBackupErrorDto`, for the same reason:
+/// `create_backup` never opens, renames or writes the active target, so
+/// there is no `target_unchanged` field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreateBackupErrorDto {
+    pub kind: String,
+    pub message: String,
 }

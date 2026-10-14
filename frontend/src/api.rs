@@ -2,8 +2,8 @@
 //! `get_target_info`, `list_entries`, `validate_candidate`,
 //! `discover_devices` (T11), plus `render_candidate`, `save`,
 //! `list_backups` and `restore_backup` (T12), plus `read_backup` and
-//! `delete_backup` (T20). See `docs/API_CONTRACT.md` for the exact
-//! contract.
+//! `delete_backup` (T20), plus `create_backup` (T21.1). See
+//! `docs/API_CONTRACT.md` for the exact contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -19,8 +19,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::dto::DocumentDto;
 use crate::dto::{
-    BackupInfoDto, CommandErrorDto, DeleteBackupErrorDto, DeviceDiscoveryDto, DocumentViewDto,
-    TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteOutcomeDto,
+    BackupInfoDto, CommandErrorDto, CreateBackupErrorDto, DeleteBackupErrorDto, DeviceDiscoveryDto,
+    DocumentViewDto, TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteOutcomeDto,
 };
 
 #[wasm_bindgen]
@@ -258,4 +258,63 @@ struct DeleteBackupArgs<'a> {
 /// and `restore_backup`; no prompt for any other target.
 pub async fn delete_backup(backup_path: &str) -> Result<(), DeleteError> {
     invoke_delete("delete_backup", &DeleteBackupArgs { backup_path }).await
+}
+
+/// The rejection shape of `create_backup` (API_CONTRACT.md §8): either the
+/// documented `CreateBackupErrorDto`, or — per §1 — an unstructured
+/// rejection, which is a frontend bug rather than a user-facing outcome but
+/// is still captured here instead of panicking. Deliberately not a variant
+/// of `WriteError`/`DeleteError`: `CreateBackupErrorDto` is not
+/// `WriteErrorDto`-shaped (no `target_unchanged`, `report`, `path` or
+/// `backup`), mirroring `DeleteBackupErrorDto`'s own two-field shape.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreateError {
+    Create(CreateBackupErrorDto),
+    Other(String),
+}
+
+impl CreateError {
+    /// A message safe to display verbatim (`CreateBackupErrorDto::message`
+    /// already is, per the contract; the unstructured fallback is
+    /// best-effort).
+    pub fn message(&self) -> String {
+        match self {
+            CreateError::Create(err) => err.message.clone(),
+            CreateError::Other(message) => message.clone(),
+        }
+    }
+}
+
+/// Like `invoke_delete`, but for `create_backup`, which resolves with a
+/// `BackupInfoDto` (unlike `delete_backup`'s `()`/`null`) and rejects with a
+/// `CreateBackupErrorDto` rather than a `DeleteBackupErrorDto`
+/// (API_CONTRACT.md §3.11/§8).
+async fn invoke_create_backup<A: Serialize>(
+    cmd: &str,
+    args: &A,
+) -> Result<BackupInfoDto, CreateError> {
+    let args_js = serde_wasm_bindgen::to_value(args).map_err(|err| {
+        CreateError::Other(format!("failed to serialize arguments for {cmd}: {err}"))
+    })?;
+    let promise = invoke_raw(cmd, args_js);
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(resolved) => serde_wasm_bindgen::from_value(resolved).map_err(|err| {
+            CreateError::Other(format!("failed to deserialize response from {cmd}: {err}"))
+        }),
+        Err(rejection) => {
+            match serde_wasm_bindgen::from_value::<CreateBackupErrorDto>(rejection.clone()) {
+                Ok(create_error) => Err(CreateError::Create(create_error)),
+                Err(_) => Err(CreateError::Other(rejection_message(&rejection))),
+            }
+        }
+    }
+}
+
+/// `create_backup() -> BackupInfoDto` (API_CONTRACT.md §3.11). Takes no
+/// arguments: like every other command, which file it acts on is resolved
+/// server-side and never supplied by the frontend. Escalates for the real
+/// target exactly like `save`/`delete_backup`; no prompt for any other
+/// target.
+pub async fn create_backup() -> Result<BackupInfoDto, CreateError> {
+    invoke_create_backup("create_backup", &EmptyArgs {}).await
 }
