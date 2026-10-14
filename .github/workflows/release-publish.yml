@@ -1,0 +1,387 @@
+name: Release publish
+
+# Maintainer-triggered version bump + GitHub Release (docs/SPEC.md §13
+# point 2). This is the ONLY thing in the repository that ever advances the
+# version: `release-build.yml` builds packages on every push to `release`
+# but deliberately contains no version logic, so a routine merge can never
+# silently cut a release nobody asked for.
+#
+# Run it manually (Actions -> Release publish -> Run workflow) with the
+# `release` branch selected, after the content for the release has been
+# merged into `release`. The bump level is an explicit human choice, never
+# inferred from commit messages or diff size (SPEC §12).
+#
+# What one run does:
+#   1. reads the current version (all four version fields are kept in
+#      lockstep per SPEC §12) and computes the new one,
+#   2. rewrites the version in the three crate manifests and in
+#      tauri.conf.json, refreshes both Cargo.lock files,
+#   3. commits `chore(release): vX.Y.Z` and an annotated tag `vX.Y.Z`, and
+#      pushes both to `release` atomically,
+#   4. calls `release-build.yml` as a reusable workflow against that exact
+#      commit, so the packaging recipe lives in exactly one place,
+#   5. creates the GitHub Release for `vX.Y.Z` with the .deb/.rpm/.AppImage
+#      attached.
+#
+# Ordering tradeoff worth knowing before a failure happens: the commit and
+# tag have to be pushed *before* packaging, because a reusable workflow
+# checks out a ref from the remote - it cannot see a commit that only
+# exists in another job's working copy. So if `package` or `publish` fails,
+# the tag exists with no Release behind it. The fix is "Re-run failed jobs"
+# on the same run: `bump` is skipped, its outputs (version/tag/SHA) are
+# reused, and no second tag is created.
+#
+# Note: a commit pushed with the default GITHUB_TOKEN does not retrigger
+# `push`-triggered workflows, so step 3 does NOT also start a redundant
+# `release-build.yml` run of its own. Step 4 invoking it explicitly is the
+# intended (and only) packaging run for the release commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of MAJOR.MINOR.PATCH to bump"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+# Read-only by default; the two jobs that need to write (push the commit /
+# tag, create the Release) widen this for themselves only.
+permissions:
+  contents: read
+
+# Two concurrent bumps would race on the same branch and could produce a
+# tag that points at a commit whose version file says something else.
+# Queue instead of cancelling: a run that has already pushed a tag must be
+# allowed to finish publishing its Release.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    name: Bump version, commit and tag
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to push the release commit and the tag back to `release`.
+      contents: write
+    outputs:
+      version: ${{ steps.compute.outputs.new }}
+      tag: ${{ steps.compute.outputs.tag }}
+      sha: ${{ steps.commit.outputs.sha }}
+
+    steps:
+      # SPEC §13 point 2 says this workflow is run from `release`. The
+      # branch selector on a workflow_dispatch run accepts any branch, so
+      # the intent is enforced here rather than assumed - bumping the
+      # version on `master`, or on a feature branch, is always a mistake.
+      - name: Refuse to run outside the release branch
+        if: github.ref != 'refs/heads/release'
+        shell: bash
+        env:
+          DISPATCHED_REF: ${{ github.ref }}
+        run: |
+          echo "::error::This workflow must be dispatched from the 'release' branch (got $DISPATCHED_REF)."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the annotated tag and `gh release
+          # --generate-notes` have the commits they describe. Checking out
+          # a branch ref (not a SHA) leaves a real local `release` branch
+          # to commit onto rather than a detached HEAD.
+          fetch-depth: 0
+          # Keeps the GITHUB_TOKEN credentials in .git/config so the push
+          # step below authenticates without extra wiring.
+          persist-credentials: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compute the new version
+        id: compute
+        shell: bash
+        env:
+          # Via env, not direct `${{ }}` interpolation into the script
+          # body: a choice input is constrained to the three options, but
+          # interpolating run-time values straight into shell is a habit
+          # worth not having.
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          # Any of the four files would do (they are in lockstep);
+          # tauri.conf.json is the one SPEC §13 names.
+          current="$(jq -er '.version' src-tauri/tauri.conf.json)"
+
+          if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Current version '$current' is not a plain MAJOR.MINOR.PATCH semver; refusing to guess a bump."
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+
+          # Lockstep is a documented invariant (SPEC §12), so a drifted
+          # manifest means something upstream is wrong - fail loudly here
+          # instead of quietly re-aligning files and hiding it in a
+          # release commit.
+          for manifest in crates/fstab-core/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
+            have="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' "$manifest" | head -n1)"
+            if [[ "$have" != "$current" ]]; then
+              echo "::error file=$manifest::Version '$have' is out of lockstep with '$current' (SPEC §12). Fix this before releasing."
+              exit 1
+            fi
+          done
+
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            *) echo "::error::Unknown bump level '$BUMP'."; exit 1 ;;
+          esac
+
+          new="${major}.${minor}.${patch}"
+          {
+            echo "current=$current"
+            echo "new=$new"
+            echo "tag=v$new"
+          } >> "$GITHUB_OUTPUT"
+          echo "Bumping $current -> $new ($BUMP)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Checked before anything is written: re-cutting an existing tag
+      # would either fail at push time (leaving the version bumped on
+      # `release` with no release behind it) or, worse, move a published
+      # tag.
+      - name: Ensure the tag does not exist yet
+        shell: bash
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists locally."
+            exit 1
+          fi
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]]; then
+            echo "::error::Tag $TAG already exists on the remote."
+            exit 1
+          fi
+
+      - name: Write the new version to every manifest
+        shell: bash
+        env:
+          NEW: ${{ steps.compute.outputs.new }}
+        run: |
+          set -euo pipefail
+
+          # `[package]` is the first table in all three manifests, so the
+          # first line-initial `version = ` is always the package version.
+          # The `0,/re/` address limits the substitution to that first
+          # match, which keeps dependency version requirements (always
+          # inside inline tables, never line-initial) untouched.
+          for manifest in crates/fstab-core/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
+            sed -i '0,/^version = /s/^version = .*/version = "'"$NEW"'"/' "$manifest"
+          done
+
+          # jq round-trips this file byte-for-byte apart from the version
+          # line (verified against the committed file), so it is safe to
+          # use here and more robust than another regex.
+          tmp="$(mktemp)"
+          jq --arg v "$NEW" '.version = $v' src-tauri/tauri.conf.json > "$tmp"
+          mv "$tmp" src-tauri/tauri.conf.json
+
+          # frontend/package.json is deliberately NOT touched: it is Node
+          # tooling metadata (Tailwind CLI devDependency) and is not one of
+          # the artefacts SPEC §12 puts in lockstep.
+
+      - name: Verify all four version fields
+        shell: bash
+        env:
+          NEW: ${{ steps.compute.outputs.new }}
+        run: |
+          set -euo pipefail
+          status=0
+          for manifest in crates/fstab-core/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
+            have="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' "$manifest" | head -n1)"
+            if [[ "$have" != "$NEW" ]]; then
+              echo "::error file=$manifest::Expected version $NEW after rewrite, found '$have'."
+              status=1
+            fi
+          done
+          have="$(jq -er '.version' src-tauri/tauri.conf.json)"
+          if [[ "$have" != "$NEW" ]]; then
+            echo "::error file=src-tauri/tauri.conf.json::Expected version $NEW after rewrite, found '$have'."
+            status=1
+          fi
+          exit "$status"
+
+      # The lockfiles carry the workspace members' own version stamps, so
+      # they go stale the moment the manifests change. `cargo update
+      # --workspace` re-resolves only the workspace members and leaves
+      # every third-party pin alone (it reports the others as "unchanged
+      # dependencies behind latest"). Verified locally that it produces a
+      # byte-identical Cargo.lock to a real `cargo check` for both
+      # workspaces, which is why it is used in preference: it needs no
+      # Tauri system libraries and compiles nothing, so this job stays
+      # fast and cannot fail for reasons unrelated to the version bump.
+      # The packaging job below then does a real full build of this exact
+      # commit, which is the actual proof that the lockfiles are usable.
+      - name: Refresh Cargo.lock (native workspace)
+        run: cargo update --workspace
+
+      # frontend/ is its own workspace root (wasm32 target), hence a
+      # second, separate lockfile.
+      - name: Refresh Cargo.lock (frontend)
+        working-directory: frontend
+        run: cargo update --workspace
+
+      - name: Commit, tag and push
+        id: commit
+        shell: bash
+        env:
+          NEW: ${{ steps.compute.outputs.new }}
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Automation identity for an automation-authored commit: the
+          # standard github-actions[bot] account (the numeric prefix is
+          # that account's user id, which is what makes GitHub attribute
+          # the commit to the bot and show its avatar). This is CI
+          # authorship of a mechanical version bump, not an AI co-author
+          # trailer on human development work - the repo's CLAUDE.md
+          # no-AI-attribution policy is about the latter and is respected
+          # below: the commit message is exactly `chore(release): vX.Y.Z`
+          # with no trailers at all. Do not add any.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            crates/fstab-core/Cargo.toml \
+            src-tauri/Cargo.toml \
+            frontend/Cargo.toml \
+            src-tauri/tauri.conf.json \
+            Cargo.lock \
+            frontend/Cargo.lock
+
+          # Nothing staged means the version rewrite was a no-op, which
+          # should be impossible after the checks above - treat it as a
+          # bug rather than cutting an empty release commit.
+          if git diff --cached --quiet; then
+            echo "::error::No version changes to commit; aborting instead of tagging an unchanged tree."
+            exit 1
+          fi
+
+          # Anything else dirty in the tree is unexpected on a clean
+          # checkout and must not ride along into a release commit.
+          if [[ -n "$(git status --porcelain --untracked-files=no | grep -v '^M ' || true)" ]]; then
+            echo "::error::Unexpected unstaged changes in the working tree:"
+            git status --porcelain --untracked-files=no
+            exit 1
+          fi
+
+          git commit --no-verify -m "chore(release): $TAG"
+          git tag -a "$TAG" -m "Rustab $TAG"
+
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          # --atomic: the branch update and the tag either both land or
+          # neither does. Without it, a rejected branch push (someone
+          # merged into `release` in the meantime) could still leave a
+          # published tag pointing at a commit that is not on any branch.
+          git push --atomic origin "HEAD:refs/heads/release" "refs/tags/$TAG"
+
+          {
+            echo "Released commit: \`$sha\`"
+            echo ""
+            echo "Tag: \`$TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Reusable-workflow call into T17's packaging workflow instead of
+  # duplicating the bundler recipe. A local path (`./.github/...`) resolves
+  # the called workflow from this same commit of this same repository, and
+  # the jobs it runs are part of *this* workflow run - which is why the
+  # publish job below can download its artifacts by name with no run-id or
+  # cross-run token.
+  #
+  # `ref` is the release commit's SHA rather than the tag: it is the
+  # narrowest possible "that exact commit" (SPEC §13), and it cannot be
+  # affected by anything that happens to the tag afterwards.
+  package:
+    name: Package the release commit
+    needs: bump
+    uses: ./.github/workflows/release-build.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+    permissions:
+      # Exactly what release-build.yml declares it needs. A called
+      # workflow can never hold more than the calling job grants, so this
+      # stays explicit rather than inheriting the job-level default.
+      contents: read
+
+  publish:
+    name: Publish GitHub Release
+    needs: [bump, package]
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating a release writes to the repository's contents scope.
+      contents: write
+
+    steps:
+      # Same run, so the three artifacts release-build.yml uploaded are
+      # directly addressable. `merge-multiple` flattens all of them into
+      # dist/ instead of one subdirectory per artifact name.
+      - name: Download the packaged bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rustab-*
+          path: dist
+          merge-multiple: true
+
+      # A Release with a missing asset is worse than a failed run: assert
+      # exactly one of each format before publishing anything.
+      - name: Verify the three expected assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          status=0
+          for ext in deb rpm AppImage; do
+            count="$(find dist -maxdepth 1 -type f -name "*.$ext" | wc -l)"
+            if [[ "$count" -ne 1 ]]; then
+              echo "::error::Expected exactly one *.$ext in dist, found $count."
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # `gh` over a third-party release action on purpose: it is
+      # preinstalled on the runner, maintained by GitHub, and this is the
+      # one step holding `contents: write` plus the release assets - so it
+      # is the step where an unpinned third-party action would matter
+      # most. --verify-tag makes gh refuse to invent the tag if the push
+      # above somehow did not land, rather than silently creating a tag
+      # that points somewhere else. --generate-notes fills the body from
+      # the commits/PRs since the previous release; the title is the tag
+      # itself, as SPEC §13 requires.
+      - name: Create the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            dist/*
+          echo "Release $TAG published with $(find dist -maxdepth 1 -type f | wc -l) assets." >> "$GITHUB_STEP_SUMMARY"
