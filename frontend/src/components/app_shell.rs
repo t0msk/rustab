@@ -20,6 +20,8 @@ use yew::prelude::*;
 
 use crate::api;
 use crate::candidate::CandidateDocument;
+use crate::components::backup_delete_confirm_dialog::BackupDeleteConfirmDialog;
+use crate::components::backup_diff_view::BackupDiffView;
 use crate::components::backup_panel::{format_timestamps, BackupPanel};
 use crate::components::backup_restore_confirm_dialog::BackupRestoreConfirmDialog;
 use crate::components::delete_confirm_dialog::DeleteConfirmDialog;
@@ -100,6 +102,20 @@ pub fn app_shell() -> Html {
     let diff_view_open = use_state(|| false);
     let diff_confirm_checked = use_state(|| false);
     let restore_confirm_checked = use_state(|| false);
+
+    // Backup-delete flow state, a structural sibling of the restore flow
+    // above (`docs/UI_DESIGN.md` §7).
+    let backup_delete_target: UseStateHandle<Option<usize>> = use_state(|| None);
+    let backup_delete_confirm_checked = use_state(|| false);
+    let backup_delete_saving = use_state(|| false);
+    let backup_delete_error: UseStateHandle<Option<String>> = use_state(|| None);
+
+    // View-diff flow state: which backup's diff overlay is open, its
+    // fetched raw text (`None` = loading or not open), and the last
+    // `read_backup` failure, if any (`docs/UI_DESIGN.md` §7).
+    let view_diff_target: UseStateHandle<Option<usize>> = use_state(|| None);
+    let view_diff_text: UseStateHandle<Option<String>> = use_state(|| None);
+    let view_diff_error: UseStateHandle<Option<String>> = use_state(|| None);
 
     // `render_candidate`'s result for the currently open diff view's raw
     // tab, and the save/restore in-flight + error state for their
@@ -457,6 +473,113 @@ pub fn app_shell() -> Html {
         })
     };
 
+    let on_backup_delete = {
+        let backup_delete_target = backup_delete_target.clone();
+        let backup_delete_error = backup_delete_error.clone();
+        Callback::from(move |idx: usize| {
+            backup_delete_error.set(None);
+            backup_delete_target.set(Some(idx));
+        })
+    };
+    let on_backup_delete_cancel = {
+        let backup_delete_target = backup_delete_target.clone();
+        let backup_delete_confirm_checked = backup_delete_confirm_checked.clone();
+        let backup_delete_error = backup_delete_error.clone();
+        let backup_delete_saving = backup_delete_saving.clone();
+        Callback::from(move |()| {
+            if *backup_delete_saving {
+                return;
+            }
+            backup_delete_target.set(None);
+            backup_delete_confirm_checked.set(false);
+            backup_delete_error.set(None);
+        })
+    };
+    let on_backup_delete_confirm = {
+        let backup_delete_target = backup_delete_target.clone();
+        let backup_delete_confirm_checked = backup_delete_confirm_checked.clone();
+        let backup_delete_saving = backup_delete_saving.clone();
+        let backup_delete_error = backup_delete_error.clone();
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
+        let show_toast = show_toast.clone();
+        Callback::from(move |()| {
+            if *backup_delete_saving {
+                return;
+            }
+            let Some(idx) = *backup_delete_target else {
+                return;
+            };
+            let Some(backup_path) = backups.get(idx).map(|b| b.path.clone()) else {
+                return;
+            };
+            let backup_delete_target = backup_delete_target.clone();
+            let backup_delete_confirm_checked = backup_delete_confirm_checked.clone();
+            let backup_delete_saving = backup_delete_saving.clone();
+            let backup_delete_error = backup_delete_error.clone();
+            let backups = backups.clone();
+            let backups_error = backups_error.clone();
+            let show_toast = show_toast.clone();
+            backup_delete_saving.set(true);
+            backup_delete_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::delete_backup(&backup_path).await {
+                    Ok(()) => {
+                        // A backup deletion never touches the live target,
+                        // so `reload_entries` is deliberately not called
+                        // here — only the backup list changed.
+                        reload_backups(backups, backups_error).await;
+                        backup_delete_saving.set(false);
+                        backup_delete_target.set(None);
+                        backup_delete_confirm_checked.set(false);
+                        show_toast.emit((ToastKind::Success, "Backup deleted.".to_string()));
+                    }
+                    Err(delete_error) => {
+                        // No `target_unchanged` to branch on here (§8): a
+                        // `delete_backup` failure never touches the
+                        // target, so `reload_entries` is never called on
+                        // failure either.
+                        backup_delete_error.set(Some(delete_error.message()));
+                        backup_delete_saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+
+    let on_view_diff = {
+        let view_diff_target = view_diff_target.clone();
+        let view_diff_text = view_diff_text.clone();
+        let view_diff_error = view_diff_error.clone();
+        let backups = backups.clone();
+        Callback::from(move |idx: usize| {
+            view_diff_target.set(Some(idx));
+            view_diff_text.set(None);
+            view_diff_error.set(None);
+            let Some(backup_path) = backups.get(idx).map(|b| b.path.clone()) else {
+                return;
+            };
+            let view_diff_text = view_diff_text.clone();
+            let view_diff_error = view_diff_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::read_backup(&backup_path).await {
+                    Ok(text) => view_diff_text.set(Some(text)),
+                    Err(message) => view_diff_error.set(Some(message)),
+                }
+            });
+        })
+    };
+    let on_view_diff_close = {
+        let view_diff_target = view_diff_target.clone();
+        let view_diff_text = view_diff_text.clone();
+        let view_diff_error = view_diff_error.clone();
+        Callback::from(move |()| {
+            view_diff_target.set(None);
+            view_diff_text.set(None);
+            view_diff_error.set(None);
+        })
+    };
+
     let rows: Vec<(usize, RowEntry)> = candidate
         .rows()
         .into_iter()
@@ -520,6 +643,27 @@ pub fn app_shell() -> Html {
         })
     });
 
+    let backup_delete_dialog_data: Option<AttrValue> = (*backup_delete_target).and_then(|idx| {
+        backups.get(idx).map(|b| {
+            let (relative, _iso) = format_timestamps(b.created_unix_secs);
+            AttrValue::from(relative)
+        })
+    });
+
+    let view_diff_dialog_data: Option<(AttrValue, AttrValue)> =
+        (*view_diff_target).and_then(|idx| {
+            backups.get(idx).map(|b| {
+                let (relative, _iso) = format_timestamps(b.created_unix_secs);
+                (
+                    AttrValue::from(relative),
+                    AttrValue::from(b.target_path.clone()),
+                )
+            })
+        });
+    let view_diff_lines: Option<Vec<crate::diff::RawDiffLine>> = (*view_diff_text)
+        .as_ref()
+        .map(|old| crate::diff::compute_raw_diff(old, original_text.as_str()));
+
     let is_real = target.as_ref().map(|t| t.is_real).unwrap_or(false);
     let target_path = target.as_ref().map(|t| t.path.clone()).unwrap_or_default();
 
@@ -558,7 +702,12 @@ pub fn app_shell() -> Html {
                         { format!("Could not load backups: {err}") }
                     </div>
                 } else {
-                    <BackupPanel backups={(*backups).clone()} on_restore={on_restore} />
+                    <BackupPanel
+                        backups={(*backups).clone()}
+                        on_restore={on_restore}
+                        on_view_diff={on_view_diff}
+                        on_delete={on_backup_delete}
+                    />
                 }
             </main>
 
@@ -608,6 +757,32 @@ pub fn app_shell() -> Html {
                     on_confirm={on_restore_confirm}
                     saving={*restore_saving}
                     error={(*restore_error).clone().map(AttrValue::from)}
+                />
+            }
+
+            if let Some(backup_timestamp) = backup_delete_dialog_data {
+                <BackupDeleteConfirmDialog
+                    backup_timestamp={backup_timestamp}
+                    is_real={is_real}
+                    confirm_checked={*backup_delete_confirm_checked}
+                    on_confirm_checked_change={{
+                        let backup_delete_confirm_checked = backup_delete_confirm_checked.clone();
+                        Callback::from(move |checked: bool| backup_delete_confirm_checked.set(checked))
+                    }}
+                    on_cancel={on_backup_delete_cancel}
+                    on_confirm={on_backup_delete_confirm}
+                    saving={*backup_delete_saving}
+                    error={(*backup_delete_error).clone().map(AttrValue::from)}
+                />
+            }
+
+            if let Some((backup_timestamp, backup_target_path)) = view_diff_dialog_data {
+                <BackupDiffView
+                    backup_timestamp={backup_timestamp}
+                    target_path={backup_target_path}
+                    lines={view_diff_lines}
+                    error={(*view_diff_error).clone().map(AttrValue::from)}
+                    on_close={on_view_diff_close}
                 />
             }
 

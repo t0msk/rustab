@@ -163,6 +163,16 @@ pub struct WriteErrorDto {
     pub backup: Option<String>,
 }
 
+/// `DeleteBackupErrorDto` (§8), the rejection shape of `delete_backup`.
+/// Deliberately NOT the same shape as `WriteErrorDto`: deleting a backup
+/// never touches the active target, so there is no `target_unchanged`
+/// field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeleteBackupErrorDto {
+    pub kind: String,
+    pub message: String,
+}
+
 /// `BackupInfoDto` (§9), an element of `list_backups`'s return array.
 /// `path` is the exact string to hand back to `restore_backup`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

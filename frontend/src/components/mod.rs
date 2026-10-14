@@ -2,6 +2,8 @@
 //! `docs/UI_DESIGN.md` §9 for the full component inventory this maps to.
 
 pub mod app_shell;
+pub mod backup_delete_confirm_dialog;
+pub mod backup_diff_view;
 pub mod backup_panel;
 pub mod backup_restore_confirm_dialog;
 pub mod delete_confirm_dialog;

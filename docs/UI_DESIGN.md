@@ -331,8 +331,12 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
 - **BackupListItem** rows, newest first: human-readable relative timestamp (e.g. `"2
   hours ago"`, exact ISO timestamp on hover tooltip), file size, which target path it
-  was backed up from, and a `Restore` button (secondary styling, not primary — restoring
-  is not the app's main action).
+  was backed up from, and three row-level actions: `Restore` (secondary styling, not
+  primary — restoring is not the app's main action), `View diff` (secondary styling,
+  identical treatment to `Restore`), and `Delete` (destructive but still a row-level
+  secondary button — red text, `text-red-600 hover:bg-red-50 dark:text-red-400
+  dark:hover:bg-red-900/20` — the giant red confirm button lives in the dialog below,
+  not in the row).
 - `EmptyState` if no backups exist yet: `"No backups yet — one will be created
   automatically the first time you save."`
 - **BackupRestoreConfirmDialog**: centered modal, same non-click-outside-dismiss
@@ -346,6 +350,37 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
     from §6 (red + required understanding checkbox for a real target, plain sky blue
     with no extra gate for sandbox).
   - On confirm: same loading → success/error handling pattern as DiffView's save.
+- **BackupDeleteConfirmDialog**: centered modal, triggered by a row's `Delete` button.
+  Deliberately **non-dismissible by backdrop click**, the same as
+  `BackupRestoreConfirmDialog` and for the same reason: unlike `DeleteConfirmDialog`'s
+  staged, undoable entry removal, deleting a backup is an immediate, irreversible
+  action that — for the real target — goes through the same `pkexec` prompt as a
+  save/restore, so it must not be dismissible by an accidental click.
+  - Copy: `"Delete the backup from {timestamp}? This cannot be undone — there is no
+    backup of a backup."`
+  - For a real target, the confirmation checkbox's copy is deliberately **not** the
+    restore/save dialog's sentence (that sentence talks about modifying `/etc/fstab`
+    on next mount/boot, which is false for a backup deletion — a backup delete never
+    touches the live target file at all). Instead: `"I understand this permanently
+    deletes a backup of /etc/fstab and requires administrator privileges."`
+  - The confirm button is styled destructively (`bg-red-600 hover:bg-red-700
+    text-white`) **regardless of `is_real`** — unlike restore/save, which are sky-blue
+    for a sandbox target, a backup deletion is irreversible either way, so there is no
+    "safe" variant to signal with a calmer color. Label `"Delete backup"` while idle,
+    `"Deleting…"` + spinner while in flight.
+  - On confirm: same loading → success/error handling pattern as
+    BackupRestoreConfirmDialog; on success, only the backup list is reloaded (a backup
+    deletion never touches the live target, so there is nothing else to refresh).
+- **BackupDiffView**: a read-only overlay opened by a row's `View diff` button, showing
+  `crate::diff::compute_raw_diff` between the backup's raw text (fetched via
+  `read_backup`) and the live target's current text — reusing `DiffRawText` directly,
+  raw tab only (there is no `render_candidate` equivalent for arbitrary backup text, so
+  a parsed Summary tab isn't buildable here, and adding one is out of scope). Unlike the
+  two dialogs above, this performs no write and no deletion, so — judgment call,
+  mirroring `DeleteConfirmDialog`'s reasoning — it **is dismissible by clicking the
+  backdrop**: there is nothing a stray click could lose. Header names both sides, e.g.
+  `"Diff: backup from {timestamp} vs. current {target path}"`; a single `Close` button.
+  If the `read_backup` call rejected, the error is shown in place of the diff.
 
 ---
 
@@ -486,10 +521,12 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 24. `RealTargetConfirmCheckbox` — the extra "I understand..." gate, reused by DiffView
     and BackupRestoreConfirmDialog
 25. `BackupPanel` — backup list view (§7)
-26. `BackupListItem` — one backup's row + Restore button
+26. `BackupListItem` — one backup's row + Restore/View diff/Delete buttons
 27. `BackupRestoreConfirmDialog` — restore confirmation modal (§7)
 28. `StatusToast` — transient success/error notification
 29. `LoadingSpinner` — inline loading indicator (buttons, panel loads)
+30. `BackupDeleteConfirmDialog` — backup delete confirmation modal (§7)
+31. `BackupDiffView` — read-only backup-vs-current-target diff overlay (§7)
 
 ---
 

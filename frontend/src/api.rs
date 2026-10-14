@@ -1,8 +1,9 @@
 //! Thin Tauri IPC bindings for the commands this app uses:
 //! `get_target_info`, `list_entries`, `validate_candidate`,
 //! `discover_devices` (T11), plus `render_candidate`, `save`,
-//! `list_backups` and `restore_backup` (T12). See `docs/API_CONTRACT.md`
-//! for the exact contract.
+//! `list_backups` and `restore_backup` (T12), plus `read_backup` and
+//! `delete_backup` (T20). See `docs/API_CONTRACT.md` for the exact
+//! contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -18,8 +19,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::dto::DocumentDto;
 use crate::dto::{
-    BackupInfoDto, CommandErrorDto, DeviceDiscoveryDto, DocumentViewDto, TargetInfoDto,
-    ValidationReportDto, WriteErrorDto, WriteOutcomeDto,
+    BackupInfoDto, CommandErrorDto, DeleteBackupErrorDto, DeviceDiscoveryDto, DocumentViewDto,
+    TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteOutcomeDto,
 };
 
 #[wasm_bindgen]
@@ -189,4 +190,72 @@ struct RestoreBackupArgs<'a> {
 /// `list_backups` result for the current target.
 pub async fn restore_backup(backup_path: &str) -> Result<WriteOutcomeDto, WriteError> {
     invoke_write("restore_backup", &RestoreBackupArgs { backup_path }).await
+}
+
+#[derive(Serialize)]
+struct ReadBackupArgs<'a> {
+    backup_path: &'a str,
+}
+
+/// `read_backup(backup_path: string) -> string` (API_CONTRACT.md §3.9).
+/// `backup_path` must be a `path` value from a `list_backups` result for
+/// the current target. Never escalates privilege, never prompts.
+pub async fn read_backup(backup_path: &str) -> Result<String, String> {
+    invoke("read_backup", &ReadBackupArgs { backup_path }).await
+}
+
+/// The rejection shape of `delete_backup` (API_CONTRACT.md §8): either the
+/// documented `DeleteBackupErrorDto`, or — per §1 — an unstructured
+/// rejection, which is a frontend bug rather than a user-facing outcome but
+/// is still captured here instead of panicking. Deliberately not a variant
+/// of `WriteError`: `DeleteBackupErrorDto` is not `WriteErrorDto`-shaped
+/// (no `target_unchanged`, `report`, `path` or `backup`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeleteError {
+    Delete(DeleteBackupErrorDto),
+    Other(String),
+}
+
+impl DeleteError {
+    /// A message safe to display verbatim (`DeleteBackupErrorDto::message`
+    /// already is, per the contract; the unstructured fallback is
+    /// best-effort).
+    pub fn message(&self) -> String {
+        match self {
+            DeleteError::Delete(err) => err.message.clone(),
+            DeleteError::Other(message) => message.clone(),
+        }
+    }
+}
+
+/// Like `invoke_write`, but for `delete_backup`, which resolves with `()`
+/// (JSON `null`) on success and rejects with a `DeleteBackupErrorDto`
+/// rather than a `WriteErrorDto` (API_CONTRACT.md §3.10/§8).
+async fn invoke_delete<A: Serialize>(cmd: &str, args: &A) -> Result<(), DeleteError> {
+    let args_js = serde_wasm_bindgen::to_value(args).map_err(|err| {
+        DeleteError::Other(format!("failed to serialize arguments for {cmd}: {err}"))
+    })?;
+    let promise = invoke_raw(cmd, args_js);
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(_resolved) => Ok(()),
+        Err(rejection) => {
+            match serde_wasm_bindgen::from_value::<DeleteBackupErrorDto>(rejection.clone()) {
+                Ok(delete_error) => Err(DeleteError::Delete(delete_error)),
+                Err(_) => Err(DeleteError::Other(rejection_message(&rejection))),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DeleteBackupArgs<'a> {
+    backup_path: &'a str,
+}
+
+/// `delete_backup(backup_path: string) -> null` (API_CONTRACT.md §3.10).
+/// `backup_path` must be a `path` value from a `list_backups` result for
+/// the current target. Escalates for the real target exactly like `save`
+/// and `restore_backup`; no prompt for any other target.
+pub async fn delete_backup(backup_path: &str) -> Result<(), DeleteError> {
+    invoke_delete("delete_backup", &DeleteBackupArgs { backup_path }).await
 }

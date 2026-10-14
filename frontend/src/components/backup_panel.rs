@@ -48,6 +48,8 @@ fn relative_time(diff_secs: i64) -> String {
 pub struct BackupPanelProps {
     pub backups: Vec<BackupInfoDto>,
     pub on_restore: Callback<usize>,
+    pub on_view_diff: Callback<usize>,
+    pub on_delete: Callback<usize>,
 }
 
 #[function_component(BackupPanel)]
@@ -69,7 +71,23 @@ pub fn backup_panel(props: &BackupPanelProps) -> Html {
                             let cb = props.on_restore.clone();
                             Callback::from(move |_: MouseEvent| cb.emit(idx))
                         };
-                        html! { <BackupListItem key={idx} backup={backup.clone()} on_restore={on_restore} /> }
+                        let on_view_diff = {
+                            let cb = props.on_view_diff.clone();
+                            Callback::from(move |_: MouseEvent| cb.emit(idx))
+                        };
+                        let on_delete = {
+                            let cb = props.on_delete.clone();
+                            Callback::from(move |_: MouseEvent| cb.emit(idx))
+                        };
+                        html! {
+                            <BackupListItem
+                                key={idx}
+                                backup={backup.clone()}
+                                on_restore={on_restore}
+                                on_view_diff={on_view_diff}
+                                on_delete={on_delete}
+                            />
+                        }
                     }) }
                 </ul>
             }
@@ -81,6 +99,8 @@ pub fn backup_panel(props: &BackupPanelProps) -> Html {
 pub struct BackupListItemProps {
     pub backup: BackupInfoDto,
     pub on_restore: Callback<MouseEvent>,
+    pub on_view_diff: Callback<MouseEvent>,
+    pub on_delete: Callback<MouseEvent>,
 }
 
 #[function_component(BackupListItem)]
@@ -99,13 +119,29 @@ pub fn backup_list_item(props: &BackupListItemProps) -> Html {
                     { backup.target_path.clone() }{ " · " }{ size_kb }
                 </p>
             </div>
-            <button
-                type="button"
-                class="px-3 py-1.5 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
-                onclick={props.on_restore.clone()}
-            >
-                { "Restore" }
-            </button>
+            <div class="flex items-center gap-2">
+                <button
+                    type="button"
+                    class="px-3 py-1.5 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
+                    onclick={props.on_restore.clone()}
+                >
+                    { "Restore" }
+                </button>
+                <button
+                    type="button"
+                    class="px-3 py-1.5 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
+                    onclick={props.on_view_diff.clone()}
+                >
+                    { "View diff" }
+                </button>
+                <button
+                    type="button"
+                    class="px-3 py-1.5 rounded-md text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-900/20 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
+                    onclick={props.on_delete.clone()}
+                >
+                    { "Delete" }
+                </button>
+            </div>
         </li>
     }
 }
