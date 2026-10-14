@@ -1,0 +1,156 @@
+name: Release build
+
+# Continuous packaging build for the `release` branch (docs/SPEC.md §13
+# point 1). Deliberately kept separate from `ci.yml`, which gates every
+# push/PR to `master` with fmt/clippy/test/build: this workflow's only job
+# is to turn whatever is currently on `release` into installable packages
+# (.deb / .rpm / .AppImage) and upload them as run artifacts, so there is
+# always a downloadable build of the latest `release` state.
+#
+# This workflow never changes the version. A plain push to `release` must
+# not bump anything - the version bump plus GitHub Release is a separate,
+# explicitly maintainer-triggered workflow (SPEC §13 point 2).
+#
+# Note: the `release` branch does not exist in the repository yet. That is
+# expected; this workflow simply starts running as soon as it does.
+
+on:
+  push:
+    branches: [release]
+
+  # Entry point for the (separate) version-bump workflow, so the packaging
+  # recipe lives in exactly one place instead of being duplicated there.
+  # `ref` lets a caller package an exact commit - e.g. the freshly created
+  # `chore(release): vX.Y.Z` commit - rather than the ref that happened to
+  # start the run. Left empty (the default) it behaves like a normal push
+  # build and checks out the triggering ref.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref or SHA to package. Defaults to the triggering ref."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # Tauri's AppImage bundler downloads its helper tools at bundle time
+  # (AppRun, linuxdeploy, and linuxdeploy's GTK/GStreamer plugin scripts),
+  # and linuxdeploy is itself an AppImage. Self-mounting an AppImage needs
+  # FUSE 2, which current Ubuntu images do not provide. This makes those
+  # helpers unpack into a temp dir and run from there instead of mounting,
+  # which removes the FUSE dependency entirely - verified by bundling
+  # successfully in an Ubuntu 24.04 container that had no FUSE at all.
+  #
+  # The downloads mean AppImage bundling needs outbound network access at
+  # build time (fine on GitHub-hosted runners) and is the one step here
+  # that can fail for reasons outside this repository, e.g. a GitHub
+  # release asset being temporarily unavailable. If that turns out to be
+  # flaky in practice, re-running the job is the cheapest fix.
+  APPIMAGE_EXTRACT_AND_RUN: "1"
+
+jobs:
+  package:
+    name: Build .deb / .rpm / .AppImage
+    # Matches the rest of the project's CI. Worth knowing: an AppImage is
+    # only as portable as the glibc of the machine that built it, so the
+    # artifact produced here requires a target system at least as new as
+    # the runner image's Ubuntu. Pinning an older image (e.g.
+    # `ubuntu-22.04`) would widen AppImage compatibility at the cost of
+    # using a runner image that is closer to end-of-support.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Empty for `push` runs, which means "the triggering ref".
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # `frontend/` compiles to wasm32 and is built by Trunk via
+          # tauri.conf.json's `beforeBuildCommand`, so the bundle build
+          # needs this target even though the app itself is native.
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            frontend
+
+      # Same base set as ci.yml's `build-tauri` job (per the official Tauri
+      # 2 Linux prerequisites), plus `rpm`, because Ubuntu ships no rpm
+      # tooling at all by default. It is installed deliberately rather than
+      # trusting Tauri's rpm bundler to be fully self-contained; `.deb`
+      # needs nothing beyond the base set.
+      - name: Install Tauri 2 Linux system dependencies and rpm tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            rpm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # trunk builds the wasm frontend; cargo-tauri drives the release
+      # build and the bundlers. The tauri-cli version is pinned to the one
+      # this workflow was developed and verified against, so a CLI release
+      # cannot silently change bundling behaviour on a release build.
+      - name: Install trunk and tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk,tauri-cli@2.2.7
+
+      - name: npm ci (Tailwind CLI devDependency)
+        working-directory: frontend
+        run: npm ci
+
+      # `bundle.targets` is "all" in tauri.conf.json, but the bundle list is
+      # given explicitly here so this workflow produces exactly the three
+      # artifacts it promises, regardless of what "all" expands to in a
+      # future CLI version. `beforeBuildCommand` runs `trunk build
+      # --release` for the frontend as part of this step.
+      - name: Build bundles (cargo tauri build)
+        run: cargo tauri build --ci --bundles deb,rpm,appimage
+
+      # Uploaded as three separate artifacts so each package can be
+      # downloaded on its own. `if-no-files-found: error` is deliberate: a
+      # bundler that silently produced nothing must fail the run rather
+      # than leave an empty artifact behind.
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustab-deb
+          path: target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+      - name: Upload .rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustab-rpm
+          path: target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+      - name: Upload .AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustab-appimage
+          path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
