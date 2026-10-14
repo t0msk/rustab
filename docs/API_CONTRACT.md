@@ -14,8 +14,9 @@ format a real contract rather than an implementation detail:
   so the format cannot change because someone renamed a field in
   `fstab-core`.
 - The exact JSON in [§10](#10-wire-format-lock) is asserted literally by
-  unit tests (`dto::tests::document_wire_format_is_exactly_as_documented`
-  and `remaining_wire_formats_are_exactly_as_documented`). A change to any
+  unit tests (`dto::tests::document_wire_format_is_exactly_as_documented`,
+  `remaining_wire_formats_are_exactly_as_documented` and
+  `every_error_kind_spelling_is_exactly_as_documented`). A change to any
   field name, `kind` spelling or nesting level breaks those tests first.
 - Changing anything in this document means changing the tests and the
   frontend in the same commit. Additive changes (a new command, a new
@@ -36,7 +37,7 @@ Related documents: `docs/SPEC.md` (requirements, especially §6 atomicity and
 | Enum values | `snake_case` strings (`"uuid"`, `"part_uuid"`, `"sandbox_default"`, `"privilege_escalation"`). |
 | Tagged unions | A `kind` (or `severity`/`status`) string field discriminates; see each type. |
 | Absent values | JSON `null`, never an omitted key and never `""`. A `null` and an empty string mean different things (see `OptionDto`). |
-| Success | The `invoke` promise resolves with the return shape. |
+| Success | The `invoke` promise resolves with the return shape. A command whose return type is `void`/`null` (only `delete_backup`) resolves with JSON `null`. |
 | Failure | The promise rejects with the error *object* described per command. |
 | Threading | Every command is `#[tauri::command(async)]`, i.e. it runs on Tauri's thread pool, not the main thread. Calls can overlap; the UI never blocks, including while a `pkexec` prompt is on screen. |
 
@@ -87,9 +88,10 @@ once, and they cannot disagree because they all read the same field: the UI's
 danger banner and the extra confirmation checkbox (`docs/UI_DESIGN.md` §2,
 §6), and whether a save escalates (§4 below).
 
-**No command accepts a target path.** The only path the frontend may ever
-send is `restore_backup`'s `backup_path`, and it is matched against the
-active target's real backup list before being used (see §3.7).
+**No command accepts a target path.** The only paths the frontend may ever
+send are the `backup_path` arguments of `restore_backup` (§3.7),
+`read_backup` (§3.9) and `delete_backup` (§3.10), and each is matched against
+the active target's real backup list before being used as a path.
 
 ---
 
@@ -259,6 +261,70 @@ and the UI must keep manual entry fully available (`docs/SPEC.md` §8). Show
 "device discovery unavailable", not "no devices found", when
 `lsblk_available` is `false`.
 
+### 3.9 `read_backup`
+
+```
+read_backup(backup_path: string) -> string      (rejects with CommandErrorDto)
+```
+
+Returns a backup's raw text, exactly as the bytes on disk. `backup_path` must
+be a `path` value from a `list_backups` result for the **current** target, and
+is resolved the same way `restore_backup` resolves it (§3.7): matched against
+the real backup list before it is ever used as a path, so `/etc/shadow`,
+`../../etc/fstab`, a different target's backup and a near-miss file name all
+fail closed with `invalid_backup` — nothing is read.
+
+Intended for a backup-diff view: diff this against `list_entries`'s `text` to
+show what restoring this backup would change. There is no `render_candidate`
+step involved — both sides are already raw text.
+
+**No privilege escalation, for either target kind.** `/etc/fstab` and the
+backups beside it are world-readable, which is the same reason `list_entries`
+and `list_backups` already work against the real target without a password
+prompt. This command never prompts and never writes.
+
+Error kinds: `target_resolution`, `invalid_backup`, `read_backup`, `not_utf8`.
+A backup that is not valid UTF-8 is **refused** (`not_utf8`) rather than
+returned lossily, for the same reason `list_entries` refuses such a target —
+and note that such a backup cannot be restored either (§3.7's `read_backup`
+error), so the UI can say the same thing in both places.
+
+### 3.10 `delete_backup`
+
+```
+delete_backup(backup_path: string) -> null   (rejects with DeleteBackupErrorDto)
+```
+
+Deletes one of the active target's backups. `backup_path` must be a `path`
+value from a `list_backups` result for the **current** target; it is resolved
+exactly as in §3.7 and §3.9, so the same set of near misses and arbitrary
+paths fail closed with `invalid_backup` and nothing is removed.
+
+- **It only ever removes a backup file.** The active target is never one of
+  its own backups, so it can never be the file removed here — asserted in both
+  halves of the implementation, including inside the elevated process.
+- **It escalates for the real target, exactly like `save` and
+  `restore_backup`.** The backups of `/etc/fstab` live beside it in
+  root-owned `/etc/` (`<target>.rustab-backup.<secs>.<nanos>`), which an
+  unprivileged process cannot unlink, so a real-target deletion goes through
+  the same single `pkexec` re-exec — see §4. A non-real target's backups live
+  in a user-owned directory and are removed in-process with no prompt.
+- Resolution happens *before* the dispatch in both branches, so a
+  `backup_path` that cannot work is refused without costing the user a
+  password prompt. That is a courtesy only: the elevated process re-resolves
+  the path itself and does not trust this side (§4.5).
+
+On success the promise resolves with `null`. There is deliberately no outcome
+object: either the backup is gone or the promise rejected. Re-call
+`list_backups` afterwards rather than mutating a local list.
+
+On failure the rejection is a **`DeleteBackupErrorDto`** (§8), *not* a
+`WriteErrorDto`: this operation never opens, renames or writes the target, so
+there is no `target_unchanged` question to answer and the field does not exist.
+
+Error kinds: `target_resolution`, `invalid_backup`, `privilege_escalation`,
+`delete`.
+
 ---
 
 ## 4. Privilege escalation
@@ -271,45 +337,89 @@ steps mean a window where a crash, a failure of the second step, or a race
 can leave `/etc/fstab` in a state nobody planned. The elevated process must
 "either do nothing or complete the full atomic swap".
 
-### 4.2 The mechanism
+### 4.2 Two operations, one flag
 
-When `save` (or `restore_backup`) runs against a target with
+Two things need root, and only when `is_real == true`:
+
+| Operation | Used by | What the elevated process does |
+| --- | --- | --- |
+| `write` | `save` (§3.5), `restore_backup` (§3.7) | One `fstab_core::writer::write_document` call: the whole `docs/SPEC.md` §6 sequence. |
+| `delete_backup` | `delete_backup` (§3.10) | Resolve the requested path against the target's real backup list, then one `remove_file`. |
+
+They share a **single** hidden re-exec flag. Which operation is being asked
+for is a field of the request, not a second flag, so there is exactly one
+branch in the whole program that can turn Rustab into a root process, and the
+"no Tauri runtime, webview, plugin or logger is ever initialized as root"
+property stays a one-flag check.
+
+### 4.3 The mechanism
+
+When `save`, `restore_backup` or `delete_backup` runs against a target with
 `is_real == true`:
 
-1. The unprivileged side validates the candidate first — purely to avoid
-   asking for a password for a save that cannot succeed. This check writes
-   nothing and is **not** the safety net.
+1. The unprivileged side does its cheap pre-check first — purely to avoid
+   asking for a password for an operation that cannot succeed. For a write
+   that is validating the candidate; for a delete it is resolving
+   `backup_path` against the backup list. Both write nothing and neither is
+   **the safety net** (see §4.6).
 2. It re-executes **its own binary** (`std::env::current_exe()`) as
    `pkexec <rustab> --internal-privileged-write`, with stdin, stdout and
-   stderr piped.
-3. It writes one JSON request to the child's stdin and closes the pipe:
+   stderr piped. (The flag's name is historical — it predates the delete
+   operation and now carries either one. It is deliberately unchanged: the
+   point is that there is exactly one such string.)
+3. It writes one JSON request to the child's stdin and closes the pipe. The
+   request is a union tagged by `op`:
    ```json
-   {"target": "/etc/fstab", "candidate": { /* DocumentDto */ }}
+   {"op": "write",         "target": "/etc/fstab", "candidate": { /* DocumentDto */ }}
+   {"op": "delete_backup", "target": "/etc/fstab", "backup_path": "/etc/fstab.rustab-backup.0000000001.000000002"}
    ```
 4. The elevated process, in `main()`, sees `--internal-privileged-write` as
    `argv[1]` **before anything else starts** — no Tauri runtime, no webview,
    no plugins, no logger are ever initialized in a root process. It reads
-   stdin to EOF, refuses any target other than `/etc/fstab`, reconstructs the
-   document, and calls `fstab_core::writer::write_document` **once**.
+   stdin to EOF exactly once, refuses any `target` other than `/etc/fstab`
+   (for either operation), and then:
+   - `write`: reconstructs the document and calls
+     `fstab_core::writer::write_document` **once**.
+   - `delete_backup`: resolves `backup_path` against the *already-validated*
+     target's real backup list — in this process, trusting nothing the
+     unprivileged side claimed — and calls `remove_file` on the path that
+     list yielded. If the resolution fails, nothing is unlinked.
 5. It prints exactly one JSON object to stdout and exits:
    ```json
-   {"status": "ok",    "outcome": { /* WriteOutcomeDto */ }}
-   {"status": "error", "error":   { /* WriteErrorDto   */ }}
+   {"status": "ok",                   "outcome": { /* WriteOutcomeDto */ }}
+   {"status": "error",                "error":   { /* WriteErrorDto */ }}
+   {"status": "backup_deleted"}
+   {"status": "backup_delete_failed", "error":   { /* DeleteBackupErrorDto */ }}
    ```
-   Exit codes: `0` success, `1` the write was attempted and failed (a JSON
+   The first two answer a `write`, the last two a `delete_backup`.
+   `{"status": "error"}` is *also* how a framing failure (stdin unreadable,
+   request unparsable) is reported, because at that point the helper does not
+   yet know which operation it was asked for; the delete path reads that
+   variant too and reports it as "nothing was deleted".
+
+   Exit codes: `0` success, `1` the operation was attempted and failed (a JSON
    error body is present), `2` the request itself was unusable (a JSON error
-   body is still present; nothing was written). Diagnostics go to stderr,
-   never stdout.
+   body is still present; nothing was written and nothing was deleted).
+   Diagnostics go to stderr, never stdout.
 6. The unprivileged side parses that object. A parsable response always wins
    over the exit code — it is the helper's own account of what it did. With
-   no usable response, the exit code decides, conservatively (see §8).
+   no usable response, the exit code decides, conservatively (see §8), and
+   **both operations classify `pkexec`'s own exit codes through one shared
+   function**, so they can never disagree about whether a dismissed prompt
+   means "nothing happened".
 
 The candidate travels as a `DocumentDto`, not as rendered text, so the
 elevated side reconstructs the identical document the user was shown and lets
 `write_document` render it. There is no second serializer anywhere in the
 chain whose output could differ from the first one's.
 
-### 4.3 Why this does the *entire* atomic operation as root
+This stdin/stdout protocol is internal, undocumented as an interface and
+unstable by design (§11): nothing but this binary ever speaks it, to itself,
+in a single build. It is described here because it is the mechanism the
+`privilege_escalation` error kinds refer to, not because anything else may
+use it.
+
+### 4.4 Why a write does the *entire* atomic operation as root
 
 By construction, not by convention:
 
@@ -330,7 +440,15 @@ By construction, not by convention:
   reimplementation. The elevated path calls the identical function compiled
   from the identical source in the same build.
 
-### 4.4 Why a re-exec and not a separate helper binary
+None of this applies to the `delete_backup` operation, and none of it is
+needed there: unlinking a backup is a single syscall with no intermediate
+state, it does not touch the target file at all, and there is nothing to make
+atomic. The elevated delete is deliberately two checks and one `remove_file`
+— no backup-of-a-backup, no temp file, no rename, no verification pass. Its
+guarantee is narrower and simpler: either the named backup is gone, or
+nothing changed.
+
+### 4.5 Why a re-exec and not a separate helper binary
 
 A dedicated `rustab-helper` executable is the textbook answer. It was
 rejected deliberately:
@@ -347,46 +465,64 @@ rejected deliberately:
   smaller elevated code surface, but the elevated surface here is already
   minimal and provably so: the flag is checked as the first statement of
   `main`, matched as `argv[1]` exactly, extra arguments are refused, and the
-  elevated process reads stdin, calls one function, prints JSON and exits.
+  elevated process reads stdin, performs one of two operations, prints JSON
+  and exits. Adding the second operation did not add a second entry point —
+  it added one `match` arm behind the same single flag (§4.2).
 - **The authorization cost is identical.** `pkexec` prompts per invocation
   either way, so nothing improves for the user.
 
-### 4.5 Why the target path is sent as data, and re-checked
+### 4.6 Why the target path is sent as data, and re-checked
 
 `pkexec` does not forward the caller's environment, so the elevated process
 cannot re-resolve the target itself — `RUSTAB_TARGET_PATH` does not survive
 the transition. That is a feature (an env var cannot influence the elevated
 process at all), and it is why the path must travel inside the request.
 
-Because the path arrives as data, the elevated side refuses to write anywhere
+Because the path arrives as data, the elevated side refuses to act on anything
 except `/etc/fstab` (literally, or via a symlink that resolves to it), using
 the *same* comparison that decided `is_real` in the first place. Escalation
 only ever happens for a real target, so this costs nothing in normal
 operation and bounds the elevated write to exactly one file.
 
+`delete_backup`'s `backup_path` arrives as data for the same reason and is
+re-checked the same way, with one extra step on top of the target check: the
+elevated process resolves it against the real backup list of the target it
+has *already* verified, and unlinks the path that list yielded — never the
+string from the request. So the only files the elevated delete can ever
+remove are that one target's own backups. Not `/etc/shadow`, not
+`../../etc/fstab`, not a different target's backup sitting in the same
+directory, not a near-miss file name, and not the target file itself. A bug
+(or a lie) on the unprivileged side cannot widen that, because the
+unprivileged side's own resolution is not consulted.
+
 **Known limitation:** escalation is therefore only available for the real
 `/etc/fstab`. Pointing `RUSTAB_TARGET_PATH` at some *other* root-owned file
 gives an in-process save that fails with a permission error
 (`kind: "write"`/`"backup"`, `target_unchanged: true`), not a password
-prompt. That is the intended trade for v1; widening it would mean the
-elevated writer accepting arbitrary paths from data.
+prompt — and, likewise, an in-process backup deletion that fails with
+`kind: "delete"`. That is the intended trade for v1; widening it would mean
+the elevated process accepting arbitrary paths from data.
 
-### 4.6 What the frontend sees
+### 4.7 What the frontend sees
 
-Nothing special. `save` and `restore_backup` behave identically for both
-targets; `WriteOutcomeDto.elevated` is `true` when the write went through
-`pkexec`. A dismissed or refused password prompt is an ordinary rejection with
-`kind: "privilege_escalation"` and `target_unchanged: true`. The call can sit
-unresolved for as long as the prompt is on screen, so keep the "Writing
-changes…" state of `docs/UI_DESIGN.md` §6 until it settles, and do not add a
-client-side timeout.
+Nothing special. `save`, `restore_backup` and `delete_backup` behave
+identically for both targets; `WriteOutcomeDto.elevated` is `true` when a
+write went through `pkexec`. A dismissed or refused password prompt is an
+ordinary rejection with `kind: "privilege_escalation"` — plus
+`target_unchanged: true` for a write; for a delete there is no such field and
+the message says the backup was not deleted. The call can sit unresolved for
+as long as the prompt is on screen, so keep the "Writing changes…" state of
+`docs/UI_DESIGN.md` §6 (and its equivalent for a deletion) until it settles,
+and do not add a client-side timeout.
+
+`read_backup` never escalates, for either target, so it never prompts.
 
 **Requirement:** `pkexec` (polkit) must be installed. Without it, a real-target
-save rejects with `kind: "privilege_escalation"` and a message saying so. No
-polkit `.policy` file ships yet, so `pkexec` applies its default
-"authenticate as an administrator" rule; adding a policy file (to refine the
-prompt text and the auth rule) is a packaging-time follow-up, not an API
-change.
+save or backup deletion rejects with `kind: "privilege_escalation"` and a
+message saying so. No polkit `.policy` file ships yet, so `pkexec` applies its
+default "authenticate as an administrator" rule; adding a policy file (to
+refine the prompt text and the auth rule) is a packaging-time follow-up, not
+an API change.
 
 ---
 
@@ -583,8 +719,39 @@ message, reload the target with `list_entries`, and point at the backup panel.
 ```
 
 `kind` is one of `target_resolution`, `read_target`, `not_utf8`,
-`list_backups`. These commands never wrote anything, so there is no
-`target_unchanged` field.
+`list_backups`, `invalid_backup`, `read_backup`. These commands never wrote
+anything, so there is no `target_unchanged` field.
+
+| `kind` | Meaning | Raised by |
+| --- | --- | --- |
+| `target_resolution` | The active target could not be determined | every read-side command |
+| `read_target` | The target exists but could not be read | `list_entries` |
+| `not_utf8` | The bytes read are not valid UTF-8 and are refused rather than mangled | `list_entries` (the target), `read_backup` (a backup) |
+| `list_backups` | The target's directory could not be listed | `list_backups` |
+| `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read. Nothing was read. | `read_backup` |
+| `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
+
+### `DeleteBackupErrorDto` (`delete_backup` only)
+
+```json
+{ "kind": "invalid_backup", "message": "..." }
+```
+
+The same two fields as `CommandErrorDto` and nothing else. In particular
+there is **no `target_unchanged`**, on purpose: `delete_backup` never opens,
+renames or writes the active target, so that flag would be trivially `true`
+for every variant and would invite the UI to read significance into it. The
+only question this error answers is "is the backup still there", and the
+`kind` plus the message say it.
+
+| `kind` | Meaning | Is the backup still there? |
+| --- | --- | --- |
+| `target_resolution` | The active target could not be determined, so its backups could not be identified | yes |
+| `invalid_backup` | The requested path is not one of this target's backups, or the list could not be read. The path was never used as a path. | yes (and it may never have existed) |
+| `privilege_escalation` | Real target only: `pkexec` missing, prompt dismissed or refused, or the elevated helper gave no usable response | yes for dismissed/refused/not-launched; **unknown** when the helper exited without a usable response — the message says so, and the fix is to re-call `list_backups` |
+| `delete` | The file is a genuine backup of this target but could not be removed (permissions, I/O error, or the elevated helper refusing a target other than `/etc/fstab`) | yes |
+
+`message` is written for a user and is safe to display verbatim.
 
 ---
 
@@ -600,7 +767,8 @@ message, reload the target with `list_entries`, and point at the backup panel.
   "created_unix_secs": 1760000000 }
 ```
 
-`path` is the exact string to hand back to `restore_backup`.
+`path` is the exact string to hand back to `restore_backup` (§3.7),
+`read_backup` (§3.9) and `delete_backup` (§3.10).
 `created_unix_secs` may be `null` if the platform could not report an mtime.
 
 ### `DeviceDiscoveryDto` / `DeviceInfoDto`
@@ -634,38 +802,66 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 {"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true}
 {"kind":"privilege_escalation","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null}
 {"kind":"not_utf8","message":"m"}
+{"kind":"invalid_backup","message":"m"}
 {"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000}
 {"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}
 ```
+
+The fifth line above is `CommandErrorDto` and the sixth is
+`DeleteBackupErrorDto` — they are the same two-field shape, distinguished only
+by which command produced them and by which `kind` strings are possible.
+
+Every `kind` spelling of both error-kind enums is pinned individually by
+`dto::tests::every_error_kind_spelling_is_exactly_as_documented`, because the
+frontend matches these strings exhaustively:
+
+- `CommandErrorKindDto`: `target_resolution`, `read_target`, `not_utf8`,
+  `list_backups`, `invalid_backup`, `read_backup`.
+- `DeleteBackupErrorKindDto`: `target_resolution`, `invalid_backup`,
+  `privilege_escalation`, `delete`.
 
 ---
 
 ## 11. Other notes for integrators
 
 - **Non-UTF-8 paths.** Paths cross the boundary as strings and a non-UTF-8
-  path is rendered lossily. Such a path can be displayed but not restored
-  *to*: `restore_backup` matches what it is given against the real backup
-  list, so a mangled string fails closed with `invalid_backup` rather than
-  writing somewhere unintended. Non-UTF-8 target paths are not a supported
-  configuration.
+  path is rendered lossily. Such a path can be displayed but not acted on:
+  `restore_backup`, `read_backup` and `delete_backup` each match what they are
+  given against the real backup list, so a mangled string fails closed with
+  `invalid_backup` rather than reading, writing or deleting somewhere
+  unintended. Non-UTF-8 target paths are not a supported configuration.
 - **Reload after every save.** `WriteOutcomeDto` intentionally does not carry
   the new document. Call `list_entries` again so the UI shows what is
   actually on disk, not what it hoped to put there.
+- **Reload the backup list after every deletion.** `delete_backup` resolves
+  with `null` and carries no outcome object, and a
+  `privilege_escalation` failure can leave the outcome genuinely unknown.
+  Call `list_backups` again rather than removing a row locally.
 - **Concurrency.** Commands run on a thread pool and can overlap. The backend
   keeps no session state at all — every command re-resolves the target — so
   there is nothing to invalidate, but two concurrent saves would race on the
   file. Keep the UI's single-save-at-a-time gating (`docs/UI_DESIGN.md` §6).
+  The same applies to a deletion: a backup deleted while a save is pruning
+  old backups can produce an `invalid_backup` from either side, which means
+  "it is already gone", not "something is wrong".
 - **The internal flag is not a public CLI.** `rustab
-  --internal-privileged-write` and its stdin/stdout protocol are an
-  implementation detail of §4, unstable by design, and must not be invoked by
-  anything but the escalation path.
-- **Manual smoke test of the elevated path** (deliberately not automated —
-  it needs a password prompt and writes the real file; run it by hand on a
-  machine you can afford to fix, and check `findmnt --verify` afterwards):
+  --internal-privileged-write` and its stdin/stdout protocol (both operations
+  of it) are an implementation detail of §4, unstable by design, and must not
+  be invoked by anything but the escalation path.
+- **Manual smoke test of the elevated paths** (deliberately not automated —
+  they need a password prompt and touch the real file and its backups; run
+  them by hand on a machine you can afford to fix, and check
+  `findmnt --verify` afterwards):
   ```sh
   cargo build -p rustab
   RUSTAB_TARGET_PATH=/etc/fstab ./target/debug/rustab
   ```
-  Automated tests instead exercise the elevated writer's own function
-  directly, with a temp file standing in for `/etc/fstab`, and the
-  `pkexec`-result interpretation as a pure function.
+  Save once (that creates a backup), then delete that backup from the backup
+  panel and confirm with `ls /etc/fstab.rustab-backup.*` that exactly that
+  file is gone and `/etc/fstab` is untouched.
+
+  Automated tests instead exercise the elevated handler's own function
+  directly, with a temp file standing in for `/etc/fstab` — including the
+  delete operation's refusal of every near-miss path — and the
+  `pkexec`-result interpretation as a pure function shared by both
+  operations.

@@ -54,11 +54,13 @@ use std::path::Path;
 /// Paths cross the boundary as plain strings. A path that is not valid UTF-8
 /// is rendered lossily (U+FFFD replacement characters) rather than failing the
 /// whole command: the frontend's job with these strings is to display them,
-/// and the one command that takes a path *back* ([`crate::commands::restore_backup`])
-/// does not trust the string it is given — it matches it against the real
-/// backup list, so a mangled path fails closed with "not a backup of the
-/// active target" instead of writing somewhere unintended. See
-/// `docs/API_CONTRACT.md` ("Non-UTF-8 paths").
+/// and the only commands that take a path *back*
+/// ([`crate::commands::restore_backup`], [`crate::commands::read_backup`] and
+/// [`crate::commands::delete_backup`]) do not trust the string they are given —
+/// each matches it against the real backup list, so a mangled path fails
+/// closed with "not a backup of the active target" instead of reading,
+/// writing or deleting somewhere unintended. See `docs/API_CONTRACT.md`
+/// ("Non-UTF-8 paths").
 fn path_to_wire(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -640,10 +642,20 @@ pub enum CommandErrorKindDto {
     /// The target exists but could not be read (most often permissions).
     ReadTarget,
     /// The target's bytes are not valid UTF-8, so it cannot be represented or
-    /// safely re-serialized.
+    /// safely re-serialized. Also reported for a *backup* whose bytes are not
+    /// valid UTF-8 (see [`crate::commands::read_backup`]), rather than adding
+    /// a second kind that would mean the same thing to the frontend.
     NotUtf8,
     /// The target's directory could not be listed for backups.
     ListBackups,
+    /// The requested backup is not one of the backups the active target
+    /// actually has (or the backup list could not be read). The read-only
+    /// counterpart of [`WriteErrorKindDto::InvalidBackup`].
+    InvalidBackup,
+    /// The requested backup is one of this target's own backups but could not
+    /// be read (permissions, I/O error). A backup that exists and is readable
+    /// but is not valid UTF-8 is reported as [`CommandErrorKindDto::NotUtf8`].
+    ReadBackup,
 }
 
 /// A failed read-only command.
@@ -666,14 +678,66 @@ impl CommandErrorDto {
 }
 
 // ---------------------------------------------------------------------------
+// Backup deletion errors
+// ---------------------------------------------------------------------------
+
+/// Why deleting one of the active target's backups failed.
+///
+/// Deliberately *not* [`WriteErrorKindDto`]: deleting a backup never opens,
+/// renames or otherwise touches the active target file, so the whole notion of
+/// `target_unchanged` (the field the UI branches on for a save) has no meaning
+/// here — it would be trivially `true` for every variant and would invite the
+/// frontend to read significance into it. A small, separate shape says the
+/// true thing instead: either the backup is gone, or it is not, and nothing
+/// else moved either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteBackupErrorKindDto {
+    /// The active target could not be determined, so its backups could not be
+    /// identified. Nothing was deleted.
+    TargetResolution,
+    /// The requested path is not one of the backups the active target actually
+    /// has (or the backup list could not be read). Nothing was deleted, and
+    /// the path was never used as a path (see [`crate::backups`]).
+    InvalidBackup,
+    /// Real-target only: `pkexec` is missing, the prompt was dismissed or
+    /// refused, or the elevated helper produced no usable response.
+    PrivilegeEscalation,
+    /// The file was a genuine backup of the active target but could not be
+    /// removed (permissions, I/O error, or the elevated helper refusing a
+    /// target other than the one it is allowed to manage).
+    Delete,
+}
+
+/// A failed [`crate::commands::delete_backup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteBackupErrorDto {
+    /// Which part failed.
+    pub kind: DeleteBackupErrorKindDto,
+    /// Human-readable message, safe to show verbatim.
+    pub message: String,
+}
+
+impl DeleteBackupErrorDto {
+    /// Builds an error of `kind` with `message`.
+    pub fn new(kind: DeleteBackupErrorKindDto, message: impl Into<String>) -> Self {
+        DeleteBackupErrorDto {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Backups
 // ---------------------------------------------------------------------------
 
 /// One auto-backup of the active target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupInfoDto {
-    /// Full path, and the exact string [`crate::commands::restore_backup`]
-    /// expects back.
+    /// Full path, and the exact string [`crate::commands::restore_backup`],
+    /// [`crate::commands::read_backup`] and
+    /// [`crate::commands::delete_backup`] expect back.
     pub path: String,
     /// Just the file name, for a compact list display.
     pub file_name: String,
@@ -844,6 +908,12 @@ mod tests {
             r#"{"kind":"not_utf8","message":"m"}"#
         );
 
+        let delete_error = DeleteBackupErrorDto::new(DeleteBackupErrorKindDto::InvalidBackup, "m");
+        assert_eq!(
+            serde_json::to_string(&delete_error).expect("serialize"),
+            r#"{"kind":"invalid_backup","message":"m"}"#
+        );
+
         let backup = BackupInfoDto {
             path: "/p.b".to_string(),
             file_name: "p.b".to_string(),
@@ -871,6 +941,51 @@ mod tests {
             serde_json::to_string(&devices).expect("serialize"),
             r#"{"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}"#
         );
+    }
+
+    /// Every `kind` spelling of the two error enums the frontend matches on
+    /// by string, pinned individually.
+    ///
+    /// `remaining_wire_formats_are_exactly_as_documented` pins one instance of
+    /// each shape; this pins every *variant*, because the frontend's `match`
+    /// on these strings is exhaustive and a renamed variant would otherwise
+    /// only break at runtime, in the error path, where it is least likely to
+    /// be noticed.
+    #[test]
+    fn every_error_kind_spelling_is_exactly_as_documented() {
+        let command_kinds = [
+            (CommandErrorKindDto::TargetResolution, "target_resolution"),
+            (CommandErrorKindDto::ReadTarget, "read_target"),
+            (CommandErrorKindDto::NotUtf8, "not_utf8"),
+            (CommandErrorKindDto::ListBackups, "list_backups"),
+            (CommandErrorKindDto::InvalidBackup, "invalid_backup"),
+            (CommandErrorKindDto::ReadBackup, "read_backup"),
+        ];
+        for (kind, spelling) in command_kinds {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{spelling}\"")
+            );
+        }
+
+        let delete_kinds = [
+            (
+                DeleteBackupErrorKindDto::TargetResolution,
+                "target_resolution",
+            ),
+            (DeleteBackupErrorKindDto::InvalidBackup, "invalid_backup"),
+            (
+                DeleteBackupErrorKindDto::PrivilegeEscalation,
+                "privilege_escalation",
+            ),
+            (DeleteBackupErrorKindDto::Delete, "delete"),
+        ];
+        for (kind, spelling) in delete_kinds {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{spelling}\"")
+            );
+        }
     }
 
     /// Every source syntax survives the trip, with the `KEY=` prefix living
@@ -1094,6 +1209,17 @@ mod tests {
         });
         let json = serde_json::to_string(&dto).expect("serialize");
         let back: WriteErrorDto = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, dto);
+
+        // The same applies to a backup deletion: the elevated helper
+        // serializes this one and the unprivileged side reads it back.
+        let dto = DeleteBackupErrorDto::new(
+            DeleteBackupErrorKindDto::Delete,
+            "could not delete the backup /etc/fstab.rustab-backup.0000000001.000000002: \
+             Permission denied",
+        );
+        let json = serde_json::to_string(&dto).expect("serialize");
+        let back: DeleteBackupErrorDto = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, dto);
     }
 }

@@ -5,10 +5,11 @@
 //!
 //! Every other command refuses to accept a path at all, precisely so a buggy
 //! or compromised UI cannot redirect a read or a write (see
-//! [`crate::target`]). `restore_backup` is the one exception, and it is safe
-//! for a structural reason rather than a careful-string-checking reason: the
-//! path it is given is never used as a path until it has been found in the
-//! list [`fstab_core::writer::list_backups`] reports for *the active target*.
+//! [`crate::target`]). `restore_backup`, `read_backup` and `delete_backup`
+//! are the only exceptions, and they are safe for a structural reason rather
+//! than a careful-string-checking reason: the path they are given is never
+//! used as a path until it has been found in the list
+//! [`fstab_core::writer::list_backups`] reports for *the active target*.
 //! That list is built by `fstab-core` from the backup naming scheme it owns,
 //! and only from the target's own directory. So `/etc/shadow`,
 //! `../../etc/fstab`, a backup of a *different* target sitting in the same
@@ -29,6 +30,17 @@
 //! spelling of the same file (a symlinked directory, a `./` prefix) still
 //! resolves — but to the canonical path from the list, which is what is then
 //! read.
+//!
+//! ## Called on both sides of the privilege boundary
+//!
+//! [`resolve_requested`] is also called *inside* the elevated process, by
+//! [`crate::privileged`]'s backup-deletion handler, against the backup list of
+//! the target that process has already verified it is allowed to manage. The
+//! unprivileged side resolving first is only a courtesy (fail without a
+//! password prompt for a path that cannot work); the elevated side's own call
+//! is the one that decides, because nothing the unprivileged side claims is
+//! trusted there. Both calls run this same function, so the two can never
+//! disagree about what counts as a backup.
 
 use crate::dto::BackupInfoDto;
 use fstab_core::writer;
@@ -65,9 +77,13 @@ impl fmt::Display for BackupError {
                 "could not list the backups in {}: {source}",
                 path.display()
             ),
+            // Deliberately says nothing about the consequence: the same
+            // refusal is reported by a restore, a read and a delete, and each
+            // caller appends the clause that is true for it ("nothing was
+            // restored" / "nothing was deleted").
             BackupError::NotABackupOfTarget { requested, target } => write!(
                 f,
-                "{requested} is not one of the backups Rustab made of {}; nothing was restored",
+                "{requested} is not one of the backups Rustab made of {}",
                 target.display()
             ),
         }
@@ -164,15 +180,16 @@ fn containing_dir(path: &Path) -> PathBuf {
 ///
 /// Returns the underlying [`io::Error`], including
 /// [`io::ErrorKind::InvalidData`] for a backup that is not valid UTF-8 (which
-/// cannot be represented as an [`fstab_core::model::Document`] and so must
-/// not be restored through it).
+/// can neither be represented as an [`fstab_core::model::Document`], and so
+/// must not be restored through one, nor be sent across the Tauri boundary as
+/// a string).
 pub fn read_text(backup: &Path) -> io::Result<String> {
     let bytes = fs::read(backup)?;
     String::from_utf8(bytes).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} is not valid UTF-8 ({err}), so it cannot be restored through Rustab; \
+                "{} is not valid UTF-8 ({err}), so Rustab can neither show it nor restore it; \
                  copy it into place manually instead",
                 backup.display()
             ),

@@ -7,13 +7,24 @@
 //! through [`crate::target`], converts DTOs through [`crate::dto`], and
 //! delegates the real work to `fstab-core`. No command re-implements
 //! validation, serialization, backup naming or writing, and no command takes
-//! a target path from the frontend (the single, carefully bounded exception
-//! being [`restore_backup`] — see [`crate::backups`]).
+//! a *target* path from the frontend. The carefully bounded exceptions —
+//! [`restore_backup`], [`read_backup`] and [`delete_backup`], which take a
+//! *backup* path — never use it as a path until it has been matched against
+//! the active target's real backup list (see [`crate::backups`]).
 //!
 //! The genuinely interesting logic — "which save path do I take" — is
 //! [`save_document_with`], and it is a single `if` on purpose: both branches
 //! end in the same [`writer::write_document`] call, one of them simply has a
 //! `pkexec` re-exec in front of it (see [`crate::privileged`]).
+//! [`delete_backup_with`] is the same shape for the same reason: the real
+//! `/etc/fstab`'s backups live in root-owned `/etc/`, so removing one needs
+//! the same single escalation, while a sandbox target's backups live in a
+//! user-owned directory and need none.
+//!
+//! Reading a backup, by contrast, needs no escalation at all in either case:
+//! `/etc/fstab` and the backups beside it are world-readable, which is the
+//! same reason [`list_entries`] and [`list_backups`] already work against the
+//! real target unprivileged.
 //!
 //! ## Why every command is `#[tauri::command(async)]`
 //!
@@ -37,9 +48,9 @@
 
 use crate::backups;
 use crate::dto::{
-    BackupInfoDto, CommandErrorDto, CommandErrorKindDto, DeviceDiscoveryDto, DocumentDto,
-    DocumentViewDto, TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteErrorKindDto,
-    WriteOutcomeDto,
+    BackupInfoDto, CommandErrorDto, CommandErrorKindDto, DeleteBackupErrorDto,
+    DeleteBackupErrorKindDto, DeviceDiscoveryDto, DocumentDto, DocumentViewDto, TargetInfoDto,
+    ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
 use crate::privileged;
 use crate::target::{self, ActiveTarget};
@@ -203,7 +214,11 @@ pub fn restore_backup(backup_path: String) -> Result<WriteOutcomeDto, WriteError
     // cannot be used, and nothing was written), and the message says which
     // one it was.
     let backup = backups::resolve_requested(&target.path, &backup_path).map_err(|err| {
-        WriteErrorDto::new(WriteErrorKindDto::InvalidBackup, true, err.to_string())
+        WriteErrorDto::new(
+            WriteErrorKindDto::InvalidBackup,
+            true,
+            format!("{err}; nothing was restored"),
+        )
     })?;
 
     let text = backups::read_text(&backup).map_err(|err| {
@@ -219,6 +234,57 @@ pub fn restore_backup(backup_path: String) -> Result<WriteOutcomeDto, WriteError
     })?;
 
     save_document(&target, &parser::parse(&text))
+}
+
+/// Returns a backup's raw text, for the backup-diff view.
+///
+/// `backup_path` must be one of the paths [`list_backups`] returned for the
+/// *current* target, and is resolved exactly the way [`restore_backup`]
+/// resolves it — matched against the real backup list before it is ever used
+/// as a path (see [`crate::backups`]).
+///
+/// Writes nothing and needs no privilege escalation for either target kind:
+/// `/etc/fstab` and the backups beside it are world-readable, so an
+/// unprivileged read suffices — the same reason [`list_entries`] can read the
+/// real target without a password prompt. Pair the returned text with
+/// [`list_entries`]'s `text` to diff a restore point against what is live now.
+///
+/// # Errors
+///
+/// [`CommandErrorKindDto::TargetResolution`] if the target could not be
+/// determined, [`CommandErrorKindDto::InvalidBackup`] if `backup_path` is not
+/// one of this target's backups, [`CommandErrorKindDto::ReadBackup`] if it is
+/// one but could not be read, [`CommandErrorKindDto::NotUtf8`] if its bytes
+/// are not valid UTF-8.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn read_backup(backup_path: String) -> Result<String, CommandErrorDto> {
+    let target = resolve_target()?;
+    read_backup_of(&target.path, &backup_path)
+}
+
+/// Deletes one of the active target's backups.
+///
+/// `backup_path` must be one of the paths [`list_backups`] returned for the
+/// *current* target. Only ever a backup file: the active target itself is
+/// never one of its own backups, so it can never be the file removed here
+/// (asserted by [`crate::privileged`]'s and this module's tests).
+///
+/// Dispatches on [`ActiveTarget::is_real`] exactly like [`save`] and
+/// [`restore_backup`] do: a non-real target's backups live in a user-owned
+/// directory and are removed in-process, while the real `/etc/fstab`'s
+/// backups live in root-owned `/etc/` and are removed by a single elevated
+/// re-exec (see [`crate::privileged`]). Unlike a save, this never opens,
+/// renames or writes the target file — which is why it rejects with a
+/// [`DeleteBackupErrorDto`] rather than a [`WriteErrorDto`]: there is no
+/// `target_unchanged` question to answer.
+///
+/// # Errors
+///
+/// A [`DeleteBackupErrorDto`]; see [`DeleteBackupErrorKindDto`] for the kinds.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
+    let target = resolve_target_for_delete()?;
+    delete_backup_from(&target, &backup_path)
 }
 
 /// Lists block devices for the source picker.
@@ -277,6 +343,80 @@ fn save_document_with(
     }
 }
 
+/// The body of [`read_backup`], with the target passed in.
+///
+/// Split out for the same reason [`save_document`] is: the tests can point it
+/// at a temp file without mutating the process-wide environment that
+/// [`target::active_target`] reads.
+fn read_backup_of(target: &Path, backup_path: &str) -> Result<String, CommandErrorDto> {
+    let backup = backups::resolve_requested(target, backup_path)
+        .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::InvalidBackup, err.to_string()))?;
+
+    backups::read_text(&backup).map_err(|err| {
+        // `read_text`'s own `InvalidData` is the not-valid-UTF-8 case, which
+        // already has a kind of its own that the frontend handles for the
+        // target; reusing it keeps one meaning per kind.
+        let kind = if err.kind() == io::ErrorKind::InvalidData {
+            CommandErrorKindDto::NotUtf8
+        } else {
+            CommandErrorKindDto::ReadBackup
+        };
+        CommandErrorDto::new(
+            kind,
+            format!("could not read the backup {}: {err}", backup.display()),
+        )
+    })
+}
+
+/// The body of [`delete_backup`], with the target passed in (see
+/// [`read_backup_of`] for why).
+fn delete_backup_from(
+    target: &ActiveTarget,
+    backup_path: &str,
+) -> Result<(), DeleteBackupErrorDto> {
+    delete_backup_with(target, backup_path, privileged::delete_backup_elevated)
+}
+
+/// The one dispatch point between the two backup-deletion paths, with the
+/// elevated half injectable.
+///
+/// Mirrors [`save_document_with`] exactly, and for the same reason: the
+/// dispatch decision ("a real target's backups are never unlinked by this
+/// process") has to be *asserted*, and asserting it against the production
+/// `privileged::delete_backup_elevated` would mean a unit test that launches
+/// `pkexec` and waits on an authentication prompt.
+///
+/// `backup_path` is resolved before the dispatch, in **both** branches. For
+/// the elevated branch that is only a courtesy — it means a path that cannot
+/// work is refused without making the user authenticate first, the same
+/// courtesy [`privileged::save_elevated`]'s pre-validation provides. The
+/// authoritative check is the elevated process's own
+/// [`backups::resolve_requested`] call, which does not trust this one (see
+/// [`crate::privileged`]).
+fn delete_backup_with(
+    target: &ActiveTarget,
+    backup_path: &str,
+    elevate: impl Fn(&Path, &str) -> Result<(), DeleteBackupErrorDto>,
+) -> Result<(), DeleteBackupErrorDto> {
+    let backup = backups::resolve_requested(&target.path, backup_path).map_err(|err| {
+        DeleteBackupErrorDto::new(
+            DeleteBackupErrorKindDto::InvalidBackup,
+            format!("{err}; nothing was deleted"),
+        )
+    })?;
+
+    if target.is_real {
+        elevate(&target.path, &backup.to_string_lossy())
+    } else {
+        fs::remove_file(&backup).map_err(|err| {
+            DeleteBackupErrorDto::new(
+                DeleteBackupErrorKindDto::Delete,
+                format!("could not delete the backup {}: {err}", backup.display()),
+            )
+        })
+    }
+}
+
 /// Resolves the active target for a read-side command.
 fn resolve_target() -> Result<ActiveTarget, CommandErrorDto> {
     target::active_target()
@@ -291,6 +431,17 @@ fn resolve_target_for_write() -> Result<ActiveTarget, WriteErrorDto> {
             WriteErrorKindDto::TargetResolution,
             true,
             format!("{err}; nothing was written"),
+        )
+    })
+}
+
+/// Resolves the active target for [`delete_backup`], reporting failure in its
+/// own error shape.
+fn resolve_target_for_delete() -> Result<ActiveTarget, DeleteBackupErrorDto> {
+    target::active_target().map_err(|err| {
+        DeleteBackupErrorDto::new(
+            DeleteBackupErrorKindDto::TargetResolution,
+            format!("{err}; nothing was deleted"),
         )
     })
 }
@@ -519,6 +670,277 @@ mod tests {
             fs::read_to_string(&path).expect("read the target"),
             ORIGINAL
         );
+    }
+
+    // -- read_backup --------------------------------------------------------
+
+    /// Seeds `count` real backups by performing `count` real saves, so the
+    /// names under test are the ones `fstab-core` actually produces.
+    fn seed_backups(target: &Path, count: usize) {
+        fs::write(target, ORIGINAL).expect("seed the target");
+        for i in 0..count {
+            writer::write_document(target, &valid_candidate(&format!("/mnt/save-{i}")))
+                .expect("the save should succeed");
+        }
+    }
+
+    #[test]
+    fn read_backup_returns_the_backup_text_verbatim() {
+        let dir = TempDir::new("read-backup");
+        let path = dir.join("fstab.sandbox");
+        seed_backups(&path, 2);
+
+        let listed = backups::list(&path).expect("listing must succeed");
+        // Newest first: the newest backup holds what the *second* save
+        // replaced, and the oldest holds the content the target started with.
+        let oldest = &listed[listed.len() - 1];
+
+        assert_eq!(
+            read_backup_of(&path, &oldest.path).expect("a real backup must be readable"),
+            ORIGINAL
+        );
+        assert_eq!(
+            read_backup_of(&path, &listed[0].path).expect("a real backup must be readable"),
+            valid_candidate("/mnt/save-0").to_string()
+        );
+        // Reading does not change anything: the target and the backup list are
+        // exactly as they were.
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the target"),
+            valid_candidate("/mnt/save-1").to_string()
+        );
+        assert_eq!(backups::list(&path).expect("listing").len(), 2);
+    }
+
+    /// The same structural guarantee `restore_backup` has, asserted for the
+    /// read path: a path that is not in this target's own backup list is never
+    /// used as a path at all.
+    #[test]
+    fn read_backup_refuses_anything_that_is_not_a_backup_of_this_target() {
+        let dir = TempDir::new("read-backup-refuse");
+        let path = dir.join("fstab.sandbox");
+        seed_backups(&path, 1);
+
+        let other = dir.join("fstab.other");
+        seed_backups(&other, 1);
+        let other_backup = backups::list(&other).expect("listing")[0].path.clone();
+
+        let near_misses = [
+            "fstab.sandbox.rustab-backup.1.2",
+            "fstab.sandbox.rustab-backup.0000000001.000000002.old",
+            "fstab.sandbox.rustab-backup.aaaaaaaaaa.bbbbbbbbb",
+            "fstab.sandbox.bak",
+        ];
+        for name in near_misses {
+            fs::write(dir.join(name), "# not a Rustab backup\n").expect("write the near miss");
+        }
+
+        let mut refused: Vec<String> = vec![
+            other_backup,
+            "/etc/shadow".to_string(),
+            "/etc/fstab".to_string(),
+            "../../etc/fstab".to_string(),
+            String::new(),
+            path.to_string_lossy().into_owned(),
+        ];
+        refused.extend(
+            near_misses
+                .iter()
+                .map(|name| dir.join(name).to_string_lossy().into_owned()),
+        );
+
+        for requested in &refused {
+            let error = read_backup_of(&path, requested)
+                .expect_err("only this target's own backups may be read");
+            assert_eq!(
+                error.kind,
+                CommandErrorKindDto::InvalidBackup,
+                "unexpected kind for {requested}: {error:?}"
+            );
+        }
+    }
+
+    /// A backup that is not valid UTF-8 is refused with the same kind the
+    /// target's own non-UTF-8 case uses — there is nothing to send across the
+    /// boundary as a string, and there is no second meaning to invent.
+    #[test]
+    fn read_backup_refuses_non_utf8_content() {
+        let dir = TempDir::new("read-backup-utf8");
+        let path = dir.join("fstab.sandbox");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        // A hand-made but exactly-named backup, which `backups` deliberately
+        // accepts as a backup of this target (see its module docs).
+        let backup = dir.join("fstab.sandbox.rustab-backup.0000000001.000000002");
+        fs::write(&backup, [0xff, 0xfe, 0x00]).expect("write invalid UTF-8");
+
+        let error = read_backup_of(&path, &backup.to_string_lossy())
+            .expect_err("invalid UTF-8 must be refused");
+        assert_eq!(error.kind, CommandErrorKindDto::NotUtf8);
+        assert!(backup.exists(), "a refused read must not remove anything");
+    }
+
+    // -- delete_backup ------------------------------------------------------
+
+    #[test]
+    fn deleting_a_sandbox_backup_removes_exactly_that_file() {
+        let dir = TempDir::new("delete-backup");
+        let path = dir.join("fstab.sandbox");
+        seed_backups(&path, 3);
+        let target = sandbox_target(path.clone());
+        let before = backups::list(&path).expect("listing");
+        assert_eq!(before.len(), 3);
+        let target_content = fs::read_to_string(&path).expect("read the target");
+
+        let doomed = before[1].path.clone();
+        delete_backup_from(&target, &doomed).expect("deleting a real backup must succeed");
+
+        assert!(
+            !Path::new(&doomed).exists(),
+            "the named backup must be gone"
+        );
+        let after = backups::list(&path).expect("listing");
+        assert_eq!(after.len(), 2);
+        assert!(!after.iter().any(|info| info.path == doomed));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the target"),
+            target_content,
+            "deleting a backup must not touch the target file"
+        );
+    }
+
+    #[test]
+    fn deleting_a_path_that_is_not_a_backup_is_refused() {
+        let dir = TempDir::new("delete-backup-refuse");
+        let path = dir.join("fstab.sandbox");
+        seed_backups(&path, 1);
+        let target = sandbox_target(path.clone());
+        let real_backup = backups::list(&path).expect("listing")[0].path.clone();
+
+        for requested in [
+            "/etc/shadow",
+            "../../etc/fstab",
+            "",
+            &path.to_string_lossy(),
+            &dir.join("fstab.sandbox.rustab-backup.1.2")
+                .to_string_lossy(),
+        ] {
+            let error = delete_backup_from(&target, requested)
+                .expect_err("only this target's own backups may be deleted");
+            assert_eq!(
+                error.kind,
+                DeleteBackupErrorKindDto::InvalidBackup,
+                "unexpected kind for {requested}: {error:?}"
+            );
+            assert!(error.message.contains("nothing was deleted"));
+        }
+
+        assert!(path.exists(), "the target must still exist");
+        assert!(
+            Path::new(&real_backup).exists(),
+            "the one real backup must still exist"
+        );
+    }
+
+    /// Deleting the same backup twice: the second attempt is `invalid_backup`,
+    /// because the path is no longer in the target's backup list. The frontend
+    /// can treat that as "already gone" and refresh.
+    #[test]
+    fn deleting_an_already_deleted_backup_is_reported_as_invalid() {
+        let dir = TempDir::new("delete-backup-twice");
+        let path = dir.join("fstab.sandbox");
+        seed_backups(&path, 1);
+        let target = sandbox_target(path.clone());
+        let backup = backups::list(&path).expect("listing")[0].path.clone();
+
+        delete_backup_from(&target, &backup).expect("the first delete must succeed");
+        let error = delete_backup_from(&target, &backup)
+            .expect_err("the second delete must not claim success");
+        assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
+        assert!(backups::list(&path).expect("listing").is_empty());
+    }
+
+    /// The dispatch guarantee for the delete path, mirroring
+    /// `a_real_target_is_dispatched_to_the_elevated_writer_and_never_written_in_process`:
+    /// a target flagged real goes to the elevated deleter and **nothing** is
+    /// unlinked by this process. Asserted with a recording stand-in, so the
+    /// test neither launches `pkexec` nor waits on a prompt.
+    #[test]
+    fn a_real_target_delete_is_dispatched_to_the_elevated_deleter_and_never_deleted_in_process() {
+        let dir = TempDir::new("real-delete-dispatch");
+        let path = dir.join("fstab");
+        seed_backups(&path, 2);
+        let target = ActiveTarget {
+            path: path.clone(),
+            is_real: true,
+            source: TargetSource::Environment,
+        };
+        let before = backups::list(&path).expect("listing");
+        let wanted = before[0].path.clone();
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        delete_backup_with(&target, &wanted, |elevated_target, elevated_backup| {
+            calls
+                .borrow_mut()
+                .push((elevated_target.to_path_buf(), elevated_backup.to_string()));
+            Ok(())
+        })
+        .expect("the elevated stand-in succeeds");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
+        assert_eq!(calls[0].0, path, "the elevated call must get the target");
+        assert_eq!(
+            calls[0].1, wanted,
+            "the elevated call must get the resolved backup path"
+        );
+        // Nothing was unlinked here: both backups, and the target, survive.
+        assert_eq!(
+            backups::list(&path).expect("listing").len(),
+            2,
+            "the in-process deleter must not have touched a real target's backups"
+        );
+        assert!(path.exists());
+    }
+
+    /// The other half of the dispatch guarantee: a non-real target's backup is
+    /// removed in-process and must never escalate (no password prompt for a
+    /// sandbox file).
+    #[test]
+    fn a_sandbox_delete_never_reaches_the_elevated_deleter() {
+        let dir = TempDir::new("sandbox-delete-dispatch");
+        let path = dir.join("fstab.sandbox");
+        seed_backups(&path, 1);
+        let target = sandbox_target(path.clone());
+        let backup = backups::list(&path).expect("listing")[0].path.clone();
+
+        delete_backup_with(&target, &backup, |_, _| {
+            panic!("a sandbox backup deletion must never escalate");
+        })
+        .expect("the delete should succeed");
+
+        assert!(!Path::new(&backup).exists());
+        assert!(path.exists());
+    }
+
+    /// A refused `backup_path` must be refused *before* the dispatch, so a
+    /// bogus path never costs the user a password prompt — the same courtesy
+    /// `save_elevated`'s pre-validation provides.
+    #[test]
+    fn a_refused_backup_path_never_reaches_the_elevated_deleter() {
+        let dir = TempDir::new("real-delete-refuse");
+        let path = dir.join("fstab");
+        seed_backups(&path, 1);
+        let target = ActiveTarget {
+            path: path.clone(),
+            is_real: true,
+            source: TargetSource::Environment,
+        };
+
+        let error = delete_backup_with(&target, "/etc/shadow", |_, _| {
+            panic!("a path that is not a backup must not reach the elevated deleter");
+        })
+        .expect_err("an arbitrary path must be refused");
+        assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
     }
 
     // -- read-side commands -------------------------------------------------

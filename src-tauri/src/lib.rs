@@ -15,9 +15,10 @@
 //!   lossless conversions to and from `fstab-core`'s domain types.
 //! - [`backups`]: listing backups of the active target and resolving a
 //!   frontend-supplied backup path against that list.
-//! - [`privileged`]: both halves of the elevated write — the `pkexec`
-//!   re-exec on the unprivileged side and the hidden internal subcommand on
-//!   the elevated side.
+//! - [`privileged`]: both halves of the two elevated operations (writing the
+//!   real `/etc/fstab`, and deleting one of its backups) — the `pkexec`
+//!   re-exec on the unprivileged side and the single hidden internal
+//!   subcommand on the elevated side.
 //! - [`commands`]: the `#[tauri::command]` functions themselves.
 
 pub mod backups;
@@ -50,6 +51,8 @@ pub fn run() {
             commands::save,
             commands::list_backups,
             commands::restore_backup,
+            commands::read_backup,
+            commands::delete_backup,
             commands::discover_devices,
         ])
         .run(tauri::generate_context!())
