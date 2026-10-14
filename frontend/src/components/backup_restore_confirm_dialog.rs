@@ -6,7 +6,10 @@
 
 use yew::prelude::*;
 
-use crate::components::real_target_confirm_checkbox::RealTargetConfirmCheckbox;
+use crate::components::loading_spinner::LoadingSpinner;
+use crate::components::real_target_confirm_checkbox::{
+    confirm_disabled, RealTargetConfirmCheckbox,
+};
 
 #[derive(Properties, PartialEq)]
 pub struct BackupRestoreConfirmDialogProps {
@@ -17,6 +20,16 @@ pub struct BackupRestoreConfirmDialogProps {
     pub on_confirm_checked_change: Callback<bool>,
     pub on_cancel: Callback<()>,
     pub on_confirm: Callback<()>,
+    /// Set by `AppShell` while the `restore_backup` call is in flight
+    /// (§7's "same loading → success/error handling pattern as DiffView's
+    /// save").
+    #[prop_or(false)]
+    pub saving: bool,
+    /// The last `restore_backup` failure's message, shown inside this
+    /// still-open dialog (not only as a toast) — same treatment as
+    /// `DiffView` (§6 point 4).
+    #[prop_or_default]
+    pub error: Option<AttrValue>,
 }
 
 #[function_component(BackupRestoreConfirmDialog)]
@@ -31,7 +44,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
     };
     let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
 
-    let confirm_disabled = props.is_real && !props.confirm_checked;
+    let confirm_disabled = confirm_disabled(props.is_real, props.confirm_checked, props.saving);
     let confirm_classes = if props.is_real {
         classes!("bg-red-600", "hover:bg-red-700", "text-white")
     } else {
@@ -64,6 +77,11 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">
                     { "Restoring itself creates a fresh backup of the current file first, following the same atomic write guarantee used everywhere else — but any unsaved pending edits in this session will be discarded." }
                 </p>
+                if let Some(error) = &props.error {
+                    <div class="mb-4 rounded-md border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-3 py-2 text-sm" role="alert">
+                        { error.clone() }
+                    </div>
+                }
                 if props.is_real {
                     <div class="mb-4">
                         <RealTargetConfirmCheckbox
@@ -76,7 +94,8 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                 <div class="flex justify-end gap-2">
                     <button
                         type="button"
-                        class="px-4 py-2 rounded-md bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-sm font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
+                        disabled={props.saving}
+                        class="px-4 py-2 rounded-md bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-sm font-medium focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60 disabled:cursor-not-allowed"
                         onclick={on_cancel_click}
                     >
                         { "Cancel" }
@@ -85,7 +104,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                         type="button"
                         disabled={confirm_disabled}
                         class={classes!(
-                            "px-4", "py-2", "rounded-md", "text-sm", "font-medium",
+                            "px-4", "py-2", "rounded-md", "text-sm", "font-medium", "inline-flex", "items-center", "gap-2",
                             "focus-visible:ring-2", "focus-visible:ring-sky-500",
                             if confirm_disabled {
                                 classes!("bg-slate-300", "text-slate-500", "dark:bg-slate-700", "dark:text-slate-500", "cursor-not-allowed")
@@ -95,7 +114,12 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                         )}
                         onclick={on_confirm_click}
                     >
-                        { confirm_label }
+                        if props.saving {
+                            <LoadingSpinner />
+                            { "Restoring…" }
+                        } else {
+                            { confirm_label }
+                        }
                     </button>
                 </div>
             </div>

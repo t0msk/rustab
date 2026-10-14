@@ -1,15 +1,52 @@
 //! `BackupPanel` — backup list view (§7), rows are `BackupListItem`.
-//! Renders from a small hardcoded `Vec<MockBackup>` for this task; T12
-//! replaces this with real backup data.
+//! Renders from the real `list_backups` result (T12); `AppShell` owns the
+//! fetch, this component is purely presentational.
 
+use wasm_bindgen::JsValue;
 use yew::prelude::*;
 
 use crate::components::empty_state::EmptyState;
-use crate::mock::MockBackup;
+use crate::dto::BackupInfoDto;
+
+/// Formats a backup's `created_unix_secs` into `(relative, iso)` strings
+/// for `BackupListItem`'s display text + hover tooltip
+/// (`docs/API_CONTRACT.md` §3.6: "format the relative and ISO timestamps
+/// from it in the frontend"). Uses `js_sys::Date` rather than pulling in a
+/// date/time crate, since the wasm target already has it for free.
+pub fn format_timestamps(created_unix_secs: Option<i64>) -> (String, String) {
+    let Some(secs) = created_unix_secs else {
+        return ("unknown time".to_string(), "unknown".to_string());
+    };
+    let date = js_sys::Date::new(&JsValue::from_f64(secs as f64 * 1000.0));
+    let iso = date
+        .to_iso_string()
+        .as_string()
+        .unwrap_or_else(|| "unknown".to_string());
+    let diff_secs = ((js_sys::Date::now() / 1000.0) - secs as f64).max(0.0) as i64;
+    (relative_time(diff_secs), iso)
+}
+
+fn relative_time(diff_secs: i64) -> String {
+    if diff_secs < 60 {
+        "just now".to_string()
+    } else if diff_secs < 3600 {
+        let minutes = diff_secs / 60;
+        format!(
+            "{minutes} minute{} ago",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else if diff_secs < 86_400 {
+        let hours = diff_secs / 3600;
+        format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+    } else {
+        let days = diff_secs / 86_400;
+        format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+    }
+}
 
 #[derive(Properties, PartialEq)]
 pub struct BackupPanelProps {
-    pub backups: Vec<MockBackup>,
+    pub backups: Vec<BackupInfoDto>,
     pub on_restore: Callback<usize>,
 }
 
@@ -42,23 +79,24 @@ pub fn backup_panel(props: &BackupPanelProps) -> Html {
 
 #[derive(Properties, PartialEq)]
 pub struct BackupListItemProps {
-    pub backup: MockBackup,
+    pub backup: BackupInfoDto,
     pub on_restore: Callback<MouseEvent>,
 }
 
 #[function_component(BackupListItem)]
 pub fn backup_list_item(props: &BackupListItemProps) -> Html {
     let backup = &props.backup;
+    let (relative, iso) = format_timestamps(backup.created_unix_secs);
     let size_kb = format!("{:.1} KB", backup.size_bytes as f64 / 1024.0);
 
     html! {
         <li class="flex items-center justify-between px-4 py-3 hover:bg-sky-50 dark:hover:bg-slate-700/60">
             <div>
-                <p class="text-sm text-slate-900 dark:text-slate-100" title={backup.iso_timestamp}>
-                    { backup.relative_time }
+                <p class="text-sm text-slate-900 dark:text-slate-100" title={iso}>
+                    { relative }
                 </p>
                 <p class="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                    { backup.target_path }{ " · " }{ size_kb }
+                    { backup.target_path.clone() }{ " · " }{ size_kb }
                 </p>
             </div>
             <button

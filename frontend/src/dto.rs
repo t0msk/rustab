@@ -138,3 +138,38 @@ pub struct DeviceInfoDto {
     pub partlabel: Option<String>,
     pub fs_type: Option<String>,
 }
+
+/// `WriteOutcomeDto` (§8), the resolved shape of `save`/`restore_backup`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WriteOutcomeDto {
+    pub target: String,
+    pub backup: Option<String>,
+    pub pruned_backups: Vec<String>,
+    pub validation_warnings: Vec<FindingDto>,
+    pub notes: Vec<String>,
+    pub elevated: bool,
+}
+
+/// `WriteErrorDto` (§8), the rejection shape of `save`/`restore_backup`.
+/// `target_unchanged` is the field the UI must branch on (§8's table): a
+/// `true` here is a guarantee the target still holds its previous bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WriteErrorDto {
+    pub kind: String,
+    pub message: String,
+    pub target_unchanged: bool,
+    pub report: Option<ValidationReportDto>,
+    pub path: Option<String>,
+    pub backup: Option<String>,
+}
+
+/// `BackupInfoDto` (§9), an element of `list_backups`'s return array.
+/// `path` is the exact string to hand back to `restore_backup`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BackupInfoDto {
+    pub path: String,
+    pub file_name: String,
+    pub target_path: String,
+    pub size_bytes: u64,
+    pub created_unix_secs: Option<i64>,
+}

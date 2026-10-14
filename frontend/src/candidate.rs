@@ -58,11 +58,7 @@ impl CandidateDocument {
     }
 
     /// Renders the candidate back to a `DocumentDto`, in its current
-    /// order — what T12's `save`/`render_candidate` calls need. Not called
-    /// anywhere in T11 itself (this task only ever validates/stages via
-    /// `lines_excluding` + a single appended/replaced entry), kept because
-    /// it is the obvious, already-correct building block T12 needs next.
-    #[allow(dead_code)]
+    /// order — used by T12's `save` and `render_candidate` calls.
     pub fn to_document(&self) -> DocumentDto {
         DocumentDto {
             lines: self.lines.iter().map(|cl| cl.line.clone()).collect(),

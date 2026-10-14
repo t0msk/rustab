@@ -1,6 +1,8 @@
-//! Thin Tauri IPC bindings for the commands this task wires up (T11):
+//! Thin Tauri IPC bindings for the commands this app uses:
 //! `get_target_info`, `list_entries`, `validate_candidate`,
-//! `discover_devices`. See `docs/API_CONTRACT.md` for the exact contract.
+//! `discover_devices` (T11), plus `render_candidate`, `save`,
+//! `list_backups` and `restore_backup` (T12). See `docs/API_CONTRACT.md`
+//! for the exact contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -10,16 +12,14 @@
 //! injected by Tauri's core runtime into the webview regardless of the
 //! `app.withGlobalTauri` config flag (which only controls whether the
 //! friendlier `window.__TAURI__` wrapper is *also* injected).
-//!
-//! `save`, `list_backups`, `restore_backup` and `render_candidate` are
-//! intentionally not bound here — they are out of this task's scope (T12).
 
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::prelude::*;
 
 use crate::dto::DocumentDto;
 use crate::dto::{
-    CommandErrorDto, DeviceDiscoveryDto, DocumentViewDto, TargetInfoDto, ValidationReportDto,
+    BackupInfoDto, CommandErrorDto, DeviceDiscoveryDto, DocumentViewDto, TargetInfoDto,
+    ValidationReportDto, WriteErrorDto, WriteOutcomeDto,
 };
 
 #[wasm_bindgen]
@@ -92,4 +92,101 @@ pub async fn validate_candidate(candidate: &DocumentDto) -> Result<ValidationRep
 /// means a frontend bug, not an expected soft failure.
 pub async fn discover_devices() -> Result<DeviceDiscoveryDto, String> {
     invoke("discover_devices", &EmptyArgs {}).await
+}
+
+#[derive(Serialize)]
+struct RenderCandidateArgs<'a> {
+    candidate: &'a DocumentDto,
+}
+
+/// `render_candidate(candidate: DocumentDto) -> string`
+/// (API_CONTRACT.md §3.4). Contractually never rejects (it is pure, no
+/// I/O); a `Result::Err` here means a frontend bug.
+pub async fn render_candidate(candidate: &DocumentDto) -> Result<String, String> {
+    invoke("render_candidate", &RenderCandidateArgs { candidate }).await
+}
+
+/// `list_backups() -> BackupInfoDto[]` (API_CONTRACT.md §3.6), newest
+/// first, rejecting with a `CommandErrorDto` like the other read-side
+/// commands.
+pub async fn list_backups() -> Result<Vec<BackupInfoDto>, String> {
+    invoke("list_backups", &EmptyArgs {}).await
+}
+
+/// The rejection shape of `save`/`restore_backup` (API_CONTRACT.md §8):
+/// either the documented `WriteErrorDto`, or — per §1 — an unstructured
+/// rejection, which is a frontend bug rather than a user-facing outcome but
+/// is still captured here instead of panicking.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WriteError {
+    Write(WriteErrorDto),
+    Other(String),
+}
+
+impl WriteError {
+    /// A message safe to display verbatim (`WriteErrorDto::message` already
+    /// is, per the contract; the unstructured fallback is best-effort).
+    pub fn message(&self) -> String {
+        match self {
+            WriteError::Write(err) => err.message.clone(),
+            WriteError::Other(message) => message.clone(),
+        }
+    }
+
+    /// Whether the target is guaranteed to still hold its previous bytes
+    /// (API_CONTRACT.md §8: "`target_unchanged` is the field to branch
+    /// on"). The unstructured fallback case is not a documented outcome at
+    /// all, so it is treated conservatively as `false` — "the guarantee
+    /// cannot be made" — rather than assumed safe.
+    pub fn target_unchanged(&self) -> bool {
+        match self {
+            WriteError::Write(err) => err.target_unchanged,
+            WriteError::Other(_) => false,
+        }
+    }
+}
+
+/// Like `invoke`, but for the two commands that reject with a structured
+/// `WriteErrorDto` (`save`, `restore_backup`) rather than a plain message —
+/// callers need `target_unchanged` to decide how to recover
+/// (API_CONTRACT.md §8).
+async fn invoke_write<A: Serialize>(cmd: &str, args: &A) -> Result<WriteOutcomeDto, WriteError> {
+    let args_js = serde_wasm_bindgen::to_value(args).map_err(|err| {
+        WriteError::Other(format!("failed to serialize arguments for {cmd}: {err}"))
+    })?;
+    let promise = invoke_raw(cmd, args_js);
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(resolved) => serde_wasm_bindgen::from_value(resolved).map_err(|err| {
+            WriteError::Other(format!("failed to deserialize response from {cmd}: {err}"))
+        }),
+        Err(rejection) => {
+            match serde_wasm_bindgen::from_value::<WriteErrorDto>(rejection.clone()) {
+                Ok(write_error) => Err(WriteError::Write(write_error)),
+                Err(_) => Err(WriteError::Other(rejection_message(&rejection))),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SaveArgs<'a> {
+    candidate: &'a DocumentDto,
+}
+
+/// `save(candidate: DocumentDto) -> WriteOutcomeDto` (API_CONTRACT.md
+/// §3.5). The only write path in the application.
+pub async fn save(candidate: &DocumentDto) -> Result<WriteOutcomeDto, WriteError> {
+    invoke_write("save", &SaveArgs { candidate }).await
+}
+
+#[derive(Serialize)]
+struct RestoreBackupArgs<'a> {
+    backup_path: &'a str,
+}
+
+/// `restore_backup(backup_path: string) -> WriteOutcomeDto`
+/// (API_CONTRACT.md §3.7). `backup_path` must be a `path` value from a
+/// `list_backups` result for the current target.
+pub async fn restore_backup(backup_path: &str) -> Result<WriteOutcomeDto, WriteError> {
+    invoke_write("restore_backup", &RestoreBackupArgs { backup_path }).await
 }

@@ -8,20 +8,19 @@
 //! from `list_entries` on mount. `EntriesTable` renders it, deletes/edits
 //! mutate it directly, and `EntryDetailDrawer` stages adds/edits into it
 //! via `DrawerSaveResult` — nothing below `AppShell` ever calls a write
-//! command. `original_document` keeps the document exactly as loaded (never
-//! mutated after load, only replaced wholesale after a future `save` —
-//! T12), so `CandidateDocument::pending_count` can compare "what's staged"
-//! against "what's actually on disk" without any diffing logic living in
-//! this file. T12's diff view is expected to use the same two pieces of
-//! state (`original_document`, `candidate`) to build its Added/Modified/
-//! Removed grouping and its `render_candidate` call — no rewrite of this
-//! state shape should be needed.
+//! command except the diff-confirm/save and restore flows below.
+//! `original_document`/`original_text` keep the document exactly as loaded
+//! (replaced wholesale only after a successful `save`/`restore_backup`, or
+//! after a failed one that can't guarantee the target is unchanged — see
+//! `on_diff_confirm`/`on_restore_confirm`), so `CandidateDocument`'s own
+//! comparison helpers and `crate::diff` can build the diff view without any
+//! further bookkeeping here.
 
 use yew::prelude::*;
 
 use crate::api;
 use crate::candidate::CandidateDocument;
-use crate::components::backup_panel::BackupPanel;
+use crate::components::backup_panel::{format_timestamps, BackupPanel};
 use crate::components::backup_restore_confirm_dialog::BackupRestoreConfirmDialog;
 use crate::components::delete_confirm_dialog::DeleteConfirmDialog;
 use crate::components::diff_view::DiffView;
@@ -29,14 +28,53 @@ use crate::components::entries_table::{source_badge, EntriesTable, RowEntry};
 use crate::components::entry_detail_drawer::{DrawerMode, DrawerSaveResult, EntryDetailDrawer};
 use crate::components::header_bar::{HeaderBar, Tab};
 use crate::components::pending_changes_bar::PendingChangesBar;
+use crate::components::status_toast::{StatusToast, ToastKind};
 use crate::components::target_banner::TargetBanner;
-use crate::dto::{DocumentDto, LineDto, TargetInfoDto};
-use crate::mock::mock_backups;
+use crate::diff::compute_summary_diff;
+use crate::dto::{BackupInfoDto, DocumentDto, LineDto, TargetInfoDto};
+
+/// Reloads `original_document`/`original_text`/`candidate` from
+/// `list_entries` — "reload after every save" (API_CONTRACT.md §11) — used
+/// after a successful write and after a failed one that can't guarantee
+/// the target is unchanged.
+async fn reload_entries(
+    candidate: UseStateHandle<CandidateDocument>,
+    original_document: UseStateHandle<Option<DocumentDto>>,
+    original_text: UseStateHandle<String>,
+    list_error: UseStateHandle<Option<String>>,
+) {
+    match api::list_entries().await {
+        Ok(view) => {
+            candidate.set(CandidateDocument::from_document(&view.document));
+            original_text.set(view.text);
+            original_document.set(Some(view.document));
+            list_error.set(None);
+        }
+        Err(message) => list_error.set(Some(message)),
+    }
+}
+
+/// Reloads the backup list — called after mount and after every successful
+/// write, since a save prunes old backups and adds a new one.
+async fn reload_backups(
+    backups: UseStateHandle<Vec<BackupInfoDto>>,
+    backups_error: UseStateHandle<Option<String>>,
+) {
+    match api::list_backups().await {
+        Ok(list) => {
+            backups.set(list);
+            backups_error.set(None);
+        }
+        Err(message) => backups_error.set(Some(message)),
+    }
+}
 
 #[function_component(AppShell)]
 pub fn app_shell() -> Html {
     let active_tab = use_state(|| Tab::Entries);
-    let backups = use_state(mock_backups);
+
+    let backups: UseStateHandle<Vec<BackupInfoDto>> = use_state(Vec::new);
+    let backups_error: UseStateHandle<Option<String>> = use_state(|| None);
 
     // Live target info (§2), loaded from `get_target_info` on mount —
     // replaces T10's `MOCK_TARGET` constant.
@@ -44,9 +82,12 @@ pub fn app_shell() -> Html {
     let target_error: UseStateHandle<Option<String>> = use_state(|| None);
 
     // The document exactly as `list_entries` returned it (never mutated
-    // after load) and the in-memory candidate derived from it (mutated by
-    // every staged add/edit/delete). See the module doc comment.
+    // after load except by a reload) and the in-memory candidate derived
+    // from it (mutated by every staged add/edit/delete). See the module
+    // doc comment. `original_text` is the document's raw text, needed by
+    // the diff view's raw-text tab (`docs/API_CONTRACT.md` §5).
     let original_document: UseStateHandle<Option<DocumentDto>> = use_state(|| None);
+    let original_text: UseStateHandle<String> = use_state(String::new);
     let candidate = use_state(CandidateDocument::default);
     let list_error: UseStateHandle<Option<String>> = use_state(|| None);
 
@@ -59,6 +100,22 @@ pub fn app_shell() -> Html {
     let diff_view_open = use_state(|| false);
     let diff_confirm_checked = use_state(|| false);
     let restore_confirm_checked = use_state(|| false);
+
+    // `render_candidate`'s result for the currently open diff view's raw
+    // tab, and the save/restore in-flight + error state for their
+    // respective confirm buttons (`docs/UI_DESIGN.md` §6/§7).
+    let rendered_text: UseStateHandle<Option<String>> = use_state(|| None);
+    let diff_saving = use_state(|| false);
+    let diff_error: UseStateHandle<Option<String>> = use_state(|| None);
+    let restore_saving = use_state(|| false);
+    let restore_error: UseStateHandle<Option<String>> = use_state(|| None);
+
+    // Transient success notification (§6 point 4 / §7's "same ... success
+    // ... pattern"); auto-dismissed a few seconds after it's shown. A
+    // monotonically increasing request id guards against an older timeout
+    // clearing a toast a newer one just set.
+    let toast: UseStateHandle<Option<(ToastKind, String)>> = use_state(|| None);
+    let toast_request = use_mut_ref(|| 0u64);
 
     {
         let target = target.clone();
@@ -74,22 +131,71 @@ pub fn app_shell() -> Html {
         });
     }
     {
-        let original_document = original_document.clone();
         let candidate = candidate.clone();
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
         let list_error = list_error.clone();
         use_effect_with((), move |_| {
-            wasm_bindgen_futures::spawn_local(async move {
-                match api::list_entries().await {
-                    Ok(view) => {
-                        candidate.set(CandidateDocument::from_document(&view.document));
-                        original_document.set(Some(view.document));
-                    }
-                    Err(message) => list_error.set(Some(message)),
-                }
-            });
+            wasm_bindgen_futures::spawn_local(reload_entries(
+                candidate,
+                original_document,
+                original_text,
+                list_error,
+            ));
             || ()
         });
     }
+    {
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
+        use_effect_with((), move |_| {
+            wasm_bindgen_futures::spawn_local(reload_backups(backups, backups_error));
+            || ()
+        });
+    }
+    // Renders the exact "after" text for the raw-diff tab whenever the
+    // diff view opens (API_CONTRACT.md §3.4) — the candidate can't change
+    // while the modal is open (it's a blocking overlay), so this only
+    // needs to run once per open, not per keystroke.
+    {
+        let rendered_text = rendered_text.clone();
+        let candidate = candidate.clone();
+        use_effect_with(*diff_view_open, move |open| {
+            if *open {
+                let document = candidate.to_document();
+                let rendered_text = rendered_text.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Ok(text) = api::render_candidate(&document).await {
+                        rendered_text.set(Some(text));
+                    }
+                });
+            } else {
+                rendered_text.set(None);
+            }
+            || ()
+        });
+    }
+
+    let show_toast = {
+        let toast = toast.clone();
+        let toast_request = toast_request.clone();
+        Callback::from(move |(kind, message): (ToastKind, String)| {
+            let request_id = {
+                let mut counter = toast_request.borrow_mut();
+                *counter += 1;
+                *counter
+            };
+            toast.set(Some((kind, message)));
+            let toast = toast.clone();
+            let toast_request = toast_request.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(4000).await;
+                if *toast_request.borrow() == request_id {
+                    toast.set(None);
+                }
+            });
+        })
+    };
 
     let on_tab_change = {
         let active_tab = active_tab.clone();
@@ -142,7 +248,7 @@ pub fn app_shell() -> Html {
 
     // Stages the drawer's result into the in-memory candidate document.
     // Never calls a write command — the actual file is untouched until
-    // T12's diff-confirm flow runs `save`.
+    // the diff-confirm flow below runs `save`.
     let on_drawer_save = {
         let drawer_mode = drawer_mode.clone();
         let editing_index = editing_index.clone();
@@ -185,42 +291,169 @@ pub fn app_shell() -> Html {
 
     let on_review = {
         let diff_view_open = diff_view_open.clone();
-        Callback::from(move |()| diff_view_open.set(true))
+        let diff_error = diff_error.clone();
+        Callback::from(move |()| {
+            diff_error.set(None);
+            diff_view_open.set(true);
+        })
     };
     let on_diff_cancel = {
         let diff_view_open = diff_view_open.clone();
-        Callback::from(move |()| diff_view_open.set(false))
+        let diff_confirm_checked = diff_confirm_checked.clone();
+        let diff_error = diff_error.clone();
+        let diff_saving = diff_saving.clone();
+        Callback::from(move |()| {
+            // Not reachable while `*diff_saving` is true (the Cancel button
+            // is disabled then — see the `DiffView` render below), but
+            // guard anyway rather than ever closing the modal out from
+            // under an in-flight save.
+            if *diff_saving {
+                return;
+            }
+            diff_view_open.set(false);
+            diff_confirm_checked.set(false);
+            diff_error.set(None);
+        })
     };
     let on_diff_confirm = {
-        // Stub only: building the real diff and calling `save` is T12's
-        // job (`docs/UI_DESIGN.md` §6's "no save action that skips the
-        // diff view" rule means this still must not short-circuit into a
-        // write). This only closes the modal; staged changes remain
-        // staged, matching "Cancel" — proven here as the show/hide round
-        // trip, same as T10.
+        let candidate = candidate.clone();
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
+        let list_error = list_error.clone();
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
         let diff_view_open = diff_view_open.clone();
-        Callback::from(move |()| diff_view_open.set(false))
+        let diff_confirm_checked = diff_confirm_checked.clone();
+        let diff_saving = diff_saving.clone();
+        let diff_error = diff_error.clone();
+        let show_toast = show_toast.clone();
+        Callback::from(move |()| {
+            if *diff_saving {
+                return;
+            }
+            let document = candidate.to_document();
+            let candidate = candidate.clone();
+            let original_document = original_document.clone();
+            let original_text = original_text.clone();
+            let list_error = list_error.clone();
+            let backups = backups.clone();
+            let backups_error = backups_error.clone();
+            let diff_view_open = diff_view_open.clone();
+            let diff_confirm_checked = diff_confirm_checked.clone();
+            let diff_saving = diff_saving.clone();
+            let diff_error = diff_error.clone();
+            let show_toast = show_toast.clone();
+            diff_saving.set(true);
+            diff_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::save(&document).await {
+                    Ok(_outcome) => {
+                        reload_entries(candidate, original_document, original_text, list_error)
+                            .await;
+                        reload_backups(backups, backups_error).await;
+                        diff_saving.set(false);
+                        diff_confirm_checked.set(false);
+                        diff_view_open.set(false);
+                        show_toast.emit((ToastKind::Success, "Changes saved.".to_string()));
+                    }
+                    Err(write_error) => {
+                        // API_CONTRACT.md §8: "target_unchanged is the
+                        // field to branch on" — `true` keeps the user's
+                        // pending changes in place and offers retry;
+                        // `false` means the write's guarantee can't be
+                        // made, so reload what's actually on disk instead.
+                        let unchanged = write_error.target_unchanged();
+                        diff_error.set(Some(write_error.message()));
+                        if !unchanged {
+                            reload_entries(candidate, original_document, original_text, list_error)
+                                .await;
+                        }
+                        diff_saving.set(false);
+                    }
+                }
+            });
+        })
     };
 
     let on_restore = {
         let restore_target = restore_target.clone();
-        Callback::from(move |idx: usize| restore_target.set(Some(idx)))
+        let restore_error = restore_error.clone();
+        Callback::from(move |idx: usize| {
+            restore_error.set(None);
+            restore_target.set(Some(idx));
+        })
     };
     let on_restore_cancel = {
         let restore_target = restore_target.clone();
         let restore_confirm_checked = restore_confirm_checked.clone();
+        let restore_error = restore_error.clone();
+        let restore_saving = restore_saving.clone();
         Callback::from(move |()| {
+            if *restore_saving {
+                return;
+            }
             restore_target.set(None);
             restore_confirm_checked.set(false);
+            restore_error.set(None);
         })
     };
     let on_restore_confirm = {
-        // Stub only: no real restore happens in T11 (T12's job).
         let restore_target = restore_target.clone();
         let restore_confirm_checked = restore_confirm_checked.clone();
+        let restore_saving = restore_saving.clone();
+        let restore_error = restore_error.clone();
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
+        let candidate = candidate.clone();
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
+        let list_error = list_error.clone();
+        let show_toast = show_toast.clone();
         Callback::from(move |()| {
-            restore_target.set(None);
-            restore_confirm_checked.set(false);
+            if *restore_saving {
+                return;
+            }
+            let Some(idx) = *restore_target else {
+                return;
+            };
+            let Some(backup_path) = backups.get(idx).map(|b| b.path.clone()) else {
+                return;
+            };
+            let restore_target = restore_target.clone();
+            let restore_confirm_checked = restore_confirm_checked.clone();
+            let restore_saving = restore_saving.clone();
+            let restore_error = restore_error.clone();
+            let backups = backups.clone();
+            let backups_error = backups_error.clone();
+            let candidate = candidate.clone();
+            let original_document = original_document.clone();
+            let original_text = original_text.clone();
+            let list_error = list_error.clone();
+            let show_toast = show_toast.clone();
+            restore_saving.set(true);
+            restore_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::restore_backup(&backup_path).await {
+                    Ok(_outcome) => {
+                        reload_entries(candidate, original_document, original_text, list_error)
+                            .await;
+                        reload_backups(backups, backups_error).await;
+                        restore_saving.set(false);
+                        restore_target.set(None);
+                        restore_confirm_checked.set(false);
+                        show_toast.emit((ToastKind::Success, "Backup restored.".to_string()));
+                    }
+                    Err(write_error) => {
+                        let unchanged = write_error.target_unchanged();
+                        restore_error.set(Some(write_error.message()));
+                        if !unchanged {
+                            reload_entries(candidate, original_document, original_text, list_error)
+                                .await;
+                        }
+                        restore_saving.set(false);
+                    }
+                }
+            });
         })
     };
 
@@ -240,6 +473,14 @@ pub fn app_shell() -> Html {
         .as_ref()
         .map(|doc| candidate.pending_count(doc))
         .unwrap_or(0);
+
+    let summary_diff = original_document
+        .as_ref()
+        .map(|doc| compute_summary_diff(doc, &candidate))
+        .unwrap_or_default();
+    let raw_diff = rendered_text
+        .as_ref()
+        .map(|new_text| crate::diff::compute_raw_diff(original_text.as_str(), new_text));
 
     let delete_dialog_data: Option<(AttrValue, AttrValue, AttrValue)> =
         (*delete_target).and_then(|idx| {
@@ -271,9 +512,10 @@ pub fn app_shell() -> Html {
 
     let restore_dialog_data: Option<(AttrValue, AttrValue)> = (*restore_target).and_then(|idx| {
         backups.get(idx).map(|b| {
+            let (relative, _iso) = format_timestamps(b.created_unix_secs);
             (
-                AttrValue::from(b.iso_timestamp),
-                AttrValue::from(b.target_path),
+                AttrValue::from(relative),
+                AttrValue::from(b.target_path.clone()),
             )
         })
     });
@@ -311,6 +553,10 @@ pub fn app_shell() -> Html {
                             on_add_entry={on_add_entry}
                         />
                     }
+                } else if let Some(err) = &*backups_error {
+                    <div class="rounded-md border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-4 py-3 text-sm" role="alert">
+                        { format!("Could not load backups: {err}") }
+                    </div>
                 } else {
                     <BackupPanel backups={(*backups).clone()} on_restore={on_restore} />
                 }
@@ -341,6 +587,10 @@ pub fn app_shell() -> Html {
                     }}
                     on_cancel={on_diff_cancel}
                     on_confirm={on_diff_confirm}
+                    summary={summary_diff}
+                    raw_diff={raw_diff}
+                    saving={*diff_saving}
+                    error={(*diff_error).clone().map(AttrValue::from)}
                 />
             }
 
@@ -356,7 +606,13 @@ pub fn app_shell() -> Html {
                     }}
                     on_cancel={on_restore_cancel}
                     on_confirm={on_restore_confirm}
+                    saving={*restore_saving}
+                    error={(*restore_error).clone().map(AttrValue::from)}
                 />
+            }
+
+            if let Some((kind, message)) = (*toast).clone() {
+                <StatusToast kind={kind} message={AttrValue::from(message)} />
             }
         </div>
     }

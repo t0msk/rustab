@@ -1,17 +1,23 @@
 //! `StatusToast` — transient success/error notification.
 //!
-//! No real save/restore result exists yet (T10 is mock-only), so this
-//! component is a self-contained, presentational shell: given a message and
-//! severity it renders the toast; nothing in this task triggers it from a
-//! real operation. Deliberately deferred: present per the §9 inventory,
-//! ready for T12 to trigger on save/restore success or failure.
-#![allow(dead_code)]
+//! A self-contained, presentational shell: given a message and severity it
+//! renders the toast. `AppShell` (T12) triggers it on a successful `save`/
+//! `restore_backup`, auto-dismissing it after a few seconds; a *failed*
+//! save/restore shows its error inside the still-open modal instead
+//! (`docs/UI_DESIGN.md` §6 point 4), so only `ToastKind::Success` is
+//! actually used today — `ToastKind::Error` stays available for any future
+//! fire-and-forget failure that isn't modal-gated.
 
 use yew::prelude::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     Success,
+    /// Not constructed anywhere yet: every failure path T12 wires
+    /// (`save`/`restore_backup`) shows its error inside the still-open
+    /// modal instead (`docs/UI_DESIGN.md` §6 point 4), not as a toast.
+    /// Kept for a future fire-and-forget failure that isn't modal-gated.
+    #[allow(dead_code)]
     Error,
 }
 
