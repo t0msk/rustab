@@ -72,6 +72,15 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      # frontend/ is a separate Cargo package (its own Cargo.toml, not a
+      # workspace member) and is therefore not covered by the check above.
+      # Its unit tests (e.g. diff-computation logic, the real-target
+      # confirm-checkbox safety gating) are plain Rust and run on the
+      # native host target, not wasm32.
+      - name: cargo test (frontend)
+        working-directory: frontend
+        run: cargo test
+
   build-tauri:
     name: Build Tauri app
     runs-on: ubuntu-latest
