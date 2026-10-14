@@ -44,7 +44,7 @@
 
 use fstab_core::discovery::{DeviceInfo, DiscoveryResult};
 use fstab_core::model::{Document, FstabEntry, FstabOption, Line, Options, SourceId};
-use fstab_core::validate::{Finding, Severity, ValidationReport};
+use fstab_core::validate::{Finding, FindingField, Severity, ValidationReport};
 use fstab_core::writer::{
     CreateBackupError, CreateBackupOutcome, FsyncStage, WriteError, WriteOutcome,
 };
@@ -394,6 +394,30 @@ impl From<Severity> for SeverityDto {
     }
 }
 
+/// Which of an entry's fields a [`FindingDto`] is about, when it is about
+/// exactly one. Mirrors [`FindingField`]; see that type's doc comment for
+/// why `None` on [`FindingDto::field`] does not mean "unknown".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationFieldDto {
+    /// The entry's mount point.
+    MountPoint,
+    /// The entry's source device/identifier.
+    Source,
+    /// The entry's filesystem type.
+    FsType,
+}
+
+impl From<FindingField> for ValidationFieldDto {
+    fn from(field: FindingField) -> Self {
+        match field {
+            FindingField::MountPoint => ValidationFieldDto::MountPoint,
+            FindingField::Source => ValidationFieldDto::Source,
+            FindingField::FsType => ValidationFieldDto::FsType,
+        }
+    }
+}
+
 /// A single validation finding, ready to display.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingDto {
@@ -401,6 +425,15 @@ pub struct FindingDto {
     pub severity: SeverityDto,
     /// Human-readable message, suitable for showing verbatim.
     pub message: String,
+    /// Which single field of an entry this finding is about, if any. `null`
+    /// means this finding is not about exactly one field — see
+    /// [`FindingField`]'s doc comment for the full explanation.
+    pub field: Option<ValidationFieldDto>,
+    /// The 0-based index into the validated `DocumentDto.lines` array of the
+    /// single line this finding is about, if any — the same identity scheme
+    /// [`LineDto`]'s doc comment already describes elsewhere in this file.
+    /// `null` for the same reason [`Self::field`] is `null`.
+    pub line_index: Option<usize>,
 }
 
 impl From<&Finding> for FindingDto {
@@ -408,6 +441,8 @@ impl From<&Finding> for FindingDto {
         FindingDto {
             severity: SeverityDto::from(finding.severity),
             message: finding.message.clone(),
+            field: finding.field.map(ValidationFieldDto::from),
+            line_index: finding.line_index,
         }
     }
 }
@@ -996,12 +1031,30 @@ mod tests {
             findings: vec![FindingDto {
                 severity: SeverityDto::Warning,
                 message: "m".to_string(),
+                field: None,
+                line_index: None,
             }],
             has_errors: false,
         };
         assert_eq!(
             serde_json::to_string(&report).expect("serialize"),
-            r#"{"findings":[{"severity":"warning","message":"m"}],"has_errors":false}"#
+            r#"{"findings":[{"severity":"warning","message":"m","field":null,"line_index":null}],"has_errors":false}"#
+        );
+
+        // A field/line-tagged finding — the shape `mount_point_missing`,
+        // `malformed_uuid`/`malformed_partuuid`, and `empty_fs_type` produce.
+        let tagged_report = ValidationReportDto {
+            findings: vec![FindingDto {
+                severity: SeverityDto::Warning,
+                message: "m".to_string(),
+                field: Some(ValidationFieldDto::MountPoint),
+                line_index: Some(2),
+            }],
+            has_errors: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&tagged_report).expect("serialize"),
+            r#"{"findings":[{"severity":"warning","message":"m","field":"mount_point","line_index":2}],"has_errors":false}"#
         );
 
         let outcome = WriteOutcomeDto {
@@ -1147,6 +1200,25 @@ mod tests {
         }
     }
 
+    /// Every `field` spelling of [`ValidationFieldDto`], pinned individually
+    /// for the same reason `every_error_kind_spelling_is_exactly_as_documented`
+    /// pins the `kind` enums: the frontend matches on these strings, so a
+    /// renamed variant would otherwise only break silently at runtime.
+    #[test]
+    fn every_validation_field_spelling_is_exactly_as_documented() {
+        let field_kinds = [
+            (ValidationFieldDto::MountPoint, "mount_point"),
+            (ValidationFieldDto::Source, "source"),
+            (ValidationFieldDto::FsType, "fs_type"),
+        ];
+        for (field, spelling) in field_kinds {
+            assert_eq!(
+                serde_json::to_string(&field).expect("serialize"),
+                format!("\"{spelling}\"")
+            );
+        }
+    }
+
     /// Each `fstab-core` backup-creation failure maps to the kind the
     /// contract promises, and carries the message `Display` already worded.
     ///
@@ -1284,6 +1356,8 @@ mod tests {
                 findings: vec![Finding {
                     severity: Severity::Error,
                     message: "nope".to_string(),
+                    field: None,
+                    line_index: None,
                 }],
             }),
             WriteError::InvalidTarget {
@@ -1364,10 +1438,14 @@ mod tests {
                 Finding {
                     severity: Severity::Error,
                     message: "duplicate mount point".to_string(),
+                    field: None,
+                    line_index: None,
                 },
                 Finding {
                     severity: Severity::Warning,
                     message: "mount point does not exist".to_string(),
+                    field: Some(FindingField::MountPoint),
+                    line_index: Some(1),
                 },
             ],
         };
@@ -1380,6 +1458,12 @@ mod tests {
         assert_eq!(carried.findings.len(), 2);
         assert_eq!(carried.findings[0].severity, SeverityDto::Error);
         assert_eq!(carried.findings[1].severity, SeverityDto::Warning);
+        assert_eq!(carried.findings[0].field, None);
+        assert_eq!(
+            carried.findings[1].field,
+            Some(ValidationFieldDto::MountPoint)
+        );
+        assert_eq!(carried.findings[1].line_index, Some(1));
     }
 
     /// A `Verify` failure forwards the backup path (the user's way out) but

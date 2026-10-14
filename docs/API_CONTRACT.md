@@ -694,7 +694,11 @@ one flag the danger banner and the escalation decision both read.
 ### `ValidationReportDto`
 
 ```json
-{ "findings": [ { "severity": "warning", "message": "..." } ],
+{ "findings": [
+    { "severity": "warning", "message": "...", "field": null, "line_index": null },
+    { "severity": "warning", "message": "mount point \"/mnt/usb\" does not currently exist on disk",
+      "field": "mount_point", "line_index": 2 }
+  ],
   "has_errors": false }
 ```
 
@@ -702,6 +706,30 @@ one flag the danger banner and the escalation decision both read.
 is written for a user and is safe to display verbatim; it may be multi-line
 (the `findmnt` finding includes `findmnt`'s own output). `has_errors` is
 precomputed so the UI's "can I save?" test cannot disagree with the backend's.
+
+`field` and `line_index` let the UI render a finding next to the specific
+input it is about, instead of only in a flat list:
+
+- `field` is `"mount_point"`, `"source"`, or `"fs_type"` when the finding is
+  about exactly one of those fields on one entry, and `null` otherwise.
+  `mount_point_missing` sets `"mount_point"`; `malformed_uuid` and
+  `malformed_partuuid` set `"source"`; `empty_fs_type` sets `"fs_type"`.
+- `line_index` is the 0-based index, into the `DocumentDto.lines` array that
+  was sent to `validate_candidate`, of the single line the finding is about
+  — the same identity scheme `LineDto` already uses elsewhere in this
+  contract (a line's identity is simply its index in `lines`). It is set
+  exactly when `field` is set (both or neither).
+- Both are `null` for every document-level finding: duplicate mount point
+  (spans two or more lines, not one), a malformed line present (not a parsed
+  entry), the `findmnt --verify` output, and the degraded-mode warning
+  (`findmnt` unavailable) — none of these are about exactly one field/line.
+
+Because `validate_candidate` can be called against a document containing
+several entries, a response can carry several independent findings with the
+same `field` but different `line_index` values (e.g. two different entries
+both missing their mount point) — a caller must key off *both* `field` and
+`line_index` together to tell which entry a given finding is about, not
+`field` alone.
 
 Typical findings: duplicate mount point, empty filesystem type, malformed
 `UUID=`/`PARTUUID=` value, mount point missing on disk (warning), malformed
@@ -900,7 +928,8 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 
 ```json
 {"target":{"path":"/p","is_real":false,"source":"sandbox_default"},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}
-{"findings":[{"severity":"warning","message":"m"}],"has_errors":false}
+{"findings":[{"severity":"warning","message":"m","field":null,"line_index":null}],"has_errors":false}
+{"findings":[{"severity":"warning","message":"m","field":"mount_point","line_index":2}],"has_errors":false}
 {"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true}
 {"kind":"privilege_escalation","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null}
 {"kind":"not_utf8","message":"m"}
@@ -911,12 +940,14 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 {"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}
 ```
 
-The fifth line above is `CommandErrorDto` and the sixth is
-`DeleteBackupErrorDto` — they are the same two-field shape, distinguished only
-by which command produced them and by which `kind` strings are possible. The
-same goes for the ninth, `CreateBackupErrorDto`. The eighth is
-`CreateBackupOutcomeDto`, which only ever travels inside the elevated
-protocol (§4.3), never to the frontend.
+The second and third lines above are both `ValidationReportDto`, showing an
+untagged (`field`/`line_index` both `null`) and a field/line-tagged finding
+respectively — see §7 for what the two extra fields mean. The sixth line is
+`CommandErrorDto` and the seventh is `DeleteBackupErrorDto` — they are the
+same two-field shape, distinguished only by which command produced them and
+by which `kind` strings are possible. The same goes for the tenth,
+`CreateBackupErrorDto`. The ninth is `CreateBackupOutcomeDto`, which only
+ever travels inside the elevated protocol (§4.3), never to the frontend.
 
 Every `kind` spelling of all three error-kind enums is pinned individually by
 `dto::tests::every_error_kind_spelling_is_exactly_as_documented`, because the
@@ -928,6 +959,10 @@ frontend matches these strings exhaustively:
   `privilege_escalation`, `delete`.
 - `CreateBackupErrorKindDto`: `target_resolution`, `target_missing`,
   `invalid_target`, `backup`, `privilege_escalation`.
+
+Likewise, every `field` spelling of `ValidationFieldDto` (§7) is pinned
+individually by `dto::tests::every_validation_field_spelling_is_exactly_as_documented`:
+`mount_point`, `source`, `fs_type`.
 
 ---
 

@@ -85,6 +85,27 @@ pub enum Severity {
     Warning,
 }
 
+/// Which of an entry's fields a [`Finding`] is about, when it is about
+/// exactly one.
+///
+/// This is a domain concept — one of the six fields of a
+/// [`crate::model::FstabEntry`] line — not a UI concept; a GUI consuming
+/// this is free to map each variant onto whichever input widget shows that
+/// field. [`Finding::field`] being `None` does not mean "unknown"; it means
+/// the finding is not about exactly one field/line at all — either it spans
+/// multiple lines (e.g. a mount point shared by two entries), or it isn't
+/// about a parsed entry in the first place (e.g. a [`Line::Malformed`] line,
+/// or the whole-document `findmnt --verify` result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingField {
+    /// The entry's mount point (second fstab field).
+    MountPoint,
+    /// The entry's source device/identifier (first fstab field).
+    Source,
+    /// The entry's filesystem type (third fstab field).
+    FsType,
+}
+
 /// A single structural or semantic validation finding, with a severity and a
 /// human-readable message describing the problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,24 +117,66 @@ pub struct Finding {
     /// directly to a user (e.g. in the GUI's inline validation feedback, per
     /// `docs/SPEC.md` §9).
     pub message: String,
+    /// Which single field of an entry this finding is about, if any. See
+    /// [`FindingField`]'s doc comment for exactly what `None` means here —
+    /// it is not "unknown", it is "not applicable to a single field".
+    pub field: Option<FindingField>,
+    /// The 0-based index, into the validated [`Document`]'s `lines`, of the
+    /// single line this finding is about, if any. This reuses the project's
+    /// existing convention that a line's identity is simply its index in
+    /// the lines array (already documented on `LineDto` in both DTO
+    /// crates) rather than inventing a new identity scheme — a caller that
+    /// knows which `Document`/`DocumentDto` was validated can use this
+    /// index to look the exact line back up. `None` for the same reason
+    /// [`Self::field`] is `None`: the finding is not about exactly one
+    /// line.
+    pub line_index: Option<usize>,
 }
 
 impl Finding {
     /// Constructs a blocking [`Severity::Error`] finding with the given
-    /// message.
+    /// message, not localized to any one field/line.
     fn error(message: impl Into<String>) -> Self {
         Finding {
             severity: Severity::Error,
             message: message.into(),
+            field: None,
+            line_index: None,
         }
     }
 
     /// Constructs an advisory [`Severity::Warning`] finding with the given
-    /// message.
+    /// message, not localized to any one field/line.
     fn warning(message: impl Into<String>) -> Self {
         Finding {
             severity: Severity::Warning,
             message: message.into(),
+            field: None,
+            line_index: None,
+        }
+    }
+
+    /// Constructs a blocking [`Severity::Error`] finding localized to a
+    /// single field of a single line — see [`FindingField`] and
+    /// [`Self::line_index`] for what the two extra parameters mean.
+    fn error_at(message: impl Into<String>, field: FindingField, line_index: usize) -> Self {
+        Finding {
+            severity: Severity::Error,
+            message: message.into(),
+            field: Some(field),
+            line_index: Some(line_index),
+        }
+    }
+
+    /// Constructs an advisory [`Severity::Warning`] finding localized to a
+    /// single field of a single line — see [`FindingField`] and
+    /// [`Self::line_index`] for what the two extra parameters mean.
+    fn warning_at(message: impl Into<String>, field: FindingField, line_index: usize) -> Self {
+        Finding {
+            severity: Severity::Warning,
+            message: message.into(),
+            field: Some(field),
+            line_index: Some(line_index),
         }
     }
 }
@@ -228,13 +291,22 @@ fn malformed_line_findings(doc: &Document) -> Vec<Finding> {
 /// `fstab-core` API (e.g. by a future GUI add/edit form) bypassing the
 /// parser entirely.
 fn empty_fs_type_findings(doc: &Document) -> Vec<Finding> {
-    doc.entries()
-        .filter(|entry| entry.fs_type.is_empty())
-        .map(|entry| {
-            Finding::error(format!(
-                "entry for mount point {:?} has an empty filesystem type",
-                entry.mount_point
-            ))
+    doc.lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| match line {
+            Line::Entry(entry) if entry.fs_type.is_empty() => Some((idx, entry)),
+            _ => None,
+        })
+        .map(|(idx, entry)| {
+            Finding::error_at(
+                format!(
+                    "entry for mount point {:?} has an empty filesystem type",
+                    entry.mount_point
+                ),
+                FindingField::FsType,
+                idx,
+            )
         })
         .collect()
 }
@@ -277,22 +349,32 @@ fn duplicate_mount_point_findings(doc: &Document) -> Vec<Finding> {
 /// stricter than that would risk rejecting valid-but-uncommon real-world
 /// values this crate has no way to double-check against actual hardware.
 fn malformed_uuid_findings(doc: &Document) -> Vec<Finding> {
-    doc.entries()
-        .filter_map(|entry| match &entry.source {
+    doc.lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| match line {
+            Line::Entry(entry) => Some((idx, entry)),
+            _ => None,
+        })
+        .filter_map(|(idx, entry)| match &entry.source {
             SourceId::Uuid(value) if !looks_like_uuid(value) => {
-                Some(("UUID", value, &entry.mount_point))
+                Some((idx, "UUID", value, &entry.mount_point))
             }
             SourceId::PartUuid(value) if !looks_like_uuid(value) => {
-                Some(("PARTUUID", value, &entry.mount_point))
+                Some((idx, "PARTUUID", value, &entry.mount_point))
             }
             _ => None,
         })
-        .map(|(prefix, value, mount_point)| {
-            Finding::error(format!(
-                "entry for mount point {mount_point:?} has a malformed {prefix}= value \
-                 {value:?}; expected the standard 8-4-4-4-12 hex UUID shape \
-                 (e.g. 11111111-2222-3333-4444-555555555555)"
-            ))
+        .map(|(idx, prefix, value, mount_point)| {
+            Finding::error_at(
+                format!(
+                    "entry for mount point {mount_point:?} has a malformed {prefix}= value \
+                     {value:?}; expected the standard 8-4-4-4-12 hex UUID shape \
+                     (e.g. 11111111-2222-3333-4444-555555555555)"
+                ),
+                FindingField::Source,
+                idx,
+            )
         })
         .collect()
 }
@@ -336,14 +418,24 @@ fn looks_like_uuid(value: &str) -> bool {
 /// crate does not currently expose (see `model.rs`'s module docs); not worth
 /// adding for an advisory-only check unless a concrete need arises.
 fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
-    doc.entries()
-        .filter(|entry| entry.mount_point != SWAP_NONE_MOUNT_POINT)
-        .filter(|entry| !Path::new(&entry.mount_point).exists())
-        .map(|entry| {
-            Finding::warning(format!(
-                "mount point {:?} does not currently exist on disk",
-                entry.mount_point
-            ))
+    doc.lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| match line {
+            Line::Entry(entry) => Some((idx, entry)),
+            _ => None,
+        })
+        .filter(|(_, entry)| entry.mount_point != SWAP_NONE_MOUNT_POINT)
+        .filter(|(_, entry)| !Path::new(&entry.mount_point).exists())
+        .map(|(idx, entry)| {
+            Finding::warning_at(
+                format!(
+                    "mount point {:?} does not currently exist on disk",
+                    entry.mount_point
+                ),
+                FindingField::MountPoint,
+                idx,
+            )
         })
         .collect()
 }
@@ -620,6 +712,31 @@ mod tests {
         assert!(empty_fs_type_findings(&doc_with_entry(entry)).is_empty());
     }
 
+    #[test]
+    fn empty_fs_type_finding_is_tagged_with_its_field_and_real_line_index() {
+        // The offending entry is preceded by a comment and a blank line, so
+        // a correct `line_index` of 2 (not "the first entry", which would
+        // coincidentally also be the case if this test only had one
+        // preceding line) proves the index is really `doc.lines`' index,
+        // not just "the first/only entry" by accident.
+        let doc = Document::from_lines(vec![
+            Line::Comment(" a comment".to_string()),
+            Line::Blank,
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sda1".into()),
+                "/mnt",
+                "",
+                Options::new(),
+                0,
+                0,
+            )),
+        ]);
+        let findings = empty_fs_type_findings(&doc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].field, Some(FindingField::FsType));
+        assert_eq!(findings[0].line_index, Some(2));
+    }
+
     // --- Structural: duplicate mount points ---
 
     #[test]
@@ -646,6 +763,10 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
         assert!(findings[0].message.contains("/data"));
+        // Regression guard: this finding spans two lines, so it must never
+        // be tagged as if it were about a single field/line.
+        assert_eq!(findings[0].field, None);
+        assert_eq!(findings[0].line_index, None);
     }
 
     #[test]
@@ -736,6 +857,26 @@ mod tests {
     }
 
     #[test]
+    fn malformed_uuid_finding_is_tagged_with_its_field_and_real_line_index() {
+        let doc = Document::from_lines(vec![
+            Line::Comment(" a comment".to_string()),
+            Line::Blank,
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("not-a-real-uuid".into()),
+                "/",
+                "ext4",
+                Options::new(),
+                0,
+                1,
+            )),
+        ]);
+        let findings = malformed_uuid_findings(&doc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].field, Some(FindingField::Source));
+        assert_eq!(findings[0].line_index, Some(2));
+    }
+
+    #[test]
     fn malformed_partuuid_shape_is_an_error() {
         let doc = doc_with_entry(FstabEntry::new(
             SourceId::PartUuid("1234".into()),
@@ -766,6 +907,10 @@ mod tests {
         let findings = malformed_line_findings(&doc);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
+        // Regression guard: a malformed line is not a parsed entry, so it
+        // must never be tagged with a field/line.
+        assert_eq!(findings[0].field, None);
+        assert_eq!(findings[0].line_index, None);
     }
 
     // --- Structural: mount point existence (advisory) ---
@@ -809,6 +954,62 @@ mod tests {
             0,
         ));
         assert!(mount_point_missing_findings(&doc).is_empty());
+    }
+
+    #[test]
+    fn mount_point_missing_finding_is_tagged_with_its_field_and_real_line_index() {
+        let doc = Document::from_lines(vec![
+            Line::Comment(" a comment".to_string()),
+            Line::Blank,
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+                "/this/path/almost-certainly/does/not/exist/on/any/machine",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )),
+        ]);
+        let findings = mount_point_missing_findings(&doc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].field, Some(FindingField::MountPoint));
+        assert_eq!(findings[0].line_index, Some(2));
+    }
+
+    /// The exact scenario T21.3 of `PROJECT_PLAN.md` exists to get right: a
+    /// document with two entries that both have a missing mount point must
+    /// produce two independently-tagged `MountPoint` findings, each pointing
+    /// at its own entry's real `line_index` — not, say, both pointing at the
+    /// same index, or the two findings being indistinguishable from each
+    /// other by field alone.
+    #[test]
+    fn two_missing_mount_points_produce_two_findings_with_distinct_line_indexes() {
+        let doc = Document::from_lines(vec![
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+                "/this/path/almost-certainly/does/not/exist/on/any/machine/one",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )),
+            Line::Comment(" separating comment".to_string()),
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("22222222-3333-4444-5555-666666666666".into()),
+                "/this/path/almost-certainly/does/not/exist/on/any/machine/two",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )),
+        ]);
+        let findings = mount_point_missing_findings(&doc);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].field, Some(FindingField::MountPoint));
+        assert_eq!(findings[1].field, Some(FindingField::MountPoint));
+        assert_eq!(findings[0].line_index, Some(0));
+        assert_eq!(findings[1].line_index, Some(2));
+        assert_ne!(findings[0].line_index, findings[1].line_index);
     }
 
     // --- Semantic: pure decision logic (findmnt I/O-vs-logic split) ---
