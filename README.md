@@ -1,6 +1,6 @@
 # Rustab
 
-![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white) [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/t0msk)
+![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white) [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/t0msk) [![X](https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white)](https://x.com/TomskDEV)
 
 A modern, native Linux desktop GUI for viewing, editing, adding, and removing entries in `/etc/fstab`, built with stability and data safety as the top priority.
 
@@ -10,7 +10,7 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Clear target indicator & mandatory diff review**: A prominent real-vs-sandbox banner and a required diff-before-save step ensure you always know what you're changing and can review every modification before it persists.
 - **Dev sandbox by default**: Rustab defaults to a safe per-user sandbox file; pointing at the real `/etc/fstab` is an explicit, auditable choice.
 
-![Discord Badge](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white) · [GitHub Sponsors](https://github.com/sponsors/t0msk)
+![Discord Badge](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white) · [GitHub Sponsors](https://github.com/sponsors/t0msk) · [X / Twitter](https://x.com/TomskDEV)
 
 ## Contents
 
@@ -149,6 +149,7 @@ See `CONTRIBUTING.md` for guidelines on setting up the dev environment, running 
 
 - **Email**: [rustab@tomsk.dev](mailto:rustab@tomsk.dev)
 - **Discord**: [Join the dev server](https://discord.gg/vymDkeQnpj)
+- **X / Twitter**: [@TomskDEV](https://x.com/TomskDEV)
 - **Sponsor**: [Support on GitHub Sponsors](https://github.com/sponsors/t0msk)
 
 Have a question, found a bug, or want to contribute? Reach out on Discord or email — all are welcome.
