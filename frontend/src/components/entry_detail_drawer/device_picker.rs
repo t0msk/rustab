@@ -13,6 +13,12 @@ use crate::dto::DeviceInfoDto;
 pub struct DevicePickerProps {
     pub devices: Vec<DeviceInfoDto>,
     pub lsblk_available: bool,
+    /// The source-value input's current text. Devices whose label doesn't
+    /// contain this (case-insensitively) are filtered out, so typing
+    /// narrows the list instead of always showing every device — once a
+    /// device is picked, its full value lands back in this same field, so
+    /// the list naturally narrows to just that one match.
+    pub filter: String,
     /// Emits the full picked device; the caller decides which field
     /// (`path`/`uuid`/`label`/...) to pull the source value from, since
     /// that depends on the currently selected source *type*, which this
@@ -42,8 +48,19 @@ fn device_label(device: &DeviceInfoDto) -> String {
 
 #[function_component(DevicePicker)]
 pub fn device_picker(props: &DevicePickerProps) -> Html {
+    let needle = props.filter.trim().to_lowercase();
+    let filtered: Vec<&DeviceInfoDto> = props
+        .devices
+        .iter()
+        .filter(|device| needle.is_empty() || device_label(device).to_lowercase().contains(&needle))
+        .collect();
+
     html! {
-        <div class="mt-2 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 p-2">
+        // Hidden until something in the enclosing `.group` (the source-value
+        // input or a device button below) has focus, so a long device list
+        // doesn't permanently push the rest of the form down — see the
+        // `group` wrapper in `render_source_value_field`.
+        <div class="hidden group-focus-within:block mt-2 max-h-48 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 p-2">
             if !props.lsblk_available {
                 <p class="text-xs text-slate-500 dark:text-slate-400 px-1 py-1">
                     { "Device discovery unavailable — enter a value manually" }
@@ -52,10 +69,14 @@ pub fn device_picker(props: &DevicePickerProps) -> Html {
                 <p class="text-xs text-slate-500 dark:text-slate-400 px-1 py-1">
                     { "No devices discovered — enter a value manually" }
                 </p>
+            } else if filtered.is_empty() {
+                <p class="text-xs text-slate-500 dark:text-slate-400 px-1 py-1">
+                    { "No discovered device matches — enter a value manually" }
+                </p>
             } else {
                 <ul class="space-y-1">
-                    { for props.devices.iter().map(|device| {
-                        let device_value = device.clone();
+                    { for filtered.iter().map(|device| {
+                        let device_value = (*device).clone();
                         let on_pick = {
                             let cb = props.on_pick.clone();
                             Callback::from(move |_: MouseEvent| cb.emit(device_value.clone()))

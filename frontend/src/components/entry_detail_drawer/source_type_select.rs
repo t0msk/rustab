@@ -128,15 +128,23 @@ pub fn source_type_select(props: &SourceTypeSelectProps) -> Html {
             <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1" for="source-type-select">
                 { "Source type" }
             </label>
-            <select
-                id="source-type-select"
-                class="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm px-3 py-2 focus-visible:ring-2 focus-visible:ring-sky-500"
-                onchange={on_change}
-            >
-                { for SourceType::ALL.iter().map(|option| html! {
-                    <option value={option.value()} selected={*option == props.value}>{ option.label() }</option>
-                }) }
-            </select>
+            <div class="relative">
+                <select
+                    id="source-type-select"
+                    class="w-full appearance-none rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 text-sm pl-3 pr-8 py-2 focus-visible:ring-2 focus-visible:ring-sky-500"
+                    onchange={on_change}
+                >
+                    { for SourceType::ALL.iter().map(|option| html! {
+                        <option value={option.value()} selected={*option == props.value}>{ option.label() }</option>
+                    }) }
+                </select>
+                <svg
+                    class="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400"
+                    viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"
+                >
+                    <path d="M5.5 7.5L10 12l4.5-4.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+            </div>
         </div>
     }
 }

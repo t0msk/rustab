@@ -571,7 +571,9 @@ fn render_source_value_field(
     };
 
     html! {
-        <div>
+        // `group`: lets `DevicePicker` stay hidden until the input or one of
+        // the device buttons inside it has focus (`group-focus-within`).
+        <div class="group">
             <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1" for="source-value-input">
                 { label }
             </label>
@@ -587,6 +589,7 @@ fn render_source_value_field(
             <DevicePicker
                 devices={(**devices).clone()}
                 lsblk_available={lsblk_available}
+                filter={(**source_value).clone()}
                 on_pick={on_pick}
             />
         </div>
