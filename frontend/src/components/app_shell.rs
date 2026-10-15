@@ -722,7 +722,14 @@ pub fn app_shell() -> Html {
                     { "Loading target…" }
                 </div>
             }
-            <HeaderBar active_tab={*active_tab} on_tab_change={on_tab_change} on_add_entry={on_add_entry.clone()} />
+            <HeaderBar
+                active_tab={*active_tab}
+                on_tab_change={on_tab_change}
+                on_add_entry={on_add_entry.clone()}
+                on_create_backup={on_create_backup.clone()}
+                create_saving={*backup_create_saving}
+                create_error={(*backup_create_error).clone().map(AttrValue::from)}
+            />
             <PendingChangesBar count={pending_count} on_review={on_review} />
 
             <main class="flex-1 overflow-y-auto px-6 py-6">
@@ -749,9 +756,6 @@ pub fn app_shell() -> Html {
                         on_restore={on_restore}
                         on_view_diff={on_view_diff}
                         on_delete={on_backup_delete}
-                        on_create={on_create_backup}
-                        create_saving={*backup_create_saving}
-                        create_error={(*backup_create_error).clone().map(AttrValue::from)}
                     />
                 }
             </main>

@@ -28,6 +28,7 @@ Single-window desktop app, no page routing — view switching is in-memory state
 │ TargetBanner  (always on top, full width, never hidden)  │  <- safety-critical, §2
 ├─────────────────────────────────────────────────────────┤
 │ HeaderBar: "Rustab" · [Entries] [Backups] tabs · Add Entry│
+│ (Entries tab) / Create backup (Backups tab)               │
 ├─────────────────────────────────────────────────────────┤
 │ PendingChangesBar (only visible once ≥1 staged change)   │
 ├─────────────────────────────────────────────────────────┤
@@ -336,9 +337,12 @@ user restore one")
 
 Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
-- **"Create backup" button**, rendered above the list (not a row action — it is not
-  tied to an existing backup, it acts on the active target's current content,
-  `docs/API_CONTRACT.md` §3.11). Primary-ish but not alarming styling
+- **"Create backup" button**, living in `HeaderBar`'s top-right contextual action
+  slot — the same slot `"+ Add Entry"` occupies while the `Entries` tab is active.
+  It renders only while the `Backups` tab is active, and `"+ Add Entry"` is absent
+  from the DOM during that time (not a row action — it is not tied to an existing
+  backup, it acts on the active target's current content, `docs/API_CONTRACT.md`
+  §3.11). Primary-ish but not alarming styling
   (`bg-sky-600 hover:bg-sky-700 text-white`, the same non-destructive-primary treatment
   used elsewhere in the app), label `"Create backup"` while idle, `"Creating…"` with the
   same inline spinner treatment as `BackupDeleteConfirmDialog`'s `"Deleting…"` state
@@ -518,7 +522,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 
 1. `AppShell` — top-level layout: banner + header + tab content area
 2. `TargetBanner` — real-vs-sandbox indicator (§2)
-3. `HeaderBar` — app title, `Entries`/`Backups` tab nav, `Add Entry` button
+3. `HeaderBar` — app title, `Entries`/`Backups` tab nav, contextual action button
+   (`Add Entry` on the `Entries` tab, `Create backup` on the `Backups` tab)
 4. `PendingChangesBar` — "N entries changed" + `Review & Save…` trigger (§6)
 5. `EntriesTable` — main entry list (§3)
 6. `EntryRow` — one parsed entry's row
