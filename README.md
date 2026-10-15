@@ -139,7 +139,7 @@ Rustab is dual-licensed under the MIT License or the Apache License 2.0 — your
 
 ## AI Use Disclosure
 
-Rustab's development made use of AI code assistance (Claude Code) to accelerate initial implementation. This is disclosed openly: the maintainer is a senior software developer with 10+ years of production experience, and personally code-reviewed and tested every change before merging. The codebase is backed by a comprehensive automated test suite (169 tests, all passing) in addition to manual review and end-to-end smoke testing against real compiled binaries. AI assistance was a development tool, not a replacement for professional engineering judgment or testing discipline.
+Rustab's development made use of AI code assistance (Claude Code) to accelerate initial implementation. This is disclosed openly: the maintainer is a senior software developer with 10+ years of production experience, and personally code-reviewed and tested every change before merging. The codebase is backed by a comprehensive automated test suite (227 tests, all passing) in addition to manual review and repeated live testing of the real application through its documented entrypoint (`cargo tauri dev`). AI assistance was a development tool, not a replacement for professional engineering judgment or testing discipline.
 
 ## Contributing
 
