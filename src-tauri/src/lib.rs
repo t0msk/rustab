@@ -55,6 +55,7 @@ pub fn run() {
             commands::delete_backup,
             commands::create_backup,
             commands::discover_devices,
+            commands::open_backup_location,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -375,6 +375,31 @@ returned row) to refresh the panel.
 Error kinds: `target_resolution`, `target_missing`, `invalid_target`,
 `backup`, `privilege_escalation`.
 
+### 3.12 `open_backup_location`
+
+```
+open_backup_location() -> null   (rejects with CommandErrorDto)
+```
+
+Opens the directory containing the active target in the host file manager
+(`xdg-open`). That directory is also where the target's backups live — there
+is no separate backup folder (`src-tauri/src/backups.rs`'s module docs) — so
+this is the one button the Backups panel needs to let the user browse the
+backup files directly. Takes no arguments: like every other command, which
+directory it opens is resolved server-side and never supplied by the
+frontend.
+
+**No privilege escalation.** `/etc/` is world-readable and
+world-executable, the same reasoning §3.9 already gives for reading a
+backup's content — listing a directory needs strictly less access than
+reading a file inside it. This command never prompts.
+
+On success the promise resolves with `null`; the file manager window is not
+waited on. On failure (most commonly `xdg-open` missing) the rejection names
+the directory that could not be opened.
+
+Error kinds: `target_resolution`, `open_location`.
+
 ---
 
 ## 4. Privilege escalation
@@ -821,7 +846,7 @@ message, reload the target with `list_entries`, and point at the backup panel.
 ```
 
 `kind` is one of `target_resolution`, `read_target`, `not_utf8`,
-`list_backups`, `invalid_backup`, `read_backup`. These commands never wrote
+`list_backups`, `invalid_backup`, `read_backup`, `open_location`. These commands never wrote
 anything, so there is no `target_unchanged` field.
 
 | `kind` | Meaning | Raised by |
@@ -832,6 +857,7 @@ anything, so there is no `target_unchanged` field.
 | `list_backups` | The target's directory could not be listed | `list_backups` |
 | `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read. Nothing was read. | `read_backup` |
 | `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
+| `open_location` | The host file manager could not be launched | `open_backup_location` |
 
 ### `DeleteBackupErrorDto` (`delete_backup` only)
 
@@ -954,7 +980,7 @@ Every `kind` spelling of all three error-kind enums is pinned individually by
 frontend matches these strings exhaustively:
 
 - `CommandErrorKindDto`: `target_resolution`, `read_target`, `not_utf8`,
-  `list_backups`, `invalid_backup`, `read_backup`.
+  `list_backups`, `invalid_backup`, `read_backup`, `open_location`.
 - `DeleteBackupErrorKindDto`: `target_resolution`, `invalid_backup`,
   `privilege_escalation`, `delete`.
 - `CreateBackupErrorKindDto`: `target_resolution`, `target_missing`,

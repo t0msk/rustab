@@ -693,6 +693,10 @@ pub enum CommandErrorKindDto {
     /// be read (permissions, I/O error). A backup that exists and is readable
     /// but is not valid UTF-8 is reported as [`CommandErrorKindDto::NotUtf8`].
     ReadBackup,
+    /// The host file manager could not be launched
+    /// ([`crate::commands::open_backup_location`]) — the `xdg-open` binary is
+    /// missing, or starting it failed for some other reason.
+    OpenLocation,
 }
 
 /// A failed read-only command.
@@ -1152,6 +1156,7 @@ mod tests {
             (CommandErrorKindDto::ListBackups, "list_backups"),
             (CommandErrorKindDto::InvalidBackup, "invalid_backup"),
             (CommandErrorKindDto::ReadBackup, "read_backup"),
+            (CommandErrorKindDto::OpenLocation, "open_location"),
         ];
         for (kind, spelling) in command_kinds {
             assert_eq!(

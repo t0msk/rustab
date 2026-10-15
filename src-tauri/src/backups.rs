@@ -208,9 +208,12 @@ pub fn resolve_requested(target: &Path, requested: &str) -> Result<PathBuf, Back
         })
 }
 
-/// The directory `path` lives in, used only for error messages (mirrors the
-/// `.` fallback [`writer`] itself uses for a bare relative name).
-fn containing_dir(path: &Path) -> PathBuf {
+/// The directory `path` lives in — used for error messages here, and by
+/// [`crate::commands::open_backup_location`] as the directory to open in the
+/// host file manager, since it is also where `path`'s backups live (see the
+/// module docs). Mirrors the `.` fallback [`writer`] itself uses for a bare
+/// relative name.
+pub(crate) fn containing_dir(path: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),

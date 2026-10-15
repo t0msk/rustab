@@ -332,6 +332,30 @@ pub fn discover_devices() -> DeviceDiscoveryDto {
     DeviceDiscoveryDto::from(&discovery::discover_devices())
 }
 
+/// Opens the directory containing the active target in the host file
+/// manager, via `xdg-open`.
+///
+/// The active target's directory is also where its backups live (see
+/// [`crate::backups`]'s module docs), so this is the one button the Backups
+/// panel needs to let the user browse the backup files directly.
+///
+/// **No privilege escalation, for either target kind.** `/etc/` is
+/// world-readable and world-executable, which is the same reasoning
+/// [`read_backup`] already documents for reading a backup's content —
+/// listing a directory needs strictly less access than reading a file inside
+/// it.
+///
+/// # Errors
+///
+/// [`CommandErrorKindDto::TargetResolution`] if the target could not be
+/// determined, [`CommandErrorKindDto::OpenLocation`] if the file manager
+/// could not be launched.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn open_backup_location() -> Result<(), CommandErrorDto> {
+    let target = resolve_target()?;
+    open_backup_location_of(&target.path)
+}
+
 // ---------------------------------------------------------------------------
 // Shared internals
 // ---------------------------------------------------------------------------
@@ -401,6 +425,49 @@ fn read_backup_of(target: &Path, backup_path: &str) -> Result<String, CommandErr
             format!("could not read the backup {}: {err}", backup.display()),
         )
     })
+}
+
+/// The body of [`open_backup_location`], with the target passed in (see
+/// [`read_backup_of`] for why).
+fn open_backup_location_of(target: &Path) -> Result<(), CommandErrorDto> {
+    open_backup_location_with(target, open_in_file_manager)
+}
+
+/// [`open_backup_location_of`], with the actual launch of a GUI program
+/// injectable.
+///
+/// The seam exists for the same structural reason [`save_document_with`]'s
+/// does: a unit test has to be able to assert *which* directory this command
+/// would open without truly spawning a file manager window — there is no way
+/// to do that in CI, which has no display and no file manager installed at
+/// all. The production path is a one-line delegation to
+/// [`open_in_file_manager`] that cannot diverge from what ships.
+fn open_backup_location_with(
+    target: &Path,
+    opener: impl Fn(&Path) -> io::Result<()>,
+) -> Result<(), CommandErrorDto> {
+    let dir = backups::containing_dir(target);
+    opener(&dir).map_err(|err| {
+        CommandErrorDto::new(
+            CommandErrorKindDto::OpenLocation,
+            format!("could not open {} in a file manager: {err}", dir.display()),
+        )
+    })
+}
+
+/// Launches the host file manager on `dir` via `xdg-open`.
+///
+/// `spawn`, never `output`/`status`: this command must return as soon as the
+/// file manager process has started, not block the async command handler
+/// until the user closes that window. Only a failure to *start* the process
+/// (the binary is missing, or launching it was refused) is reported back;
+/// what the file manager itself does afterwards is none of this command's
+/// business.
+fn open_in_file_manager(dir: &Path) -> io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(dir)
+        .spawn()
+        .map(|_child| ())
 }
 
 /// The body of [`delete_backup`], with the target passed in (see
@@ -883,6 +950,49 @@ mod tests {
             .expect_err("invalid UTF-8 must be refused");
         assert_eq!(error.kind, CommandErrorKindDto::NotUtf8);
         assert!(backup.exists(), "a refused read must not remove anything");
+    }
+
+    // -- open_backup_location -------------------------------------------------
+
+    /// The happy path: a fake opener captures the directory it was given, and
+    /// the command reports success. The directory handed to the opener must
+    /// be exactly what `backups::containing_dir` computes for the target —
+    /// not re-derived or approximated here.
+    #[test]
+    fn open_backup_location_opens_the_target_s_containing_directory() {
+        let dir = TempDir::new("open-backup-location");
+        let target = dir.join("fstab.sandbox");
+        fs::write(&target, ORIGINAL).expect("seed the target");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        open_backup_location_with(&target, |opened| {
+            calls.borrow_mut().push(opened.to_path_buf());
+            Ok(())
+        })
+        .expect("the opener stand-in succeeds");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls, vec![backups::containing_dir(&target)]);
+    }
+
+    /// A failure to launch the file manager (binary missing, permission
+    /// denied, ...) is reported as `OpenLocation`, with the directory's own
+    /// error folded into the message.
+    #[test]
+    fn open_backup_location_reports_a_launch_failure() {
+        let dir = TempDir::new("open-backup-location-fail");
+        let target = dir.join("fstab.sandbox");
+
+        let error =
+            open_backup_location_with(&target, |_| Err(io::Error::from(io::ErrorKind::NotFound)))
+                .expect_err("a launch failure must be reported");
+
+        assert_eq!(error.kind, CommandErrorKindDto::OpenLocation);
+        let expected_dir = backups::containing_dir(&target);
+        assert!(
+            error.message.contains(&expected_dir.display().to_string()),
+            "the message must name the directory that could not be opened: {error:?}"
+        );
     }
 
     // -- delete_backup ------------------------------------------------------
