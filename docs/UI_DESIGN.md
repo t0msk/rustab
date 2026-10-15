@@ -369,6 +369,24 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   loading state and an inline error are the whole of its UI. On failure, the message is
   shown as a small red error line directly beneath the button (no dialog, no toast); on
   success, a success toast (`"Backup created."`) and the list reloads.
+- **"Open backup location" button** (T25, `docs/API_CONTRACT.md` §3.12), living inside
+  `BackupPanel`'s own content area (not `HeaderBar`'s contextual action slot, which stays
+  dedicated to `"Create backup"`), in a small bar near the top of the panel, rendered
+  **once per panel, not once per row** — every backup lives in the same directory as the
+  active target (`backups.rs`'s own module docs: "in that directory the name *is* the
+  identity"), so a per-row button would just duplicate the same action. Rendered
+  unconditionally, even when the backup list is empty, since the directory still exists
+  in the overwhelmingly common case. Secondary styling, identical treatment to
+  `BackupListItem`'s `Restore`/`View diff` buttons, label `"Open backup location"`.
+  Deliberately **no confirm dialog** (opening a directory for viewing is not a write or a
+  privileged action) and **no loading/disabled state** (the call is a near-instant
+  `spawn()` of the host file manager, not a slow operation, unlike every other backup
+  action in this panel). On failure, a small red error line directly beneath the button
+  (no dialog, no toast), the same treatment as the "Create backup" button's own
+  `create_error` above. On success, **no toast and no list reload**: unlike
+  `create_backup`/`restore_backup`/`delete_backup`, this action does not change the
+  backup list or the target, so there is nothing to refresh — the file manager window
+  appearing is its own visible confirmation.
 - **BackupListItem** rows, newest first: human-readable relative timestamp (e.g. `"2
   hours ago"`, exact ISO timestamp on hover tooltip), a pill badge showing whether the
   backup is automatic or manual (same rounded-pill shape as `EntriesTable`'s source-kind
@@ -564,7 +582,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 23. `DiffRawText` — unified-diff monospace rendering (§6)
 24. `RealTargetConfirmCheckbox` — the extra "I understand..." gate, reused by DiffView
     and BackupRestoreConfirmDialog
-25. `BackupPanel` — backup list view (§7)
+25. `BackupPanel` — backup list view (§7); also hosts the once-per-panel
+    "Open backup location" button (T25)
 26. `BackupListItem` — one backup's row + Restore/View diff/Delete buttons
 27. `BackupRestoreConfirmDialog` — restore confirmation modal (§7)
 28. `StatusToast` — transient success/error notification

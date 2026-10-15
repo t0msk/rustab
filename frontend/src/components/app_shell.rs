@@ -116,6 +116,12 @@ pub fn app_shell() -> Html {
     let backup_create_saving = use_state(|| false);
     let backup_create_error: UseStateHandle<Option<String>> = use_state(|| None);
 
+    // Open-backup-location flow state (T25): no loading/disabled state —
+    // the call is a near-instant `spawn()`, not a slow operation — and no
+    // success toast/reload either, since it doesn't change the backup list
+    // or the target; only a failure needs to be surfaced, inline.
+    let open_location_error: UseStateHandle<Option<String>> = use_state(|| None);
+
     // View-diff flow state: which backup's diff overlay is open, its
     // fetched raw text (`None` = loading or not open), and the last
     // `read_backup` failure, if any (`docs/UI_DESIGN.md` §7).
@@ -589,6 +595,19 @@ pub fn app_shell() -> Html {
         })
     };
 
+    let on_open_location = {
+        let open_location_error = open_location_error.clone();
+        Callback::from(move |()| {
+            let open_location_error = open_location_error.clone();
+            open_location_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(message) = api::open_backup_location().await {
+                    open_location_error.set(Some(message));
+                }
+            });
+        })
+    };
+
     let on_view_diff = {
         let view_diff_target = view_diff_target.clone();
         let view_diff_text = view_diff_text.clone();
@@ -756,6 +775,8 @@ pub fn app_shell() -> Html {
                         on_restore={on_restore}
                         on_view_diff={on_view_diff}
                         on_delete={on_backup_delete}
+                        on_open_location={on_open_location.clone()}
+                        open_location_error={(*open_location_error).clone().map(AttrValue::from)}
                     />
                 }
             </main>

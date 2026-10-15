@@ -2,8 +2,9 @@
 //! `get_target_info`, `list_entries`, `validate_candidate`,
 //! `discover_devices` (T11), plus `render_candidate`, `save`,
 //! `list_backups` and `restore_backup` (T12), plus `read_backup` and
-//! `delete_backup` (T20), plus `create_backup` (T21.1). See
-//! `docs/API_CONTRACT.md` for the exact contract.
+//! `delete_backup` (T20), plus `create_backup` (T21.1), plus
+//! `open_backup_location` (T25). See `docs/API_CONTRACT.md` for the exact
+//! contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -317,4 +318,12 @@ async fn invoke_create_backup<A: Serialize>(
 /// target.
 pub async fn create_backup() -> Result<BackupInfoDto, CreateError> {
     invoke_create_backup("create_backup", &EmptyArgs {}).await
+}
+
+/// `open_backup_location() -> null` (API_CONTRACT.md §3.12). Opens the
+/// host file manager at the directory containing the active target
+/// (the same directory its backups live in). Never escalates privilege,
+/// never writes.
+pub async fn open_backup_location() -> Result<(), String> {
+    invoke("open_backup_location", &EmptyArgs {}).await
 }
