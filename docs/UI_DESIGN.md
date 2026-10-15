@@ -220,10 +220,27 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
    filesystem, 2 = checked after root"`.
 
 **FormActionBar** (bottom of drawer, sticky): `Cancel` (secondary, `bg-slate-100
-dark:bg-slate-700`) and `Save entry` (primary, `bg-sky-600 hover:bg-sky-700 text-white`,
-disabled while blocking validation errors exist — see §5). Saving here only stages the
-change in memory as a pending edit; it does **not** write to disk. Disk writes only ever
-happen through the DiffView confirm step (§6).
+dark:bg-slate-700`), `Verify` (secondary/outline, `bg-white dark:bg-slate-800 border
+border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200`), and `Save
+entry` (primary, `bg-sky-600 hover:bg-sky-700 text-white`, disabled while blocking
+validation errors exist — see §5). Saving here only stages the change in memory as a
+pending edit; it does **not** write to disk. Disk writes only ever happen through the
+DiffView confirm step (§6).
+
+`Verify`, between Cancel and Save, is on-demand reassurance distinct from the passive
+debounced check already running while typing (§5): it forces an immediate,
+non-debounced `validate_candidate` re-check against the same candidate document, and
+confirms the outcome with a toast — a success toast `"No validation issues found."`
+when the report has neither errors nor warnings, or an error-styled toast stating the
+error and warning counts otherwise (deliberately error-styled even when only warnings
+are present, so a non-blocking warning never goes unnoticed just because the user
+didn't wait for the debounce). It does **not** change how findings render inline, in
+the flat warning stack, or in `ValidationSummary` — that result is the exact same
+`validate_candidate` response already driving those displays, just fetched immediately
+instead of after the 400ms debounce, so clicking Verify also refreshes them right away.
+Hidden entirely in raw-text edit mode (§3), since there is no structured document to
+validate there. Disabled while a Save or a Verify call is already in flight, labeled
+`"Verifying…"` with a spinner while its own call is in flight.
 
 **DeleteConfirmDialog**: small centered modal, `"Remove this entry from {mount
 point}?"` + the entry's source/mount-point/fstype summarized read-only, `Cancel` /
@@ -540,7 +557,7 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 16. `DumpPassFields` — the two small numeric inputs
 17. `ValidationMessage` — generic per-field error/warning renderer (§5)
 18. `ValidationSummary` — drawer-top aggregate error banner (§5)
-19. `FormActionBar` — Cancel/Save buttons inside the drawer
+19. `FormActionBar` — Cancel/Verify/Save buttons inside the drawer
 20. `DeleteConfirmDialog` — single-entry delete confirmation (§4)
 21. `DiffView` — the pending-changes/diff confirmation modal (§6)
 22. `DiffSummaryList` — structured per-field Added/Modified/Removed list (§6)

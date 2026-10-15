@@ -42,6 +42,7 @@ use source_type_select::SourceTypeSelect;
 use validation_message::{Severity, ValidationMessage};
 
 use crate::api;
+use crate::components::status_toast::ToastKind;
 use crate::dto::{
     DeviceInfoDto, DocumentDto, EntryDto, FindingSeverity, LineDto, OptionDto, SourceDto,
     ValidationField, ValidationReportDto,
@@ -77,6 +78,10 @@ pub struct EntryDetailDrawerProps {
     pub other_lines: Vec<LineDto>,
     pub on_close: Callback<()>,
     pub on_save: Callback<DrawerSaveResult>,
+    /// Lets the drawer's own Verify action show an on-demand confirmation
+    /// toast; owned/rendered by `AppShell`, same callback it already
+    /// threads to other actions.
+    pub show_toast: Callback<(ToastKind, String)>,
 }
 
 fn chips_to_options(chips: &[String]) -> Vec<OptionDto> {
@@ -249,6 +254,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
 
     let has_blocking_errors = validation.as_ref().map(|r| r.has_errors).unwrap_or(false);
     let saving = use_state(|| false);
+    let verifying = use_state(|| false);
 
     let title = match &props.mode {
         DrawerMode::Add => "Add entry",
@@ -345,6 +351,108 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                             }));
                         }
                         saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+
+    let on_verify_click = {
+        let other_lines = props.other_lines.clone();
+        let source_type = source_type.clone();
+        let source_value = source_value.clone();
+        let mount_point = mount_point.clone();
+        let fs_type = fs_type.clone();
+        let chips = chips.clone();
+        let dump = dump.clone();
+        let pass = pass.clone();
+        let trailing_comment = trailing_comment.clone();
+        let validation = validation.clone();
+        let validation_request = validation_request.clone();
+        let verifying = verifying.clone();
+        let show_toast = props.show_toast.clone();
+        Callback::from(move |()| {
+            let draft = build_entry(
+                &source_type,
+                &source_value,
+                &mount_point,
+                &fs_type,
+                &chips,
+                *dump,
+                *pass,
+                &trailing_comment,
+            );
+            let document = DocumentDto {
+                lines: other_lines
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(LineDto::Entry { entry: draft }))
+                    .collect(),
+            };
+
+            let validation = validation.clone();
+            let validation_request = validation_request.clone();
+            let verifying = verifying.clone();
+            let show_toast = show_toast.clone();
+            // Any in-flight debounced check becomes stale once this
+            // immediate re-check starts — bump the shared cancellation
+            // counter so its eventual result is ignored when it lands.
+            let request_id = {
+                let mut counter = validation_request.borrow_mut();
+                *counter += 1;
+                *counter
+            };
+            verifying.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::validate_candidate(&document).await {
+                    Ok(report) => {
+                        let error_count = report
+                            .findings
+                            .iter()
+                            .filter(|f| f.severity == FindingSeverity::Error)
+                            .count();
+                        let warning_count = report
+                            .findings
+                            .iter()
+                            .filter(|f| f.severity == FindingSeverity::Warning)
+                            .count();
+                        if *validation_request.borrow() == request_id {
+                            validation.set(Some(report));
+                        }
+                        verifying.set(false);
+                        if error_count == 0 && warning_count == 0 {
+                            show_toast.emit((
+                                ToastKind::Success,
+                                "No validation issues found.".to_string(),
+                            ));
+                        } else {
+                            show_toast.emit((
+                                ToastKind::Error,
+                                format!(
+                                    "{error_count} error{}, {warning_count} warning{} found.",
+                                    if error_count == 1 { "" } else { "s" },
+                                    if warning_count == 1 { "" } else { "s" }
+                                ),
+                            ));
+                        }
+                    }
+                    Err(message) => {
+                        if *validation_request.borrow() == request_id {
+                            validation.set(Some(ValidationReportDto {
+                                findings: vec![crate::dto::FindingDto {
+                                    severity: FindingSeverity::Error,
+                                    message: format!("Could not validate this entry: {message}"),
+                                    field: None,
+                                    line_index: None,
+                                }],
+                                has_errors: true,
+                            }));
+                        }
+                        verifying.set(false);
+                        show_toast.emit((
+                            ToastKind::Error,
+                            format!("Could not verify this entry: {message}"),
+                        ));
                     }
                 }
             });
@@ -508,6 +616,9 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                     save_disabled={!is_raw_mode && (has_blocking_errors || *saving)}
                     on_cancel={props.on_close.clone()}
                     on_save={on_save_click}
+                    on_verify={if is_raw_mode { None } else { Some(on_verify_click) }}
+                    verify_disabled={*saving || *verifying}
+                    verifying={*verifying}
                 />
             </div>
         </div>

@@ -761,7 +761,7 @@ pub fn app_shell() -> Html {
             </main>
 
             if let Some(mode) = (*drawer_mode).clone() {
-                <EntryDetailDrawer mode={mode} other_lines={other_lines} on_close={on_drawer_close} on_save={on_drawer_save} />
+                <EntryDetailDrawer mode={mode} other_lines={other_lines} on_close={on_drawer_close} on_save={on_drawer_save} show_toast={show_toast.clone()} />
             }
 
             if let Some((source_summary, mount_point, fs_type)) = delete_dialog_data {
