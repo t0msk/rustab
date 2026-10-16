@@ -1,3 +1,18 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Default cursor is the normal pointer/arrow, not the text-select I-beam,
+   for static/non-editable text (the app title, labels, table cells, etc.)
+   - an I-beam over text that isn't meant to be edited is misleading. Actual
+   text-entry fields (source value, mount point, filesystem type, options,
+   description, dump/pass) opt back into the I-beam explicitly below. */
+body {
+  cursor: default;
+}
+
+input[type="text"],
+input[type="number"],
+textarea {
+  cursor: text;
+}
