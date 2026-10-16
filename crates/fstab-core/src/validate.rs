@@ -363,7 +363,18 @@ fn malformed_uuid_findings(doc: &Document) -> Vec<Finding> {
             _ => None,
         })
         .filter_map(|(idx, entry)| match &entry.source {
-            SourceId::Uuid(value) if !looks_like_uuid(value) => {
+            // `UUID=` accepts a second, shorter shape beyond the canonical
+            // 36-char form: `blkid`/the kernel report a FAT/exFAT
+            // filesystem's volume serial number as an 8-4 hex pair (e.g.
+            // `CAF7-75BB`), and a real `/etc/fstab` referencing a FAT/EFI
+            // system partition this way is common and valid - rejecting it
+            // was a real false positive, not overcaution. `PARTUUID=`
+            // (always a GPT/MBR partition-table GUID, never a filesystem
+            // volume ID) is deliberately not given the same allowance here;
+            // no report has shown a real short PARTUUID shape in the wild.
+            SourceId::Uuid(value)
+                if !looks_like_uuid(value) && !looks_like_fat_volume_id(value) =>
+            {
                 Some((idx, "UUID", value, &entry.mount_point))
             }
             SourceId::PartUuid(value) if !looks_like_uuid(value) => {
@@ -372,11 +383,18 @@ fn malformed_uuid_findings(doc: &Document) -> Vec<Finding> {
             _ => None,
         })
         .map(|(idx, prefix, value, mount_point)| {
+            let expected = if prefix == "UUID" {
+                "either the standard 8-4-4-4-12 hex UUID shape (e.g. \
+                 11111111-2222-3333-4444-555555555555) or a FAT/exFAT volume ID \
+                 (e.g. CAF7-75BB)"
+            } else {
+                "the standard 8-4-4-4-12 hex UUID shape (e.g. \
+                 11111111-2222-3333-4444-555555555555)"
+            };
             Finding::error_at(
                 format!(
                     "entry for mount point {mount_point:?} has a malformed {prefix}= value \
-                     {value:?}; expected the standard 8-4-4-4-12 hex UUID shape \
-                     (e.g. 11111111-2222-3333-4444-555555555555)"
+                     {value:?}; expected {expected}"
                 ),
                 FindingField::Source,
                 idx,
@@ -405,6 +423,24 @@ fn looks_like_uuid(value: &str) -> bool {
         }
     }
     true
+}
+
+/// Returns `true` if `value` has the shape `blkid`/the kernel use for a
+/// FAT/exFAT filesystem's volume serial number: exactly 4 hex digits, a
+/// literal hyphen, then exactly 4 more hex digits (e.g. `CAF7-75BB`),
+/// case-insensitively. Unlike [`looks_like_uuid`], this is a real,
+/// commonly-seen alternate `UUID=` shape - FAT-family filesystems (vfat,
+/// the typical ESP filesystem) have no 128-bit UUID to report, only this
+/// 32-bit volume ID, and `/etc/fstab` entries referencing one this way are
+/// valid and unremarkable, not a malformed value.
+fn looks_like_fat_volume_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 9 {
+        return false;
+    }
+    bytes[..4].iter().all(u8::is_ascii_hexdigit)
+        && bytes[4] == b'-'
+        && bytes[5..].iter().all(u8::is_ascii_hexdigit)
 }
 
 /// Advisory check: flags a mount point that doesn't currently exist on disk.
@@ -943,6 +979,52 @@ mod tests {
         assert!(!looks_like_uuid("11111111222233334444555555555555")); // no hyphens
         assert!(!looks_like_uuid("11111111-2222-3333-4444-5555555555")); // too short
         assert!(!looks_like_uuid("gggggggg-2222-3333-4444-555555555555")); // non-hex
+    }
+
+    #[test]
+    fn fat_volume_id_shaped_uuid_is_not_malformed() {
+        // Real `blkid` output for a FAT/exFAT filesystem (e.g. the ESP) -
+        // a genuine, common real-world fstab value, not a typo.
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Uuid("CAF7-75BB".into()),
+            "/boot",
+            "vfat",
+            Options::new(),
+            0,
+            2,
+        ));
+        assert!(malformed_uuid_findings(&doc).is_empty());
+    }
+
+    #[test]
+    fn fat_volume_id_shape_is_case_insensitive_and_rejects_near_misses() {
+        assert!(looks_like_fat_volume_id("CAF7-75BB"));
+        assert!(looks_like_fat_volume_id("caf7-75bb"));
+        assert!(!looks_like_fat_volume_id("CAF7_75BB")); // wrong separator
+        assert!(!looks_like_fat_volume_id("CAF75-75BB")); // wrong length (5-4)
+        assert!(!looks_like_fat_volume_id("CAF7-75B")); // wrong length (4-3)
+        assert!(!looks_like_fat_volume_id("CAFG-75BB")); // non-hex
+        assert!(!looks_like_fat_volume_id(
+            "11111111-2222-3333-4444-555555555555"
+        )); // the other (full) shape, not this one
+    }
+
+    #[test]
+    fn fat_volume_id_shape_is_not_accepted_for_partuuid() {
+        // PARTUUID is always a GPT/MBR partition-table GUID, never a
+        // filesystem volume ID - the short FAT shape must still be
+        // rejected here even though it is fine for UUID=.
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::PartUuid("CAF7-75BB".into()),
+            "/boot",
+            "vfat",
+            Options::new(),
+            0,
+            2,
+        ));
+        let findings = malformed_uuid_findings(&doc);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("PARTUUID="));
     }
 
     // --- Structural: malformed lines surfaced as warnings ---
