@@ -400,6 +400,32 @@ the directory that could not be opened.
 
 Error kinds: `target_resolution`, `open_location`.
 
+### 3.13 `open_external_link`
+
+```
+open_external_link(link: ExternalLinkDto) -> null   (rejects with CommandErrorDto)
+```
+
+Opens one of this app's two known external links (the GitHub repo or GitHub
+Sponsors page, used by the About dialog) in the host's default web browser
+(`xdg-open`). `link` is a closed enum (`github_repo` or `github_sponsors`),
+never a raw URL string: the two URLs this command will ever open are a fixed,
+hardcoded pair on the backend side, not anything the frontend supplies.
+
+**No privilege escalation.** Opening a web browser needs no elevated access,
+the same reasoning §3.12 already gives for opening a file manager. This
+command never prompts.
+
+Unlike `open_backup_location`, this command's only failure mode is the
+browser launch itself: it does not touch the active target at all, so there
+is no target-resolution step and no `target_resolution` error kind.
+
+On success the promise resolves with `null`; the browser window is not
+waited on. On failure (most commonly `xdg-open` missing) the rejection names
+the URL that could not be opened.
+
+Error kinds: `open_external_link`.
+
 ---
 
 ## 4. Privilege escalation
@@ -846,8 +872,9 @@ message, reload the target with `list_entries`, and point at the backup panel.
 ```
 
 `kind` is one of `target_resolution`, `read_target`, `not_utf8`,
-`list_backups`, `invalid_backup`, `read_backup`, `open_location`. These commands never wrote
-anything, so there is no `target_unchanged` field.
+`list_backups`, `invalid_backup`, `read_backup`, `open_location`,
+`open_external_link`. These commands never wrote anything, so there is no
+`target_unchanged` field.
 
 | `kind` | Meaning | Raised by |
 | --- | --- | --- |
@@ -858,6 +885,7 @@ anything, so there is no `target_unchanged` field.
 | `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read. Nothing was read. | `read_backup` |
 | `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
 | `open_location` | The host file manager could not be launched | `open_backup_location` |
+| `open_external_link` | The browser could not be launched | `open_external_link` |
 
 ### `DeleteBackupErrorDto` (`delete_backup` only)
 
@@ -980,7 +1008,8 @@ Every `kind` spelling of all three error-kind enums is pinned individually by
 frontend matches these strings exhaustively:
 
 - `CommandErrorKindDto`: `target_resolution`, `read_target`, `not_utf8`,
-  `list_backups`, `invalid_backup`, `read_backup`, `open_location`.
+  `list_backups`, `invalid_backup`, `read_backup`, `open_location`,
+  `open_external_link`.
 - `DeleteBackupErrorKindDto`: `target_resolution`, `invalid_backup`,
   `privilege_escalation`, `delete`.
 - `CreateBackupErrorKindDto`: `target_resolution`, `target_missing`,

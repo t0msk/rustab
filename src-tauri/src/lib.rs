@@ -56,6 +56,7 @@ pub fn run() {
             commands::create_backup,
             commands::discover_devices,
             commands::open_backup_location,
+            commands::open_external_link,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

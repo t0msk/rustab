@@ -697,6 +697,10 @@ pub enum CommandErrorKindDto {
     /// ([`crate::commands::open_backup_location`]) — the `xdg-open` binary is
     /// missing, or starting it failed for some other reason.
     OpenLocation,
+    /// The host browser could not be launched
+    /// ([`crate::commands::open_external_link`]) — the `xdg-open` binary is
+    /// missing, or starting it failed for some other reason.
+    OpenExternalLink,
 }
 
 /// A failed read-only command.
@@ -714,6 +718,33 @@ impl CommandErrorDto {
         CommandErrorDto {
             kind,
             message: message.into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External links
+// ---------------------------------------------------------------------------
+
+/// Which of this app's two known external links to open
+/// ([`crate::commands::open_external_link`]) — a closed set, not a raw
+/// URL, by design: see that command's own doc comment for why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalLinkDto {
+    /// `https://github.com/t0msk/rustab`.
+    GithubRepo,
+    /// `https://github.com/sponsors/t0msk`.
+    GithubSponsors,
+}
+
+impl ExternalLinkDto {
+    /// The literal URL for this link. Hardcoded here, not supplied by the
+    /// frontend — see the command's doc comment.
+    pub(crate) fn url(self) -> &'static str {
+        match self {
+            ExternalLinkDto::GithubRepo => "https://github.com/t0msk/rustab",
+            ExternalLinkDto::GithubSponsors => "https://github.com/sponsors/t0msk",
         }
     }
 }
@@ -1157,6 +1188,7 @@ mod tests {
             (CommandErrorKindDto::InvalidBackup, "invalid_backup"),
             (CommandErrorKindDto::ReadBackup, "read_backup"),
             (CommandErrorKindDto::OpenLocation, "open_location"),
+            (CommandErrorKindDto::OpenExternalLink, "open_external_link"),
         ];
         for (kind, spelling) in command_kinds {
             assert_eq!(

@@ -50,8 +50,8 @@ use crate::backups;
 use crate::dto::{
     BackupInfoDto, CommandErrorDto, CommandErrorKindDto, CreateBackupErrorDto,
     CreateBackupErrorKindDto, CreateBackupOutcomeDto, DeleteBackupErrorDto,
-    DeleteBackupErrorKindDto, DeviceDiscoveryDto, DocumentDto, DocumentViewDto, TargetInfoDto,
-    ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
+    DeleteBackupErrorKindDto, DeviceDiscoveryDto, DocumentDto, DocumentViewDto, ExternalLinkDto,
+    TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
 use crate::privileged;
 use crate::target::{self, ActiveTarget};
@@ -356,6 +356,30 @@ pub fn open_backup_location() -> Result<(), CommandErrorDto> {
     open_backup_location_of(&target.path)
 }
 
+/// `open_external_link(link) -> null` (API_CONTRACT.md §3.13). Opens one
+/// of this app's two known external links (used by the About dialog) in
+/// the host's default web browser via `xdg-open`.
+///
+/// Deliberately takes a closed enum, not a raw URL string: the two URLs
+/// this command will ever open are a fixed, hardcoded pair baked into
+/// [`ExternalLinkDto::url`], never anything the frontend supplies —
+/// applying this project's minimal-dispatch-surface philosophy (compare
+/// `privileged.rs`'s own module doc) to a non-privileged case: there is no
+/// argument surface here for a caller to redirect this command at an
+/// arbitrary URL.
+///
+/// **No privilege escalation.** Opening a web browser needs no elevated
+/// access, same reasoning as [`open_backup_location`].
+///
+/// # Errors
+///
+/// [`CommandErrorKindDto::OpenExternalLink`] if the browser could not be
+/// launched.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> {
+    open_external_link_with(link, open_browser)
+}
+
 // ---------------------------------------------------------------------------
 // Shared internals
 // ---------------------------------------------------------------------------
@@ -466,6 +490,36 @@ fn open_backup_location_with(
 fn open_in_file_manager(dir: &Path) -> io::Result<()> {
     std::process::Command::new("xdg-open")
         .arg(dir)
+        .spawn()
+        .map(|_child| ())
+}
+
+/// [`open_external_link`], with the actual browser launch injectable —
+/// same structural reason as [`open_backup_location_with`]: a unit test
+/// has to assert which URL this command would open without truly
+/// spawning a browser.
+fn open_external_link_with(
+    link: ExternalLinkDto,
+    opener: impl Fn(&str) -> io::Result<()>,
+) -> Result<(), CommandErrorDto> {
+    let url = link.url();
+    opener(url).map_err(|err| {
+        CommandErrorDto::new(
+            CommandErrorKindDto::OpenExternalLink,
+            format!("could not open {url} in a browser: {err}"),
+        )
+    })
+}
+
+/// Launches the host's default web browser on `url` via `xdg-open`.
+/// Deliberately separate from [`open_in_file_manager`] rather than
+/// generalized over both (different argument types, `&Path` vs. `&str`,
+/// and each is a single one-line `spawn()` call — not worth sharing a
+/// generic seam over, and keeping this separate means zero risk of
+/// regressing the already-shipped `open_backup_location`).
+fn open_browser(url: &str) -> io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
         .spawn()
         .map(|_child| ())
 }
@@ -992,6 +1046,45 @@ mod tests {
         assert!(
             error.message.contains(&expected_dir.display().to_string()),
             "the message must name the directory that could not be opened: {error:?}"
+        );
+    }
+
+    // -- open_external_link --------------------------------------------------
+
+    /// The happy path for both known links: a fake opener captures the URL
+    /// it was given, and the command reports success. The URL handed to the
+    /// opener must be exactly what [`ExternalLinkDto::url`] returns for that
+    /// variant — not re-derived or approximated here.
+    #[test]
+    fn open_external_link_opens_the_link_s_own_url() {
+        for link in [ExternalLinkDto::GithubRepo, ExternalLinkDto::GithubSponsors] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            open_external_link_with(link, |opened| {
+                calls.borrow_mut().push(opened.to_string());
+                Ok(())
+            })
+            .expect("the opener stand-in succeeds");
+
+            let calls = calls.into_inner();
+            assert_eq!(calls, vec![link.url().to_string()]);
+        }
+    }
+
+    /// A failure to launch the browser (binary missing, permission denied,
+    /// ...) is reported as `OpenExternalLink`, with the URL's own error
+    /// folded into the message.
+    #[test]
+    fn open_external_link_reports_a_launch_failure() {
+        let link = ExternalLinkDto::GithubSponsors;
+
+        let error =
+            open_external_link_with(link, |_| Err(io::Error::from(io::ErrorKind::NotFound)))
+                .expect_err("a launch failure must be reported");
+
+        assert_eq!(error.kind, CommandErrorKindDto::OpenExternalLink);
+        assert!(
+            error.message.contains(link.url()),
+            "the message must name the URL that could not be opened: {error:?}"
         );
     }
 
