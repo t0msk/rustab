@@ -172,6 +172,48 @@ replies." The actual PR open/description/commit-message step is listed as
 a **[MAINTAINER ACTION]** throughout §5 for this reason too, independent
 of the earlier scope boundary that already ruled it out for this session.
 
+### 1.5 Known WebKitGTK rendering issue (blank window / choppy scrolling) and its fix
+
+On some GPU/driver combinations (seen directly during this project's own
+development - certain Nvidia drivers, Wayland sessions, and VMs are the
+common pattern), WebKitGTK's hardware-compositing/DMA-BUF renderer fails
+silently instead of falling back, producing a completely blank white
+window instead of the UI. The documented fix (see `README.md`'s own
+"Troubleshooting: blank/white window on launch" section, which this
+mirrors for the Flatpak case) is forcing software rendering via two
+environment variables:
+
+```
+WEBKIT_DISABLE_COMPOSITING_MODE=1
+WEBKIT_DISABLE_DMABUF_RENDERER=1
+```
+
+**The tradeoff**: this fixes the blank window, but software-rendered
+WebKitGTK scrolls/repaints noticeably slower than GPU-accelerated
+rendering - more visible with a longer entries table (a real `/etc/fstab`
+has far more DOM content per row than a short practice file) or a large
+raw-text view. This is inherent to forcing software rendering on an
+affected system, not something fixable in the app's own code.
+
+**This is deliberately not baked into the manifest/`finish-args` as an
+always-on default** - most users will never hit the underlying GPU bug,
+and forcing software rendering unconditionally would make the app
+artificially slower for everyone else for no benefit. Instead, a user who
+actually hits the blank-window symptom applies the fix themselves, the
+Flatpak-native way (equivalent to setting the env vars before launching a
+plain binary, but persists across launches including from a GUI
+launcher - no need to open a terminal every time):
+
+```bash
+flatpak override --user \
+  --env=WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+  --env=WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+  dev.tomsk.Rustab
+```
+
+To undo it: `flatpak override --user --reset dev.tomsk.Rustab` (or
+`--unset-env` for just these two keys).
+
 ---
 
 ## 2. Writing the Flatpak manifest
