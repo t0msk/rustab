@@ -68,9 +68,18 @@ it determines what the UI must show and whether a save escalates.
    release builds**. `source` is `"environment"`.
 2. Otherwise the target is a per-user sandbox file,
    `$XDG_DATA_HOME/rustab/fstab.sandbox` (falling back to
-   `$HOME/.local/share/rustab/fstab.sandbox`, then to a temp-dir path). It is
-   created on first resolution, seeded with a comment-only file that parses
-   and validates cleanly. `source` is `"sandbox_default"`.
+   `$HOME/.local/share/rustab/fstab.sandbox`, then to a temp-dir path).
+   `source` is `"sandbox_default"`. The sandbox is **refreshed from the real
+   `/etc/fstab` once per application process launch** - the first target
+   resolution of a run replaces it with a byte-for-byte copy of `/etc/fstab`
+   (a literal file copy, never a parse/re-serialize round trip), so every
+   launch starts from current reality; every later resolution in the same run
+   leaves the file alone, so the user's own sandbox edits and saves survive
+   the session that made them. If `/etc/fstab` cannot be read (missing, or no
+   permission) the refresh is skipped silently - best-effort, never a
+   resolution failure - and the sandbox is created, if it does not exist yet,
+   with a comment-only seed that parses and validates cleanly; an existing
+   sandbox is left as it is.
 
 Rule 2 applies to release builds too. `docs/SPEC.md` §7 only *requires* the
 sandbox default in debug builds, but a release build that opens pointed at

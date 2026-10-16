@@ -166,6 +166,15 @@ original file byte-for-byte untouched).
 - The app must **never** default to writing the real `/etc/fstab` during
   development. Support a configurable target path (env var or app setting),
   defaulting in debug builds to a local sandbox file.
+- That sandbox file is a practice ground, not a persisted fixture: it is
+  refreshed from the real `/etc/fstab` once per application process launch
+  (a plain byte-for-byte file copy, never a parse/re-serialize round trip -
+  see §5), so each launch starts from current reality, deliberately
+  discarding whatever the previous session left there. Within one run the
+  sandbox is never touched again, so in-session edits and saves survive. The
+  refresh only ever *reads* `/etc/fstab`, and is best-effort: if it cannot be
+  read, the sandbox falls back to a comment-only seed when absent and is
+  otherwise left alone.
 - `dev-data/fstab.real-copy` is a real, personal copy of the maintainer's
   actual `/etc/fstab`, kept **outside of version control** (already in
   `.gitignore`) purely so the app can be exercised by hand against a
