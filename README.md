@@ -15,8 +15,8 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 ## Contents
 
 - [Features](#features)
-- [Roadmap](#roadmap)
 - [Screenshot Placeholder](#screenshot-placeholder)
+- [Roadmap](#roadmap)
 - [Safety Notes](#safety-notes)
 - [Prerequisites](#prerequisites)
 - [Building & Running](#building--running)
@@ -38,6 +38,10 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Comment and blank-line preservation** - your existing comments and formatting survive edits and round-trip without loss
 - **Real vs. sandbox visibility** - a clear, unmissable banner indicates whether you're viewing the real system file or a sandbox copy
 - **Privilege escalation gating** - when editing `/etc/fstab`, an explicit confirmation checkbox and danger banner appear; sandbox edits never require elevation
+
+## Screenshot Placeholder
+
+<!-- TODO: screenshot/GIF demonstrating the main table view, add entry form, diff review, and backup panel -->
 
 ## Roadmap
 
@@ -81,10 +85,6 @@ mount manager):
 
 Have an idea not listed here, or want to weigh in on priority? Open an issue - see
 [Contact & Support](#contact--support).
-
-## Screenshot Placeholder
-
-<!-- TODO: screenshot/GIF demonstrating the main table view, add entry form, diff review, and backup panel -->
 
 ## Safety Notes
 
