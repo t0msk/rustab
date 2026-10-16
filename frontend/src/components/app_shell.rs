@@ -34,7 +34,9 @@ use crate::components::pending_changes_bar::PendingChangesBar;
 use crate::components::status_toast::{StatusToast, ToastKind};
 use crate::components::target_banner::TargetBanner;
 use crate::diff::compute_summary_diff;
-use crate::dto::{BackupInfoDto, DocumentDto, LineDto, TargetInfoDto};
+use crate::dto::{
+    BackupInfoDto, DocumentDto, FindingSeverity, LineDto, TargetInfoDto, ValidationReportDto,
+};
 
 /// Reloads `original_document`/`original_text`/`candidate` from
 /// `list_entries` - "reload after every save" (API_CONTRACT.md §11) - used
@@ -93,6 +95,46 @@ pub fn app_shell() -> Html {
     let original_text: UseStateHandle<String> = use_state(String::new);
     let candidate = use_state(CandidateDocument::default);
     let list_error: UseStateHandle<Option<String>> = use_state(|| None);
+
+    // Document-wide validation, independent of whether a drawer is open -
+    // re-run against the whole candidate document (no draft appended)
+    // whenever it changes, so EntriesTable can flag rows with a warning
+    // even before anyone opens that row's own drawer. Only triggered by a
+    // staged add/edit/delete (not per keystroke - there is no live editing
+    // happening at this level), so no debounce needed here, unlike the
+    // drawer's own per-keystroke validation.
+    let document_validation: UseStateHandle<Option<ValidationReportDto>> = use_state(|| None);
+    {
+        let document_validation = document_validation.clone();
+        let candidate = candidate.clone();
+        use_effect_with(candidate.clone(), move |_| {
+            let document_validation = document_validation.clone();
+            let document = candidate.to_document();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(report) = api::validate_candidate(&document).await {
+                    document_validation.set(Some(report));
+                }
+            });
+            || ()
+        });
+    }
+    let row_warnings: std::collections::HashMap<usize, Vec<AttrValue>> = document_validation
+        .as_ref()
+        .map(|report| {
+            let mut map: std::collections::HashMap<usize, Vec<AttrValue>> =
+                std::collections::HashMap::new();
+            for finding in &report.findings {
+                if finding.severity == FindingSeverity::Warning {
+                    if let Some(idx) = finding.line_index {
+                        map.entry(idx)
+                            .or_default()
+                            .push(AttrValue::from(finding.message.clone()));
+                    }
+                }
+            }
+            map
+        })
+        .unwrap_or_default();
 
     let drawer_mode: UseStateHandle<Option<DrawerMode>> = use_state(|| None);
     // The candidate-document index of the line being edited (`None` means
@@ -780,6 +822,7 @@ pub fn app_shell() -> Html {
                     } else {
                         <EntriesTable
                             rows={rows}
+                            row_warnings={row_warnings}
                             on_edit={on_edit_entry}
                             on_delete={on_delete_entry}
                             on_add_entry={on_add_entry}

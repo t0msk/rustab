@@ -21,6 +21,15 @@ pub struct EntriesTableProps {
     /// is the row's identity in the app's `CandidateDocument` - the same
     /// value is reported back via `on_edit`/`on_delete`.
     pub rows: Vec<(usize, RowEntry)>,
+    /// Document-wide warning findings keyed by `candidate_index`, from a
+    /// `validate_candidate` run against the whole document (not just the
+    /// row being edited) - lets a row visibly flag "this has a warning"
+    /// before anyone opens its own drawer. A row with no entry here has no
+    /// known warning. Full message text is shown as a native tooltip, not
+    /// inline, to avoid repeating the mistake the mount-point note-glyph
+    /// made (taking up row space) - this is a border accent only.
+    #[prop_or_default]
+    pub row_warnings: std::collections::HashMap<usize, Vec<AttrValue>>,
     pub on_edit: Callback<usize>,
     pub on_delete: Callback<usize>,
     pub on_add_entry: Callback<()>,
@@ -99,9 +108,16 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                             Callback::from(move |_: MouseEvent| cb.emit(candidate_index))
                         };
                         match row {
-                            RowEntry::Parsed(entry) => html! {
-                                <EntryRow key={candidate_index} entry={entry.clone()} on_edit={on_edit} on_delete={on_delete} />
-                            },
+                            RowEntry::Parsed(entry) => {
+                                let warnings = props
+                                    .row_warnings
+                                    .get(&candidate_index)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                html! {
+                                    <EntryRow key={candidate_index} entry={entry.clone()} warnings={warnings} on_edit={on_edit} on_delete={on_delete} />
+                                }
+                            }
                             RowEntry::Unparsed(raw_line) => html! {
                                 <UnparsedEntryRow key={candidate_index} raw_line={AttrValue::from(raw_line.clone())} on_edit={on_edit} on_delete={on_delete} />
                             },
@@ -116,6 +132,10 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
 #[derive(Properties, PartialEq)]
 pub struct EntryRowProps {
     pub entry: EntryDto,
+    /// Document-wide warning messages about this row specifically (see
+    /// `EntriesTableProps::row_warnings`). Empty means no known warning.
+    #[prop_or_default]
+    pub warnings: Vec<AttrValue>,
     pub on_edit: Callback<MouseEvent>,
     pub on_delete: Callback<MouseEvent>,
 }
@@ -128,8 +148,33 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
     let overflow = options.len().saturating_sub(3);
     let full_list = options.join(", ");
 
+    let has_warnings = !props.warnings.is_empty();
+    let row_class = classes!(
+        "h-11",
+        "odd:bg-slate-50",
+        "dark:odd:bg-slate-800/60",
+        "hover:bg-sky-50",
+        "dark:hover:bg-slate-700/60",
+        "border-b",
+        "border-slate-200",
+        "dark:border-slate-700",
+        has_warnings.then_some("border-l-4"),
+        has_warnings.then_some("border-l-amber-400"),
+        has_warnings.then_some("dark:border-l-amber-500"),
+    );
+    let row_title: Option<AttrValue> = has_warnings.then(|| {
+        AttrValue::from(
+            props
+                .warnings
+                .iter()
+                .map(|w| w.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    });
+
     html! {
-        <tr class="h-11 odd:bg-slate-50 dark:odd:bg-slate-800/60 hover:bg-sky-50 dark:hover:bg-slate-700/60 border-b border-slate-200 dark:border-slate-700">
+        <tr class={row_class} title={row_title}>
             <td class="px-4 py-2 font-mono text-sm whitespace-nowrap">
                 <span class="inline-block rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-medium px-2 py-0.5 mr-2">
                     { source_badge(entry.source.kind) }

@@ -141,6 +141,21 @@ Row styling: `bg-white dark:bg-slate-800`, alternating/zebra optional (`odd:bg-s
 dark:odd:bg-slate-800/60`), hover `hover:bg-sky-50 dark:hover:bg-slate-700/60`, row
 height ~44px, `border-b border-slate-200 dark:border-slate-700`.
 
+**Document-wide warning indicator**: `AppShell` runs `validate_candidate` against the
+*whole* candidate document independently of whether any drawer is open (debounced only
+by how often the document itself changes - a staged add/edit/delete - not per
+keystroke, since nothing is being typed at this level). Any row with ≥1 Warning-severity
+finding tagged to its own `line_index` gets a left border accent, `border-l-4
+border-l-amber-400 dark:border-l-amber-500` (same token `UnparsedEntryRow` already uses
+for a different reason below), plus the full warning text as a native `title` tooltip -
+a background tint was considered and deliberately rejected in favor of the border alone:
+a full amber background reads as more alarming than a non-blocking warning deserves, and
+would look noisy across several flagged rows at once; the border is just as scannable
+without overstating severity. This is the same mechanism that powers the drawer's own
+inline mount-point warning and flat warning stack (§5) - both read from the same
+`validate_candidate` response, just scoped differently (the table scopes by row, the
+drawer by "about this draft specifically").
+
 **UnparsedEntryRow (malformed line):**
 
 - Full-width single row (spans all columns), background `bg-amber-50 dark:bg-amber-900/20`,
@@ -630,7 +645,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 4. `PendingChangesBar` - "N entries changed" + `Review & Save…` trigger (§6)
 5. `EntriesTable` - main entry list (§3)
 6. `EntryRow` - one parsed entry's row (§3); no inline description indicator - see
-   that field's own value only in the entry's detail drawer
+   that field's own value only in the entry's detail drawer. Does get a left-border
+   accent + title tooltip when a document-wide warning is tagged to this row
 7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3)
 8. `EmptyState` - generic empty-list placeholder (entries or backups)
 9. `EntryDetailDrawer` - add/edit form container (§4)
