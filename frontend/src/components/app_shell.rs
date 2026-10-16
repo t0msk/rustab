@@ -735,9 +735,12 @@ pub fn app_shell() -> Html {
                 )
             })
         });
+    // old = current live target, new = backup content: shows what *restoring*
+    // this backup would change, not what the current file changed away from
+    // it - the more useful direction when deciding whether to restore.
     let view_diff_lines: Option<Vec<crate::diff::RawDiffLine>> = (*view_diff_text)
         .as_ref()
-        .map(|old| crate::diff::compute_raw_diff(old, original_text.as_str()));
+        .map(|backup| crate::diff::compute_raw_diff(original_text.as_str(), backup));
 
     let is_real = target.as_ref().map(|t| t.is_real).unwrap_or(false);
     let target_path = target.as_ref().map(|t| t.path.clone()).unwrap_or_default();

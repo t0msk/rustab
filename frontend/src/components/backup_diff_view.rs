@@ -1,4 +1,7 @@
-//! `BackupDiffView` - read-only backup-vs-current-target diff overlay (§7).
+//! `BackupDiffView` - read-only current-target-vs-backup diff overlay (§7).
+//! Shows what *restoring* this backup would change (old = current live
+//! target, new = backup content), not the reverse - the direction that
+//! actually answers "what will happen if I restore this".
 //!
 //! Unlike `BackupRestoreConfirmDialog`/`BackupDeleteConfirmDialog`, this
 //! performs no write and no deletion - it is purely informational - so,
@@ -56,8 +59,8 @@ pub fn backup_diff_view(props: &BackupDiffViewProps) -> Html {
                 <div class="shrink-0 flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-700">
                     <h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100">
                         { format!(
-                            "Diff: backup from {} vs. current {}",
-                            props.backup_timestamp, props.target_path
+                            "Diff: current {} vs. backup from {}",
+                            props.target_path, props.backup_timestamp
                         ) }
                     </h2>
                 </div>

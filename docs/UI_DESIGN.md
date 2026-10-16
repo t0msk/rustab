@@ -474,14 +474,19 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
     BackupRestoreConfirmDialog; on success, only the backup list is reloaded (a backup
     deletion never touches the live target, so there is nothing else to refresh).
 - **BackupDiffView**: a read-only overlay opened by a row's `View diff` button, showing
-  `crate::diff::compute_raw_diff` between the backup's raw text (fetched via
-  `read_backup`) and the live target's current text - reusing `DiffRawText` directly,
+  `crate::diff::compute_raw_diff` between the live target's current text (old) and the
+  backup's raw text fetched via `read_backup` (new) - reusing `DiffRawText` directly,
   raw tab only (there is no `render_candidate` equivalent for arbitrary backup text, so
-  a parsed Summary tab isn't buildable here, and adding one is out of scope). Unlike the
-  two dialogs above, this performs no write and no deletion, so - judgment call,
-  mirroring `DeleteConfirmDialog`'s reasoning - it **is dismissible by clicking the
-  backdrop**: there is nothing a stray click could lose. Header names both sides, e.g.
-  `"Diff: backup from {timestamp} vs. current {target path}"`; a single `Close` button.
+  a parsed Summary tab isn't buildable here, and adding one is out of scope). Old/new
+  are deliberately current-then-backup, not the reverse: this answers "what would
+  restoring this backup change", which is what someone opening this dialog actually
+  wants to know before clicking Restore (changed from an earlier backup-then-current
+  ordering per direct user report - the add/removed lines read backwards from what the
+  Restore action is about to do). Unlike the two dialogs above, this performs no write
+  and no deletion, so - judgment call, mirroring `DeleteConfirmDialog`'s reasoning - it
+  **is dismissible by clicking the backdrop**: there is nothing a stray click could
+  lose. Header names both sides, e.g.
+  `"Diff: current {target path} vs. backup from {timestamp}"`; a single `Close` button.
   If the `read_backup` call rejected, the error is shown in place of the diff.
 
 ---
