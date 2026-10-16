@@ -130,7 +130,7 @@ and blanks are never dropped, just not given their own row in this list view).
 | Column | Content |
 |---|---|
 | Source | Small type badge (`UUID`, `LABEL`, `PARTUUID`, `PARTLABEL`, `PATH`, `NET`, `NONE`) + the value, `font-mono text-sm` |
-| Mount point | `font-mono text-sm`; if the entry has a description, a small muted note-glyph (`📝`) is appended after the path, carrying the full description text as a native tooltip (`title`) - shown only when a description is present |
+| Mount point | `font-mono text-sm`; no description indicator here (removed per direct request - it took up row space), description text is only visible by opening the entry's drawer |
 | FS type | plain text badge, `text-sm` |
 | Options | first ~3 options as small chips + `+N more` overflow; full ordered list visible on hover tooltip and always fully editable in the drawer |
 | Dump | single digit |
@@ -591,9 +591,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
    `Backups` tab, T26), plus an always-visible `About` trigger (both tabs, T26)
 4. `PendingChangesBar` - "N entries changed" + `Review & Save…` trigger (§6)
 5. `EntriesTable` - main entry list (§3)
-6. `EntryRow` - one parsed entry's row; its Mount point cell appends a small muted
-   note-glyph with a tooltip carrying the full description text, only when the entry
-   has one (§3)
+6. `EntryRow` - one parsed entry's row (§3); no inline description indicator - see
+   that field's own value only in the entry's detail drawer
 7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3)
 8. `EmptyState` - generic empty-list placeholder (entries or backups)
 9. `EntryDetailDrawer` - add/edit form container (§4)
