@@ -176,14 +176,20 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
 
     html! {
         <tr class={row_class} title={row_title}>
-            <td class="px-4 py-2 font-mono text-sm whitespace-nowrap">
-                <span class="inline-block rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-medium px-2 py-0.5 mr-2">
-                    { source_badge(entry.source.kind) }
-                </span>
-                { entry.source.value.clone() }
+            <td class="px-4 py-2 font-mono text-sm max-w-[16rem]">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span class="shrink-0 inline-block rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-medium px-2 py-0.5">
+                        { source_badge(entry.source.kind) }
+                    </span>
+                    <span class="truncate min-w-0" title={entry.source.value.clone()}>
+                        { entry.source.value.clone() }
+                    </span>
+                </div>
             </td>
-            <td class="px-4 py-2 font-mono text-sm">
-                { entry.mount_point.clone() }
+            <td class="px-4 py-2 font-mono text-sm max-w-[14rem]">
+                <span class="block truncate" title={entry.mount_point.clone()}>
+                    { entry.mount_point.clone() }
+                </span>
             </td>
             <td class="px-4 py-2 text-sm">
                 <span class="rounded-md bg-slate-100 dark:bg-slate-700 px-2 py-0.5 text-slate-600 dark:text-slate-300">
