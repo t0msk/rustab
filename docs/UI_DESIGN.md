@@ -164,8 +164,10 @@ height ~44px, `border-b border-slate-200 dark:border-slate-700`.
 
 Component: **EntryDetailDrawer**, slides in from the right, fixed width 520px (full
 width below the 760px breakpoint), `bg-white dark:bg-slate-800`, `shadow-lg`, backdrop
-`bg-black/40` behind it (click-outside *does* close this one, unlike DiffView, since
-it's a non-destructive in-progress edit, not a final write).
+`bg-black/40` behind it. **Not** dismissible by clicking the backdrop (changed from the
+original design, which allowed it as "non-destructive" - a misclick outside the drawer
+was silently discarding real unsaved edits with no undo, per direct user report).
+Closing is explicit only: the header's × button or FormActionBar's Cancel.
 
 Field order, top to bottom, each with a `text-sm font-medium` label above it and
 `space-y-4` (16px) between fields:
@@ -194,19 +196,18 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
      usable; it is never a blocking state.
 3. **Mount point** - text input (`font-mono`) + a `Browse…` button opening a native
    directory picker (conceptually: open a directory chooser, receive a path string
-   back - the concrete Tauri API is not this document's decision).
-4. **DescriptionField** - a plain free-text input, labeled `"Description (optional)"`,
-   grouped directly below Mount point (not at the end of the field list) because the
-   feature is conceptually about *what the mount point is for*. The value is round-
-   tripped to/from a `# // <text>` comment line placed immediately above the entry in
-   the real fstab file - see `docs/API_CONTRACT.md` §5 for the full round-trip detail.
-   Helper text below the input: `"Shown as a '# // ...' comment line directly above
-   this entry in the fstab file."`
-5. **Filesystem type** - free-text combobox: typing shows a suggestion dropdown of
+   back - the concrete Tauri API is not this document's decision). While the source
+   type is `None` and this field is still empty, it shows a `"none"` placeholder hint
+   (the conventional real-fstab value for a swap entry's mount point, e.g.
+   `/dev/sda2 none swap sw 0 0`) - a visual hint only, never written into the value
+   unless the user actually types it.
+4. **Filesystem type** - free-text combobox: typing shows a suggestion dropdown of
    common types (`ext4, btrfs, xfs, vfat, ntfs3, swap, none, nfs, nfs4, cifs, overlay,
    tmpfs, proc`) but any value can be typed and accepted - no closed enum, matching
-   SPEC §5.
-6. **OptionsTagInput** - the SPEC §9 "checklist/tag-input for options":
+   SPEC §5. No conditional placeholder here (unlike Mount point above) - `swap` is
+   already one of the suggestion-dropdown values, so a placeholder hint would be
+   redundant with (and visually confusable as) an already-entered value.
+5. **OptionsTagInput** - the SPEC §9 "checklist/tag-input for options":
    - A row of toggle chips for the well-known options named in SPEC §5:
      `defaults · noatime · relatime · ro · rw · user · nofail · auto · noauto · bind · sw`.
    - A separate, visually grouped "systemd" row of toggle/value chips for the
@@ -226,9 +227,23 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
      dark:text-sky-300`, inactive/available-but-off `bg-slate-100 text-slate-600
      dark:bg-slate-800 dark:text-slate-400`, each chip `rounded-full px-3 py-1 text-xs
      font-medium`, with an `×` to remove.
-7. **Dump** and **Pass** - two small numeric inputs side by side (`w-16` each), default
+6. **Dump** and **Pass** - two small numeric inputs side by side (`w-16` each), default
    `0`, helper text under each: `"0 = don't dump"` / `"0 = skip fsck, 1 = root
    filesystem, 2 = checked after root"`.
+7. **DescriptionField** - a fixed-size two-row `<textarea>` (`rows="2"`, not user-
+   resizable), labeled `"Description (optional)"`, giving more visible room than a
+   single-line input for a longer note while the field is edited. The underlying value
+   is still always a single line with no embedded newline (enforced both client-side,
+   by stripping any `\n`/`\r` on input, and authoritatively by the backend's
+   `description_contains_newline` validation check) - the two visible rows are purely a
+   larger editing target, not multi-line storage. Placed last in the field list, directly
+   above `ValidationSummary`, so it sits apart
+   from the six functional fstab fields above it rather than between them (a deliberate
+   repositioning - it was originally grouped right below Mount point, moved here per
+   direct user request). The value is round-tripped to/from a `# // <text>` comment line
+   placed immediately above the entry in the real fstab file - see `docs/API_CONTRACT.md`
+   §5 for the full round-trip detail. Helper text below the input: `"Shown as a
+   '# // ...' comment line directly above this entry in the fstab file."`
 
 **FormActionBar** (bottom of drawer, sticky): `Cancel` (secondary, `bg-slate-100
 dark:bg-slate-700`), `Verify` (secondary/outline, `bg-white dark:bg-slate-800 border
@@ -312,8 +327,9 @@ diff/write step; there is no other Save action that skips it.
 Clicking `Review & Save…` opens **DiffView**: a centered modal (`max-w-4xl`, up to
 ~85vh tall with internal scroll), `bg-white dark:bg-slate-800 shadow-lg rounded-lg`,
 backdrop `bg-black/50`. **Not** dismissible by clicking the backdrop (Escape still
-cancels) - this is intentionally stricter than EntryDetailDrawer because this is the
-last gate before an actual write.
+cancels) - this is the last gate before an actual write, same non-dismissible-by-
+backdrop treatment EntryDetailDrawer itself now also has (§4), for the analogous
+reason of not silently discarding unsaved work on a stray click.
 
 **Contents, top to bottom:**
 

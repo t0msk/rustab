@@ -16,6 +16,13 @@ pub struct MountPointFieldProps {
     /// the input.
     #[prop_or_default]
     pub warnings: Vec<AttrValue>,
+    /// Hint text shown when the input is empty - set by the caller to
+    /// `"none"` when the entry's source type is `None` (the conventional
+    /// real-fstab value for a swap entry's mount point, e.g.
+    /// `/dev/sda2 none swap sw 0 0`). Purely a visual hint, never written
+    /// into `value` - the user must still type it for it to actually save.
+    #[prop_or_default]
+    pub placeholder: Option<AttrValue>,
 }
 
 #[function_component(MountPointField)]
@@ -40,6 +47,7 @@ pub fn mount_point_field(props: &MountPointFieldProps) -> Html {
                     type="text"
                     class="flex-1 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 font-mono text-sm px-3 py-2 focus-visible:ring-2 focus-visible:ring-sky-500"
                     value={props.value.clone()}
+                    placeholder={props.placeholder.clone()}
                     oninput={on_input}
                 />
                 <DirectoryPickerButton />

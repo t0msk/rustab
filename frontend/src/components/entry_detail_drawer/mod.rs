@@ -1,8 +1,14 @@
 //! `EntryDetailDrawer` - add/edit form container (§4).
 //!
-//! Slides in from the right, fixed width 520px, backdrop dismissible by
-//! click (unlike `DiffView`/`BackupRestoreConfirmDialog`), since it only
-//! ever stages a non-destructive in-progress edit.
+//! Slides in from the right, fixed width 520px, **not** dismissible by
+//! backdrop click (changed from the original dismissible-by-click design per
+//! direct user request: a drawer can hold several unsaved, sometimes
+//! carefully-constructed field edits, and a single misclick outside it would
+//! silently discard all of them with no undo - too easy a way to lose real
+//! work for a purely non-destructive-sounding dismiss gesture). Closing the
+//! drawer is only ever explicit now: the header's close (×) button or
+//! `FormActionBar`'s Cancel button, both of which already call the same
+//! `on_close`.
 //!
 //! Wired (T11): prefilled from the real entry being edited, device
 //! discovery for `DevicePicker`, and inline validation via
@@ -267,12 +273,6 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
         DrawerMode::EditRaw(_) => "Edit raw entry",
     };
 
-    let on_backdrop_click = {
-        let cb = props.on_close.clone();
-        Callback::from(move |_: MouseEvent| cb.emit(()))
-    };
-    let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
-
     let on_save_click = {
         let on_save = props.on_save.clone();
         let other_lines = props.other_lines.clone();
@@ -511,10 +511,9 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
         .unwrap_or_default();
 
     html! {
-        <div class="fixed inset-0 z-50 flex justify-end bg-black/40" onclick={on_backdrop_click}>
+        <div class="fixed inset-0 z-50 flex justify-end bg-black/40">
             <div
                 class="h-full w-full sm:w-[520px] shrink-0 flex flex-col bg-white dark:bg-slate-800 shadow-lg"
-                onclick={stop_propagation}
                 role="dialog"
                 aria-modal="true"
                 aria-label={title}
@@ -583,16 +582,10 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                     Callback::from(move |value: String| mount_point.set(value))
                                 }}
                                 warnings={mount_point_warnings.clone()}
-                            />
-
-                            <DescriptionField
-                                value={AttrValue::from(
-                                    description.as_deref().unwrap_or_default().to_string()
-                                )}
-                                on_change={{
-                                    let description = description.clone();
-                                    Callback::from(move |value: String| description.set(Some(value)))
-                                }}
+                                placeholder={
+                                    (*source_type == SourceType::None)
+                                        .then(|| AttrValue::from("none"))
+                                }
                             />
 
                             <FsTypeField
@@ -621,6 +614,16 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 on_pass_change={{
                                     let pass = pass.clone();
                                     Callback::from(move |value: u32| pass.set(value))
+                                }}
+                            />
+
+                            <DescriptionField
+                                value={AttrValue::from(
+                                    description.as_deref().unwrap_or_default().to_string()
+                                )}
+                                on_change={{
+                                    let description = description.clone();
+                                    Callback::from(move |value: String| description.set(Some(value)))
                                 }}
                             />
                         </div>
