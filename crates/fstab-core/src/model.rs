@@ -1,4 +1,4 @@
-//! Domain model for fstab entries and documents — see `docs/SPEC.md` §5.
+//! Domain model for fstab entries and documents - see `docs/SPEC.md` §5.
 //!
 //! This module is pure data modeling: it defines the types that represent a
 //! parsed `/etc/fstab`-style file and small, pure accessor/mutator helpers on
@@ -15,7 +15,7 @@
 //! space in a mount point or device path) to be written as an octal escape
 //! sequence, e.g. `\040` for a space or `\011` for a tab. This module stores
 //! such text **exactly as it appears in the file, escape sequences and all**
-//! — it never decodes `\040` into a real space character, and it never
+//! - it never decodes `\040` into a real space character, and it never
 //! re-encodes a literal space into `\040`. A raw string field in this module
 //! is therefore always "the literal bytes between field separators", full
 //! stop. Rationale: decoding would require the model to track "was this
@@ -23,23 +23,23 @@
 //! is exactly the kind of lossy round-trip SPEC §5 forbids. Keeping the raw
 //! text is simple, unambiguous, and correct by construction. Any future UI
 //! code that wants to *display* a decoded path for human readability must
-//! decode on the way out and re-encode on the way back in — this crate does
+//! decode on the way out and re-encode on the way back in - this crate does
 //! not do that translation, and does not currently expose a decode/encode
 //! helper pair since one is not needed to satisfy round-trip fidelity.
 
 use std::fmt;
 
-/// The source identifier of an fstab entry — the first whitespace-separated
+/// The source identifier of an fstab entry - the first whitespace-separated
 /// field on a line (traditionally called "device" even though it is not
 /// always a device).
 ///
 /// Each variant stores the *original raw text* of the field it was built
-/// from (including any octal-escaped whitespace, untouched — see the module
+/// from (including any octal-escaped whitespace, untouched - see the module
 /// docs), so that re-serializing a [`SourceId`] produces byte-identical text
 /// to what it was parsed from. The variant itself only records which
 /// `fstab`-recognized *prefix* (`UUID=`, `LABEL=`, etc.) was present, if any;
 /// it does not attempt to validate the value after the prefix (e.g. it does
-/// not check that a `UUID=` value is a syntactically valid UUID) — that is
+/// not check that a `UUID=` value is a syntactically valid UUID) - that is
 /// `validate.rs`'s job, not the model's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceId {
@@ -80,7 +80,7 @@ pub enum SourceId {
     Network(String),
 
     /// Any other source text that does not match a recognized prefix and is
-    /// not a plain path (as best-effort distinguished by the parser) —
+    /// not a plain path (as best-effort distinguished by the parser) -
     /// a catch-all that preserves the raw text verbatim so no input is ever
     /// rejected or silently dropped at the model layer.
     Other(String),
@@ -111,7 +111,7 @@ impl SourceId {
 /// pair (`x-systemd.idle-timeout=30`).
 ///
 /// This is intentionally not a closed enum of "known" options (per
-/// `docs/SPEC.md` §5) — recognizing well-known options and offering toggles
+/// `docs/SPEC.md` §5) - recognizing well-known options and offering toggles
 /// for them is a frontend concern for a later task. This type only
 /// distinguishes the two syntactic shapes fstab options can take.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +163,7 @@ impl fmt::Display for FstabOption {
 /// An ordered list of fstab options (the fourth, comma-separated field of an
 /// entry).
 ///
-/// Order and exact spelling of each option are preserved as given —
+/// Order and exact spelling of each option are preserved as given -
 /// `Options` never sorts, deduplicates, or normalizes casing on its own.
 /// Mutation methods (`set`/`unset`) describe exactly what they do to order
 /// when an option already exists; see their docs.
@@ -173,7 +173,7 @@ pub struct Options(Vec<FstabOption>);
 impl Options {
     /// Creates an empty option list (equivalent to an entry whose options
     /// field is empty, which the serializer may choose to render as
-    /// `defaults` or leave empty — that choice belongs to `parser.rs`, not
+    /// `defaults` or leave empty - that choice belongs to `parser.rs`, not
     /// this type).
     pub fn new() -> Self {
         Options(Vec::new())
@@ -234,7 +234,7 @@ impl Options {
 
     /// Inserts a bare flag option (e.g. `noauto`) if not already present by
     /// key. If an option with this key already exists (flag or
-    /// `key=value`), this is a no-op — it does not downgrade an existing
+    /// `key=value`), this is a no-op - it does not downgrade an existing
     /// `key=value` option to a flag, since that would silently discard its
     /// value.
     pub fn set_flag(&mut self, key: impl Into<String>) {
@@ -268,7 +268,7 @@ impl fmt::Display for Options {
     }
 }
 
-/// One logical, successfully-parsed fstab entry — i.e. a non-comment,
+/// One logical, successfully-parsed fstab entry - i.e. a non-comment,
 /// non-blank line with all six whitespace-separated fields present and
 /// structurally well-formed enough to split.
 ///
@@ -276,13 +276,13 @@ impl fmt::Display for Options {
 /// enum) per `docs/SPEC.md` §5: fstab accepts arbitrary filesystem type
 /// strings, and rejecting uncommon-but-valid ones would make this crate
 /// less correct than hand-editing the file. `mount_point` follows the same
-/// escaped-whitespace policy as [`SourceId::Path`] — see the module-level
+/// escaped-whitespace policy as [`SourceId::Path`] - see the module-level
 /// docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FstabEntry {
     /// The entry's source identifier (first field).
     pub source: SourceId,
-    /// The mount point (second field), raw text — may contain
+    /// The mount point (second field), raw text - may contain
     /// octal-escaped whitespace, stored undecoded (see module docs).
     pub mount_point: String,
     /// The filesystem type (third field), free text. No closed enum: any
@@ -290,11 +290,11 @@ pub struct FstabEntry {
     pub fs_type: String,
     /// The options list (fourth field).
     pub options: Options,
-    /// The dump field (fifth field) — historically used by the `dump(8)`
+    /// The dump field (fifth field) - historically used by the `dump(8)`
     /// backup utility. Conventionally `0` or `1`; stored as a plain integer
     /// since fstab itself imposes no tighter range.
     pub dump: u32,
-    /// The pass field (sixth field) — fsck ordering. Conventionally `0`
+    /// The pass field (sixth field) - fsck ordering. Conventionally `0`
     /// (skip), `1` (check first, root filesystem), or `2` (check after
     /// pass 1); stored as a plain integer since fstab itself imposes no
     /// tighter range.
@@ -344,7 +344,7 @@ impl FstabEntry {
 /// A `Document` is an ordered sequence of `Line`s rather than just a `Vec`
 /// of entries, specifically so that comment lines, blank lines, and
 /// malformed lines retain their original position relative to real entries
-/// — required for byte-faithful round-tripping per `docs/SPEC.md` §5/§6.
+/// - required for byte-faithful round-tripping per `docs/SPEC.md` §5/§6.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
     /// A successfully parsed fstab entry.
@@ -373,7 +373,7 @@ pub enum Line {
 ///
 /// Reconstructing a file from a `Document` (serialization, a later task) is
 /// only guaranteed to be byte-faithful if every line of the original file
-/// was captured as exactly one `Line` in `lines`, in original order — this
+/// was captured as exactly one `Line` in `lines`, in original order - this
 /// type carries no separate "header comment block" or "entries" field
 /// precisely so that invariant is trivially true by construction rather
 /// than something a parser must carefully keep in sync across two
@@ -398,7 +398,7 @@ impl Document {
 
     /// Returns an iterator over just the successfully-parsed entries, in
     /// document order, skipping comments, blanks, and malformed lines. This
-    /// is a read-only convenience view — it does not let a caller mutate
+    /// is a read-only convenience view - it does not let a caller mutate
     /// entries in place while skipping the surrounding lines; for mutation,
     /// index into `lines` directly (e.g. via `iter_mut` and matching on
     /// `Line::Entry`).

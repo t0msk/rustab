@@ -1,4 +1,4 @@
-//! `FormActionBar` — Cancel/Verify/Save buttons inside the drawer (§4),
+//! `FormActionBar` - Cancel/Verify/Save buttons inside the drawer (§4),
 //! sticky at the bottom. `save_disabled` mirrors §5's "real disabled
 //! element, not just a styling warning" requirement; this task doesn't wire
 //! real validation so it is always enabled by default, driven by a prop so
@@ -19,17 +19,17 @@ pub struct FormActionBarProps {
     pub on_cancel: Callback<()>,
     pub on_save: Callback<()>,
     /// `None` hides the Verify button entirely (raw-text edit mode has no
-    /// structured document to validate — see `EntryDetailDrawer`'s `is_raw_mode`).
+    /// structured document to validate - see `EntryDetailDrawer`'s `is_raw_mode`).
     /// `Some` shows it, wired to an immediate, non-debounced `validate_candidate`
     /// re-check (distinct from the existing debounced background check).
     #[prop_or_default]
     pub on_verify: Option<Callback<()>>,
-    /// Disables the Verify button — true while a Save or a Verify call is
+    /// Disables the Verify button - true while a Save or a Verify call is
     /// already in flight (prevents overlapping `validate_candidate` calls).
     #[prop_or(false)]
     pub verify_disabled: bool,
     /// True specifically while *this* button's own call is in flight (as
-    /// opposed to a Save call) — switches the label to "Verifying…" with a
+    /// opposed to a Save call) - switches the label to "Verifying…" with a
     /// `LoadingSpinner`, same convention as `HeaderBar`'s "Creating…" state.
     #[prop_or(false)]
     pub verifying: bool,

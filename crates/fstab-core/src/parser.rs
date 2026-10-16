@@ -1,4 +1,4 @@
-//! Text-to-`Document` parser and round-trip serializer — see `docs/SPEC.md` §5.
+//! Text-to-`Document` parser and round-trip serializer - see `docs/SPEC.md` §5.
 //!
 //! This module owns the only two operations that convert between fstab text
 //! and the [`crate::model`] types: [`parse`] (text → [`Document`]) and the
@@ -19,12 +19,12 @@
 //! lines flagged (see [`Document::has_malformed_lines`]).
 //!
 //! Per the escaped-whitespace policy documented in [`crate::model`], this
-//! parser never decodes `\040`/`\011`-style octal escapes — raw field text is
+//! parser never decodes `\040`/`\011`-style octal escapes - raw field text is
 //! captured exactly as written. Field splitting itself is whitespace-based
 //! (consecutive runs of spaces/tabs are delimiters); this is safe with
 //! respect to escape sequences without any special-casing because an escape
 //! sequence's raw text (`\`, then octal digits) never itself contains a
-//! literal whitespace byte — only the *decoded* character would, and we
+//! literal whitespace byte - only the *decoded* character would, and we
 //! never decode. So naive `str::split_whitespace` cannot split in the middle
 //! of a `\NNN` sequence.
 //!
@@ -49,7 +49,7 @@
 //! (`parse(text).to_string() == text`) is therefore only guaranteed for text
 //! that was already in this canonical form (single-space-separated fields,
 //! no leading whitespace before comments, entries with all six fields
-//! present, a trailing newline at end of file) — which is exactly the shape
+//! present, a trailing newline at end of file) - which is exactly the shape
 //! this crate's own fixtures are written in. Non-canonical input (e.g. real
 //! hand-edited fstabs with tab-aligned columns) still parses correctly and
 //! still reaches a *stable fixed point*
@@ -62,7 +62,7 @@ use std::fmt;
 
 /// Parses fstab-style text into a [`Document`].
 ///
-/// Always succeeds and never panics — see the module-level "Parsing
+/// Always succeeds and never panics - see the module-level "Parsing
 /// contract" docs. Each input line (split on `\n`, with any trailing `\r`
 /// from CRLF input tolerated by [`str::lines`]) becomes exactly one
 /// [`Line`] in the returned document, in original order, so the number of
@@ -78,7 +78,7 @@ use std::fmt;
 ///
 /// Entry parsing: the line is first split at the first `#` that begins a
 /// new whitespace-delimited token (i.e. is preceded by whitespace or is the
-/// first character) — everything from there to end-of-line becomes
+/// first character) - everything from there to end-of-line becomes
 /// [`FstabEntry::trailing_comment`] (minus the `#` itself), and everything
 /// before it is split on whitespace into fields. At least four fields
 /// (source, mount point, fs type, options) are required; fewer than that
@@ -170,7 +170,7 @@ fn split_trailing_comment(raw: &str) -> (&str, Option<String>) {
 }
 
 /// Classifies a single raw source-field token into a [`SourceId`] variant.
-/// Never rejects input — anything not matching a recognized prefix, `none`,
+/// Never rejects input - anything not matching a recognized prefix, `none`,
 /// a path, or a network-style address falls back to [`SourceId::Other`].
 fn parse_source(token: &str) -> SourceId {
     if let Some(rest) = token.strip_prefix("UUID=") {

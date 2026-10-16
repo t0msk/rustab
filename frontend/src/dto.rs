@@ -196,7 +196,7 @@ pub struct BackupInfoDto {
     pub created_unix_secs: Option<i64>,
     /// `true` for a backup the user asked for with `create_backup` (§3.11),
     /// `false` for one a `save` took on its own. Never inferred from
-    /// `file_name` — the backend owns the naming scheme and reports the
+    /// `file_name` - the backend owns the naming scheme and reports the
     /// answer here.
     pub is_manual: bool,
 }

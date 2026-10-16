@@ -1,4 +1,4 @@
-//! The in-memory "candidate document" — T11's central state design.
+//! The in-memory "candidate document" - T11's central state design.
 //!
 //! `AppShell` owns one `CandidateDocument`, seeded from `list_entries`'s
 //! `DocumentDto` on load. Every staged add/edit/delete mutates it directly
@@ -11,9 +11,9 @@
 //! Each line remembers the index it had in the *original* `list_entries`
 //! response (`original_index`), or `None` if it was added this session.
 //! That is deliberately enough information for T12 to compute the
-//! Added/Modified/Removed grouping its diff view needs — by comparing each
+//! Added/Modified/Removed grouping its diff view needs - by comparing each
 //! candidate line's `original_index`/content against the original
-//! document's lines — without this task having to build that comparison
+//! document's lines - without this task having to build that comparison
 //! itself:
 //! - `original_index: None` → Added.
 //! - `original_index: Some(i)` and `line != original.lines[i]` → Modified.
@@ -21,7 +21,7 @@
 //!   candidate line's `original_index` → Removed.
 //!
 //! Comments and blank lines round-trip untouched (never surfaced as table
-//! rows, never dropped — `docs/UI_DESIGN.md` §3) because they are seeded
+//! rows, never dropped - `docs/UI_DESIGN.md` §3) because they are seeded
 //! the same way as entry/malformed lines and nothing in this task's UI
 //! offers a way to touch them.
 
@@ -58,7 +58,7 @@ impl CandidateDocument {
     }
 
     /// Renders the candidate back to a `DocumentDto`, in its current
-    /// order — used by T12's `save` and `render_candidate` calls.
+    /// order - used by T12's `save` and `render_candidate` calls.
     pub fn to_document(&self) -> DocumentDto {
         DocumentDto {
             lines: self.lines.iter().map(|cl| cl.line.clone()).collect(),
@@ -66,7 +66,7 @@ impl CandidateDocument {
     }
 
     /// Every candidate line except the one at `lines[index]`, as a plain
-    /// line list — used to build the "rest of the document" context a
+    /// line list - used to build the "rest of the document" context a
     /// drawer edit/add is validated against (see `EntryDetailDrawer`'s
     /// `other_lines` prop).
     pub fn lines_excluding(&self, index: Option<usize>) -> Vec<LineDto> {
@@ -94,7 +94,7 @@ impl CandidateDocument {
     }
 
     /// Stages an edit of the raw text of a malformed line at `index`, in
-    /// place. The line stays `Malformed` — the frontend has no parser of
+    /// place. The line stays `Malformed` - the frontend has no parser of
     /// its own to promote it to a structured entry (API_CONTRACT.md §3.2).
     pub fn stage_edit_raw(&mut self, index: usize, raw: String) {
         if let Some(candidate_line) = self.lines.get_mut(index) {
@@ -110,7 +110,7 @@ impl CandidateDocument {
     }
 
     /// Row-kind (entry/malformed) candidate lines only, each paired with
-    /// its index into `self.lines` — the identity `EntriesTable` reports
+    /// its index into `self.lines` - the identity `EntriesTable` reports
     /// back on edit/delete. Comments/blanks are preserved in `lines` but
     /// intentionally excluded from this view (`docs/UI_DESIGN.md` §3).
     pub fn rows(&self) -> Vec<(usize, &CandidateLine)> {

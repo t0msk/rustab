@@ -2,9 +2,9 @@
 //! GUI-free `fstab-core` library to a concrete target file and, when that
 //! target is the real `/etc/fstab`, to a single privilege-escalated write.
 //!
-//! The frozen contract every command here honours — names, argument shapes,
+//! The frozen contract every command here honours - names, argument shapes,
 //! return shapes, error shapes, the target-resolution policy, and the
-//! privilege-escalation mechanism — is documented in `docs/API_CONTRACT.md`.
+//! privilege-escalation mechanism - is documented in `docs/API_CONTRACT.md`.
 //! Change the docs and the code together, never one alone.
 //!
 //! Module map:
@@ -17,7 +17,7 @@
 //!   frontend-supplied backup path against that list.
 //! - [`privileged`]: both halves of the three elevated operations (writing the
 //!   real `/etc/fstab`, deleting one of its backups, and creating a manual
-//!   backup of it) — the `pkexec` re-exec on the unprivileged side and the
+//!   backup of it) - the `pkexec` re-exec on the unprivileged side and the
 //!   single hidden internal subcommand on the elevated side.
 //! - [`commands`]: the `#[tauri::command]` functions themselves.
 
@@ -56,6 +56,7 @@ pub fn run() {
             commands::create_backup,
             commands::discover_devices,
             commands::open_backup_location,
+            commands::open_external_link,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

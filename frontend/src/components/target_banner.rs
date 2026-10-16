@@ -1,4 +1,4 @@
-//! `TargetBanner` — the always-on-top real-vs-sandbox indicator.
+//! `TargetBanner` - the always-on-top real-vs-sandbox indicator.
 //!
 //! Per `docs/UI_DESIGN.md` §2, this is the single most safety-critical
 //! visual element in the app: full-width, fixed above everything else,
@@ -30,7 +30,7 @@ pub fn target_banner(props: &TargetBannerProps) -> Html {
             >
                 <span class="mr-2 text-base" aria-hidden="true">{ "⚠" }</span>
                 <span class="truncate text-sm" title={props.path.clone()}>
-                    { format!("REAL SYSTEM FILE — {}", props.path) }
+                    { format!("REAL SYSTEM FILE - {}", props.path) }
                 </span>
             </div>
         }
@@ -42,7 +42,7 @@ pub fn target_banner(props: &TargetBannerProps) -> Html {
             >
                 <span class="mr-2 text-base" aria-hidden="true">{ "🧪" }</span>
                 <span class="truncate text-sm" title={props.path.clone()}>
-                    { format!("Sandbox target — {}", props.path) }
+                    { format!("Sandbox target - {}", props.path) }
                 </span>
             </div>
         }

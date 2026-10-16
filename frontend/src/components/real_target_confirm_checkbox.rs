@@ -1,4 +1,4 @@
-//! `RealTargetConfirmCheckbox` — the extra "I understand..." gate shown
+//! `RealTargetConfirmCheckbox` - the extra "I understand..." gate shown
 //! only for real-target writes, reused by `DiffView` (§6) and
 //! `BackupRestoreConfirmDialog` (§7).
 

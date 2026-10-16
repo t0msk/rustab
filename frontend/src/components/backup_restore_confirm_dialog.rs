@@ -1,4 +1,4 @@
-//! `BackupRestoreConfirmDialog` — restore confirmation modal (§7).
+//! `BackupRestoreConfirmDialog` - restore confirmation modal (§7).
 //!
 //! Centered modal, same non-click-outside-dismiss treatment as `DiffView`
 //! since this is also a real write: the backdrop carries no click handler
@@ -26,7 +26,7 @@ pub struct BackupRestoreConfirmDialogProps {
     #[prop_or(false)]
     pub saving: bool,
     /// The last `restore_backup` failure's message, shown inside this
-    /// still-open dialog (not only as a toast) — same treatment as
+    /// still-open dialog (not only as a toast) - same treatment as
     /// `DiffView` (§6 point 4).
     #[prop_or_default]
     pub error: Option<AttrValue>,
@@ -59,7 +59,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
     html! {
         // Intentionally no `onclick` here: restoring a backup is a real
         // write, so (per docs/UI_DESIGN.md §7) clicking the backdrop must
-        // not dismiss this dialog — only explicit Cancel/Escape should.
+        // not dismiss this dialog - only explicit Cancel/Escape should.
         <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
             <div
                 class="w-full max-w-lg rounded-lg bg-white dark:bg-slate-800 shadow-lg p-6"
@@ -75,7 +75,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                     { format!("This will overwrite the current contents of {}.", props.target_path) }
                 </p>
                 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">
-                    { "Restoring itself creates a fresh backup of the current file first, following the same atomic write guarantee used everywhere else — but any unsaved pending edits in this session will be discarded." }
+                    { "Restoring itself creates a fresh backup of the current file first, following the same atomic write guarantee used everywhere else - but any unsaved pending edits in this session will be discarded." }
                 </p>
                 if let Some(error) = &props.error {
                     <div class="mb-4 rounded-md border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-3 py-2 text-sm" role="alert">

@@ -1,4 +1,4 @@
-# Rustab — Project Specification
+# Rustab - Project Specification
 
 ## 1. Purpose
 
@@ -17,7 +17,7 @@ commit, not a prototype.
 1. **Stability / data safety.** It must never be possible for a crash,
    partial write, invalid entry, or lost privilege escalation to leave
    `/etc/fstab` (or whatever file is targeted) truncated, corrupted, or in a
-   state that fails to boot a machine. See §6 (Atomicity) — this is the
+   state that fails to boot a machine. See §6 (Atomicity) - this is the
    single most important requirement in this spec and overrides convenience
    or feature requests if they ever conflict.
 2. **Correctness / full fstab fidelity.** Every field, device-identifier
@@ -39,7 +39,7 @@ commit, not a prototype.
   JS/TS allowed is what Tauri's own generated API glue requires.
 - **Styling**: Tailwind CSS, invoked as a build-time CLI step from a Trunk
   pre-build hook (or a small `build.rs`/npm script limited to CSS
-  generation). Tailwind's CLI needs Node only as its own runtime — no
+  generation). Tailwind's CLI needs Node only as its own runtime - no
   `node_modules` dependency may ship in the final bundle or be required at
   app runtime. Document this build step clearly in the README.
 - **Core logic**: a pure Rust library crate with **zero** Tauri or GUI
@@ -64,7 +64,7 @@ rustab/
 ```
 
 Adjust naming/structure if there's a better idiomatic layout, but keep the
-separation between GUI-free core logic and the Tauri/Yew shells — that
+separation between GUI-free core logic and the Tauri/Yew shells - that
 boundary is what makes the atomicity and parsing guarantees testable.
 
 ## 5. fstab domain coverage
@@ -76,12 +76,12 @@ The parser/model must handle, at minimum:
 - **Source identifiers**: raw device path (`/dev/sda1`), `UUID=`, `LABEL=`,
   `PARTUUID=`, `PARTLABEL=`, `none` (for swap/bind/virtual), and network
   sources (e.g. `//server/share`, `server:/path` for cifs/nfs). Preserve
-  whatever octal-escaped whitespace (`\040`, `\011`, etc.) appears in paths —
+  whatever octal-escaped whitespace (`\040`, `\011`, etc.) appears in paths -
   fstab requires spaces in paths to be escaped this way; do not mangle it.
 - **Mount points**: including bind mounts where the "device" field is
   itself a path.
 - **Filesystem types**: `ext4`, `btrfs`, `xfs`, `vfat`, `ntfs3`, `swap`,
-  `none`, `nfs`/`nfs4`, `cifs`, `overlay`, `tmpfs`, etc. — don't hardcode an
+  `none`, `nfs`/`nfs4`, `cifs`, `overlay`, `tmpfs`, etc. - don't hardcode an
   exhaustive allowlist that rejects valid-but-uncommon types; validate
   structurally, not against a closed enum of "known" filesystems.
 - **Options**: arbitrary comma-separated option list including common ones
@@ -99,14 +99,14 @@ The parser/model must handle, at minimum:
 - **Comments and blank lines**: must be preserved on write, in their
   original position relative to entries, including a file's leading
   comment block. Rustab is not allowed to silently reformat or drop a
-  user's existing comments when saving. (Realistic fstabs — see the
-  anonymized fixtures — mix section-header comments, inline comments above
+  user's existing comments when saving. (Realistic fstabs - see the
+  anonymized fixtures - mix section-header comments, inline comments above
   entries, and blank-line separators; all of that must survive a load →
   edit-one-entry → save round trip unchanged elsewhere in the file.)
 - **Swap entries**, **bind mounts** (`none` fstype, `bind` option), and
   entries with an empty options/placeholder line (a source line with no
   other fields, as can appear for a commented-out or reserved device) should
-  all parse without the file being rejected outright — surface malformed
+  all parse without the file being rejected outright - surface malformed
   lines to the user as a visible warning/skip rather than crashing or
   silently corrupting the rest of the file.
 
@@ -123,12 +123,12 @@ guarantees):
    (or an in-process equivalent) against the fully-rendered candidate file.
    Reject on failure, again before touching the real target file.
 3. Write the candidate content to a temp file in the **same directory** as
-   the target (not `/tmp`, which may be a different filesystem — rename
+   the target (not `/tmp`, which may be a different filesystem - rename
    across filesystems is not atomic). Use a name like
    `.<target>.rustab.tmp.<pid>`.
 4. `fsync` the temp file, then `fsync` the containing directory, then
    `rename()` the temp file onto the target path. `rename(2)` within the
-   same filesystem is atomic on Linux — this is what gives the "all or
+   same filesystem is atomic on Linux - this is what gives the "all or
    nothing" guarantee: the target either has the fully old content or the
    fully new content, never a partial write.
 5. Before step 3-4, copy the current target to a timestamped backup
@@ -140,14 +140,14 @@ guarantees):
    action, which copies the target and never writes it); such a backup is
    named with one extra trailing `.manual` suffix
    (`<target>.rustab-backup.<secs>.<nanos>.manual`) and is **exempt** from
-   the automatic bound — it is neither counted towards it nor pruned to
+   the automatic bound - it is neither counted towards it nor pruned to
    honour it, and only an explicit user deletion removes it. The rationale:
    a snapshot the user deliberately asked to keep must not be evicted by
    unrelated later saves, and manual snapshots must not be able to evict the
    automatic safety net either.
 6. If writing to a privileged path like the real `/etc/fstab`, do the
    privilege escalation (`pkexec`) around a single helper invocation that
-   performs steps 3-5 atomically as root — do not do an unprivileged
+   performs steps 3-5 atomically as root - do not do an unprivileged
    temp-file write followed by a separate privileged move where a crash
    between the two could matter; design so the elevated helper either does
    nothing or completes the full atomic swap.
@@ -188,13 +188,13 @@ To avoid the user having to hand-type UUIDs, add Tauri commands that shell
 out to already-available system tools (`lsblk`, `blkid`, `findmnt`) to list
 available block devices with their UUID/LABEL/PARTUUID/filesystem type, and
 let the GUI offer them as a picker when adding/editing an entry's source.
-Treat their absence (sandboxed/minimal systems) as a soft failure — the
+Treat their absence (sandboxed/minimal systems) as a soft failure - the
 manual text entry must still work if these tools are missing.
 
 ## 9. GUI requirements
 
 - Table/list view of all current entries (including ones Rustab doesn't
-  "understand" perfectly — show raw text with a warning rather than
+  "understand" perfectly - show raw text with a warning rather than
   dropping them).
 - Add / edit / delete an entry, with a form that offers structured inputs
   for source type (dropdown: path/UUID/LABEL/PARTUUID/none, plus a device
@@ -205,7 +205,7 @@ manual text entry must still work if these tools are missing.
   doesn't exist on disk, malformed UUID) before allowing save.
 - A clear "pending changes" / diff view before committing a save, and a
   visible indicator of which file (real `/etc/fstab` vs. a dev/sandbox path)
-  is currently targeted — this must never be ambiguous to the user.
+  is currently targeted - this must never be ambiguous to the user.
 - Backup/restore UI: list recent auto-backups (see §6) and let the user
   restore one.
 - Tailwind for styling; keep it modern and clean, dark-mode friendly.
@@ -219,7 +219,7 @@ manual text entry must still work if these tools are missing.
 - Public items (functions, types, modules) in `fstab-core` get `///` rustdoc
   comments explaining contracts/invariants (e.g. "never leaves the target
   file partially written", "returns Err without touching disk if validation
-  fails") — not restating the signature. Keep inline comments rare and
+  fails") - not restating the signature. Keep inline comments rare and
   reserved for non-obvious *why* (e.g. the same-filesystem temp-file
   reasoning in §6).
 - `README.md` (repo root): what it is, screenshot/GIF placeholder, build &
@@ -228,14 +228,14 @@ manual text entry must still work if these tools are missing.
   dev-sandbox-by-default behavior from §7.
 - **README must also include an explicit, public "AI use" disclosure
   section.** Required content (the maintainer's own words, adapt phrasing
-  but keep every point — this is a deliberate transparency statement, not
+  but keep every point - this is a deliberate transparency statement, not
   boilerplate):
   - Yes, AI assistance (Claude Code) was used during development.
   - The maintainer is a senior software developer with 10+ years of
     experience, who personally code-reviewed and tested every change.
   - An automated test suite backs the codebase (link/mention the test
     counts if it reads naturally), in addition to manual review.
-  - Tone: confident and matter-of-fact, not apologetic or defensive —
+  - Tone: confident and matter-of-fact, not apologetic or defensive -
     stating a development practice, not making an excuse.
   - Contact email for the project throughout README/CONTRIBUTORS/issue
     templates is `rustab@tomsk.dev` (not a personal address).
@@ -248,18 +248,18 @@ manual text entry must still work if these tools are missing.
     linking to `https://github.com/sponsors/t0msk` (e.g. a shields.io
     badge: `https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white`),
     placed alongside the Discord/contact badges. Also add a
-    `.github/FUNDING.yml` with `github: [t0msk]` — this is a one-line,
+    `.github/FUNDING.yml` with `github: [t0msk]` - this is a one-line,
     low-effort addition that makes GitHub render its own native "Sponsor"
     button on the repo's main page too, on top of the README badge.
 - `CONTRIBUTING.md`: how to set up the dev environment, how to run tests,
   code style expectations (fmt/clippy gates), PR process, and a note that
   contributors should add themselves to `CONTRIBUTORS.md` in their PR.
 - `CONTRIBUTORS.md` and `LICENSE-MIT` / `LICENSE-APACHE` already exist at
-  the repo root (dual MIT/Apache-2.0, the standard Rust ecosystem choice —
+  the repo root (dual MIT/Apache-2.0, the standard Rust ecosystem choice -
   set `license = "MIT OR Apache-2.0"` in each crate's `Cargo.toml`).
 - `.env.example` only if any env var is actually needed (e.g. overriding
-  the dev target path from §7) — never commit a real `.env`.
-- **Commit/PR authorship**: see the repo-root `CLAUDE.md` — no AI
+  the dev target path from §7) - never commit a real `.env`.
+- **Commit/PR authorship**: see the repo-root `CLAUDE.md` - no AI
   co-author trailer in commits or PR descriptions in this repository, by
   the maintainer's explicit request. AI use is disclosed once, clearly, in
   README instead of on every commit.
@@ -268,10 +268,10 @@ manual text entry must still work if these tools are missing.
 
 - Every crate (`fstab-core`, the `src-tauri` app, `frontend`) and
   `src-tauri/tauri.conf.json` start at **`0.0.0`**, not Cargo's default
-  `0.1.0`. Keep all of them in lockstep at the same version — this is a
+  `0.1.0`. Keep all of them in lockstep at the same version - this is a
   single-product release, not independently versioned libraries.
 - Follow semver (`MAJOR.MINOR.PATCH`). The maintainer decides, per release,
-  which part bumps — see §13; don't infer it automatically from commit
+  which part bumps - see §13; don't infer it automatically from commit
   messages or diff size.
 
 ## 13. Release & packaging CI/CD
@@ -284,7 +284,7 @@ never silently cuts a version the maintainer didn't ask for:
    fmt/clippy/test/build). Add a workflow triggered on push to the
    `release` branch that builds installable packages from the current
    `release` HEAD every time something is merged into it:
-   - `.deb` via `cargo-deb` (or an equivalent Tauri bundler step —
+   - `.deb` via `cargo-deb` (or an equivalent Tauri bundler step -
      `cargo tauri build` already produces `.deb` and `.AppImage` bundles
      out of the box for a Tauri 2 app; check whether that covers it
      before adding a separate `cargo-deb` step).
@@ -301,7 +301,7 @@ never silently cuts a version the maintainer didn't ask for:
    the `release` branch, after merging) with a **required choice input**
    `bump` restricted to `patch` / `minor` / `major`. On run, it should:
    - Read the current version (from `src-tauri/tauri.conf.json` or any
-     one crate — they're kept in lockstep per §12), compute the new
+     one crate - they're kept in lockstep per §12), compute the new
      semver value for the chosen bump level.
    - Update the version field in every workspace crate's `Cargo.toml` and
      in `tauri.conf.json`, commit that as `chore(release): vX.Y.Z`
@@ -310,10 +310,10 @@ never silently cuts a version the maintainer didn't ask for:
    - Re-run the packaging step from (1) against that exact commit and
      attach the resulting `.deb`/`.rpm`/`.AppImage` to a new GitHub
      Release for tag `vX.Y.Z`, using the tag as the release title.
-   - This is the *only* thing that advances the version — a plain push to
+   - This is the *only* thing that advances the version - a plain push to
      `release` (point 1) must never bump it on its own.
 
-## 14. Flatpak / Flathub — documentation only (not implemented in v1)
+## 14. Flatpak / Flathub - documentation only (not implemented in v1)
 
 Add `docs/FLATPAK.md`: a self-contained, step-by-step guide for a future
 contributor (or the maintainer later) to package Rustab as a Flatpak and
@@ -323,7 +323,7 @@ submit it to Flathub. Cover, concretely for *this* project's stack:
   GNOME or similar runtime that provides WebKitGTK, and that Tauri's own
   docs have Linux-packaging guidance worth cross-referencing).
 - How to write the Flatpak manifest (`dev.tomsk.Rustab.yml` or similar
-  reverse-DNS app ID — note the app will need a reverse-DNS id distinct
+  reverse-DNS app ID - note the app will need a reverse-DNS id distinct
   from the GitHub repo name) using `flatpak-builder`, and how a Rust/Cargo
   build integrates (e.g. `flatpak-cargo-generator` for vendoring
   dependencies offline, since Flathub's build sandbox has no network
@@ -331,21 +331,21 @@ submit it to Flathub. Cover, concretely for *this* project's stack:
 - Why `pkexec`/polkit-based privilege escalation needs special handling
   under Flatpak's sandbox (portals, or documenting that the Flatpak build
   may need `--filesystem=/etc/fstab:rw` or a host-system D-Bus/portal
-  approach instead of a bare `pkexec` call) — flag this as something that
+  approach instead of a bare `pkexec` call) - flag this as something that
   needs real testing on a Flatpak build before submission, not something
   to assume works unchanged.
 - The actual Flathub submission process: forking `flathub/flathub`,
   opening a PR with the manifest, their review/CI bot, and ongoing
   maintenance expectations (keeping the manifest's dependency versions
   updated).
-- This is guidance for a reader to follow later — do not actually build or
+- This is guidance for a reader to follow later - do not actually build or
   submit a Flatpak package as part of this task.
 
 ## 11. Explicit non-goals (for v1)
 
 - No remote/SSH management of other machines' fstabs.
 - No live mount/unmount execution from the GUI beyond what's needed for
-  validation (`findmnt --verify`) — editing the file is the scope, not
+  validation (`findmnt --verify`) - editing the file is the scope, not
   acting as a mount manager.
-- No Windows/macOS support — Linux-only, matches `/etc/fstab`,
+- No Windows/macOS support - Linux-only, matches `/etc/fstab`,
   `systemd.mount(5)`, `pkexec`/polkit assumptions throughout.

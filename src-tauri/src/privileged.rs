@@ -1,5 +1,5 @@
 //! The elevated operations: `pkexec` re-exec on the unprivileged side, hidden
-//! internal subcommand on the elevated side — see `docs/SPEC.md` §6 step 6
+//! internal subcommand on the elevated side - see `docs/SPEC.md` §6 step 6
 //! and `docs/API_CONTRACT.md` §4.
 //!
 //! ## The three operations, and why there is still only one flag
@@ -13,7 +13,7 @@
 //! They share one dispatch point. The request on stdin is a union tagged by
 //! `op`, so [`run_internal_if_requested`] still checks exactly one hidden
 //! argument, still reads stdin to EOF exactly once, still writes exactly one
-//! JSON object to stdout and still returns one exit code — for any of the
+//! JSON object to stdout and still returns one exit code - for any of the
 //! three. That matters because the security property this module claims is
 //! "when the flag is present, no Tauri runtime, webview, plugin or logger is
 //! ever initialized", and that claim is only as auditable as the number of
@@ -25,7 +25,7 @@
 //! copy), because neither writes the target and none of
 //! [`writer::write_document`]'s guarantees apply to them or are needed for
 //! them. In particular [`writer::create_backup`] never opens the target for
-//! writing at all — it only reads it — so the elevated backup operation
+//! writing at all - it only reads it - so the elevated backup operation
 //! cannot damage `/etc/fstab` even in principle.
 //!
 //! ## The requirement, restated
@@ -41,7 +41,7 @@
 //!
 //! The elevated process runs **the same binary** with a hidden first
 //! argument, and in that mode it does exactly one thing:
-//! [`fstab_core::writer::write_document`] — the whole §6 algorithm
+//! [`fstab_core::writer::write_document`] - the whole §6 algorithm
 //! (validate → back up → prune → temp file in the target's own directory →
 //! `fsync` → `fsync` dir → `rename` → `fsync` dir → read back and verify) in
 //! a single function call, inside a single process, under a single
@@ -80,7 +80,7 @@
 //!   be a smaller elevated code surface. Here the elevated surface is
 //!   *already* minimal and provably so: [`run_internal_if_requested`] runs
 //!   before anything else in `main`, so when the flag is present the Tauri
-//!   runtime, the webview, the logger and the plugins are never initialized —
+//!   runtime, the webview, the logger and the plugins are never initialized -
 //!   the elevated process reads stdin, calls one function, prints JSON, and
 //!   exits. The flag is matched as `argv[1]` exactly, and extra arguments are
 //!   refused.
@@ -91,7 +91,7 @@
 //! ## The target path, and why the child re-checks it
 //!
 //! `pkexec` deliberately does not forward the caller's environment, so the
-//! child cannot re-resolve the target itself — `RUSTAB_TARGET_PATH` does not
+//! child cannot re-resolve the target itself - `RUSTAB_TARGET_PATH` does not
 //! survive the transition (that is a feature: it means an env var cannot
 //! influence the elevated process at all). The target therefore travels
 //! inside the request.
@@ -111,7 +111,7 @@
 //! of the target it has *already* verified, so the only files it can ever
 //! unlink are that one target's own backups. A bug (or a lie) on the
 //! unprivileged side cannot turn the elevated delete into "unlink an arbitrary
-//! root-owned path" — not `/etc/shadow`, not a different target's backup, not
+//! root-owned path" - not `/etc/shadow`, not a different target's backup, not
 //! the target itself.
 //!
 //! The create-backup operation carries only a `target`, and that single
@@ -141,7 +141,7 @@ use std::process::{Command, Output, Stdio};
 /// [`save_elevated`], [`delete_backup_elevated`] and [`create_backup_elevated`]
 /// is expected to pass it.
 ///
-/// The name and the spelling are historical — the flag predates the two
+/// The name and the spelling are historical - the flag predates the two
 /// backup operations and now carries any [`PrivilegedRequest`] variant. It is
 /// kept as-is on purpose: changing it buys nothing and the whole point of this
 /// module is that there is exactly *one* string that can turn this process
@@ -156,7 +156,7 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_OPERATION_ERROR: i32 = 1;
 
 /// Exit code when the request itself was unusable (unreadable or malformed
-/// stdin, stray arguments). Nothing was written and nothing was deleted — the
+/// stdin, stray arguments). Nothing was written and nothing was deleted - the
 /// helper never got as far as knowing which operation it was asked for.
 pub const EXIT_PROTOCOL_ERROR: i32 = 2;
 
@@ -176,7 +176,7 @@ const PKEXEC_NOT_AUTHORIZED: i32 = 127;
 ///
 /// A union tagged by `op`, so the single hidden flag can carry either
 /// operation. Every variant names its `target` explicitly rather than relying
-/// on the elevated process to re-resolve it (it cannot — see the module docs),
+/// on the elevated process to re-resolve it (it cannot - see the module docs),
 /// and the elevated side re-checks that name against the one target it is
 /// allowed to touch before doing anything at all.
 ///
@@ -238,7 +238,7 @@ pub enum PrivilegedResponse {
         error: WriteErrorDto,
     },
     /// A `delete_backup` completed: the backup is gone, and nothing else was
-    /// touched. Carries no payload — there is nothing to report.
+    /// touched. Carries no payload - there is nothing to report.
     BackupDeleted,
     /// A `delete_backup` did not complete. The backup may or may not still
     /// exist (`kind` says which); the target itself was never opened.
@@ -271,7 +271,7 @@ pub enum PrivilegedResponse {
 /// Called as the very first statement of `main` so that, in elevated mode,
 /// no Tauri runtime, webview, plugin or logger is ever initialized. This is
 /// the *only* branch in the whole program that can do that, for either
-/// operation — see the module docs.
+/// operation - see the module docs.
 pub fn run_internal_if_requested() -> Option<i32> {
     let mut args = std::env::args_os();
     args.next()?; // argv[0]
@@ -297,9 +297,9 @@ pub fn run_internal_if_requested() -> Option<i32> {
 /// return the exit code.
 ///
 /// `allowed_target` is the only target this is permitted to act on (matched
-/// literally or by canonicalized identity) — the only file it may write, and
+/// literally or by canonicalized identity) - the only file it may write, and
 /// the only file whose backups it may delete. Production passes `/etc/fstab`;
-/// tests pass a temp file so that this exact function — not a stand-in — is
+/// tests pass a temp file so that this exact function - not a stand-in - is
 /// what they exercise.
 ///
 /// Never panics and never returns without having written a response: a caller
@@ -419,7 +419,7 @@ fn handle_write<W: Write>(
 /// Two checks, then one syscall. Neither check trusts anything the
 /// unprivileged side said:
 ///
-/// 1. `target` must be the one target this process may act on — the identical
+/// 1. `target` must be the one target this process may act on - the identical
 ///    [`target::is_same_file`] test [`handle_write`] applies, so "which file
 ///    is the real `/etc/fstab`" is decided in one place for both operations.
 /// 2. `backup_path` must resolve, through
@@ -427,7 +427,7 @@ fn handle_write<W: Write>(
 ///    backups. The path that is then unlinked is the one the backup list
 ///    yielded, never the string that arrived in the request.
 ///
-/// If either check fails, nothing is unlinked — the response is written before
+/// If either check fails, nothing is unlinked - the response is written before
 /// anything touches the disk, which is the same shape of guarantee
 /// [`handle_write`] gives for an invalid target.
 ///
@@ -494,7 +494,7 @@ fn handle_delete_backup<W: Write>(
 /// The elevated manual backup, in full: refuse any target but
 /// `allowed_target`, then call [`writer::create_backup`] on it.
 ///
-/// One check, then one function call — the same shape, and the same "nothing
+/// One check, then one function call - the same shape, and the same "nothing
 /// happens before the check passes" guarantee, as [`handle_write`] and
 /// [`handle_delete_backup`]. The identity test is the identical
 /// [`target::is_same_file`] call those two use, so "which file is the real
@@ -504,8 +504,8 @@ fn handle_delete_backup<W: Write>(
 /// request: [`writer::create_backup`] derives the backup's path from the
 /// verified target's own name, in the target's own directory, so this
 /// operation cannot be pointed at another file the way an operation taking a
-/// destination path could be. And it never opens the target for writing —
-/// only for reading — so unlike [`handle_write`] it has no atomicity
+/// destination path could be. And it never opens the target for writing -
+/// only for reading - so unlike [`handle_write`] it has no atomicity
 /// ceremony to perform and no way to leave `/etc/fstab` in a state nobody
 /// planned.
 fn handle_create_backup<W: Write>(output: &mut W, allowed_target: &Path, target: &str) -> i32 {
@@ -576,16 +576,16 @@ fn respond<W: Write>(output: &mut W, response: PrivilegedResponse, code: i32) ->
 /// Carries the underlying error but **no message**: each operation words its
 /// own, because the useful wording names what was not done ("nothing was
 /// written" / "nothing was deleted") and the right error `kind` differs
-/// between the two shapes. The *mechanics* — the order of the steps, killing a
+/// between the two shapes. The *mechanics* - the order of the steps, killing a
 /// child whose stdin could not be delivered, and which of these failures mean
-/// "the helper provably never acted" — are shared, which is the part that is
+/// "the helper provably never acted" - are shared, which is the part that is
 /// safety-relevant.
 #[derive(Debug)]
 enum LaunchFailure {
     /// [`std::env::current_exe`] failed, so there was nothing to re-exec.
     /// The helper never ran.
     NoExePath(io::Error),
-    /// The request could not be serialized — a bug between the two halves.
+    /// The request could not be serialized - a bug between the two halves.
     /// The helper never ran.
     Serialize(serde_json::Error),
     /// `pkexec` itself could not be spawned (most often: polkit is not
@@ -622,7 +622,7 @@ impl LaunchFailure {
 /// drift apart in ways that matter (a forgotten `child.kill()` on a failed
 /// stdin write leaves a root process blocked on a pipe that will never close).
 ///
-/// Performs **no filesystem writes of its own** — it serializes JSON to a pipe
+/// Performs **no filesystem writes of its own** - it serializes JSON to a pipe
 /// and reads bytes back.
 fn run_elevated(request: &PrivilegedRequest) -> Result<Output, LaunchFailure> {
     let exe = std::env::current_exe().map_err(LaunchFailure::NoExePath)?;
@@ -658,7 +658,7 @@ fn run_elevated(request: &PrivilegedRequest) -> Result<Output, LaunchFailure> {
 /// on stdout.
 ///
 /// Both operations classify through this one enum so they can never disagree
-/// about whether a dismissed prompt means "nothing happened" — that
+/// about whether a dismissed prompt means "nothing happened" - that
 /// interpretation is itself safety-relevant, and `pkexec`'s codes cannot be
 /// provoked reliably in a test, so it is worth having exactly one copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,7 +728,7 @@ pub fn save_elevated(
     // document with blocking findings is rejected without making the user
     // authenticate for a save that cannot succeed. `write_document` validates
     // again inside the elevated process, and that call is the authoritative
-    // one — this check could be deleted without weakening any guarantee.
+    // one - this check could be deleted without weakening any guarantee.
     let report = validate::validate(candidate);
     if report.has_errors() {
         return Err(WriteErrorDto::from(&writer::WriteError::Validation(report)));
@@ -793,7 +793,7 @@ fn write_launch_error(target: &Path, failure: &LaunchFailure) -> WriteErrorDto {
 /// (including the `pkexec`-specific exit codes, which cannot be provoked
 /// reliably in a test) is unit-testable on its own.
 ///
-/// A parsable JSON response always wins over the exit code — it is the
+/// A parsable JSON response always wins over the exit code - it is the
 /// helper's own account of what it did. Only when there is no usable response
 /// does the exit code decide, and then the rule is conservative: claim
 /// `target_unchanged` only for the codes that mean the helper never ran.
@@ -865,7 +865,7 @@ fn interpret_write_output(
 
 // -- the backup-deletion operation ------------------------------------------
 
-/// Deletes `backup_path` — one of `target`'s own backups — as root, by
+/// Deletes `backup_path` - one of `target`'s own backups - as root, by
 /// re-executing this binary under `pkexec` with [`INTERNAL_WRITE_FLAG`].
 ///
 /// Needed at all because the backups of the real `/etc/fstab` live beside it
@@ -907,8 +907,8 @@ pub fn delete_backup_elevated(
 /// Words a [`LaunchFailure`] as a backup-deletion failure.
 ///
 /// Every variant lands on [`DeleteBackupErrorKindDto::PrivilegeEscalation`]:
-/// from the frontend's point of view these are one situation — the elevated
-/// helper never got to do the job — and the message says which it was.
+/// from the frontend's point of view these are one situation - the elevated
+/// helper never got to do the job - and the message says which it was.
 /// (A serialization failure is a bug rather than an escalation problem, but
 /// `DeleteBackupErrorKindDto` deliberately has no `internal` kind: a request of
 /// two `String`s cannot fail to serialize, and inventing a variant the
@@ -943,7 +943,7 @@ fn delete_launch_error(backup_path: &str, failure: &LaunchFailure) -> DeleteBack
 ///
 /// Pure, for the same reason [`interpret_write_output`] is, and it follows the
 /// same rule: a parsable JSON response wins over the exit code, and only when
-/// there is none does the exit code decide — through the same
+/// there is none does the exit code decide - through the same
 /// [`NoResponseReason`], so the two operations cannot disagree about what
 /// `pkexec`'s codes mean.
 fn interpret_delete_output(
@@ -957,7 +957,7 @@ fn interpret_delete_output(
         Ok(PrivilegedResponse::BackupDeleted) => return Ok(()),
         Ok(PrivilegedResponse::BackupDeleteFailed { error }) => return Err(error),
         // The helper answers in this shape when it could not read or parse the
-        // request at all — at that point it does not yet know which operation
+        // request at all - at that point it does not yet know which operation
         // was asked for, so it cannot answer in the delete-specific shape.
         // Nothing was deleted: it never got as far as a path.
         Ok(PrivilegedResponse::Error { error }) => {
@@ -1010,7 +1010,7 @@ fn interpret_delete_output(
 /// under `pkexec` with [`INTERNAL_WRITE_FLAG`].
 ///
 /// Needed at all because a backup of the real `/etc/fstab` has to be created
-/// *in* `/etc/`, which an unprivileged process cannot write to — the mirror
+/// *in* `/etc/`, which an unprivileged process cannot write to - the mirror
 /// image of why [`delete_backup_elevated`] exists. A non-real target's backups
 /// live in a user-owned directory and never come through here.
 ///
@@ -1041,8 +1041,8 @@ pub fn create_backup_elevated(
 ///
 /// Every variant lands on [`CreateBackupErrorKindDto::PrivilegeEscalation`],
 /// for the same reason [`delete_launch_error`]'s do: from the frontend's point
-/// of view these are one situation — the elevated helper never got to do the
-/// job — and the message says which it was. (A serialization failure is a bug
+/// of view these are one situation - the elevated helper never got to do the
+/// job - and the message says which it was. (A serialization failure is a bug
 /// rather than an escalation problem, but a request of one `String` cannot fail
 /// to serialize, and inventing a kind the frontend must handle for an
 /// unreachable case is not worth it.)
@@ -1077,7 +1077,7 @@ fn create_launch_error(target: &Path, failure: &LaunchFailure) -> CreateBackupEr
 ///
 /// Pure, for the same reason [`interpret_write_output`] is, and it follows the
 /// same rule: a parsable JSON response wins over the exit code, and only when
-/// there is none does the exit code decide — through the same
+/// there is none does the exit code decide - through the same
 /// [`NoResponseReason`], so no operation can disagree with another about what
 /// `pkexec`'s codes mean.
 fn interpret_create_backup_output(
@@ -1091,7 +1091,7 @@ fn interpret_create_backup_output(
         Ok(PrivilegedResponse::BackupCreated { outcome }) => return Ok(outcome),
         Ok(PrivilegedResponse::BackupCreateFailed { error }) => return Err(error),
         // The helper answers in this shape when it could not read or parse the
-        // request at all — at that point it does not yet know which operation
+        // request at all - at that point it does not yet know which operation
         // was asked for, so it cannot answer in the create-specific shape.
         // Nothing was created: it never got as far as a target.
         Ok(PrivilegedResponse::Error { error }) => {
@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     /// The core claim of this module: given a request on stdin, the helper
-    /// performs the *entire* `write_document` operation — backup included —
+    /// performs the *entire* `write_document` operation - backup included -
     /// and reports it as JSON.
     #[test]
     fn helper_performs_the_whole_write_document_operation_from_stdin() {
@@ -1263,7 +1263,7 @@ mod tests {
         );
     }
 
-    /// Validation happens *inside* the helper, before anything is written —
+    /// Validation happens *inside* the helper, before anything is written -
     /// the unprivileged side's pre-check is not what protects the file.
     #[test]
     fn helper_refuses_an_invalid_candidate_and_leaves_the_target_untouched() {
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     /// The request shape is the DTO shape, so a candidate survives the trip
-    /// through JSON exactly — including malformed lines and trailing
+    /// through JSON exactly - including malformed lines and trailing
     /// comments, which a text-based protocol could silently reinterpret.
     #[test]
     fn request_round_trips_the_candidate_exactly() {
@@ -1552,7 +1552,7 @@ mod tests {
     }
 
     /// The core claim of the delete operation: the named backup is gone, and
-    /// *nothing else* is — most importantly not the target file itself, which
+    /// *nothing else* is - most importantly not the target file itself, which
     /// this operation never opens.
     #[test]
     fn helper_deletes_exactly_the_named_backup_and_leaves_the_target_untouched() {
@@ -1582,7 +1582,7 @@ mod tests {
             target_content,
             "deleting a backup must not touch the target file"
         );
-        // Nothing else appeared either — no temp file, no backup of a backup.
+        // Nothing else appeared either - no temp file, no backup of a backup.
         let mut leftovers: Vec<String> = fs::read_dir(dir.path())
             .expect("read the temp dir")
             .map(|entry| {
@@ -1609,8 +1609,8 @@ mod tests {
     /// The elevated process runs as root, so the only thing standing between a
     /// `backup_path` that arrived as *data* and an arbitrary `unlink()` as root
     /// is the re-resolution inside `handle_delete_backup`. This asserts that
-    /// guarantee against the elevated handler itself — not against
-    /// `backups::resolve_requested` in isolation, which is separately tested —
+    /// guarantee against the elevated handler itself - not against
+    /// `backups::resolve_requested` in isolation, which is separately tested -
     /// using the same near-miss list `backups.rs` uses: a different target's
     /// backup in the same directory, names that *almost* match the scheme, a
     /// path outside the directory entirely, path traversal, the empty string,
@@ -1884,7 +1884,7 @@ mod tests {
 
     /// The core claim of the create operation: a manual backup of the target's
     /// current content appears beside it, and the target itself is not written
-    /// to at all — no new content, no temp file, no rename.
+    /// to at all - no new content, no temp file, no rename.
     #[test]
     fn helper_creates_a_manual_backup_and_never_writes_the_target() {
         let dir = TempDir::new("helper-create-backup");
@@ -1913,7 +1913,7 @@ mod tests {
             fs::read_to_string(&target).expect("read the target"),
             ORIGINAL
         );
-        // And nothing else was created — in particular no temp file.
+        // And nothing else was created - in particular no temp file.
         let mut leftovers: Vec<String> = fs::read_dir(dir.path())
             .expect("read the temp dir")
             .map(|entry| {
@@ -2154,7 +2154,7 @@ mod tests {
 
     /// The operations must never disagree about what `pkexec`'s own exit
     /// codes mean. They cannot, because they classify through one shared
-    /// [`NoResponseReason`] — asserted here directly, and cross-checked
+    /// [`NoResponseReason`] - asserted here directly, and cross-checked
     /// against the `target_unchanged` the write path derives from it.
     #[test]
     fn all_operations_agree_on_what_pkexecs_exit_codes_mean() {
