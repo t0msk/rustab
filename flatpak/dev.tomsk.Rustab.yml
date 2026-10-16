@@ -81,14 +81,20 @@ modules:
       # --- problem" section. This whole block is a best-effort draft, not
       # --- a proven offline build chain. ---
       #
-      # 1. Tailwind CSS, via the npm devDependency frontend/package.json
+      # 1. Tailwind CSS, via the npm devDependencies frontend/package.json
       #    already declares (see Trunk.toml's pre_build hook) - offline,
       #    from an npm cache this manifest's node-sources.json (not yet
-      #    generated - see below) would need to populate.
+      #    generated - see below) would need to populate. Tailwind v4 ships
+      #    its CLI as @tailwindcss/cli, hence the package-qualified npx
+      #    invocation; it must stay byte-identical to Trunk.toml's hook.
+      #    Note for whoever generates node-sources.json: v4 pulls in
+      #    platform-specific native binaries (@tailwindcss/oxide-*,
+      #    lightningcss-*) as optional dependencies, so the vendored set
+      #    must include the ones for the build architecture.
       - >-
         cd frontend &&
         npm ci --offline --cache ../flatpak-node-cache &&
-        npx tailwindcss -i styles/input.css -o styles/tailwind.css &&
+        npx @tailwindcss/cli -i styles/input.css -o styles/tailwind.css &&
         cd ..
       # 2. Trunk itself fetches its OWN tool dependencies (wasm-bindgen-cli,
       #    sass) the first time it runs, on top of Cargo's. That is a

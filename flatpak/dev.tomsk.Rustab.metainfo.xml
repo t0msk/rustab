@@ -88,11 +88,13 @@
   <url type="donation">https://github.com/sponsors/t0msk</url>
 
   <!--
-    PLACEHOLDER, not a verified brand color: frontend/tailwind.config.js
-    has no custom theme (empty `extend: {}`), so there is no established
-    Rustab brand palette to draw from. These are a neutral light/dark pair
-    picked only so this optional tag is well-formed; replace with real
-    brand colors (or drop this tag entirely) if/when one is chosen - see
+    PLACEHOLDER, not a verified brand color: frontend/styles/input.css
+    (which is where Tailwind v4 keeps the configuration the old
+    frontend/tailwind.config.js used to hold) defines no custom theme, so
+    there is no established Rustab brand palette to draw from. These are a
+    neutral light/dark pair picked only so this optional tag is
+    well-formed; replace with real brand colors (or drop this tag
+    entirely) if/when one is chosen - see
     https://docs.flathub.org/banner-preview to preview before submitting.
   -->
   <branding>

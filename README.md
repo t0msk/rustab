@@ -121,6 +121,8 @@ This invokes `trunk build --release` to compile the frontend, then bundles every
 
 Tailwind is run as a CLI tool (Node.js runtime only) via a pre-build hook in `frontend/Trunk.toml`. The compiled CSS is written to `frontend/styles/tailwind.css` and included in the final bundle. This step is automatic - no manual invocation needed.
 
+This project uses Tailwind v4, which is configured from CSS rather than from a JavaScript config file: everything that used to live in `tailwind.config.js` (content globs, base-style overrides) is now in `frontend/styles/input.css`. The CLI itself ships as the separate `@tailwindcss/cli` package, which is why `frontend/package.json` declares two devDependencies.
+
 ## Testing
 
 The repository includes an automated test suite covering the parser, validator, atomic writer, and frontend components:

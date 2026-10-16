@@ -476,9 +476,12 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
 ## 8. Visual design tokens
 
-Tailwind v3 (per the locked architecture decision), class-based dark mode
-(`darkMode: 'class'` or media-based - either works; tokens below are written as
-light-value / dark-value pairs so either strategy applies them the same way).
+Tailwind v4 (originally locked as v3; migrated to v4 after the UI was built - the
+tokens below are unchanged by that, see the note at the end of this section).
+Dark mode uses Tailwind's default media strategy (`prefers-color-scheme`): the app
+has no class toggling anywhere, it follows the OS colour scheme. The tokens below are
+written as light-value / dark-value pairs, so a class-based strategy would apply them
+identically if one were ever adopted.
 
 **Brand flag**: SPEC/PROJECT_PLAN define no existing brand colors, logo, or voice for
 Rustab. The palette below (slate neutrals + sky primary) is a reasonable
@@ -576,6 +579,24 @@ visual weight stays a reliable signal (§2).
   full-width/full-height instead of `max-w-4xl` centered.
 - `≥ 760px`: full layout as specified above. No further breakpoints are defined - this
   is a desktop app, not a target for phone-width layouts.
+
+### What the Tailwind v3 → v4 migration changed about these tokens
+
+The token *names* above are all still valid in v4, and the migration was verified to
+generate exactly the same set of utility class names v3 did (250 classes, no additions
+and no omissions). Two token *values* differ, both by Tailwind's own design rather
+than by a project decision:
+
+- **The default colour palette moved from sRGB hex to OKLCH.** The slate neutrals that
+  carry most of this UI are visually unchanged (≤ 4/255 per channel); the saturated
+  accents are deliberately more vivid (up to ≈ 39/255 on a single channel for
+  `red-600`, `pink-600`, `amber-400`), because v4 pushes saturated colours toward the
+  P3 gamut. Expect accent colours to read slightly stronger than the hex values quoted
+  in the colour-token tables above, especially on a wide-gamut display.
+- **The shadow scale was renamed**, so `shadow-sm` in v4 is what `shadow` was in v3,
+  and v3's `shadow-sm` is now `shadow-xs`. The three card surfaces that use
+  `shadow-sm` therefore render a slightly stronger shadow than they did under v3;
+  switch them to `shadow-xs` if the original hairline shadow is wanted back.
 
 ---
 

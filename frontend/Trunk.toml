@@ -6,6 +6,12 @@
 # bundled into the compiled `dist/` output or required at application
 # runtime - Tailwind is purely a dev-time CSS-generation step; Node is never
 # needed to run the built app.
+#
+# Tailwind v4 moved the standalone CLI out of the `tailwindcss` package into
+# `@tailwindcss/cli`, so the hook below invokes that package rather than the
+# v3 `npx tailwindcss` form. All Tailwind configuration (content globs,
+# compatibility base styles) now lives in `styles/input.css` - there is no
+# `tailwind.config.js` anymore, because v4 does not auto-load one.
 
 [build]
 target = "index.html"
@@ -15,7 +21,7 @@ dist = "dist"
 stage = "pre_build"
 command = "npx"
 command_arguments = [
-  "tailwindcss",
+  "@tailwindcss/cli",
   "-i",
   "styles/input.css",
   "-o",

@@ -1,12 +1,99 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/*
+ * Tailwind CSS v4 entry point for the Rustab frontend.
+ *
+ * Compiled by the Tailwind CLI (@tailwindcss/cli, see package.json) from
+ * Trunk.toml's pre_build hook into styles/tailwind.css - a git-ignored
+ * build artifact. Nothing from node_modules ships at runtime.
+ *
+ * Tailwind v4 configures itself from CSS instead of a JavaScript config
+ * file, so this file replaces both the v3 trio of @tailwind directives and
+ * the old frontend/tailwind.config.js, which was deleted in the v3 -> v4
+ * migration because v4 no longer auto-loads one.
+ *
+ * NOTE when editing the comments in this file: v4 scans this stylesheet
+ * itself for class-name candidates, comments included, so avoid writing
+ * literal utility class names in prose here - a stray one silently adds
+ * CSS to the output.
+ *
+ * Dark mode is deliberately left on Tailwind's default
+ * `prefers-color-scheme` strategy: every dark-variant utility in src/
+ * relies on the OS colour scheme and there is no JS/WASM class toggling
+ * anywhere in this app. Do NOT add a `@custom-variant` override for the
+ * dark variant here - that would switch all of them to class-based dark
+ * mode, which nothing in this codebase sets.
+ */
+
+/*
+ * source(none) turns off v4's automatic source detection, which otherwise
+ * scans outward from the CLI's current working directory. That would make
+ * the generated CSS depend on where the CLI is invoked from (Trunk's hook
+ * runs in frontend/, the Flatpak manifest cds there itself, a developer
+ * shell may not) and would pick up Tailwind class names that appear as
+ * prose in docs/*.md. The two globs below are exactly the ones v3's
+ * tailwind.config.js `content` array listed, so the set of scanned files
+ * is unchanged by the migration.
+ */
+@import "tailwindcss" source(none);
+
+@source "../index.html";
+@source "../src/**/*.rs";
+
+/*
+ * v3-compatibility base styles.
+ *
+ * Both rules below are the ones Tailwind's own v3 -> v4 upgrade guide
+ * documents for keeping v3's Preflight behaviour, and are kept because
+ * this app's markup depends on them. The guide's other compatibility
+ * snippets are deliberately NOT included: an audit of every border,
+ * divide and ring call site in src/ found that all of them already pair
+ * the width utility with an explicit colour utility, so v4's new
+ * `currentColor` defaults for those cannot change anything here, and no
+ * call site uses the bare (now 1px instead of 3px) ring width utility.
+ */
+@layer base {
+  /*
+   * v4's Preflight no longer sets `cursor: pointer` on buttons; it follows
+   * the browser default instead. That matters more here than in a typical
+   * v4 project because of the body-level cursor rule further down: without
+   * this, every button would inherit the plain arrow and the app would
+   * lose the hand cursor it has on buttons today. Disabled buttons are
+   * excluded, matching what v3's Preflight did.
+   */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  /*
+   * v4's Preflight renders placeholder text as the current text colour at
+   * 50% opacity instead of at a fixed colour. Some inputs here set their
+   * own muted text colour (the read-only options field is the clearest
+   * case), where halving the opacity on top of that would be noticeably
+   * fainter than before, so v3's fixed colour is kept.
+   *
+   * The value below is exactly what v3 emitted for its default placeholder
+   * colour (step 400 of the old default gray ramp). It is written out as a
+   * hex literal rather than referenced through a theme variable because v4
+   * only emits theme variables that the generated utilities actually use,
+   * and no utility in this app uses that ramp.
+   */
+  input::placeholder,
+  textarea::placeholder {
+    opacity: 1;
+    color: #9ca3af;
+  }
+}
 
 /* Default cursor is the normal pointer/arrow, not the text-select I-beam,
    for static/non-editable text (the app title, labels, table cells, etc.)
    - an I-beam over text that isn't meant to be edited is misleading. Actual
    text-entry fields (source value, mount point, filesystem type, options,
-   description, dump/pass) opt back into the I-beam explicitly below. */
+   description, dump/pass) opt back into the I-beam explicitly below.
+
+   Kept outside any @layer deliberately: unlayered rules outrank every
+   cascade layer in v4, which is the same precedence these two rules had in
+   v3 (where they were plain CSS appended after the generated utilities).
+   Putting them in a layer would quietly let utilities override them. */
 body {
   cursor: default;
 }

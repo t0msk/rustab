@@ -2,8 +2,9 @@
   "name": "rustab-frontend",
   "private": true,
   "version": "0.1.0",
-  "description": "Dev-only Tailwind CSS build tooling for the Rustab frontend. Nothing here ships at runtime; the Tailwind CLI is invoked via npx from Trunk.toml purely to generate CSS at build time.",
+  "description": "Dev-only Tailwind CSS build tooling for the Rustab frontend. Nothing here ships at runtime; the Tailwind CLI is invoked via npx from Trunk.toml purely to generate CSS at build time. Tailwind v4 ships its standalone CLI as a separate package (@tailwindcss/cli), so both are declared here; the framework itself (tailwindcss) is pinned explicitly rather than left implicit as @tailwindcss/cli's transitive dependency, so the Tailwind version this app is built against is visible in this file.",
   "devDependencies": {
-    "tailwindcss": "^3.4.0"
+    "@tailwindcss/cli": "^4.3.3",
+    "tailwindcss": "^4.3.3"
   }
 }
