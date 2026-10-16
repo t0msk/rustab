@@ -16,6 +16,7 @@ pub mod header_bar;
 pub mod icons;
 pub mod loading_spinner;
 pub mod pending_changes_bar;
+pub mod raw_view_dialog;
 pub mod real_target_confirm_checkbox;
 pub mod status_toast;
 pub mod target_banner;

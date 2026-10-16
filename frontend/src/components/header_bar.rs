@@ -47,6 +47,11 @@ pub struct HeaderBarProps {
     /// regardless of `active_tab` (unlike every other button in this
     /// component).
     pub on_about_click: Callback<()>,
+    /// Fired when the always-visible "Raw view" trigger is clicked - opens
+    /// `RawViewDialog` showing the active target's exact current raw text,
+    /// independent of any pending edit or tab. Rendered regardless of
+    /// `active_tab`, same as About.
+    pub on_raw_view_click: Callback<()>,
 }
 
 #[function_component(HeaderBar)]
@@ -102,6 +107,10 @@ pub fn header_bar(props: &HeaderBarProps) -> Html {
     };
     let on_about_click = {
         let cb = props.on_about_click.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+    let on_raw_view_click = {
+        let cb = props.on_raw_view_click.clone();
         Callback::from(move |_: MouseEvent| cb.emit(()))
     };
 
@@ -165,6 +174,13 @@ pub fn header_bar(props: &HeaderBarProps) -> Html {
                         </div>
                     </div>
                 }
+                <button
+                    type="button"
+                    class="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 rounded-md px-2 py-1 focus-visible:ring-2 focus-visible:ring-sky-500"
+                    onclick={on_raw_view_click}
+                >
+                    { "Raw view" }
+                </button>
                 <button
                     type="button"
                     class="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 rounded-md px-2 py-1 focus-visible:ring-2 focus-visible:ring-sky-500"

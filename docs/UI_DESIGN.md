@@ -29,7 +29,8 @@ Single-window desktop app, no page routing - view switching is in-memory state
 ├─────────────────────────────────────────────────────────┤
 │ HeaderBar: "Rustab" · [Entries] [Backups] tabs · Add Entry│
 │ (Entries tab) / Create backup + Open backup location       │
-│ (Backups tab) · always-visible About trigger (far right)  │
+│ (Backups tab) · always-visible Raw view + About triggers  │
+│ (far right)                                                │
 ├─────────────────────────────────────────────────────────┤
 │ PendingChangesBar (only visible once ≥1 staged change)   │
 ├─────────────────────────────────────────────────────────┤
@@ -44,8 +45,8 @@ Single-window desktop app, no page routing - view switching is in-memory state
         ↕ (centered modal overlay, blocking)
    DiffView / DeleteConfirmDialog / BackupRestoreConfirmDialog
         ↕ (centered modal overlay, dismissible by backdrop click)
-   BackupDiffView / AboutDialog - read-only, so unlike the overlays above
-   these two are dismissible by clicking the backdrop
+   BackupDiffView / AboutDialog / RawViewDialog - read-only, so unlike the
+   overlays above these three are dismissible by clicking the backdrop
 ```
 
 **Layout decisions and justification:**
@@ -683,6 +684,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
     `UnparsedEntryRow`'s Edit/Delete buttons used before. `stroke="currentColor"`
     so hover/dark-mode color changes already applied to the button apply to the
     icon too, same as `AboutDialog`'s own icons.
+34. `RawViewDialog` - read-only overlay showing the active target's exact current
+    raw text, no diff (§11)
 
 ---
 
@@ -709,6 +712,31 @@ every other button in that component, which is tab-conditional).
   informational, so - the same judgment call as that component - it **is dismissible by
   clicking the backdrop**, unlike the non-dismissible write/delete confirm dialogs. A
   `Close` button is also present, styled identically to `BackupDiffView`'s.
+
+---
+
+## 11. Raw view dialog
+
+Component: **RawViewDialog**, triggered by an always-visible `"Raw view"` text button in
+`HeaderBar`, placed immediately before `About` (same always-on, both-tabs treatment,
+same plain-text-button reasoning - §10). Added per direct user request after a live
+real-target session surfaced a real need: there was no way to see the active target's
+exact current raw content without either opening `DiffView` (which always computes a
+diff against a pending edit - meaningless/unavailable with zero staged changes) or
+`BackupDiffView` (which is about a *backup*, not the live target). This fills that gap:
+no diff, no comparison, just "what does this file actually contain right now."
+
+- **Content**: the target's current raw text - the exact same `original_text` state
+  `AppShell` already holds for `DiffView`'s own raw-text tab (`docs/API_CONTRACT.md`
+  §5), so this needs no new fetch - rendered verbatim in a `font-mono text-sm
+  whitespace-pre-wrap` block, the same raw-text treatment `UnparsedEntryRow` already
+  uses for a malformed line's text (§3). Header names the target path, e.g.
+  `"Raw view: /etc/fstab"`.
+- **Dismiss behavior**: purely read-only, so - same reasoning as `BackupDiffView`/
+  `AboutDialog` - it **is dismissible by clicking the backdrop**. A `Close` button is
+  also present, styled identically to those two.
+- Reuses the identical modal shell (`max-w-4xl max-h-[85vh]`, header/body/footer
+  structure) `BackupDiffView` already established, rather than inventing a new one.
 
 ---
 

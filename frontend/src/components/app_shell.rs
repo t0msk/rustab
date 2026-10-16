@@ -31,6 +31,7 @@ use crate::components::entries_table::{source_badge, EntriesTable, RowEntry};
 use crate::components::entry_detail_drawer::{DrawerMode, DrawerSaveResult, EntryDetailDrawer};
 use crate::components::header_bar::{HeaderBar, Tab};
 use crate::components::pending_changes_bar::PendingChangesBar;
+use crate::components::raw_view_dialog::RawViewDialog;
 use crate::components::status_toast::{StatusToast, ToastKind};
 use crate::components::target_banner::TargetBanner;
 use crate::diff::compute_summary_diff;
@@ -168,6 +169,11 @@ pub fn app_shell() -> Html {
     // About-dialog flow state (T26): purely static/informational content,
     // no fetch, so a single open/closed flag is the whole of its state.
     let about_open: UseStateHandle<bool> = use_state(|| false);
+
+    // Raw-view dialog flow state: no fetch either - `original_text` is
+    // already loaded (it drives DiffView's own raw-text tab), so this just
+    // toggles visibility, same shape as `about_open`.
+    let raw_view_open: UseStateHandle<bool> = use_state(|| false);
 
     // View-diff flow state: which backup's diff overlay is open, its
     // fetched raw text (`None` = loading or not open), and the last
@@ -664,6 +670,15 @@ pub fn app_shell() -> Html {
         Callback::from(move |()| about_open.set(false))
     };
 
+    let on_raw_view_click = {
+        let raw_view_open = raw_view_open.clone();
+        Callback::from(move |()| raw_view_open.set(true))
+    };
+    let on_raw_view_close = {
+        let raw_view_open = raw_view_open.clone();
+        Callback::from(move |()| raw_view_open.set(false))
+    };
+
     let on_view_diff = {
         let view_diff_target = view_diff_target.clone();
         let view_diff_text = view_diff_text.clone();
@@ -810,6 +825,7 @@ pub fn app_shell() -> Html {
                 on_open_location={on_open_location.clone()}
                 open_location_error={(*open_location_error).clone().map(AttrValue::from)}
                 on_about_click={on_about_click.clone()}
+                on_raw_view_click={on_raw_view_click.clone()}
             />
             <PendingChangesBar count={pending_count} on_review={on_review} />
 
@@ -919,6 +935,14 @@ pub fn app_shell() -> Html {
 
             if *about_open {
                 <AboutDialog on_close={on_about_close} />
+            }
+
+            if *raw_view_open {
+                <RawViewDialog
+                    target_path={AttrValue::from(target_path.clone())}
+                    text={AttrValue::from((*original_text).clone())}
+                    on_close={on_raw_view_close}
+                />
             }
 
             if let Some((kind, message)) = (*toast).clone() {
