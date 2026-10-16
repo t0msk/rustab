@@ -561,7 +561,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                         }
                                     })
                                 }}
-                            ></textarea>
+                            />
                         </div>
                     } else {
                         <div class="space-y-4">
