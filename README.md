@@ -147,7 +147,7 @@ See `CONTRIBUTING.md` for guidelines on setting up the dev environment, running 
 
 ## Contact & Support
 
-- **Email**: [rustab@tomsk.dev](mailto:rustab@tomsk.dev)
+- **Email**: [opensource@tomsk.dev](mailto:opensource@tomsk.dev)
 - **Discord**: [Join the dev server](https://discord.gg/vymDkeQnpj)
 - **X / Twitter**: [@TomskDEV](https://x.com/TomskDEV)
 - **Sponsor**: [Support on GitHub Sponsors](https://github.com/sponsors/t0msk)

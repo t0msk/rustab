@@ -168,7 +168,7 @@ In your PR, please add yourself to the `CONTRIBUTORS.md` file in the same format
 
 ## Questions or issues?
 
-Reach out to the maintainer at **rustab@tomsk.dev** for anything related to contributing, development setup, or the contribution workflow.
+Reach out to the maintainer at **opensource@tomsk.dev** for anything related to contributing, development setup, or the contribution workflow.
 
 ## Key references
 

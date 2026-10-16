@@ -238,7 +238,7 @@ manual text entry must still work if these tools are missing.
   - Tone: confident and matter-of-fact, not apologetic or defensive -
     stating a development practice, not making an excuse.
   - Contact email for the project throughout README/CONTRIBUTORS/issue
-    templates is `rustab@tomsk.dev` (not a personal address).
+    templates is `opensource@tomsk.dev` (not a personal address).
   - README must also include a Discord badge/link to the maintainer's dev
     server, `https://discord.gg/vymDkeQnpj`, with a Discord icon (e.g. a
     shields.io badge: `https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white`

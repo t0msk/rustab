@@ -129,7 +129,7 @@ substitute for this document), see
 `src-tauri/tauri.conf.json`'s `"identifier"` field is currently
 `com.rustab.app`. The Flatpak app ID used throughout this guide and in
 `flatpak/` is `dev.tomsk.Rustab` (established by the previous version of
-this doc, derived from the project's `rustab@tomsk.dev` contact domain).
+this doc, derived from the project's `opensource@tomsk.dev` contact domain).
 **These two identifiers do not match each other.** A Flatpak app ID does
 not strictly have to equal Tauri's own `identifier` field (they serve
 different ecosystems), but having them diverge is still worth a deliberate
@@ -182,7 +182,7 @@ The manifest lives at `flatpak/dev.tomsk.Rustab.yml` in this repo (the name
 is a convention: Flathub requires the manifest be named after the
 application ID, with a `.yml`/`.yaml`/`.json` extension, at the top level
 of whatever gets submitted). The reverse-DNS app ID **`dev.tomsk.Rustab`**
-is derived from the project's contact domain (`rustab@tomsk.dev`) and is
+is derived from the project's contact domain (`opensource@tomsk.dev`) and is
 distinct from the GitHub repo name (`rustab`) - see §1.3 above for the one
 place this diverges from Tauri's own `identifier`.
 
@@ -643,4 +643,4 @@ habits, not one-time steps.
 **Questions?** Refer to the live, authoritative documentation at
 [docs.flathub.org](https://docs.flathub.org/) linked throughout this
 guide, and reach out to the maintainer at
-[rustab@tomsk.dev](mailto:rustab@tomsk.dev).
+[opensource@tomsk.dev](mailto:opensource@tomsk.dev).

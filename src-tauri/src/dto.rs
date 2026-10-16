@@ -776,7 +776,7 @@ pub enum ExternalLinkDto {
     GithubRepo,
     /// `https://github.com/sponsors/t0msk`.
     GithubSponsors,
-    /// `mailto:rustab@tomsk.dev`. `xdg-open` dispatches a `mailto:` URI to
+    /// `mailto:opensource@tomsk.dev`. `xdg-open` dispatches a `mailto:` URI to
     /// the host's default mail client, the same way it dispatches an
     /// `https:` URL to the default browser - no separate code path needed.
     Email,
@@ -801,7 +801,7 @@ impl ExternalLinkDto {
         match self {
             ExternalLinkDto::GithubRepo => "https://github.com/t0msk/rustab",
             ExternalLinkDto::GithubSponsors => "https://github.com/sponsors/t0msk",
-            ExternalLinkDto::Email => "mailto:rustab@tomsk.dev",
+            ExternalLinkDto::Email => "mailto:opensource@tomsk.dev",
             ExternalLinkDto::Issues => "https://github.com/t0msk/rustab/issues",
             ExternalLinkDto::License => "https://github.com/t0msk/rustab",
         }

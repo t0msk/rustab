@@ -2,7 +2,7 @@
 
 Thank you to everyone who has contributed to Rustab.
 
-- Tomsk ([tomsk.slovak@gmail.com](mailto:tomsk.slovak@gmail.com)) - Project creator and maintainer
+- Tomsk ([opensource@tomsk.dev](mailto:opensource@tomsk.dev)) - Project creator and maintainer
 
 <!--
 When you open a pull request, feel free to add yourself to this list

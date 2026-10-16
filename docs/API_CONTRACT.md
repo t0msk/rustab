@@ -409,7 +409,7 @@ open_external_link(link: ExternalLinkDto) -> null   (rejects with CommandErrorDt
 Opens one of this app's five known external links (the GitHub repo page, the
 GitHub issues page, the GitHub Sponsors page, the license (repo root, since
 Rustab is dual MIT/Apache-2.0 - see `docs/SPEC.md` §10 - rather than one
-specific license file), or the `rustab@tomsk.dev` contact address, all used
+specific license file), or the `opensource@tomsk.dev` contact address, all used
 by the About dialog) via `xdg-open`. `link` is a closed enum (`github_repo`,
 `github_sponsors`, `email`, `issues` or `license`), never a raw URL string:
 the URL/URI this command will ever open for a given variant is fixed and
@@ -420,7 +420,7 @@ represent distinct user intent and may point elsewhere independently later.
 
 For every variant except `email`, `xdg-open` launches the host's default web
 browser on the `https:` URL. For `email`, `xdg-open` is given a
-`mailto:rustab@tomsk.dev` URI instead, which it dispatches to the host's
+`mailto:opensource@tomsk.dev` URI instead, which it dispatches to the host's
 default mail client - the same `xdg-open` call handles both cases, since it
 resolves the right handler from the URI's scheme. The About dialog
 deliberately does not use a plain `<a href="mailto:...">` for the email
