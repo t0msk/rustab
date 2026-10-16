@@ -15,6 +15,7 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 ## Contents
 
 - [Features](#features)
+- [Roadmap](#roadmap)
 - [Screenshot Placeholder](#screenshot-placeholder)
 - [Safety Notes](#safety-notes)
 - [Prerequisites](#prerequisites)
@@ -38,6 +39,49 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Real vs. sandbox visibility** - a clear, unmissable banner indicates whether you're viewing the real system file or a sandbox copy
 - **Privilege escalation gating** - when editing `/etc/fstab`, an explicit confirmation checkbox and danger banner appear; sandbox edits never require elevation
 
+## Roadmap
+
+Ideas for future versions, roughly ordered by how naturally they follow from what's
+already built. None of these are committed or scheduled - this is a wishlist, not a
+promise.
+
+**Most natural next steps:**
+- **In-GUI real/sandbox target switch** - today, pointing Rustab at the real
+  `/etc/fstab` requires restarting it with `RUSTAB_TARGET_PATH` set; a toggle inside
+  the app (with the same confirmation/banner safeguards) has been the planned "next"
+  step since early in the project.
+- **Search/filter and column sorting** in the entries table - becomes genuinely useful
+  once a real fstab has many entries (containers, lots of bind mounts).
+- **Click-to-expand row detail** - today, a long mount point or an options list with
+  many entries gets truncated in the table, and seeing the full untruncated data means
+  opening Edit. An expandable row (click anywhere on a row to reveal all of that
+  entry's fields inline, read-only, without entering edit mode) would let you inspect
+  the real full data without committing to editing anything.
+- **systemd unit preview** - show what `systemd-fstab-generator` would actually
+  produce for a given line, read-only, useful for debugging boot/mount behavior.
+
+**Validation extensions** (all read-only checks, no live mount/unmount - see Safety
+Notes and the project's own non-goals: Rustab edits the file, it doesn't act as a
+mount manager):
+- Cross-check a UUID/LABEL against currently attached devices (via `lsblk`) and warn
+  if it doesn't match anything currently visible.
+- Flag a removable/network source missing `nofail`/`noauto` - a common real-world
+  mistake that can hang boot when the device isn't present.
+
+**Workflow/productivity:**
+- Guided templates for common entry types (swap, CIFS/NFS share, bind mount) instead
+  of the generic blank form.
+- Paste-to-import: paste a raw block of fstab lines (e.g. migrating from another
+  system) and have them parsed into staged pending entries.
+- Compare two backups against each other, not just a backup against the current file.
+
+**Reach:**
+- Finish and submit the Flathub packaging (see `docs/FLATPAK.md` - in progress).
+- Additional UI languages beyond English.
+
+Have an idea not listed here, or want to weigh in on priority? Open an issue - see
+[Contact & Support](#contact--support).
+
 ## Screenshot Placeholder
 
 <!-- TODO: screenshot/GIF demonstrating the main table view, add entry form, diff review, and backup panel -->
@@ -53,6 +97,10 @@ $XDG_DATA_HOME/rustab/fstab.sandbox
 ```
 
 (falling back to `$HOME/.local/share/rustab/fstab.sandbox` if `$XDG_DATA_HOME` is not set).
+
+**Sandbox refresh on launch:**
+
+So that the sandbox reflects your actual system, Rustab refreshes it from your real `/etc/fstab` **once per application launch**: the first time the target is resolved in a run, the sandbox becomes a byte-for-byte copy of `/etc/fstab`. `/etc/fstab` itself is only ever read, never written, by this. Note what this implies: starting Rustab again **discards** whatever you left in the sandbox during a previous session - it is a fresh practice ground each time, not a saved scratch file. Within one run your sandbox edits and saves are left alone (and still backed up as usual). If `/etc/fstab` cannot be read, the refresh is skipped and a harmless comment-only sandbox file is created instead.
 
 To point Rustab at the real system file, set the environment variable `RUSTAB_TARGET_PATH=/etc/fstab` before starting the application. This is the **only** way to enable real-file editing. When enabled:
 
