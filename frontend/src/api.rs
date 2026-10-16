@@ -3,8 +3,8 @@
 //! `discover_devices` (T11), plus `render_candidate`, `save`,
 //! `list_backups` and `restore_backup` (T12), plus `read_backup` and
 //! `delete_backup` (T20), plus `create_backup` (T21.1), plus
-//! `open_backup_location` (T25), plus `open_external_link` (T26). See
-//! `docs/API_CONTRACT.md` for the exact contract.
+//! `open_backup_location` (T25), plus `open_external_link` (T26), plus
+//! `pick_directory`. See `docs/API_CONTRACT.md` for the exact contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -338,4 +338,28 @@ pub async fn open_external_link(link: ExternalLink) -> Result<(), String> {
         link: ExternalLink,
     }
     invoke("open_external_link", &OpenExternalLinkArgs { link }).await
+}
+
+#[derive(Serialize)]
+struct PickDirectoryOptions {
+    directory: bool,
+}
+
+#[derive(Serialize)]
+struct PickDirectoryArgs {
+    options: PickDirectoryOptions,
+}
+
+/// `plugin:dialog|open` (tauri-plugin-dialog) - opens a native directory
+/// chooser. `Ok(None)` means the user cancelled (expected, not an error);
+/// `Ok(Some(path))` means they picked a directory. Never escalates
+/// privilege, never writes.
+pub async fn pick_directory() -> Result<Option<String>, String> {
+    invoke(
+        "plugin:dialog|open",
+        &PickDirectoryArgs {
+            options: PickDirectoryOptions { directory: true },
+        },
+    )
+    .await
 }

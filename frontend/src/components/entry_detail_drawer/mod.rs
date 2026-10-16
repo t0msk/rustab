@@ -596,6 +596,17 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                     (*source_type == SourceType::None)
                                         .then(|| AttrValue::from("none"))
                                 }
+                                on_browse={{
+                                    let mount_point = mount_point.clone();
+                                    Callback::from(move |()| {
+                                        let mount_point = mount_point.clone();
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            if let Ok(Some(path)) = crate::api::pick_directory().await {
+                                                mount_point.set(path);
+                                            }
+                                        });
+                                    })
+                                }}
                             />
 
                             <FsTypeField

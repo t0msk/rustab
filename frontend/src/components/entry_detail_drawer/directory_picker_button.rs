@@ -1,9 +1,10 @@
 //! `DirectoryPickerButton` - native directory chooser trigger (§4 item 3).
 //!
-//! The concrete Tauri API for opening a native directory chooser is not
-//! this task's decision (that's T11/T8) - this is a no-op stub button for
-//! now, wired via an optional callback prop so a later task can attach
-//! real behavior without changing this component's shape.
+//! A plain presentational button that takes an `on_click` callback and
+//! nothing else. `MountPointField` wires that callback to open a native
+//! directory chooser via `tauri-plugin-dialog`'s `plugin:dialog|open`
+//! command and feed the chosen path back into the Mount point field on
+//! success (a cancelled chooser leaves the field untouched).
 
 use yew::prelude::*;
 

@@ -23,6 +23,7 @@ pub struct MountPointFieldProps {
     /// into `value` - the user must still type it for it to actually save.
     #[prop_or_default]
     pub placeholder: Option<AttrValue>,
+    pub on_browse: Callback<()>,
 }
 
 #[function_component(MountPointField)]
@@ -50,7 +51,12 @@ pub fn mount_point_field(props: &MountPointFieldProps) -> Html {
                     placeholder={props.placeholder.clone()}
                     oninput={on_input}
                 />
-                <DirectoryPickerButton />
+                <DirectoryPickerButton
+                    on_click={{
+                        let cb = props.on_browse.clone();
+                        Callback::from(move |_: MouseEvent| cb.emit(()))
+                    }}
+                />
             </div>
             { for props.warnings.iter().map(|message| html! {
                 <ValidationMessage message={message.clone()} severity={Severity::Warning} />
