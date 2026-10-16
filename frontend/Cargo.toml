@@ -29,4 +29,4 @@ gloo-timers = { version = "0.4", features = ["futures"] }
 # Raw unified-diff rendering for `DiffView`'s "Raw diff" tab (T12,
 # `docs/UI_DESIGN.md` §6) - a frontend-only, non-safety-critical dependency;
 # the actual write path never touches this crate.
-similar = "2"
+similar = "3"
