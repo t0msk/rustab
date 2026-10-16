@@ -160,6 +160,15 @@ fn diff_entry_fields(old: &EntryDto, new: &EntryDto) -> Vec<ChangedField> {
             new: new_comment,
         });
     }
+    let old_description = old.description.clone().unwrap_or_default();
+    let new_description = new.description.clone().unwrap_or_default();
+    if old_description != new_description {
+        fields.push(ChangedField {
+            label: "description".to_string(),
+            old: old_description,
+            new: new_description,
+        });
+    }
 
     fields
 }
@@ -295,6 +304,7 @@ mod tests {
                 dump: 0,
                 pass: 2,
                 trailing_comment: None,
+                description: None,
             },
         }
     }

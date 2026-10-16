@@ -130,7 +130,7 @@ and blanks are never dropped, just not given their own row in this list view).
 | Column | Content |
 |---|---|
 | Source | Small type badge (`UUID`, `LABEL`, `PARTUUID`, `PARTLABEL`, `PATH`, `NET`, `NONE`) + the value, `font-mono text-sm` |
-| Mount point | `font-mono text-sm` |
+| Mount point | `font-mono text-sm`; if the entry has a description, a small muted note-glyph (`📝`) is appended after the path, carrying the full description text as a native tooltip (`title`) - shown only when a description is present |
 | FS type | plain text badge, `text-sm` |
 | Options | first ~3 options as small chips + `+N more` overflow; full ordered list visible on hover tooltip and always fully editable in the drawer |
 | Dump | single digit |
@@ -195,11 +195,18 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
 3. **Mount point** - text input (`font-mono`) + a `Browse…` button opening a native
    directory picker (conceptually: open a directory chooser, receive a path string
    back - the concrete Tauri API is not this document's decision).
-4. **Filesystem type** - free-text combobox: typing shows a suggestion dropdown of
+4. **DescriptionField** - a plain free-text input, labeled `"Description (optional)"`,
+   grouped directly below Mount point (not at the end of the field list) because the
+   feature is conceptually about *what the mount point is for*. The value is round-
+   tripped to/from a `# // <text>` comment line placed immediately above the entry in
+   the real fstab file - see `docs/API_CONTRACT.md` §5 for the full round-trip detail.
+   Helper text below the input: `"Shown as a '# // ...' comment line directly above
+   this entry in the fstab file."`
+5. **Filesystem type** - free-text combobox: typing shows a suggestion dropdown of
    common types (`ext4, btrfs, xfs, vfat, ntfs3, swap, none, nfs, nfs4, cifs, overlay,
    tmpfs, proc`) but any value can be typed and accepted - no closed enum, matching
    SPEC §5.
-5. **OptionsTagInput** - the SPEC §9 "checklist/tag-input for options":
+6. **OptionsTagInput** - the SPEC §9 "checklist/tag-input for options":
    - A row of toggle chips for the well-known options named in SPEC §5:
      `defaults · noatime · relatime · ro · rw · user · nofail · auto · noauto · bind · sw`.
    - A separate, visually grouped "systemd" row of toggle/value chips for the
@@ -219,7 +226,7 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
      dark:text-sky-300`, inactive/available-but-off `bg-slate-100 text-slate-600
      dark:bg-slate-800 dark:text-slate-400`, each chip `rounded-full px-3 py-1 text-xs
      font-medium`, with an `×` to remove.
-6. **Dump** and **Pass** - two small numeric inputs side by side (`w-16` each), default
+7. **Dump** and **Pass** - two small numeric inputs side by side (`w-16` each), default
    `0`, helper text under each: `"0 = don't dump"` / `"0 = skip fsck, 1 = root
    filesystem, 2 = checked after root"`.
 
@@ -568,7 +575,9 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
    `Backups` tab, T26), plus an always-visible `About` trigger (both tabs, T26)
 4. `PendingChangesBar` - "N entries changed" + `Review & Save…` trigger (§6)
 5. `EntriesTable` - main entry list (§3)
-6. `EntryRow` - one parsed entry's row
+6. `EntryRow` - one parsed entry's row; its Mount point cell appends a small muted
+   note-glyph with a tooltip carrying the full description text, only when the entry
+   has one (§3)
 7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3)
 8. `EmptyState` - generic empty-list placeholder (entries or backups)
 9. `EntryDetailDrawer` - add/edit form container (§4)

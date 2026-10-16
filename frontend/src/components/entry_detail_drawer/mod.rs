@@ -15,6 +15,7 @@
 //! (see `crate::candidate`). Disk writes only ever happen through T12's
 //! diff-confirm flow.
 
+mod description_field;
 mod device_picker;
 mod directory_picker_button;
 mod dump_pass_fields;
@@ -33,6 +34,7 @@ pub use validation_summary::ValidationSummary;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
+use description_field::DescriptionField;
 use device_picker::DevicePicker;
 use dump_pass_fields::DumpPassFields;
 use fs_type_field::FsTypeField;
@@ -156,6 +158,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
             .as_ref()
             .and_then(|e| e.trailing_comment.clone())
     });
+    let description = use_state(|| editing_entry.as_ref().and_then(|e| e.description.clone()));
     let raw_text = use_state(|| match &props.mode {
         DrawerMode::EditRaw(raw) => raw.to_string(),
         _ => String::new(),
@@ -208,6 +211,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
             *dump,
             *pass,
             &trailing_comment,
+            &description,
         );
         use_effect_with(
             (
@@ -220,6 +224,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 *dump,
                 *pass,
                 other_lines.clone(),
+                (*description).clone(),
             ),
             move |_| {
                 if !is_raw_mode {
@@ -279,6 +284,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
         let dump = dump.clone();
         let pass = pass.clone();
         let trailing_comment = trailing_comment.clone();
+        let description = description.clone();
         let raw_text = raw_text.clone();
         let validation = validation.clone();
         let validation_request = validation_request.clone();
@@ -298,6 +304,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 *dump,
                 *pass,
                 &trailing_comment,
+                &description,
             );
             let document = DocumentDto {
                 lines: other_lines
@@ -367,6 +374,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
         let dump = dump.clone();
         let pass = pass.clone();
         let trailing_comment = trailing_comment.clone();
+        let description = description.clone();
         let validation = validation.clone();
         let validation_request = validation_request.clone();
         let verifying = verifying.clone();
@@ -381,6 +389,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 *dump,
                 *pass,
                 &trailing_comment,
+                &description,
             );
             let document = DocumentDto {
                 lines: other_lines
@@ -576,6 +585,16 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 warnings={mount_point_warnings.clone()}
                             />
 
+                            <DescriptionField
+                                value={AttrValue::from(
+                                    description.as_deref().unwrap_or_default().to_string()
+                                )}
+                                on_change={{
+                                    let description = description.clone();
+                                    Callback::from(move |value: String| description.set(Some(value)))
+                                }}
+                            />
+
                             <FsTypeField
                                 value={AttrValue::from((*fs_type).clone())}
                                 on_change={{
@@ -635,6 +654,7 @@ fn build_entry(
     dump: u32,
     pass: u32,
     trailing_comment: &UseStateHandle<Option<String>>,
+    description: &UseStateHandle<Option<String>>,
 ) -> EntryDto {
     EntryDto {
         source: SourceDto {
@@ -647,6 +667,13 @@ fn build_entry(
         dump,
         pass,
         trailing_comment: (**trailing_comment).clone(),
+        // Mirrors the backend's own IPC-boundary normalization exactly, so
+        // a save -> reload round trip is WYSIWYG (API_CONTRACT.md §5).
+        description: description
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
 }
 

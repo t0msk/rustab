@@ -36,6 +36,7 @@ pub struct EntryDto {
     pub dump: u32,
     pub pass: u32,
     pub trailing_comment: Option<String>,
+    pub description: Option<String>,
 }
 
 /// `source.kind` (§5): never includes the `KEY=` prefix in `value`.
@@ -113,6 +114,7 @@ pub enum ValidationField {
     MountPoint,
     Source,
     FsType,
+    Description,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
