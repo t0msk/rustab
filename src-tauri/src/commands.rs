@@ -1,5 +1,5 @@
 //! The `#[tauri::command]` layer: the complete, frozen set of calls the
-//! frontend may make — see `docs/API_CONTRACT.md`.
+//! frontend may make - see `docs/API_CONTRACT.md`.
 //!
 //! ## Shape of this module
 //!
@@ -7,12 +7,12 @@
 //! through [`crate::target`], converts DTOs through [`crate::dto`], and
 //! delegates the real work to `fstab-core`. No command re-implements
 //! validation, serialization, backup naming or writing, and no command takes
-//! a *target* path from the frontend. The carefully bounded exceptions —
+//! a *target* path from the frontend. The carefully bounded exceptions -
 //! [`restore_backup`], [`read_backup`] and [`delete_backup`], which take a
-//! *backup* path — never use it as a path until it has been matched against
+//! *backup* path - never use it as a path until it has been matched against
 //! the active target's real backup list (see [`crate::backups`]).
 //!
-//! The genuinely interesting logic — "which save path do I take" — is
+//! The genuinely interesting logic - "which save path do I take" - is
 //! [`save_document_with`], and it is a single `if` on purpose: both branches
 //! end in the same [`writer::write_document`] call, one of them simply has a
 //! `pkexec` re-exec in front of it (see [`crate::privileged`]).
@@ -33,7 +33,7 @@
 //! a password. A plain synchronous Tauri command runs on the main thread,
 //! which would freeze the window for the duration. `(async)` makes Tauri run
 //! these synchronous functions on its thread pool instead, which keeps them
-//! ordinary blocking Rust functions — directly callable from the unit tests
+//! ordinary blocking Rust functions - directly callable from the unit tests
 //! below, with no runtime to set up and no `AppHandle` to fake.
 //!
 //! ## Why the argument-taking commands add `rename_all = "snake_case"`
@@ -41,7 +41,7 @@
 //! Tauri renames command *arguments* to camelCase on the IPC boundary by
 //! default, while serde leaves the DTO *fields* inside them in snake_case.
 //! That mix would mean a frontend sending `{"backupPath": ..., }` whose
-//! nested objects use `{"mount_point": ...}` — one spelling rule per nesting
+//! nested objects use `{"mount_point": ...}` - one spelling rule per nesting
 //! level, which is exactly the kind of detail an integration task gets wrong
 //! once and then debugs for an hour. Pinning the argument case to snake_case
 //! makes the whole payload, at every level, snake_case.
@@ -105,7 +105,7 @@ pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
                 CommandErrorDto::new(
                     CommandErrorKindDto::NotUtf8,
                     format!(
-                        "{} is not valid UTF-8 ({err}), so Rustab will not load it — editing it \
+                        "{} is not valid UTF-8 ({err}), so Rustab will not load it - editing it \
                          here could only corrupt it. Fix the encoding with a text editor first.",
                         target.path.display()
                     ),
@@ -196,7 +196,7 @@ pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
 /// text is parsed into a document and then goes through the very same
 /// [`save_document`] a normal save uses, so it is validated, backed up (the
 /// content being replaced is itself backed up first), written to a temp file,
-/// `fsync`ed, renamed, verified — and, for the real `/etc/fstab`, elevated
+/// `fsync`ed, renamed, verified - and, for the real `/etc/fstab`, elevated
 /// exactly once. Restoring a broken backup is therefore refused for the same
 /// reasons saving broken content is.
 ///
@@ -209,8 +209,8 @@ pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
 pub fn restore_backup(backup_path: String) -> Result<WriteOutcomeDto, WriteErrorDto> {
     let target = resolve_target_for_write()?;
 
-    // Both failure modes — "the list could not be read" and "the requested
-    // path is not in it" — are reported as `InvalidBackup`: from the
+    // Both failure modes - "the list could not be read" and "the requested
+    // path is not in it" - are reported as `InvalidBackup`: from the
     // frontend's point of view they are the same situation (this backup
     // cannot be used, and nothing was written), and the message says which
     // one it was.
@@ -241,12 +241,12 @@ pub fn restore_backup(backup_path: String) -> Result<WriteOutcomeDto, WriteError
 ///
 /// `backup_path` must be one of the paths [`list_backups`] returned for the
 /// *current* target, and is resolved exactly the way [`restore_backup`]
-/// resolves it — matched against the real backup list before it is ever used
+/// resolves it - matched against the real backup list before it is ever used
 /// as a path (see [`crate::backups`]).
 ///
 /// Writes nothing and needs no privilege escalation for either target kind:
 /// `/etc/fstab` and the backups beside it are world-readable, so an
-/// unprivileged read suffices — the same reason [`list_entries`] can read the
+/// unprivileged read suffices - the same reason [`list_entries`] can read the
 /// real target without a password prompt. Pair the returned text with
 /// [`list_entries`]'s `text` to diff a restore point against what is live now.
 ///
@@ -275,7 +275,7 @@ pub fn read_backup(backup_path: String) -> Result<String, CommandErrorDto> {
 /// directory and are removed in-process, while the real `/etc/fstab`'s
 /// backups live in root-owned `/etc/` and are removed by a single elevated
 /// re-exec (see [`crate::privileged`]). Unlike a save, this never opens,
-/// renames or writes the target file — which is why it rejects with a
+/// renames or writes the target file - which is why it rejects with a
 /// [`DeleteBackupErrorDto`] rather than a [`WriteErrorDto`]: there is no
 /// `target_unchanged` question to answer.
 ///
@@ -292,7 +292,7 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
 ///
 /// The explicit counterpart of the backup a [`save`] takes on its own: it
 /// copies the target's *current* content to a new **manual** backup beside it
-/// and returns that backup as a [`BackupInfoDto`] — the same row shape
+/// and returns that backup as a [`BackupInfoDto`] - the same row shape
 /// [`list_backups`] produces, so the frontend can prepend it or simply
 /// re-list. A manual backup is exempt from the retention bound that prunes
 /// automatic ones (`fstab_core::writer::MAX_BACKUPS`); only an explicit
@@ -300,7 +300,7 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
 ///
 /// Takes no arguments: like every other command here, *which* file it acts on
 /// is resolved server-side and never supplied by the frontend. Dispatches on
-/// [`ActiveTarget::is_real`] exactly like [`save`] and [`delete_backup`] do —
+/// [`ActiveTarget::is_real`] exactly like [`save`] and [`delete_backup`] do -
 /// a non-real target is copied in-process, the real `/etc/fstab` through a
 /// single elevated re-exec, because its backups have to be created in
 /// root-owned `/etc/`.
@@ -314,7 +314,7 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
 ///
 /// A [`CreateBackupErrorDto`]; see [`CreateBackupErrorKindDto`] for the kinds.
 /// Notably [`CreateBackupErrorKindDto::TargetMissing`] when the target does
-/// not exist yet — an explicit "back this up now" reports that rather than
+/// not exist yet - an explicit "back this up now" reports that rather than
 /// succeeding with nothing to show.
 #[tauri::command(async)]
 pub fn create_backup() -> Result<BackupInfoDto, CreateBackupErrorDto> {
@@ -341,7 +341,7 @@ pub fn discover_devices() -> DeviceDiscoveryDto {
 ///
 /// **No privilege escalation, for either target kind.** `/etc/` is
 /// world-readable and world-executable, which is the same reasoning
-/// [`read_backup`] already documents for reading a backup's content —
+/// [`read_backup`] already documents for reading a backup's content -
 /// listing a directory needs strictly less access than reading a file inside
 /// it.
 ///
@@ -362,7 +362,7 @@ pub fn open_backup_location() -> Result<(), CommandErrorDto> {
 ///
 /// Deliberately takes a closed enum, not a raw URL string: the two URLs
 /// this command will ever open are a fixed, hardcoded pair baked into
-/// [`ExternalLinkDto::url`], never anything the frontend supplies —
+/// [`ExternalLinkDto::url`], never anything the frontend supplies -
 /// applying this project's minimal-dispatch-surface philosophy (compare
 /// `privileged.rs`'s own module doc) to a non-privileged case: there is no
 /// argument surface here for a caller to redirect this command at an
@@ -386,7 +386,7 @@ pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> 
 
 /// The one dispatch point between the two save paths.
 ///
-/// Both branches end in [`writer::write_document`] — the in-process branch
+/// Both branches end in [`writer::write_document`] - the in-process branch
 /// calls it directly, the elevated branch calls it inside a root process that
 /// does nothing else (see [`crate::privileged`]). There is deliberately no
 /// third branch, and no path that writes anything without going through
@@ -462,7 +462,7 @@ fn open_backup_location_of(target: &Path) -> Result<(), CommandErrorDto> {
 ///
 /// The seam exists for the same structural reason [`save_document_with`]'s
 /// does: a unit test has to be able to assert *which* directory this command
-/// would open without truly spawning a file manager window — there is no way
+/// would open without truly spawning a file manager window - there is no way
 /// to do that in CI, which has no display and no file manager installed at
 /// all. The production path is a one-line delegation to
 /// [`open_in_file_manager`] that cannot diverge from what ships.
@@ -494,7 +494,7 @@ fn open_in_file_manager(dir: &Path) -> io::Result<()> {
         .map(|_child| ())
 }
 
-/// [`open_external_link`], with the actual browser launch injectable —
+/// [`open_external_link`], with the actual browser launch injectable -
 /// same structural reason as [`open_backup_location_with`]: a unit test
 /// has to assert which URL this command would open without truly
 /// spawning a browser.
@@ -514,7 +514,7 @@ fn open_external_link_with(
 /// Launches the host's default web browser on `url` via `xdg-open`.
 /// Deliberately separate from [`open_in_file_manager`] rather than
 /// generalized over both (different argument types, `&Path` vs. `&str`,
-/// and each is a single one-line `spawn()` call — not worth sharing a
+/// and each is a single one-line `spawn()` call - not worth sharing a
 /// generic seam over, and keeping this separate means zero risk of
 /// regressing the already-shipped `open_backup_location`).
 fn open_browser(url: &str) -> io::Result<()> {
@@ -543,7 +543,7 @@ fn delete_backup_from(
 /// `pkexec` and waits on an authentication prompt.
 ///
 /// `backup_path` is resolved before the dispatch, in **both** branches. For
-/// the elevated branch that is only a courtesy — it means a path that cannot
+/// the elevated branch that is only a courtesy - it means a path that cannot
 /// work is refused without making the user authenticate first, the same
 /// courtesy [`privileged::save_elevated`]'s pre-validation provides. The
 /// authoritative check is the elevated process's own
@@ -588,7 +588,7 @@ fn create_backup_of(target: &ActiveTarget) -> Result<BackupInfoDto, CreateBackup
 /// production [`privileged::create_backup_elevated`] would mean a unit test
 /// that launches `pkexec` and waits on an authentication prompt.
 ///
-/// Both branches end in the same `fstab_core::writer::create_backup` — the
+/// Both branches end in the same `fstab_core::writer::create_backup` - the
 /// in-process branch calls it directly, the elevated branch calls it inside a
 /// root process that does nothing else. Neither branch is given a path to
 /// write to: `create_backup` derives the backup's name from the target it was
@@ -597,7 +597,7 @@ fn create_backup_of(target: &ActiveTarget) -> Result<BackupInfoDto, CreateBackup
 /// The resulting path is turned back into a [`BackupInfoDto`] by
 /// [`backups::describe_one`], the same helper [`backups::list`] builds its
 /// rows with, so a freshly created backup is described exactly the way the
-/// next `list_backups` will describe it — including its `is_manual` flag,
+/// next `list_backups` will describe it - including its `is_manual` flag,
 /// which is read back from the naming scheme rather than assumed here.
 fn create_backup_with(
     target: &ActiveTarget,
@@ -988,7 +988,7 @@ mod tests {
     }
 
     /// A backup that is not valid UTF-8 is refused with the same kind the
-    /// target's own non-UTF-8 case uses — there is nothing to send across the
+    /// target's own non-UTF-8 case uses - there is nothing to send across the
     /// boundary as a string, and there is no second meaning to invent.
     #[test]
     fn read_backup_refuses_non_utf8_content() {
@@ -1010,7 +1010,7 @@ mod tests {
 
     /// The happy path: a fake opener captures the directory it was given, and
     /// the command reports success. The directory handed to the opener must
-    /// be exactly what `backups::containing_dir` computes for the target —
+    /// be exactly what `backups::containing_dir` computes for the target -
     /// not re-derived or approximated here.
     #[test]
     fn open_backup_location_opens_the_target_s_containing_directory() {
@@ -1054,7 +1054,7 @@ mod tests {
     /// The happy path for both known links: a fake opener captures the URL
     /// it was given, and the command reports success. The URL handed to the
     /// opener must be exactly what [`ExternalLinkDto::url`] returns for that
-    /// variant — not re-derived or approximated here.
+    /// variant - not re-derived or approximated here.
     #[test]
     fn open_external_link_opens_the_link_s_own_url() {
         for link in [ExternalLinkDto::GithubRepo, ExternalLinkDto::GithubSponsors] {
@@ -1232,7 +1232,7 @@ mod tests {
     }
 
     /// A refused `backup_path` must be refused *before* the dispatch, so a
-    /// bogus path never costs the user a password prompt — the same courtesy
+    /// bogus path never costs the user a password prompt - the same courtesy
     /// `save_elevated`'s pre-validation provides.
     #[test]
     fn a_refused_backup_path_never_reaches_the_elevated_deleter() {

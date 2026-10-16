@@ -35,7 +35,7 @@ impl TempDir {
     ///
     /// # Panics
     ///
-    /// Panics if the directory cannot be created — a test that has no scratch
+    /// Panics if the directory cannot be created - a test that has no scratch
     /// space cannot produce a meaningful result, so failing loudly and
     /// immediately is better than every later assertion failing obscurely.
     pub fn new(tag: &str) -> Self {
@@ -55,7 +55,7 @@ impl TempDir {
     }
 
     /// Joins `name` (which may contain `/` separators) onto this directory
-    /// without creating anything — the returned path is a *name*, and whether
+    /// without creating anything - the returned path is a *name*, and whether
     /// it exists is up to the code under test.
     pub fn join(&self, name: &str) -> PathBuf {
         self.path.join(name)

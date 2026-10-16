@@ -1,4 +1,4 @@
-//! `AboutDialog` — static, read-only "About Rustab" overlay (T26),
+//! `AboutDialog` - static, read-only "About Rustab" overlay (T26),
 //! triggered by `HeaderBar`'s always-visible "About" button.
 //!
 //! Reuses `BackupDiffView`'s exact modal shell (backdrop `onclick` dismiss,

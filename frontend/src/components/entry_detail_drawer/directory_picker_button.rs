@@ -1,7 +1,7 @@
-//! `DirectoryPickerButton` — native directory chooser trigger (§4 item 3).
+//! `DirectoryPickerButton` - native directory chooser trigger (§4 item 3).
 //!
 //! The concrete Tauri API for opening a native directory chooser is not
-//! this task's decision (that's T11/T8) — this is a no-op stub button for
+//! this task's decision (that's T11/T8) - this is a no-op stub button for
 //! now, wired via an optional callback prop so a later task can attach
 //! real behavior without changing this component's shape.
 

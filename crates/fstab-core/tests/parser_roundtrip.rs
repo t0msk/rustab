@@ -1,6 +1,6 @@
 //! Integration tests for `fstab-core::parser` against the synthetic fixtures
 //! in `tests/fixtures/` (workspace root). See `docs/SPEC.md` §7: these
-//! fixtures are hand-written, synthetic, and safe to publish — this test
+//! fixtures are hand-written, synthetic, and safe to publish - this test
 //! suite must never read `dev-data/fstab.real-copy`.
 
 use fstab_core::model::Line;
@@ -72,7 +72,7 @@ fn malformed_fixture_line_is_preserved_not_dropped() {
 
 /// Loading a multi-entry document, editing exactly one entry in place, and
 /// re-serializing must leave every *other* line byte-identical to the
-/// original — proving comment/blank-line/other-entry preservation
+/// original - proving comment/blank-line/other-entry preservation
 /// independent of whitespace-canonicalization concerns.
 #[test]
 fn editing_one_entry_leaves_every_other_line_byte_identical() {

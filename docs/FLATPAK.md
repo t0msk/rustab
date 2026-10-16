@@ -180,10 +180,10 @@ Use Flatpak's [file portal system](https://flatpak.org/documentation/portal-docs
 
 For current, authoritative information on Flatpak manifest syntax and Flathub's exact requirements:
 
-- **[Flatpak Application Manifest Reference](https://docs.flatpak.org/en/latest/manifests.html)** — detailed manifest format
-- **[Flathub Guidelines](https://github.com/flathub/flathub/blob/master/CONTRIBUTING.md)** — submission requirements, what Flathub reviewers look for
-- **[Flatpak Cargo Tools](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo)** — current vendoring approach
-- **Existing Tauri apps on Flathub** — search Flathub's repository for `buildsystem: cargo` examples to see how other Rust/Tauri apps are packaged
+- **[Flatpak Application Manifest Reference](https://docs.flatpak.org/en/latest/manifests.html)** - detailed manifest format
+- **[Flathub Guidelines](https://github.com/flathub/flathub/blob/master/CONTRIBUTING.md)** - submission requirements, what Flathub reviewers look for
+- **[Flatpak Cargo Tools](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo)** - current vendoring approach
+- **Existing Tauri apps on Flathub** - search Flathub's repository for `buildsystem: cargo` examples to see how other Rust/Tauri apps are packaged
 
 ## 5. Submitting to Flathub
 

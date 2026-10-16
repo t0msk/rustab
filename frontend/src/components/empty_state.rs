@@ -1,4 +1,4 @@
-//! `EmptyState` — generic empty-list placeholder, reused by `EntriesTable`
+//! `EmptyState` - generic empty-list placeholder, reused by `EntriesTable`
 //! and `BackupPanel` (§3, §7).
 
 use yew::prelude::*;

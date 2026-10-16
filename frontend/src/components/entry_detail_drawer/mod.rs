@@ -1,4 +1,4 @@
-//! `EntryDetailDrawer` — add/edit form container (§4).
+//! `EntryDetailDrawer` - add/edit form container (§4).
 //!
 //! Slides in from the right, fixed width 520px, backdrop dismissible by
 //! click (unlike `DiffView`/`BackupRestoreConfirmDialog`), since it only
@@ -8,7 +8,7 @@
 //! discovery for `DevicePicker`, and inline validation via
 //! `validate_candidate` run against the *whole* candidate document (this
 //! draft entry plus every other line already staged), per
-//! `docs/API_CONTRACT.md` §3.3 — duplicate-mount-point-style checks need
+//! `docs/API_CONTRACT.md` §3.3 - duplicate-mount-point-style checks need
 //! the full document, not just this one entry. Clicking "Save entry" never
 //! calls a write command: it emits the finished `EntryDto`/raw text back
 //! to `AppShell`, which stages it into the in-memory candidate document
@@ -150,7 +150,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
     let dump = use_state(|| editing_entry.as_ref().map(|e| e.dump).unwrap_or(0));
     let pass = use_state(|| editing_entry.as_ref().map(|e| e.pass).unwrap_or(0));
     // Preserved losslessly but not user-editable in this form (no field
-    // for it in `docs/UI_DESIGN.md` §4) — carried through unchanged.
+    // for it in `docs/UI_DESIGN.md` §4) - carried through unchanged.
     let trailing_comment = use_state(|| {
         editing_entry
             .as_ref()
@@ -193,7 +193,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
     let validation_request = use_mut_ref(|| 0u64);
     {
         // Hooks must run unconditionally every render (Yew tracks them by
-        // call order) — `is_raw_mode` is folded into the dependency tuple
+        // call order) - `is_raw_mode` is folded into the dependency tuple
         // and checked *inside* the effect instead of guarding the
         // `use_effect_with` call itself.
         let validation = validation.clone();
@@ -336,7 +336,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                     }
                     Err(message) => {
                         // A rejection here is a frontend bug per the
-                        // contract ("does not reject") — fail closed
+                        // contract ("does not reject") - fail closed
                         // rather than silently staging an unvalidated
                         // entry.
                         if *validation_request.borrow() == request_id {
@@ -395,7 +395,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
             let verifying = verifying.clone();
             let show_toast = show_toast.clone();
             // Any in-flight debounced check becomes stale once this
-            // immediate re-check starts — bump the shared cancellation
+            // immediate re-check starts - bump the shared cancellation
             // counter so its eventual result is ignored when it lands.
             let request_id = {
                 let mut counter = validation_request.borrow_mut();
@@ -538,7 +538,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                 { "Raw line" }
                             </label>
                             <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
-                                { "Structured fields can't be offered for a line the parser couldn't decompose — edit the raw text directly." }
+                                { "Structured fields can't be offered for a line the parser couldn't decompose - edit the raw text directly." }
                             </p>
                             <textarea
                                 id="raw-line-textarea"

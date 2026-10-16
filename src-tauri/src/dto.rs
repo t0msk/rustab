@@ -1,4 +1,4 @@
-//! The serializable types that cross the Tauri command boundary — the frozen
+//! The serializable types that cross the Tauri command boundary - the frozen
 //! contract documented in `docs/API_CONTRACT.md`.
 //!
 //! ## Why hand-written DTOs instead of `Serialize` on `fstab-core`'s types
@@ -58,7 +58,7 @@ use std::path::Path;
 /// whole command: the frontend's job with these strings is to display them,
 /// and the only commands that take a path *back*
 /// ([`crate::commands::restore_backup`], [`crate::commands::read_backup`] and
-/// [`crate::commands::delete_backup`]) do not trust the string they are given —
+/// [`crate::commands::delete_backup`]) do not trust the string they are given -
 /// each matches it against the real backup list, so a mangled path fails
 /// closed with "not a backup of the active target" instead of reading,
 /// writing or deleting somewhere unintended. See `docs/API_CONTRACT.md`
@@ -71,7 +71,7 @@ fn path_to_wire(path: &Path) -> String {
 // Target info
 // ---------------------------------------------------------------------------
 
-/// How the active target was chosen — mirrors [`crate::target::TargetSource`].
+/// How the active target was chosen - mirrors [`crate::target::TargetSource`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetSourceDto {
@@ -146,7 +146,7 @@ pub struct SourceDto {
     pub kind: SourceKindDto,
     /// The raw value, prefix-free, with any octal-escaped whitespace left
     /// exactly as it appears in the file (see `fstab_core::model`'s
-    /// escaped-whitespace policy — this layer does not decode or re-encode).
+    /// escaped-whitespace policy - this layer does not decode or re-encode).
     pub value: String,
 }
 
@@ -223,7 +223,7 @@ pub struct EntryDto {
     /// Third field: the filesystem type, free text.
     pub fs_type: String,
     /// Fourth field: the options, in file order. An empty list renders as an
-    /// *empty* options field, which `findmnt --verify` may reject — the UI
+    /// *empty* options field, which `findmnt --verify` may reject - the UI
     /// should offer `defaults` rather than nothing.
     pub options: Vec<OptionDto>,
     /// Fifth field: the `dump(8)` flag.
@@ -275,7 +275,7 @@ impl From<EntryDto> for FstabEntry {
 /// `{"kind":"malformed","raw":"..."}`.
 ///
 /// Every line of the file is present, in order, including comments, blanks
-/// and lines the parser could not understand — dropping any of them would
+/// and lines the parser could not understand - dropping any of them would
 /// break the byte-faithful round trip the whole design rests on. A line's
 /// identity for edit/delete purposes is simply its index in
 /// [`DocumentDto::lines`].
@@ -426,11 +426,11 @@ pub struct FindingDto {
     /// Human-readable message, suitable for showing verbatim.
     pub message: String,
     /// Which single field of an entry this finding is about, if any. `null`
-    /// means this finding is not about exactly one field — see
+    /// means this finding is not about exactly one field - see
     /// [`FindingField`]'s doc comment for the full explanation.
     pub field: Option<ValidationFieldDto>,
     /// The 0-based index into the validated `DocumentDto.lines` array of the
-    /// single line this finding is about, if any — the same identity scheme
+    /// single line this finding is about, if any - the same identity scheme
     /// [`LineDto`]'s doc comment already describes elsewhere in this file.
     /// `null` for the same reason [`Self::field`] is `null`.
     pub line_index: Option<usize>,
@@ -474,7 +474,7 @@ impl From<&ValidationReport> for ValidationReportDto {
 /// What a successful save did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteOutcomeDto {
-    /// The file actually written — differs from the active target only if the
+    /// The file actually written - differs from the active target only if the
     /// target was a symlink, in which case this is its destination.
     pub target: String,
     /// The backup holding the previous content, or `null` if the target did
@@ -489,7 +489,7 @@ pub struct WriteOutcomeDto {
     /// of the file just written.
     pub notes: Vec<String>,
     /// `true` if the write was performed by the elevated helper via `pkexec`.
-    /// Set by the unprivileged side after the helper reports back — the
+    /// Set by the unprivileged side after the helper reports back - the
     /// helper itself cannot know how it was launched, so it always emits
     /// `false` (see [`crate::privileged`]).
     pub elevated: bool,
@@ -521,9 +521,9 @@ impl WriteOutcomeDto {
 /// Which stage of a save failed.
 ///
 /// The first ten variants map one-to-one onto [`WriteError`]'s variants; the
-/// rest describe failures *around* the write — resolving the target,
+/// rest describe failures *around* the write - resolving the target,
 /// escalating privileges, choosing or reading a backup to restore, and an
-/// internal protocol failure — which `fstab-core` knows nothing about.
+/// internal protocol failure - which `fstab-core` knows nothing about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteErrorKindDto {
@@ -576,7 +576,7 @@ pub struct WriteErrorDto {
     /// original file survived. Safe to show verbatim.
     pub message: String,
     /// `true` means the target is **guaranteed** to still hold its previous
-    /// content, byte for byte. `false` means that guarantee cannot be made —
+    /// content, byte for byte. `false` means that guarantee cannot be made -
     /// not that the file is definitely damaged. Never the other way round:
     /// nothing sets this to `true` on a maybe.
     pub target_unchanged: bool,
@@ -694,11 +694,11 @@ pub enum CommandErrorKindDto {
     /// but is not valid UTF-8 is reported as [`CommandErrorKindDto::NotUtf8`].
     ReadBackup,
     /// The host file manager could not be launched
-    /// ([`crate::commands::open_backup_location`]) — the `xdg-open` binary is
+    /// ([`crate::commands::open_backup_location`]) - the `xdg-open` binary is
     /// missing, or starting it failed for some other reason.
     OpenLocation,
     /// The host browser could not be launched
-    /// ([`crate::commands::open_external_link`]) — the `xdg-open` binary is
+    /// ([`crate::commands::open_external_link`]) - the `xdg-open` binary is
     /// missing, or starting it failed for some other reason.
     OpenExternalLink,
 }
@@ -727,7 +727,7 @@ impl CommandErrorDto {
 // ---------------------------------------------------------------------------
 
 /// Which of this app's two known external links to open
-/// ([`crate::commands::open_external_link`]) — a closed set, not a raw
+/// ([`crate::commands::open_external_link`]) - a closed set, not a raw
 /// URL, by design: see that command's own doc comment for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -740,7 +740,7 @@ pub enum ExternalLinkDto {
 
 impl ExternalLinkDto {
     /// The literal URL for this link. Hardcoded here, not supplied by the
-    /// frontend — see the command's doc comment.
+    /// frontend - see the command's doc comment.
     pub(crate) fn url(self) -> &'static str {
         match self {
             ExternalLinkDto::GithubRepo => "https://github.com/t0msk/rustab",
@@ -758,7 +758,7 @@ impl ExternalLinkDto {
 /// Deliberately *not* [`WriteErrorKindDto`]: deleting a backup never opens,
 /// renames or otherwise touches the active target file, so the whole notion of
 /// `target_unchanged` (the field the UI branches on for a save) has no meaning
-/// here — it would be trivially `true` for every variant and would invite the
+/// here - it would be trivially `true` for every variant and would invite the
 /// frontend to read significance into it. A small, separate shape says the
 /// true thing instead: either the backup is gone, or it is not, and nothing
 /// else moved either way.
@@ -818,13 +818,13 @@ pub struct BackupInfoDto {
     /// Size in bytes.
     pub size_bytes: u64,
     /// The backup file's modification time as whole seconds since the Unix
-    /// epoch — i.e. when the backup was taken. `null` if the platform could
+    /// epoch - i.e. when the backup was taken. `null` if the platform could
     /// not report it.
     pub created_unix_secs: Option<u64>,
     /// `true` if a user asked for this backup explicitly
     /// ([`crate::commands::create_backup`]), `false` if a save made it on its
     /// own. Reported by `fstab-core`, which owns the naming scheme the
-    /// distinction is encoded in — the frontend must not try to infer it from
+    /// distinction is encoded in - the frontend must not try to infer it from
     /// `file_name`.
     ///
     /// Worth surfacing because the two kinds behave differently: automatic
@@ -847,7 +847,7 @@ pub struct BackupInfoDto {
 /// shape to mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateBackupOutcomeDto {
-    /// The file that was backed up — the active target, or its destination if
+    /// The file that was backed up - the active target, or its destination if
     /// the target is a symlink.
     pub target: String,
     /// The backup that was created. Always a manual one.
@@ -894,13 +894,13 @@ pub enum CreateBackupErrorKindDto {
     /// The target does not exist on disk yet (a first-ever-save state), so
     /// there is nothing to copy. Its own kind rather than a generic failure:
     /// the user clicked "back this up now", and the honest answer is "there is
-    /// no file yet — save once first", not a silent success.
+    /// no file yet - save once first", not a silent success.
     TargetMissing,
     /// The target path cannot be backed up at all (it is a directory, a
     /// dangling symlink, or has no file-name component).
     InvalidTarget,
     /// Copying the target to its new backup, or flushing that copy to disk,
-    /// failed. The target itself is untouched — it was only ever read.
+    /// failed. The target itself is untouched - it was only ever read.
     Backup,
     /// Real-target only: `pkexec` is missing, the prompt was dismissed or
     /// refused, or the elevated helper produced no usable response.
@@ -930,7 +930,7 @@ impl From<&CreateBackupError> for CreateBackupErrorDto {
     fn from(error: &CreateBackupError) -> Self {
         // `Display` already words the consequence for a user ("no backup was
         // created", "save the file once first"), so the message is taken
-        // verbatim rather than re-worded here — the same policy
+        // verbatim rather than re-worded here - the same policy
         // [`WriteErrorDto::from`] follows.
         let message = error.to_string();
         let kind = match error {
@@ -1012,7 +1012,7 @@ mod tests {
     /// `docs/API_CONTRACT.md` quotes this JSON, and `frontend/` mirrors these
     /// shapes by hand. Any change to a field name, a `kind` spelling or the
     /// nesting breaks a frontend that cannot be recompiled against this
-    /// crate's types — so it has to break this test first, loudly, next to
+    /// crate's types - so it has to break this test first, loudly, next to
     /// the documentation that has to be updated with it.
     #[test]
     fn document_wire_format_is_exactly_as_documented() {
@@ -1076,7 +1076,7 @@ mod tests {
             r#"{"findings":[{"severity":"warning","message":"m","field":null,"line_index":null}],"has_errors":false}"#
         );
 
-        // A field/line-tagged finding — the shape `mount_point_missing`,
+        // A field/line-tagged finding - the shape `mount_point_missing`,
         // `malformed_uuid`/`malformed_partuuid`, and `empty_fs_type` produce.
         let tagged_report = ValidationReportDto {
             findings: vec![FindingDto {
@@ -1260,7 +1260,7 @@ mod tests {
     /// contract promises, and carries the message `Display` already worded.
     ///
     /// `target_missing` is the one that matters most: it is the difference
-    /// between the UI saying "there is no file yet — save once first" and the
+    /// between the UI saying "there is no file yet - save once first" and the
     /// UI showing a generic I/O failure for a perfectly ordinary state.
     #[test]
     fn create_backup_errors_map_to_their_documented_kinds() {

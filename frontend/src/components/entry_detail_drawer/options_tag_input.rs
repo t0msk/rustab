@@ -1,7 +1,7 @@
-//! `OptionsTagInput` — well-known toggle chips + systemd/vfat value chips +
+//! `OptionsTagInput` - well-known toggle chips + systemd/vfat value chips +
 //! free tags, rendered as one ordered removable-chip list (§4 item 5).
 //!
-//! All state here is local, in-memory scratch state for the drawer — it
+//! All state here is local, in-memory scratch state for the drawer - it
 //! does not read/write the mock entries table or any app-level state.
 
 use web_sys::HtmlInputElement;

@@ -1,4 +1,4 @@
-//! `BackupPanel` — backup list view (§7), rows are `BackupListItem`.
+//! `BackupPanel` - backup list view (§7), rows are `BackupListItem`.
 //! Renders from the real `list_backups` result (T12); `AppShell` owns the
 //! fetch, this component is purely presentational.
 
@@ -61,7 +61,7 @@ pub fn backup_panel(props: &BackupPanelProps) -> Html {
                     icon="🗄"
                     title="No backups yet"
                     description={Some(AttrValue::from(
-                        "No backups yet — one will be created automatically the first time you save."
+                        "No backups yet - one will be created automatically the first time you save."
                     ))}
                 />
             } else {

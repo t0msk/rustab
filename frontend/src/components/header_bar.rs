@@ -1,4 +1,4 @@
-//! `HeaderBar` — app title, Entries/Backups tab nav, contextual action
+//! `HeaderBar` - app title, Entries/Backups tab nav, contextual action
 //! button (Add Entry on Entries tab, Create backup on Backups tab).
 
 use yew::prelude::*;
@@ -6,7 +6,7 @@ use yew::prelude::*;
 use crate::components::loading_spinner::LoadingSpinner;
 
 /// In-memory view-state: which top-level tab is active. No router is used
-/// per `docs/UI_DESIGN.md` §1 — `AppShell` owns a `UseStateHandle<Tab>`.
+/// per `docs/UI_DESIGN.md` §1 - `AppShell` owns a `UseStateHandle<Tab>`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Entries,
@@ -18,12 +18,12 @@ pub struct HeaderBarProps {
     pub active_tab: Tab,
     pub on_tab_change: Callback<Tab>,
     pub on_add_entry: Callback<()>,
-    /// Fired when the "Create backup" button is clicked. Not tied to a row
-    /// — it always acts on the active target's current content
+    /// Fired when the "Create backup" button is clicked. Not tied to a row -
+    /// it always acts on the active target's current content
     /// (`docs/API_CONTRACT.md` §3.11).
     pub on_create_backup: Callback<()>,
     /// Set by `AppShell` while the `create_backup` call is in flight. No
-    /// confirm dialog gates this action — it is treated as safe/additive/
+    /// confirm dialog gates this action - it is treated as safe/additive/
     /// reversible (it only ever adds a file, which Delete can remove), so
     /// this is the only in-flight state the button needs.
     #[prop_or(false)]
@@ -37,7 +37,7 @@ pub struct HeaderBarProps {
     /// is clicked.
     pub on_open_location: Callback<()>,
     /// The last `open_backup_location` failure's message, shown inline
-    /// beneath the button (no dialog) — same treatment as `create_error`
+    /// beneath the button (no dialog) - same treatment as `create_error`
     /// above. No loading/disabled prop: this action has no in-flight state
     /// (T25's own reasoning: the call is a near-instant `spawn()`), unchanged
     /// by this relocation.
