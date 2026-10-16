@@ -90,15 +90,17 @@ jobs:
           echo "::error::This workflow must be dispatched from the 'release' branch (got $DISPATCHED_REF)."
           exit 1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the annotated tag and `gh release
           # --generate-notes` have the commits they describe. Checking out
           # a branch ref (not a SHA) leaves a real local `release` branch
           # to commit onto rather than a detached HEAD.
           fetch-depth: 0
-          # Keeps the GITHUB_TOKEN credentials in .git/config so the push
-          # step below authenticates without extra wiring.
+          # Keeps the GITHUB_TOKEN credentials wired into git's config (as
+          # of checkout v6+, via an included credentials file rather than
+          # inline in .git/config, but git resolves it transparently) so
+          # the push step below authenticates without extra wiring.
           persist-credentials: true
 
       - uses: dtolnay/rust-toolchain@stable
@@ -339,7 +341,7 @@ jobs:
       # directly addressable. `merge-multiple` flattens all of them into
       # dist/ instead of one subdirectory per artifact name.
       - name: Download the packaged bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: rustab-*
           path: dist
