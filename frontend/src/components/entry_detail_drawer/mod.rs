@@ -497,13 +497,23 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 .collect()
         })
         .unwrap_or_default();
+    // Only document-level findings (no line_index - e.g. a duplicate mount
+    // point spanning two lines, or a findmnt --verify dump) and findings
+    // about *this* draft's own line belong in this drawer's flat list. A
+    // warning tagged to some other line entirely (e.g. "mount point X does
+    // not exist" for an unrelated already-saved entry) is real, but isn't
+    // actionable from inside this drawer and was confusingly showing up
+    // here regardless of which entry was open - it stays visible in the
+    // document-wide ValidationSummary once the user reviews the full diff.
     let warning_messages: Vec<AttrValue> = validation
         .as_ref()
         .map(|r| {
             r.findings
                 .iter()
                 .filter(|f| {
-                    f.severity == FindingSeverity::Warning && !is_own_mount_point_warning(f)
+                    f.severity == FindingSeverity::Warning
+                        && !is_own_mount_point_warning(f)
+                        && f.line_index.is_none_or(|idx| idx == draft_line_index)
                 })
                 .map(|f| AttrValue::from(f.message.clone()))
                 .collect()

@@ -35,15 +35,14 @@ pub struct ValidationMessageProps {
 
 #[function_component(ValidationMessage)]
 pub fn validation_message(props: &ValidationMessageProps) -> Html {
-    let (classes, icon) = match props.severity {
-        Severity::Error => (classes!("text-red-700", "dark:text-red-400"), "⚠"),
-        Severity::Warning => (classes!("text-amber-600", "dark:text-amber-400"), "ℹ"),
+    let classes = match props.severity {
+        Severity::Error => classes!("text-red-700", "dark:text-red-400"),
+        Severity::Warning => classes!("text-amber-600", "dark:text-amber-400"),
     };
 
     html! {
-        <p class={classes!("flex", "items-center", "gap-1", "text-xs", "mt-1", classes)}>
-            <span aria-hidden="true">{ icon }</span>
-            <span>{ props.message.clone() }</span>
+        <p class={classes!("text-xs", "mt-1", classes)}>
+            { props.message.clone() }
         </p>
     }
 }

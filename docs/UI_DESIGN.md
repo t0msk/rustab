@@ -289,21 +289,33 @@ validator has and the UI doesn't need to know - this document only fixes how eac
 severity looks and behaves:
 
 - **error** (blocking): field border becomes `ring-2 ring-red-500`, message text
-  directly below the field in `text-red-700 dark:text-red-400 text-xs` with a small
-  error icon. **The drawer's `Save entry` button is disabled** (`bg-slate-300
+  directly below the field in `text-red-700 dark:text-red-400 text-xs`, plain text,
+  no icon. **The drawer's `Save entry` button is disabled** (`bg-slate-300
   text-slate-500 dark:bg-slate-700 dark:text-slate-500 cursor-not-allowed`) with a
   tooltip `"Fix validation errors before saving"` - this is an actual disabled state,
   not just a styling warning the user could click through.
 - **warning** (non-blocking): field border `ring-1 ring-amber-400`, message in
-  `text-amber-600 dark:text-amber-400 text-xs` with a caution icon. Does not disable
+  `text-amber-600 dark:text-amber-400 text-xs`, plain text, no icon (an earlier
+  revision prefixed each message with a small ⚠/ℹ glyph - removed per direct
+  request as visual clutter the color/weight already conveys). Does not disable
   Save.
 - A warning that is specifically about the mount point of the entry currently being
   edited (the backend's `field`/`line_index` tagging on the finding, matched against
   this draft's own position in the document) renders inline, directly below the
-  mount point input, using the same `ValidationMessage` styling (`text-amber-600
-  dark:text-amber-400 text-xs` with a caution icon). Every other warning - including
-  a mount-point-tagged one about a *different* entry elsewhere in the document -
-  still renders in the flat warning stack described below, not next to any field.
+  mount point input, using the same `ValidationMessage` styling. The flat warning
+  stack described below is deliberately scoped to **document-level findings only**
+  (no `line_index` at all - e.g. a duplicate mount point spanning two lines, or a
+  `findmnt --verify` dump) plus any other non-mount-point warning about this same
+  draft's own line. A warning tagged to some *other* line entirely (e.g. "mount
+  point X does not exist" for an unrelated, already-saved entry elsewhere in the
+  document) is real, and still surfaces inline the next time *that* entry's own
+  drawer is opened - but is not shown inside a drawer editing a different entry,
+  where it isn't actionable and was confusingly reading as if it were about the
+  entry currently open (an earlier revision showed it here unconditionally -
+  corrected per direct user report after real use surfaced the confusion). Nothing
+  in this app currently aggregates warnings across every entry into one combined
+  view outside a drawer - DiffView (§6) shows the diff only, not validation
+  findings.
 - If ≥1 error exists anywhere in the form, a **ValidationSummary** banner appears at
   the bottom of the drawer body, immediately above the Save/Cancel bar: `bg-red-50
   dark:bg-red-900/20 border border-red-300 dark:border-red-800 text-red-800
