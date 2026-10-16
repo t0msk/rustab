@@ -1,4 +1,4 @@
-//! `HeaderBar` - app title, Entries/Backups tab nav, contextual action
+//! `HeaderBar` — app title, Entries/Backups tab nav, contextual action
 //! button (Add Entry on Entries tab, Create backup on Backups tab).
 
 use yew::prelude::*;
@@ -6,7 +6,7 @@ use yew::prelude::*;
 use crate::components::loading_spinner::LoadingSpinner;
 
 /// In-memory view-state: which top-level tab is active. No router is used
-/// per `docs/UI_DESIGN.md` §1 - `AppShell` owns a `UseStateHandle<Tab>`.
+/// per `docs/UI_DESIGN.md` §1 — `AppShell` owns a `UseStateHandle<Tab>`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Entries,
@@ -19,11 +19,11 @@ pub struct HeaderBarProps {
     pub on_tab_change: Callback<Tab>,
     pub on_add_entry: Callback<()>,
     /// Fired when the "Create backup" button is clicked. Not tied to a row
-    /// - it always acts on the active target's current content
+    /// — it always acts on the active target's current content
     /// (`docs/API_CONTRACT.md` §3.11).
     pub on_create_backup: Callback<()>,
     /// Set by `AppShell` while the `create_backup` call is in flight. No
-    /// confirm dialog gates this action - it is treated as safe/additive/
+    /// confirm dialog gates this action — it is treated as safe/additive/
     /// reversible (it only ever adds a file, which Delete can remove), so
     /// this is the only in-flight state the button needs.
     #[prop_or(false)]

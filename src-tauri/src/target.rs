@@ -1,4 +1,4 @@
-//! Active-target resolution - see `docs/SPEC.md` §7 and `docs/API_CONTRACT.md`.
+//! Active-target resolution — see `docs/SPEC.md` §7 and `docs/API_CONTRACT.md`.
 //!
 //! Exactly one file is "the active target" at any moment, and this module is
 //! the only place that decides which one. Every command that reads or writes
@@ -6,7 +6,7 @@
 //! from the frontend, so a compromised or buggy UI can never redirect a save
 //! at a file of its choosing (the one exception, `restore_backup`, takes a
 //! path but only honours it if it is one of the backups
-//! [`fstab_core::writer::list_backups`] reports for *this* target - see
+//! [`fstab_core::writer::list_backups`] reports for *this* target — see
 //! `crate::backups`).
 //!
 //! ## The policy
@@ -18,14 +18,14 @@
 //!    `$XDG_DATA_HOME/rustab/fstab.sandbox` (falling back to
 //!    `$HOME/.local/share/rustab/fstab.sandbox`, and to a temp-dir path if
 //!    neither variable is set). It is created, with a harmless comment-only
-//!    seed, the first time it is resolved - so a fresh checkout has
+//!    seed, the first time it is resolved — so a fresh checkout has
 //!    something safe and valid to load.
 //!
 //! Rule 2 deliberately applies to **release builds too**. `docs/SPEC.md` §7
 //! only mandates the sandbox default for debug builds, but defaulting a
 //! release build to `/etc/fstab` would mean the app's very first screen is
 //! already pointed at the file whose corruption §2.1 calls the one
-//! unacceptable outcome - before the user has agreed to anything. Making
+//! unacceptable outcome — before the user has agreed to anything. Making
 //! "edit the real file" an explicit, deliberate act (setting the env var)
 //! costs an informed user one line and protects an uninformed one from the
 //! worst case. See `docs/API_CONTRACT.md` for the full reasoning and for the
@@ -38,7 +38,7 @@
 //! real `/etc/fstab`: either literally, or because canonicalizing both paths
 //! lands on the same file. The canonicalized comparison is what catches a
 //! symlink pointed at `/etc/fstab` (or an `/etc/fstab` symlinked elsewhere,
-//! with the env var naming the destination) - in both directions the answer
+//! with the env var naming the destination) — in both directions the answer
 //! has to be "yes, this is the real thing", because the banner driven by
 //! this flag is the user's only warning (`docs/UI_DESIGN.md` §2).
 
@@ -204,7 +204,7 @@ fn is_real_fstab(path: &Path) -> bool {
 /// Returns `true` if `path` and `other` name the same file: either the same
 /// literal path, or two paths that canonicalize to one destination (so a
 /// symlink in either direction still counts). A path that cannot be
-/// canonicalized - most often because it does not exist - is only matched
+/// canonicalized — most often because it does not exist — is only matched
 /// literally.
 ///
 /// The generalization of [`is_real_fstab`], exposed because the elevated
@@ -253,7 +253,7 @@ fn ensure_sandbox_file(path: &Path) -> Result<(), TargetError> {
 /// `<temp dir>/rustab`.
 ///
 /// Resolved with plain XDG rules rather than Tauri's path API so that target
-/// resolution needs no `AppHandle` - the elevated helper subprocess (which
+/// resolution needs no `AppHandle` — the elevated helper subprocess (which
 /// never starts a Tauri runtime) and the unit tests can both use it.
 fn default_sandbox_dir() -> PathBuf {
     let base = non_empty_env("XDG_DATA_HOME")

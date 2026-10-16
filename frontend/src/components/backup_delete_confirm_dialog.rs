@@ -1,10 +1,10 @@
-//! `BackupDeleteConfirmDialog` - backup delete confirmation modal (§7).
+//! `BackupDeleteConfirmDialog` — backup delete confirmation modal (§7).
 //!
 //! Centered modal, same non-click-outside-dismiss treatment as
 //! `BackupRestoreConfirmDialog`/`DiffView`: a backup deletion is an
-//! immediate, irreversible, potentially-`pkexec`-elevated action -
+//! immediate, irreversible, potentially-`pkexec`-elevated action —
 //! structurally like a restore, not like the staged, undoable
-//! `DeleteConfirmDialog` entry removal - so the backdrop carries no click
+//! `DeleteConfirmDialog` entry removal — so the backdrop carries no click
 //! handler at all.
 
 use yew::prelude::*;
@@ -27,7 +27,7 @@ pub struct BackupDeleteConfirmDialogProps {
     #[prop_or(false)]
     pub saving: bool,
     /// The last `delete_backup` failure's message, shown inside this
-    /// still-open dialog (not only as a toast) - same treatment as
+    /// still-open dialog (not only as a toast) — same treatment as
     /// `BackupRestoreConfirmDialog`.
     #[prop_or_default]
     pub error: Option<AttrValue>,
@@ -51,7 +51,7 @@ pub fn backup_delete_confirm_dialog(props: &BackupDeleteConfirmDialogProps) -> H
         // Intentionally no `onclick` here: deleting a backup is an
         // immediate, irreversible (and, for the real target, elevated)
         // action, so (per docs/UI_DESIGN.md §7) clicking the backdrop must
-        // not dismiss this dialog - only explicit Cancel/Escape should.
+        // not dismiss this dialog — only explicit Cancel/Escape should.
         <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
             <div
                 class="w-full max-w-lg rounded-lg bg-white dark:bg-slate-800 shadow-lg p-6"
@@ -64,7 +64,7 @@ pub fn backup_delete_confirm_dialog(props: &BackupDeleteConfirmDialogProps) -> H
                     { format!("Delete the backup from {}?", props.backup_timestamp) }
                 </h2>
                 <p class="text-sm text-slate-600 dark:text-slate-300 mb-4">
-                    { "This cannot be undone - there is no backup of a backup." }
+                    { "This cannot be undone — there is no backup of a backup." }
                 </p>
                 if let Some(error) = &props.error {
                     <div class="mb-4 rounded-md border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 px-3 py-2 text-sm" role="alert">

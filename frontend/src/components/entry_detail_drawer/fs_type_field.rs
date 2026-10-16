@@ -1,6 +1,6 @@
-//! `FsTypeField` - free-text combobox with common-type suggestions (§4
+//! `FsTypeField` — free-text combobox with common-type suggestions (§4
 //! item 4). Uses a native `<datalist>` so any value can still be typed and
-//! accepted - there is no closed enum, matching SPEC §5.
+//! accepted — there is no closed enum, matching SPEC §5.
 
 use web_sys::HtmlInputElement;
 use yew::prelude::*;

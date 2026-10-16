@@ -8,7 +8,7 @@
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
-//! step (see `frontend/Trunk.toml` - Node is only a dev-time Tailwind CSS
+//! step (see `frontend/Trunk.toml` — Node is only a dev-time Tailwind CSS
 //! generator, never bundled). `__TAURI_INTERNALS__.invoke` is the same
 //! underlying function the JS package itself calls, and it is always
 //! injected by Tauri's core runtime into the webview regardless of the
@@ -116,7 +116,7 @@ pub async fn list_backups() -> Result<Vec<BackupInfoDto>, String> {
 }
 
 /// The rejection shape of `save`/`restore_backup` (API_CONTRACT.md §8):
-/// either the documented `WriteErrorDto`, or - per §1 - an unstructured
+/// either the documented `WriteErrorDto`, or — per §1 — an unstructured
 /// rejection, which is a frontend bug rather than a user-facing outcome but
 /// is still captured here instead of panicking.
 #[derive(Clone, Debug, PartialEq)]
@@ -138,8 +138,8 @@ impl WriteError {
     /// Whether the target is guaranteed to still hold its previous bytes
     /// (API_CONTRACT.md §8: "`target_unchanged` is the field to branch
     /// on"). The unstructured fallback case is not a documented outcome at
-    /// all, so it is treated conservatively as `false` - "the guarantee
-    /// cannot be made" - rather than assumed safe.
+    /// all, so it is treated conservatively as `false` — "the guarantee
+    /// cannot be made" — rather than assumed safe.
     pub fn target_unchanged(&self) -> bool {
         match self {
             WriteError::Write(err) => err.target_unchanged,
@@ -149,7 +149,7 @@ impl WriteError {
 }
 
 /// Like `invoke`, but for the two commands that reject with a structured
-/// `WriteErrorDto` (`save`, `restore_backup`) rather than a plain message -
+/// `WriteErrorDto` (`save`, `restore_backup`) rather than a plain message —
 /// callers need `target_unchanged` to decide how to recover
 /// (API_CONTRACT.md §8).
 async fn invoke_write<A: Serialize>(cmd: &str, args: &A) -> Result<WriteOutcomeDto, WriteError> {
@@ -206,7 +206,7 @@ pub async fn read_backup(backup_path: &str) -> Result<String, String> {
 }
 
 /// The rejection shape of `delete_backup` (API_CONTRACT.md §8): either the
-/// documented `DeleteBackupErrorDto`, or - per §1 - an unstructured
+/// documented `DeleteBackupErrorDto`, or — per §1 — an unstructured
 /// rejection, which is a frontend bug rather than a user-facing outcome but
 /// is still captured here instead of panicking. Deliberately not a variant
 /// of `WriteError`: `DeleteBackupErrorDto` is not `WriteErrorDto`-shaped
@@ -262,7 +262,7 @@ pub async fn delete_backup(backup_path: &str) -> Result<(), DeleteError> {
 }
 
 /// The rejection shape of `create_backup` (API_CONTRACT.md §8): either the
-/// documented `CreateBackupErrorDto`, or - per §1 - an unstructured
+/// documented `CreateBackupErrorDto`, or — per §1 — an unstructured
 /// rejection, which is a frontend bug rather than a user-facing outcome but
 /// is still captured here instead of panicking. Deliberately not a variant
 /// of `WriteError`/`DeleteError`: `CreateBackupErrorDto` is not

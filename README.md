@@ -5,7 +5,7 @@
 A modern, native Linux desktop GUI for viewing, editing, adding, and removing entries in `/etc/fstab`, built with stability and data safety as the top priority.
 
 Rustab combines a clean, intuitive interface with a powerful safety-first architecture:
-- **Full fstab syntax support**: UUIDs, LABELs, device paths, network sources, bind mounts, swap entries, systemd-generator options (`x-systemd.*`), comments - everything fstab and systemd support, round-tripping perfectly.
+- **Full fstab syntax support**: UUIDs, LABELs, device paths, network sources, bind mounts, swap entries, systemd-generator options (`x-systemd.*`), comments — everything fstab and systemd support, round-tripping perfectly.
 - **Atomic writes & automatic backups**: Every save uses write-ahead semantics with mandatory `findmnt --verify` validation, atomic filesystem rename, and automatic timestamped backups.
 - **Clear target indicator & mandatory diff review**: A prominent real-vs-sandbox banner and a required diff-before-save step ensure you always know what you're changing and can review every modification before it persists.
 - **Dev sandbox by default**: Rustab defaults to a safe per-user sandbox file; pointing at the real `/etc/fstab` is an explicit, auditable choice.
@@ -32,11 +32,11 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Support for all fstab device identifiers**: raw device paths, UUID, LABEL, PARTUUID, PARTLABEL, and network sources
 - **Advanced option handling**: toggles for common options, checklist/tag input for custom options, first-class support for `x-systemd.*` options
 - **Device and mount-point pickers** for easier entry creation (via `lsblk`/`findmnt`; soft failure if tools unavailable)
-- **Mandatory diff review before saving** - see exactly what will change in a side-by-side Summary or unified Raw format
-- **Automatic backup management** - every save creates a timestamped backup; restore any previous state with one click
-- **Comment and blank-line preservation** - your existing comments and formatting survive edits and round-trip without loss
-- **Real vs. sandbox visibility** - a clear, unmissable banner indicates whether you're viewing the real system file or a sandbox copy
-- **Privilege escalation gating** - when editing `/etc/fstab`, an explicit confirmation checkbox and danger banner appear; sandbox edits never require elevation
+- **Mandatory diff review before saving** — see exactly what will change in a side-by-side Summary or unified Raw format
+- **Automatic backup management** — every save creates a timestamped backup; restore any previous state with one click
+- **Comment and blank-line preservation** — your existing comments and formatting survive edits and round-trip without loss
+- **Real vs. sandbox visibility** — a clear, unmissable banner indicates whether you're viewing the real system file or a sandbox copy
+- **Privilege escalation gating** — when editing `/etc/fstab`, an explicit confirmation checkbox and danger banner appear; sandbox edits never require elevation
 
 ## Screenshot Placeholder
 
@@ -68,13 +68,13 @@ You need:
 
 - **Rust toolchain** (1.77.2 or later)
   - WASM target: `rustup target add wasm32-unknown-unknown`
-- **Trunk** - build tool for Yew/WASM: `cargo install trunk` (verified: 0.21.14+)
-- **Tauri CLI** - available as `cargo tauri` or via `cargo install tauri-cli` (verified: 2.2.7+)
-- **Node.js** (dev-time only) - used by Trunk's pre-build hook to run Tailwind CSS via `npx`; nothing from `node_modules` ships in the final app or is needed at runtime
-- **Linux system dependencies** for Tauri - see [Tauri's official Linux prerequisites documentation](https://v2.tauri.app/start/prerequisites/#linux); notably:
+- **Trunk** — build tool for Yew/WASM: `cargo install trunk` (verified: 0.21.14+)
+- **Tauri CLI** — available as `cargo tauri` or via `cargo install tauri-cli` (verified: 2.2.7+)
+- **Node.js** (dev-time only) — used by Trunk's pre-build hook to run Tailwind CSS via `npx`; nothing from `node_modules` ships in the final app or is needed at runtime
+- **Linux system dependencies** for Tauri — see [Tauri's official Linux prerequisites documentation](https://v2.tauri.app/start/prerequisites/#linux); notably:
   - `libwebkit2gtk-4.1` and build tools (on Debian/Ubuntu: `libwebkit2gtk-4.1-dev`)
   - `libssl-dev`, `libgtk-3-dev`, and others (exact packages depend on your distro)
-- **`pkexec` and polkit** - required only for writing to the real `/etc/fstab`; not needed for sandbox-target saves
+- **`pkexec` and polkit** — required only for writing to the real `/etc/fstab`; not needed for sandbox-target saves
 
 ## Building & Running
 
@@ -89,9 +89,9 @@ cargo tauri dev
 This command automatically starts Trunk's dev server (which watches `frontend/src/` for changes and rebuilds on every save). The Tauri window will open with the compiled Yew frontend.
 
 The workspace layout:
-- `crates/fstab-core/` - pure Rust parser, validator, writer (zero GUI dependencies)
-- `src-tauri/` - Tauri 2 application shell, command IPC layer, privilege escalation
-- `frontend/` - Yew/WASM user interface (compiled via Trunk, not a workspace member due to target conflicts)
+- `crates/fstab-core/` — pure Rust parser, validator, writer (zero GUI dependencies)
+- `src-tauri/` — Tauri 2 application shell, command IPC layer, privilege escalation
+- `frontend/` — Yew/WASM user interface (compiled via Trunk, not a workspace member due to target conflicts)
 
 ### Release Build
 
@@ -105,7 +105,7 @@ This invokes `trunk build --release` to compile the frontend, then bundles every
 
 ### Tailwind CSS Build Step
 
-Tailwind is run as a CLI tool (Node.js runtime only) via a pre-build hook in `frontend/Trunk.toml`. The compiled CSS is written to `frontend/styles/tailwind.css` and included in the final bundle. This step is automatic - no manual invocation needed.
+Tailwind is run as a CLI tool (Node.js runtime only) via a pre-build hook in `frontend/Trunk.toml`. The compiled CSS is written to `frontend/styles/tailwind.css` and included in the final bundle. This step is automatic — no manual invocation needed.
 
 ## Testing
 
@@ -135,7 +135,7 @@ Run `cargo fmt --check` and `cargo clippy -- -D warnings` locally to catch style
 
 ## License
 
-Rustab is dual-licensed under the MIT License or the Apache License 2.0 - your choice. See `LICENSE-MIT` and `LICENSE-APACHE` at the repository root for full terms.
+Rustab is dual-licensed under the MIT License or the Apache License 2.0 — your choice. See `LICENSE-MIT` and `LICENSE-APACHE` at the repository root for full terms.
 
 ## AI Use Disclosure
 
@@ -152,4 +152,4 @@ See `CONTRIBUTING.md` for guidelines on setting up the dev environment, running 
 - **X / Twitter**: [@TomskDEV](https://x.com/TomskDEV)
 - **Sponsor**: [Support on GitHub Sponsors](https://github.com/sponsors/t0msk)
 
-Have a question, found a bug, or want to contribute? Reach out on Discord or email - all are welcome.
+Have a question, found a bug, or want to contribute? Reach out on Discord or email — all are welcome.

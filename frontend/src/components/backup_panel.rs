@@ -1,4 +1,4 @@
-//! `BackupPanel` - backup list view (§7), rows are `BackupListItem`.
+//! `BackupPanel` — backup list view (§7), rows are `BackupListItem`.
 //! Renders from the real `list_backups` result (T12); `AppShell` owns the
 //! fetch, this component is purely presentational.
 
@@ -50,7 +50,7 @@ pub struct BackupPanelProps {
     pub on_restore: Callback<usize>,
     pub on_view_diff: Callback<usize>,
     pub on_delete: Callback<usize>,
-    /// "Open backup location" (T25, `API_CONTRACT.md` §3.12) - rendered
+    /// "Open backup location" (T25, `API_CONTRACT.md` §3.12) — rendered
     /// once per panel, not once per row: every backup lives in the same
     /// directory as the target, so a per-row button would just duplicate
     /// the same action.
@@ -87,7 +87,7 @@ pub fn backup_panel(props: &BackupPanelProps) -> Html {
                     icon="🗄"
                     title="No backups yet"
                     description={Some(AttrValue::from(
-                        "No backups yet - one will be created automatically the first time you save."
+                        "No backups yet — one will be created automatically the first time you save."
                     ))}
                 />
             } else {

@@ -27,6 +27,6 @@ serde-wasm-bindgen = "0.5"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = "0.2", features = ["futures"] }
 # Raw unified-diff rendering for `DiffView`'s "Raw diff" tab (T12,
-# `docs/UI_DESIGN.md` §6) - a frontend-only, non-safety-critical dependency;
+# `docs/UI_DESIGN.md` §6) — a frontend-only, non-safety-critical dependency;
 # the actual write path never touches this crate.
 similar = "2"

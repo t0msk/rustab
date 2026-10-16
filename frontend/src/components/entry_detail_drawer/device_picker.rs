@@ -1,4 +1,4 @@
-//! `DevicePicker` - discovered-device list/combobox for the source value
+//! `DevicePicker` — discovered-device list/combobox for the source value
 //! field (§4 item 2). Backed by `discover_devices` (T11); respects the
 //! soft-failure contract (`docs/API_CONTRACT.md` §3.8, `docs/SPEC.md` §8):
 //! when `lsblk` is unavailable the picker says so plainly rather than
@@ -15,7 +15,7 @@ pub struct DevicePickerProps {
     pub lsblk_available: bool,
     /// The source-value input's current text. Devices whose label doesn't
     /// contain this (case-insensitively) are filtered out, so typing
-    /// narrows the list instead of always showing every device - once a
+    /// narrows the list instead of always showing every device — once a
     /// device is picked, its full value lands back in this same field, so
     /// the list naturally narrows to just that one match.
     pub filter: String,
@@ -58,20 +58,20 @@ pub fn device_picker(props: &DevicePickerProps) -> Html {
     html! {
         // Hidden until something in the enclosing `.group` (the source-value
         // input or a device button below) has focus, so a long device list
-        // doesn't permanently push the rest of the form down - see the
+        // doesn't permanently push the rest of the form down — see the
         // `group` wrapper in `render_source_value_field`.
         <div class="hidden group-focus-within:block mt-2 max-h-48 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 p-2">
             if !props.lsblk_available {
                 <p class="text-xs text-slate-500 dark:text-slate-400 px-1 py-1">
-                    { "Device discovery unavailable - enter a value manually" }
+                    { "Device discovery unavailable — enter a value manually" }
                 </p>
             } else if props.devices.is_empty() {
                 <p class="text-xs text-slate-500 dark:text-slate-400 px-1 py-1">
-                    { "No devices discovered - enter a value manually" }
+                    { "No devices discovered — enter a value manually" }
                 </p>
             } else if filtered.is_empty() {
                 <p class="text-xs text-slate-500 dark:text-slate-400 px-1 py-1">
-                    { "No discovered device matches - enter a value manually" }
+                    { "No discovered device matches — enter a value manually" }
                 </p>
             } else {
                 <ul class="space-y-1">

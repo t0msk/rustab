@@ -1,4 +1,4 @@
-//! `MountPointField` - text input + directory-picker trigger (§4 item 3).
+//! `MountPointField` — text input + directory-picker trigger (§4 item 3).
 
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -10,7 +10,7 @@ use super::validation_message::{Severity, ValidationMessage};
 pub struct MountPointFieldProps {
     pub value: AttrValue,
     pub on_change: Callback<String>,
-    /// Warnings about *this* draft's mount point specifically (§5/T21.3) -
+    /// Warnings about *this* draft's mount point specifically (§5/T21.3) —
     /// i.e. already filtered and attributed by the caller, not every
     /// mount-point-related warning in the document. Rendered directly below
     /// the input.

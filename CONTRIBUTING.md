@@ -19,7 +19,7 @@ rustup target add wasm32-unknown-unknown
   ```sh
   cargo install tauri-cli
   ```
-- **Node.js** (dev-time only): Required solely to run the Tailwind CSS CLI via `npx` in the build process. No `node_modules` dependency ships with the final application - Node is never needed to run the built app.
+- **Node.js** (dev-time only): Required solely to run the Tailwind CSS CLI via `npx` in the build process. No `node_modules` dependency ships with the final application — Node is never needed to run the built app.
 
 ### System dependencies (Linux)
 
@@ -31,7 +31,7 @@ sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3
 
 ### Optional: `pkexec` and polkit
 
-Only needed if you plan to test against a real `/etc/fstab` (which you should almost never do - see the safety section below). On most Linux distributions, these are already installed. If not:
+Only needed if you plan to test against a real `/etc/fstab` (which you should almost never do — see the safety section below). On most Linux distributions, these are already installed. If not:
 
 ```sh
 sudo apt-get install policykit-1  # or equivalent on your distro
@@ -50,7 +50,7 @@ This automatically:
 2. Launches the Tauri window connected to that dev server.
 3. Watches Rust source files in `src-tauri/` and `crates/fstab-core/` for changes.
 
-By default, the app targets a **sandbox file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`) for safety - see "Safety-first contribution notes" below.
+By default, the app targets a **sandbox file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`) for safety — see "Safety-first contribution notes" below.
 
 ## Safety-first contribution notes
 
@@ -59,7 +59,7 @@ Rustab edits `/etc/fstab`, a critical system file. Preventing data corruption is
 ### Never test against the real `/etc/fstab` unless you deliberately choose to
 
 - By default, in both debug and release builds, Rustab uses a **per-user sandbox file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`). This is deliberate and safe.
-- Automated tests run against synthetic sample files in `tests/fixtures/` - never against a real `/etc/fstab` or any personal copy.
+- Automated tests run against synthetic sample files in `tests/fixtures/` — never against a real `/etc/fstab` or any personal copy.
 - `dev-data/` is in `.gitignore` and is for manual smoke testing only. Its contents must never be committed and must never be read by automated tests.
 
 ### To point at `/etc/fstab` (only when you explicitly mean to)
@@ -87,8 +87,8 @@ For safe, reproducible testing, use the hand-written sample fstab files in `test
 cargo test --workspace
 ```
 
-This runs **160 tests** (109 in `fstab-core` - 105 unit tests plus 4
-parser round-trip integration tests - and 51 in the `src-tauri`/`rustab`
+This runs **160 tests** (109 in `fstab-core` — 105 unit tests plus 4
+parser round-trip integration tests — and 51 in the `src-tauri`/`rustab`
 crate), covering:
 - `fstab-core` parser, validator, and atomic writer logic.
 - Atomicity and failure-injection tests.
@@ -101,7 +101,7 @@ crate), covering:
 cd frontend && cargo test
 ```
 
-This runs **9 tests** for the Yew component logic (Rust compiling to native `x86_64` - the test code itself does not need WebAssembly).
+This runs **9 tests** for the Yew component logic (Rust compiling to native `x86_64` — the test code itself does not need WebAssembly).
 
 ## Code style and quality gates
 
@@ -132,7 +132,7 @@ cd frontend && cargo test
 
 ### Documentation
 
-Public items in `fstab-core` must have `///` rustdoc comments explaining their contract and invariants - not just restating the function signature. For example:
+Public items in `fstab-core` must have `///` rustdoc comments explaining their contract and invariants — not just restating the function signature. For example:
 
 ```rust
 /// Atomically replaces `target` with `candidate`, restoring from `backup` if the write fails.
@@ -172,6 +172,6 @@ Reach out to the maintainer at **rustab@tomsk.dev** for anything related to cont
 
 ## Key references
 
-- **Project specification:** `docs/SPEC.md` - covers atomicity requirements, safety design, fstab domain coverage, and project non-goals.
-- **API contract:** `docs/API_CONTRACT.md` - documents the Tauri command boundary, wire format, and privilege escalation design.
-- **Tauri prerequisites:** [v2.tauri.app/start/prerequisites](https://v2.tauri.app/start/prerequisites/) - official Tauri docs for system dependencies.
+- **Project specification:** `docs/SPEC.md` — covers atomicity requirements, safety design, fstab domain coverage, and project non-goals.
+- **API contract:** `docs/API_CONTRACT.md` — documents the Tauri command boundary, wire format, and privilege escalation design.
+- **Tauri prerequisites:** [v2.tauri.app/start/prerequisites](https://v2.tauri.app/start/prerequisites/) — official Tauri docs for system dependencies.

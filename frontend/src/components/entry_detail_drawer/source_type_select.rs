@@ -1,4 +1,4 @@
-//! `SourceTypeSelect` - source-type dropdown (§4 item 1).
+//! `SourceTypeSelect` — source-type dropdown (§4 item 1).
 
 use web_sys::HtmlSelectElement;
 use yew::prelude::*;

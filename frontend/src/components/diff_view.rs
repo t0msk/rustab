@@ -1,4 +1,4 @@
-//! `DiffView` - the pending-changes/diff confirmation modal (§6), plus its
+//! `DiffView` — the pending-changes/diff confirmation modal (§6), plus its
 //! `DiffSummaryList` and `DiffRawText` sub-views.
 //!
 //! Purely presentational: `AppShell` computes the Added/Modified/Removed
@@ -203,7 +203,7 @@ pub fn diff_view(props: &DiffViewProps) -> Html {
     }
 }
 
-/// `DiffSummaryList` - structured per-field Added/Modified/Removed list
+/// `DiffSummaryList` — structured per-field Added/Modified/Removed list
 /// (§6), rendered from the real diff `AppShell` computes.
 #[derive(Properties, PartialEq)]
 pub struct DiffSummaryListProps {
@@ -275,7 +275,7 @@ pub fn diff_summary_list(props: &DiffSummaryListProps) -> Html {
     }
 }
 
-/// `DiffRawText` - classic unified-diff rendering (§6), fed by
+/// `DiffRawText` — classic unified-diff rendering (§6), fed by
 /// `crate::diff::compute_raw_diff`.
 #[derive(Properties, PartialEq)]
 pub struct DiffRawTextProps {

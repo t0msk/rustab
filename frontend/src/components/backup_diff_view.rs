@@ -1,7 +1,7 @@
-//! `BackupDiffView` - read-only backup-vs-current-target diff overlay (§7).
+//! `BackupDiffView` — read-only backup-vs-current-target diff overlay (§7).
 //!
 //! Unlike `BackupRestoreConfirmDialog`/`BackupDeleteConfirmDialog`, this
-//! performs no write and no deletion - it is purely informational - so,
+//! performs no write and no deletion — it is purely informational — so,
 //! judgment call mirroring `DeleteConfirmDialog`'s reasoning, it *is*
 //! dismissible by clicking the backdrop. Reuses `DiffRawText` directly:
 //! raw tab only, no Summary tab, since there is no `render_candidate`

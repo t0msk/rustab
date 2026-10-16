@@ -6,7 +6,7 @@
 //!   originally loaded one into Added/Modified/Removed, using *exactly* the
 //!   algorithm `candidate.rs`'s module doc comment specifies (same
 //!   `original_index` comparison `CandidateDocument::pending_count` already
-//!   uses to produce a count - this produces the actual grouped lines).
+//!   uses to produce a count — this produces the actual grouped lines).
 //! - [`compute_raw_diff`] is a classic line-level unified diff between two
 //!   whole-file texts (the original file's raw text and `render_candidate`'s
 //!   output), via the `similar` crate.
@@ -178,7 +178,7 @@ fn build_modified_line(original_line: &LineDto, new_line: &LineDto) -> ModifiedL
         }
         (LineDto::Malformed { .. }, LineDto::Malformed { .. }) => Vec::new(),
         // Not expected in practice (the drawer never changes a line's
-        // kind - see `app_shell.rs`'s `on_edit_entry`), but handled rather
+        // kind — see `app_shell.rs`'s `on_edit_entry`), but handled rather
         // than panicking: show the whole line as one changed field.
         _ => vec![ChangedField {
             label: "line".to_string(),
@@ -251,7 +251,7 @@ pub struct RawDiffLine {
 }
 
 /// Line-level unified diff of `old_text` (the original file's exact text)
-/// against `new_text` (`render_candidate`'s output) - the Raw diff tab's
+/// against `new_text` (`render_candidate`'s output) — the Raw diff tab's
 /// "exact textual before/after of the real file content"
 /// (`docs/UI_DESIGN.md` §6).
 pub fn compute_raw_diff(old_text: &str, new_text: &str) -> Vec<RawDiffLine> {

@@ -1,4 +1,4 @@
-//! Listing the active target's backups - automatic and manual alike - and
+//! Listing the active target's backups — automatic and manual alike — and
 //! resolving a frontend-supplied backup path against that list.
 //!
 //! ## Why a frontend-supplied path is safe here
@@ -17,7 +17,7 @@
 //! width, a non-numeric timestamp, an extra suffix) all fail closed with
 //! [`BackupError::NotABackupOfTarget`].
 //!
-//! What this does *not* claim - deliberately - is that the file was created
+//! What this does *not* claim — deliberately — is that the file was created
 //! by this installation: a file in the target's directory whose name matches
 //! the scheme exactly counts as a backup of that target, because in that
 //! directory the name *is* the identity. That costs nothing, because creating
@@ -28,7 +28,7 @@
 //!
 //! Matching is by identity, not by string equality alone, so an equivalent
 //! spelling of the same file (a symlinked directory, a `./` prefix) still
-//! resolves - but to the canonical path from the list, which is what is then
+//! resolves — but to the canonical path from the list, which is what is then
 //! read.
 //!
 //! ## Called on both sides of the privilege boundary
@@ -109,7 +109,7 @@ impl std::error::Error for BackupError {
 /// listing and the `stat` is skipped rather than failing the whole command.
 ///
 /// Both kinds are listed together, in one chronological order, each row
-/// carrying [`BackupInfoDto::is_manual`] - the kind is a label on a backup,
+/// carrying [`BackupInfoDto::is_manual`] — the kind is a label on a backup,
 /// not a separate list.
 ///
 /// # Errors
@@ -131,7 +131,7 @@ pub fn list(target: &Path) -> Result<Vec<BackupInfoDto>, BackupError> {
 /// Builds the [`BackupInfoDto`] for one backup of `target`, `stat`-ing it on
 /// the spot.
 ///
-/// `None` if the file cannot be `stat`ed - for [`list`] that means a backup
+/// `None` if the file cannot be `stat`ed — for [`list`] that means a backup
 /// that vanished between the listing and the `stat`, which is a skipped row
 /// rather than a failed command.
 ///
@@ -161,7 +161,7 @@ fn describe(target: &Path, backup: &Path, manual: bool) -> Option<BackupInfoDto>
 ///
 /// Goes back through [`writer::list_backups`] rather than taking the caller's
 /// word for the kind, so the row handed to the frontend is built from the same
-/// source of truth as every row [`list`] produces - including when the backup
+/// source of truth as every row [`list`] produces — including when the backup
 /// was created inside the elevated helper, where this process never saw it
 /// being made. A path that is not (or is no longer) one of `target`'s backups
 /// yields `None`.
@@ -186,7 +186,7 @@ pub fn describe_one(target: &Path, backup: &Path) -> Result<Option<BackupInfoDto
 /// Resolves `requested` to one of `target`'s actual backups.
 ///
 /// The returned path always comes from [`writer::list_backups`], never from
-/// `requested` - see the module docs for why that is the whole point.
+/// `requested` — see the module docs for why that is the whole point.
 ///
 /// # Errors
 ///
@@ -208,7 +208,7 @@ pub fn resolve_requested(target: &Path, requested: &str) -> Result<PathBuf, Back
         })
 }
 
-/// The directory `path` lives in - used for error messages here, and by
+/// The directory `path` lives in — used for error messages here, and by
 /// [`crate::commands::open_backup_location`] as the directory to open in the
 /// host file manager, since it is also where `path`'s backups live (see the
 /// module docs). Mirrors the `.` fallback [`writer`] itself uses for a bare
@@ -366,7 +366,7 @@ mod tests {
 
         // Anything that is not one of this target's backups yields `None`,
         // through the same list-based check every other path-taking entry
-        // point uses - it is never described from the path alone.
+        // point uses — it is never described from the path alone.
         for not_a_backup in [
             target.clone(),
             dir.join("fstab.bak"),
@@ -461,8 +461,8 @@ mod tests {
     /// decision rather than an oversight: a file in the target's own
     /// directory whose name matches the backup scheme *exactly* counts as a
     /// backup of that target, even if this process did not create it. The
-    /// naming scheme in that directory **is** the identity - `fstab-core`
-    /// owns both halves of it - and no privilege is gained by exploiting
+    /// naming scheme in that directory **is** the identity — `fstab-core`
+    /// owns both halves of it — and no privilege is gained by exploiting
     /// this: writing such a file next to `/etc/fstab` already requires the
     /// write access that would let an attacker edit `/etc/fstab` directly,
     /// and a restore still goes through validation, backup and the atomic

@@ -1,8 +1,8 @@
-//! `PendingChangesBar` - "N entries changed" bar, hidden when N is 0.
+//! `PendingChangesBar` — "N entries changed" bar, hidden when N is 0.
 //!
 //! Per `docs/UI_DESIGN.md` §6, this is the only way to reach the diff/write
 //! step. For T10 the count is a mock `use_state<usize>` owned by
-//! `AppShell` (defaulting to 0) purely to prove the show/hide logic - real
+//! `AppShell` (defaulting to 0) purely to prove the show/hide logic — real
 //! pending-change tracking is wired in T11.
 
 use yew::prelude::*;

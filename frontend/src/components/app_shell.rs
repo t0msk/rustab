@@ -1,17 +1,17 @@
-//! `AppShell` - top-level layout: `TargetBanner` + `HeaderBar` + tab content
+//! `AppShell` — top-level layout: `TargetBanner` + `HeaderBar` + tab content
 //! area (§1). Owns all in-memory view-state for this task (which tab is
-//! active, which overlay is open) using Yew `use_state` - no router, per
+//! active, which overlay is open) using Yew `use_state` — no router, per
 //! `docs/UI_DESIGN.md` §1.
 //!
 //! **State design (T11, load-bearing for T12):** `AppShell` owns the one
 //! `CandidateDocument` for the session (see `crate::candidate`), seeded
 //! from `list_entries` on mount. `EntriesTable` renders it, deletes/edits
 //! mutate it directly, and `EntryDetailDrawer` stages adds/edits into it
-//! via `DrawerSaveResult` - nothing below `AppShell` ever calls a write
+//! via `DrawerSaveResult` — nothing below `AppShell` ever calls a write
 //! command except the diff-confirm/save and restore flows below.
 //! `original_document`/`original_text` keep the document exactly as loaded
 //! (replaced wholesale only after a successful `save`/`restore_backup`, or
-//! after a failed one that can't guarantee the target is unchanged - see
+//! after a failed one that can't guarantee the target is unchanged — see
 //! `on_diff_confirm`/`on_restore_confirm`), so `CandidateDocument`'s own
 //! comparison helpers and `crate::diff` can build the diff view without any
 //! further bookkeeping here.
@@ -36,7 +36,7 @@ use crate::diff::compute_summary_diff;
 use crate::dto::{BackupInfoDto, DocumentDto, LineDto, TargetInfoDto};
 
 /// Reloads `original_document`/`original_text`/`candidate` from
-/// `list_entries` - "reload after every save" (API_CONTRACT.md §11) - used
+/// `list_entries` — "reload after every save" (API_CONTRACT.md §11) — used
 /// after a successful write and after a failed one that can't guarantee
 /// the target is unchanged.
 async fn reload_entries(
@@ -56,7 +56,7 @@ async fn reload_entries(
     }
 }
 
-/// Reloads the backup list - called after mount and after every successful
+/// Reloads the backup list — called after mount and after every successful
 /// write, since a save prunes old backups and adds a new one.
 async fn reload_backups(
     backups: UseStateHandle<Vec<BackupInfoDto>>,
@@ -78,7 +78,7 @@ pub fn app_shell() -> Html {
     let backups: UseStateHandle<Vec<BackupInfoDto>> = use_state(Vec::new);
     let backups_error: UseStateHandle<Option<String>> = use_state(|| None);
 
-    // Live target info (§2), loaded from `get_target_info` on mount -
+    // Live target info (§2), loaded from `get_target_info` on mount —
     // replaces T10's `MOCK_TARGET` constant.
     let target: UseStateHandle<Option<TargetInfoDto>> = use_state(|| None);
     let target_error: UseStateHandle<Option<String>> = use_state(|| None);
@@ -111,13 +111,13 @@ pub fn app_shell() -> Html {
     let backup_delete_error: UseStateHandle<Option<String>> = use_state(|| None);
 
     // Backup-create flow state (T21.1): not tied to a row and has no
-    // confirm step - the button itself is the whole flow, so there's no
+    // confirm step — the button itself is the whole flow, so there's no
     // target/confirm-checked pair to mirror from the delete flow above.
     let backup_create_saving = use_state(|| false);
     let backup_create_error: UseStateHandle<Option<String>> = use_state(|| None);
 
-    // Open-backup-location flow state (T25): no loading/disabled state -
-    // the call is a near-instant `spawn()`, not a slow operation - and no
+    // Open-backup-location flow state (T25): no loading/disabled state —
+    // the call is a near-instant `spawn()`, not a slow operation — and no
     // success toast/reload either, since it doesn't change the backup list
     // or the target; only a failure needs to be surfaced, inline.
     let open_location_error: UseStateHandle<Option<String>> = use_state(|| None);
@@ -182,7 +182,7 @@ pub fn app_shell() -> Html {
         });
     }
     // Renders the exact "after" text for the raw-diff tab whenever the
-    // diff view opens (API_CONTRACT.md §3.4) - the candidate can't change
+    // diff view opens (API_CONTRACT.md §3.4) — the candidate can't change
     // while the modal is open (it's a blocking overlay), so this only
     // needs to run once per open, not per keystroke.
     {
@@ -275,7 +275,7 @@ pub fn app_shell() -> Html {
     };
 
     // Stages the drawer's result into the in-memory candidate document.
-    // Never calls a write command - the actual file is untouched until
+    // Never calls a write command — the actual file is untouched until
     // the diff-confirm flow below runs `save`.
     let on_drawer_save = {
         let drawer_mode = drawer_mode.clone();
@@ -332,7 +332,7 @@ pub fn app_shell() -> Html {
         let diff_saving = diff_saving.clone();
         Callback::from(move |()| {
             // Not reachable while `*diff_saving` is true (the Cancel button
-            // is disabled then - see the `DiffView` render below), but
+            // is disabled then — see the `DiffView` render below), but
             // guard anyway rather than ever closing the modal out from
             // under an in-flight save.
             if *diff_saving {
@@ -386,7 +386,7 @@ pub fn app_shell() -> Html {
                     }
                     Err(write_error) => {
                         // API_CONTRACT.md §8: "target_unchanged is the
-                        // field to branch on" - `true` keeps the user's
+                        // field to branch on" — `true` keeps the user's
                         // pending changes in place and offers retry;
                         // `false` means the write's guarantee can't be
                         // made, so reload what's actually on disk instead.
@@ -539,7 +539,7 @@ pub fn app_shell() -> Html {
                     Ok(()) => {
                         // A backup deletion never touches the live target,
                         // so `reload_entries` is deliberately not called
-                        // here - only the backup list changed.
+                        // here — only the backup list changed.
                         reload_backups(backups, backups_error).await;
                         backup_delete_saving.set(false);
                         backup_delete_target.set(None);
@@ -581,7 +581,7 @@ pub fn app_shell() -> Html {
                     Ok(_backup) => {
                         // A backup creation never touches the live target,
                         // so `reload_entries` is deliberately not called
-                        // here - only the backup list changed.
+                        // here — only the backup list changed.
                         reload_backups(backups, backups_error).await;
                         backup_create_saving.set(false);
                         show_toast.emit((ToastKind::Success, "Backup created.".to_string()));

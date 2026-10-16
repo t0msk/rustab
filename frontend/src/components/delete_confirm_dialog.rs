@@ -1,7 +1,7 @@
-//! `DeleteConfirmDialog` - single-entry delete confirmation (§4).
+//! `DeleteConfirmDialog` — single-entry delete confirmation (§4).
 //!
 //! Small centered modal. Unlike `DiffView`/`BackupRestoreConfirmDialog`
-//! this only stages a pending removal (no disk write), so - judgment call -
+//! this only stages a pending removal (no disk write), so — judgment call —
 //! it *is* dismissible by clicking the backdrop, same as the non-destructive
 //! `EntryDetailDrawer`.
 

@@ -1,4 +1,4 @@
-//! `EntriesTable` - main entry list (§3), rows are `EntryRow` (parsed) or
+//! `EntriesTable` — main entry list (§3), rows are `EntryRow` (parsed) or
 //! `UnparsedEntryRow` (malformed). Renders from the app's in-memory
 //! candidate document (see `crate::candidate`) rather than mock data (T11).
 
@@ -18,7 +18,7 @@ pub enum RowEntry {
 #[derive(Properties, PartialEq)]
 pub struct EntriesTableProps {
     /// `(candidate_index, row)` pairs, in document order. `candidate_index`
-    /// is the row's identity in the app's `CandidateDocument` - the same
+    /// is the row's identity in the app's `CandidateDocument` — the same
     /// value is reported back via `on_edit`/`on_delete`.
     pub rows: Vec<(usize, RowEntry)>,
     pub on_edit: Callback<usize>,
@@ -192,7 +192,7 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
                     <span class="text-amber-600 dark:text-amber-400 mt-0.5" aria-hidden="true">{ "⚠" }</span>
                     <div class="flex-1">
                         <p class="text-sm font-medium text-amber-800 dark:text-amber-300 mb-1">
-                            { "Couldn't fully parse this line - shown as raw text" }
+                            { "Couldn't fully parse this line — shown as raw text" }
                         </p>
                         <pre class="font-mono text-sm bg-slate-900/5 dark:bg-slate-950/40 rounded-md px-3 py-2 whitespace-pre-wrap">
                             { props.raw_line.clone() }

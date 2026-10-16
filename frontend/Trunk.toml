@@ -4,7 +4,7 @@
 # through `npx` against the local `node_modules` dev dependency declared in
 # `package.json` (devDependencies only). Nothing from `node_modules` is
 # bundled into the compiled `dist/` output or required at application
-# runtime - Tailwind is purely a dev-time CSS-generation step; Node is never
+# runtime — Tailwind is purely a dev-time CSS-generation step; Node is never
 # needed to run the built app.
 
 [build]

@@ -1,8 +1,8 @@
-//! `ValidationMessage` - generic error/warning finding renderer (§5).
+//! `ValidationMessage` — generic error/warning finding renderer (§5).
 //!
 //! The severity classification (which checks are hard-blocking vs.
 //! advisory) is a backend/validator decision (`fstab_core::validate`,
-//! surfaced via `validate_candidate`) - this component only renders
+//! surfaced via `validate_candidate`) — this component only renders
 //! whatever severity it is given. Wired up in T11 to render
 //! `ValidationReportDto` findings in `EntryDetailDrawer`.
 //!
@@ -10,7 +10,7 @@
 //! `line_index` (T21.3), which `EntryDetailDrawer` uses to route a warning
 //! about this draft's own mount point into `MountPointField` (rendered via
 //! this component, directly below the input) instead of the flat warning
-//! list. `severity_ring_classes` is still unused today - the per-field
+//! list. `severity_ring_classes` is still unused today — the per-field
 //! `ring-2`/`ring-1` input-border highlighting `docs/UI_DESIGN.md` §5
 //! describes has no caller yet, kept for API completeness.
 
@@ -20,7 +20,7 @@ use yew::prelude::*;
 pub enum Severity {
     // `EntryDetailDrawer` routes blocking findings through
     // `ValidationSummary` (a plain message list) instead, so nothing
-    // constructs this variant yet - kept for this component's own
+    // constructs this variant yet — kept for this component's own
     // completeness as a generic two-severity renderer.
     #[allow(dead_code)]
     Error,

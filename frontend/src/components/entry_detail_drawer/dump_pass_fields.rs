@@ -1,4 +1,4 @@
-//! `DumpPassFields` - the two small numeric inputs (§4 item 6).
+//! `DumpPassFields` — the two small numeric inputs (§4 item 6).
 
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -7,7 +7,7 @@ use yew::prelude::*;
 pub struct DumpPassFieldsProps {
     // `u32` to match `EntryDto::dump`/`pass` exactly (API_CONTRACT.md §5:
     // "unsigned integers... fstab imposes no tighter range, so neither
-    // does this contract") - narrowing to `u8` would silently corrupt an
+    // does this contract") — narrowing to `u8` would silently corrupt an
     // edit of an entry whose existing value exceeds 255.
     pub dump: u32,
     pub pass: u32,

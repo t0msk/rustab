@@ -1,8 +1,8 @@
-# Rustab - UI/UX Design Spec
+# Rustab — UI/UX Design Spec
 
 This document is the implementation contract for the Rustab frontend (T10/T11/T12).
 It covers every GUI requirement in SPEC §9 by name and gives concrete, Tailwind-based
-values - colors, spacing, typography, component states - so a frontend developer does
+values — colors, spacing, typography, component states — so a frontend developer does
 not need to invent any structural or visual decision. Where a decision required
 inventing something outside this document's remit (brand identity, backend behavior),
 it is explicitly flagged rather than guessed.
@@ -20,7 +20,7 @@ affordances.
 
 ## 1. Overall layout
 
-Single-window desktop app, no page routing - view switching is in-memory state
+Single-window desktop app, no page routing — view switching is in-memory state
 (matches T10's "routing/view-state skeleton" using Yew state, not a router).
 
 ```
@@ -58,7 +58,7 @@ Single-window desktop app, no page routing - view switching is in-memory state
   modal/panel shell" wording. Delete, by contrast, is a single irreversible action with
   no fields to show, so it uses a small centered **DeleteConfirmDialog**, not the drawer.
 - **The diff/confirm step is a centered modal (DiffView)**, deliberately *not* a drawer
-  and *not* dismissible by clicking the backdrop - it is the final safety gate before a
+  and *not* dismissible by clicking the backdrop — it is the final safety gate before a
   write (SPEC §9 "a clear pending changes / diff view before committing a save"), so it
   behaves like a blocking confirmation dialog, not a casual panel.
 - **Backups get a top-level tab, not a side panel**, because restoring a backup is a
@@ -71,7 +71,7 @@ Single-window desktop app, no page routing - view switching is in-memory state
 ---
 
 ## 2. Target-file indicator (SPEC §9: "a visible indicator of which file ... is
-currently targeted - this must never be ambiguous to the user")
+currently targeted — this must never be ambiguous to the user")
 
 Component: **TargetBanner**. This is the single most safety-critical visual element in
 the app and is designed to be *impossible to miss*, not a subtle label.
@@ -80,11 +80,11 @@ the app and is designed to be *impossible to miss*, not a subtle label.
   Height 40px. Never scrolls away, never covered by any overlay (highest z-index in the
   app, drawers/modals render below it or the banner re-renders on top).
 - **Content**: an icon + bold uppercase lead word + the literal resolved file path, e.g.
-  `⚠ REAL SYSTEM FILE - /etc/fstab` or `🧪 SANDBOX - /home/user/rustab/dev-data/fstab.sandbox`.
+  `⚠ REAL SYSTEM FILE — /etc/fstab` or `🧪 SANDBOX — /home/user/rustab/dev-data/fstab.sandbox`.
   The full path is always shown in full (truncated with an ellipsis + tooltip only if
-  genuinely too long for the window), never abbreviated to just a filename - ambiguity
+  genuinely too long for the window), never abbreviated to just a filename — ambiguity
   between two similarly-named files is exactly what this banner exists to prevent.
-- **Two states, deliberately asymmetric in alarm level** - this is the explicit
+- **Two states, deliberately asymmetric in alarm level** — this is the explicit
   requirement that real-target mode must look more "alarming" than sandbox mode, not
   just differently colored:
 
@@ -93,17 +93,17 @@ the app and is designed to be *impossible to miss*, not a subtle label.
   | Background | `bg-red-600` (`#dc2626`) | `bg-emerald-600` (`#059669`) |
   | Text | `text-white`, `font-bold`, `uppercase`, `tracking-wide` | `text-white`, `font-semibold`, normal case |
   | Icon | triangle-exclamation (hazard), filled | flask/beaker (sandbox/test), outline |
-  | Extra texture | subtle 8px diagonal hazard-stripe pattern at ~8% white opacity across the banner background (`repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, transparent 8px 16px)`) | none - flat color, calm |
+  | Extra texture | subtle 8px diagonal hazard-stripe pattern at ~8% white opacity across the banner background (`repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, transparent 8px 16px)`) | none — flat color, calm |
   | Border | `border-b-2 border-red-800` | `border-b-2 border-emerald-800` |
-  | Copy | `"REAL SYSTEM FILE - {path}"` | `"Sandbox target - {path}"` |
+  | Copy | `"REAL SYSTEM FILE — {path}"` | `"Sandbox target — {path}"` |
 
   The red/striped/uppercase/bold treatment for real-target mode is a dedicated design
-  decision, not reused anywhere else in the app at this intensity - it exists only here
+  decision, not reused anywhere else in the app at this intensity — it exists only here
   and nowhere else should a full-width striped red banner appear, so the user's
   pattern-match of "this specific look = I am touching the real system" stays reliable.
 - **Data need (not a backend decision)**: TargetBanner needs `{ path: String, is_real:
   bool }` from whatever "get active target" call T8 exposes. It re-renders live if that
-  value ever changes during the session (e.g. a future settings change) - never cached
+  value ever changes during the session (e.g. a future settings change) — never cached
   at startup only.
 - The same `is_real` flag is reused (not re-invented) to color-code the confirm button
   in DiffView and BackupRestoreConfirmDialog (§6, §7), so the "danger" signal is
@@ -112,12 +112,12 @@ the app and is designed to be *impossible to miss*, not a subtle label.
 ---
 
 ## 3. Entries table/list view (SPEC §9: "Table/list view of all current entries
-... including ones Rustab doesn't 'understand' perfectly - show raw text with a
+... including ones Rustab doesn't 'understand' perfectly — show raw text with a
 warning rather than dropping them")
 
 Component: **EntriesTable**, rows are **EntryRow** (parsed) or **UnparsedEntryRow**
 (malformed). Comments and blank lines are preserved for serialization but are not
-rendered as table rows - the table only ever lists `Entry` and `Malformed` lines
+rendered as table rows — the table only ever lists `Entry` and `Malformed` lines
 (this is a UI display decision, not a change to backend round-trip behavior: comments
 and blanks are never dropped, just not given their own row in this list view).
 
@@ -141,7 +141,7 @@ height ~44px, `border-b border-slate-200 dark:border-slate-700`.
 
 - Full-width single row (spans all columns), background `bg-amber-50 dark:bg-amber-900/20`,
   left border accent `border-l-4 border-amber-500`.
-- Content: a warning icon (amber triangle) + label `"Couldn't fully parse this line -
+- Content: a warning icon (amber triangle) + label `"Couldn't fully parse this line —
   shown as raw text"` + the raw original line text verbatim in `font-mono text-sm`
   inside a `bg-slate-900/5 dark:bg-slate-950/40` inset block so it visually reads as
   "quoted raw text," not as a normal structured row.
@@ -149,7 +149,7 @@ height ~44px, `border-b border-slate-200 dark:border-slate-700`.
   sub-mode (a single multi-line text field containing the raw line, since structured
   fields cannot be offered for a line the parser couldn't decompose) rather than the
   normal structured form. Delete removes the line like any other row. The line is never
-  silently hidden or auto-corrected - this satisfies SPEC's explicit "never dropped or
+  silently hidden or auto-corrected — this satisfies SPEC's explicit "never dropped or
   hidden" requirement.
 - `EmptyState` variant: if the table has zero entries (e.g. a truly empty fstab), show
   a centered placeholder: icon + `"No entries yet"` + a primary `Add Entry` button.
@@ -166,14 +166,14 @@ it's a non-destructive in-progress edit, not a final write).
 Field order, top to bottom, each with a `text-sm font-medium` label above it and
 `space-y-4` (16px) between fields:
 
-1. **SourceTypeSelect** - dropdown. Options, per SPEC §9's literal list (path / UUID /
+1. **SourceTypeSelect** — dropdown. Options, per SPEC §9's literal list (path / UUID /
    LABEL / PARTUUID / none) **extended** to also cover PARTLABEL and Network, since
    `fstab-core`'s `SourceId` model (T2) already defines those variants and the dropdown
    must be able to represent every value the backend can round-trip:
    `Device path` · `UUID` · `LABEL` · `PARTUUID` · `PARTLABEL` · `Network (NFS/CIFS)` ·
    `None`. *(Flagging this as a transparent completeness extension of the §9 wording,
    not a visual/brand judgment call.)*
-2. **Source value field** - changes shape based on the selected type:
+2. **Source value field** — changes shape based on the selected type:
    - `Device path` / `Network`: free-text input + a `Browse…` button that opens
      **DevicePicker**.
    - `UUID` / `LABEL` / `PARTUUID` / `PARTLABEL`: a combobox pre-populated from
@@ -184,18 +184,18 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
      text `"Used for pseudo-filesystems (tmpfs, proc) or swap entries without a
      discrete backing device."`
    - **DevicePicker** data need: a list of discovered devices, each conceptually
-     `{ path, uuid, label, partuuid, partlabel, fstype }` - sourced from whatever
+     `{ path, uuid, label, partuuid, partlabel, fstype }` — sourced from whatever
      discovery call T7/T8 exposes. If the list is empty (tools unavailable), DevicePicker
-     shows `"No devices discovered - enter a value manually"` and the manual field stays
+     shows `"No devices discovered — enter a value manually"` and the manual field stays
      usable; it is never a blocking state.
-3. **Mount point** - text input (`font-mono`) + a `Browse…` button opening a native
+3. **Mount point** — text input (`font-mono`) + a `Browse…` button opening a native
    directory picker (conceptually: open a directory chooser, receive a path string
-   back - the concrete Tauri API is not this document's decision).
-4. **Filesystem type** - free-text combobox: typing shows a suggestion dropdown of
+   back — the concrete Tauri API is not this document's decision).
+4. **Filesystem type** — free-text combobox: typing shows a suggestion dropdown of
    common types (`ext4, btrfs, xfs, vfat, ntfs3, swap, none, nfs, nfs4, cifs, overlay,
-   tmpfs, proc`) but any value can be typed and accepted - no closed enum, matching
+   tmpfs, proc`) but any value can be typed and accepted — no closed enum, matching
    SPEC §5.
-5. **OptionsTagInput** - the SPEC §9 "checklist/tag-input for options":
+5. **OptionsTagInput** — the SPEC §9 "checklist/tag-input for options":
    - A row of toggle chips for the well-known options named in SPEC §5:
      `defaults · noatime · relatime · ro · rw · user · nofail · auto · noauto · bind · sw`.
    - A separate, visually grouped "systemd" row of toggle/value chips for the
@@ -207,15 +207,15 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
      toggle+value pattern.
    - Below those: a free-text tag input (type a value, press Enter or `,` to commit) for
      anything not covered above.
-   - All of the above - toggled well-known chips, systemd/vfat value chips, and free
-     typed tags - render as one single flowing, removable-chip list in the exact order
+   - All of the above — toggled well-known chips, systemd/vfat value chips, and free
+     typed tags — render as one single flowing, removable-chip list in the exact order
      they'll be serialized (SPEC's "ordered key/key=value list"), so the user always sees
      the real resulting option order, not three disconnected UI groups.
    - Chip styling: active/selected `bg-sky-100 text-sky-700 dark:bg-sky-900/40
      dark:text-sky-300`, inactive/available-but-off `bg-slate-100 text-slate-600
      dark:bg-slate-800 dark:text-slate-400`, each chip `rounded-full px-3 py-1 text-xs
      font-medium`, with an `×` to remove.
-6. **Dump** and **Pass** - two small numeric inputs side by side (`w-16` each), default
+6. **Dump** and **Pass** — two small numeric inputs side by side (`w-16` each), default
    `0`, helper text under each: `"0 = don't dump"` / `"0 = skip fsck, 1 = root
    filesystem, 2 = checked after root"`.
 
@@ -223,19 +223,19 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
 dark:bg-slate-700`), `Verify` (secondary/outline, `bg-white dark:bg-slate-800 border
 border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200`), and `Save
 entry` (primary, `bg-sky-600 hover:bg-sky-700 text-white`, disabled while blocking
-validation errors exist - see §5). Saving here only stages the change in memory as a
+validation errors exist — see §5). Saving here only stages the change in memory as a
 pending edit; it does **not** write to disk. Disk writes only ever happen through the
 DiffView confirm step (§6).
 
 `Verify`, between Cancel and Save, is on-demand reassurance distinct from the passive
 debounced check already running while typing (§5): it forces an immediate,
 non-debounced `validate_candidate` re-check against the same candidate document, and
-confirms the outcome with a toast - a success toast `"No validation issues found."`
+confirms the outcome with a toast — a success toast `"No validation issues found."`
 when the report has neither errors nor warnings, or an error-styled toast stating the
 error and warning counts otherwise (deliberately error-styled even when only warnings
 are present, so a non-blocking warning never goes unnoticed just because the user
 didn't wait for the debounce). It does **not** change how findings render inline, in
-the flat warning stack, or in `ValidationSummary` - that result is the exact same
+the flat warning stack, or in `ValidationSummary` — that result is the exact same
 `validate_candidate` response already driving those displays, just fetched immediately
 instead of after the 400ms debounce, so clicking Verify also refreshes them right away.
 Hidden entirely in raw-text edit mode (§3), since there is no structured document to
@@ -245,7 +245,7 @@ validate there. Disabled while a Save or a Verify call is already in flight, lab
 **DeleteConfirmDialog**: small centered modal, `"Remove this entry from {mount
 point}?"` + the entry's source/mount-point/fstype summarized read-only, `Cancel` /
 `Remove` (`bg-red-600 hover:bg-red-700 text-white`) buttons. Like edit, this only stages
-a pending removal - the actual file is untouched until DiffView is confirmed.
+a pending removal — the actual file is untouched until DiffView is confirmed.
 
 ---
 
@@ -253,20 +253,20 @@ a pending removal - the actual file is untouched until DiffView is confirmed.
 doesn't exist on disk, malformed UUID" before allowing save)
 
 Component: **ValidationMessage**, a generic renderer that consumes
-`{ field: FieldId, message: String, severity: "error" | "warning" }` per field - the
+`{ field: FieldId, message: String, severity: "error" | "warning" }` per field — the
 severity classification itself (which checks are hard-blocking vs. advisory) is a
 backend/validator decision (T5), not invented here; the UI simply renders whatever
 severity the validation response assigns, so e.g. duplicate mount point and malformed
 UUID are expected to arrive as `error`, while something like "mount point doesn't exist
 yet" *could* legitimately arrive as either `error` or `warning` depending on context the
-validator has and the UI doesn't need to know - this document only fixes how each
+validator has and the UI doesn't need to know — this document only fixes how each
 severity looks and behaves:
 
 - **error** (blocking): field border becomes `ring-2 ring-red-500`, message text
   directly below the field in `text-red-700 dark:text-red-400 text-xs` with a small
   error icon. **The drawer's `Save entry` button is disabled** (`bg-slate-300
   text-slate-500 dark:bg-slate-700 dark:text-slate-500 cursor-not-allowed`) with a
-  tooltip `"Fix validation errors before saving"` - this is an actual disabled state,
+  tooltip `"Fix validation errors before saving"` — this is an actual disabled state,
   not just a styling warning the user could click through.
 - **warning** (non-blocking): field border `ring-1 ring-amber-400`, message in
   `text-amber-600 dark:text-amber-400 text-xs` with a caution icon. Does not disable
@@ -275,8 +275,8 @@ severity looks and behaves:
   edited (the backend's `field`/`line_index` tagging on the finding, matched against
   this draft's own position in the document) renders inline, directly below the
   mount point input, using the same `ValidationMessage` styling (`text-amber-600
-  dark:text-amber-400 text-xs` with a caution icon). Every other warning - including
-  a mount-point-tagged one about a *different* entry elsewhere in the document -
+  dark:text-amber-400 text-xs` with a caution icon). Every other warning — including
+  a mount-point-tagged one about a *different* entry elsewhere in the document —
   still renders in the flat warning stack described below, not next to any field.
 - If ≥1 error exists anywhere in the form, a **ValidationSummary** banner appears at
   the bottom of the drawer body, immediately above the Save/Cancel bar: `bg-red-50
@@ -293,7 +293,7 @@ before committing a save")
 
 **Flow placement**: staging an add/edit/delete (via EntryDetailDrawer or
 DeleteConfirmDialog, §4) only updates an in-memory candidate document and makes the
-**PendingChangesBar** appear - a slim bar pinned just below HeaderBar, `bg-amber-50
+**PendingChangesBar** appear — a slim bar pinned just below HeaderBar, `bg-amber-50
 dark:bg-amber-900/20 border-b border-amber-300 dark:border-amber-800`, text `"N entries
 changed"` + a primary button `Review & Save…`. This bar is the only way to reach the
 diff/write step; there is no other Save action that skips it.
@@ -301,16 +301,16 @@ diff/write step; there is no other Save action that skips it.
 Clicking `Review & Save…` opens **DiffView**: a centered modal (`max-w-4xl`, up to
 ~85vh tall with internal scroll), `bg-white dark:bg-slate-800 shadow-lg rounded-lg`,
 backdrop `bg-black/50`. **Not** dismissible by clicking the backdrop (Escape still
-cancels) - this is intentionally stricter than EntryDetailDrawer because this is the
+cancels) — this is intentionally stricter than EntryDetailDrawer because this is the
 last gate before an actual write.
 
 **Contents, top to bottom:**
 
 1. Header: `"Review changes before saving"` + a small inline reuse of the TargetBanner
    color coding (a compact badge, same red/emerald logic from §2) showing which file
-   will actually be written - the danger signal must carry through to this final
+   will actually be written — the danger signal must carry through to this final
    screen, not just live on the top banner.
-2. Two tabs, **Summary** (default) and **Raw diff** - both are required, satisfying
+2. Two tabs, **Summary** (default) and **Raw diff** — both are required, satisfying
    both halves of the brief ("structured per-field change list" and "exact textual
    diff"):
    - **DiffSummaryList** (Summary tab): entries grouped under `Added (N)` / `Modified
@@ -320,7 +320,7 @@ last gate before an actual write.
      - Removed entries: whole-row summary on `bg-red-50 dark:bg-red-900/20`, text
        `line-through text-slate-500`.
      - Modified entries: one card per entry, listing only the fields that actually
-       changed as `label: ~~old value~~ → **new value**` rows - old value muted
+       changed as `label: ~~old value~~ → **new value**` rows — old value muted
        strikethrough, new value bold, unchanged fields not repeated here at all.
    - **DiffRawText** (Raw diff tab): classic unified-diff rendering of the full
      candidate file text against the current target file text, `font-mono text-sm`,
@@ -331,7 +331,7 @@ last gate before an actual write.
      the real file content, including comments/blank-line positions, so a careful user
      can verify byte-level correctness, not just Rustab's interpretation of the change.
 3. Footer action bar:
-   - `Cancel` (secondary) - closes the modal, pending changes remain staged (nothing is
+   - `Cancel` (secondary) — closes the modal, pending changes remain staged (nothing is
      lost, nothing is written).
    - Confirm button, styled by the same `is_real` flag as TargetBanner:
      - **Sandbox**: `bg-sky-600 hover:bg-sky-700 text-white`, label `"Save changes to
@@ -339,7 +339,7 @@ last gate before an actual write.
      - **Real target**: `bg-red-600 hover:bg-red-700 text-white`, label `"Write to
        /etc/fstab"`, **disabled until** an explicit checkbox directly above the footer
        is checked: `"I understand this modifies my system's real fstab and takes
-       effect on next mount/boot."` - this extra friction step exists only for
+       effect on next mount/boot."` — this extra friction step exists only for
        real-target saves, mirroring the asymmetric alarm treatment from §2.
 4. On confirm: button becomes a loading state (`"Writing changes…"` + spinner). On
    success: toast/StatusMessage success notice, modal closes, EntriesTable refreshes
@@ -355,24 +355,24 @@ user restore one")
 Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
 - **"Create backup" button**, living in `HeaderBar`'s top-right contextual action
-  slot - the same slot `"+ Add Entry"` occupies while the `Entries` tab is active.
+  slot — the same slot `"+ Add Entry"` occupies while the `Entries` tab is active.
   It renders only while the `Backups` tab is active, and `"+ Add Entry"` is absent
-  from the DOM during that time (not a row action - it is not tied to an existing
+  from the DOM during that time (not a row action — it is not tied to an existing
   backup, it acts on the active target's current content, `docs/API_CONTRACT.md`
   §3.11). Primary-ish but not alarming styling
   (`bg-sky-600 hover:bg-sky-700 text-white`, the same non-destructive-primary treatment
   used elsewhere in the app), label `"Create backup"` while idle, `"Creating…"` with the
   same inline spinner treatment as `BackupDeleteConfirmDialog`'s `"Deleting…"` state
   while in flight, disabled while in flight. Deliberately **no confirm dialog**: this
-  action is safe/additive/reversible - it only ever adds a new file next to the existing
-  backups, and the existing `Delete` action can always clean it up afterward - so a
+  action is safe/additive/reversible — it only ever adds a new file next to the existing
+  backups, and the existing `Delete` action can always clean it up afterward — so a
   loading state and an inline error are the whole of its UI. On failure, the message is
   shown as a small red error line directly beneath the button (no dialog, no toast); on
   success, a success toast (`"Backup created."`) and the list reloads.
 - **"Open backup location" button** (T25, `docs/API_CONTRACT.md` §3.12), living inside
   `BackupPanel`'s own content area (not `HeaderBar`'s contextual action slot, which stays
   dedicated to `"Create backup"`), in a small bar near the top of the panel, rendered
-  **once per panel, not once per row** - every backup lives in the same directory as the
+  **once per panel, not once per row** — every backup lives in the same directory as the
   active target (`backups.rs`'s own module docs: "in that directory the name *is* the
   identity"), so a per-row button would just duplicate the same action. Rendered
   unconditionally, even when the backup list is empty, since the directory still exists
@@ -385,27 +385,27 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   (no dialog, no toast), the same treatment as the "Create backup" button's own
   `create_error` above. On success, **no toast and no list reload**: unlike
   `create_backup`/`restore_backup`/`delete_backup`, this action does not change the
-  backup list or the target, so there is nothing to refresh - the file manager window
+  backup list or the target, so there is nothing to refresh — the file manager window
   appearing is its own visible confirmation.
 - **BackupListItem** rows, newest first: human-readable relative timestamp (e.g. `"2
   hours ago"`, exact ISO timestamp on hover tooltip), a pill badge showing whether the
   backup is automatic or manual (same rounded-pill shape as `EntriesTable`'s source-kind
   badge: `"Automatic"` in the same neutral slate styling, `"Manual"` in the sky tones
-  used elsewhere for non-destructive emphasis - distinct but not alarming), file size,
+  used elsewhere for non-destructive emphasis — distinct but not alarming), file size,
   which target path it was backed up from, and three row-level actions: `Restore`
-  (secondary styling, not primary - restoring is not the app's main action), `View diff`
+  (secondary styling, not primary — restoring is not the app's main action), `View diff`
   (secondary styling, identical treatment to `Restore`), and `Delete` (destructive but
-  still a row-level secondary button - red text, `text-red-600 hover:bg-red-50
-  dark:text-red-400 dark:hover:bg-red-900/20` - the giant red confirm button lives in
+  still a row-level secondary button — red text, `text-red-600 hover:bg-red-50
+  dark:text-red-400 dark:hover:bg-red-900/20` — the giant red confirm button lives in
   the dialog below, not in the row).
-- `EmptyState` if no backups exist yet: `"No backups yet - one will be created
+- `EmptyState` if no backups exist yet: `"No backups yet — one will be created
   automatically the first time you save."`
 - **BackupRestoreConfirmDialog**: centered modal, same non-click-outside-dismiss
   treatment as DiffView, since this is also a real write:
   - Copy: `"Restore the backup from {timestamp}? This will overwrite the current
     contents of {target path}."` followed by a reassuring-but-accurate safety note:
     `"Restoring itself creates a fresh backup of the current file first, following the
-    same atomic write guarantee used everywhere else - but any unsaved pending edits in
+    same atomic write guarantee used everywhere else — but any unsaved pending edits in
     this session will be discarded."`
   - Confirm button follows the identical real/sandbox color + checkbox-gate pattern
     from §6 (red + required understanding checkbox for a real target, plain sky blue
@@ -415,17 +415,17 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   Deliberately **non-dismissible by backdrop click**, the same as
   `BackupRestoreConfirmDialog` and for the same reason: unlike `DeleteConfirmDialog`'s
   staged, undoable entry removal, deleting a backup is an immediate, irreversible
-  action that - for the real target - goes through the same `pkexec` prompt as a
+  action that — for the real target — goes through the same `pkexec` prompt as a
   save/restore, so it must not be dismissible by an accidental click.
-  - Copy: `"Delete the backup from {timestamp}? This cannot be undone - there is no
+  - Copy: `"Delete the backup from {timestamp}? This cannot be undone — there is no
     backup of a backup."`
   - For a real target, the confirmation checkbox's copy is deliberately **not** the
     restore/save dialog's sentence (that sentence talks about modifying `/etc/fstab`
-    on next mount/boot, which is false for a backup deletion - a backup delete never
+    on next mount/boot, which is false for a backup deletion — a backup delete never
     touches the live target file at all). Instead: `"I understand this permanently
     deletes a backup of /etc/fstab and requires administrator privileges."`
   - The confirm button is styled destructively (`bg-red-600 hover:bg-red-700
-    text-white`) **regardless of `is_real`** - unlike restore/save, which are sky-blue
+    text-white`) **regardless of `is_real`** — unlike restore/save, which are sky-blue
     for a sandbox target, a backup deletion is irreversible either way, so there is no
     "safe" variant to signal with a calmer color. Label `"Delete backup"` while idle,
     `"Deleting…"` + spinner while in flight.
@@ -434,11 +434,11 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
     deletion never touches the live target, so there is nothing else to refresh).
 - **BackupDiffView**: a read-only overlay opened by a row's `View diff` button, showing
   `crate::diff::compute_raw_diff` between the backup's raw text (fetched via
-  `read_backup`) and the live target's current text - reusing `DiffRawText` directly,
+  `read_backup`) and the live target's current text — reusing `DiffRawText` directly,
   raw tab only (there is no `render_candidate` equivalent for arbitrary backup text, so
   a parsed Summary tab isn't buildable here, and adding one is out of scope). Unlike the
-  two dialogs above, this performs no write and no deletion, so - judgment call,
-  mirroring `DeleteConfirmDialog`'s reasoning - it **is dismissible by clicking the
+  two dialogs above, this performs no write and no deletion, so — judgment call,
+  mirroring `DeleteConfirmDialog`'s reasoning — it **is dismissible by clicking the
   backdrop**: there is nothing a stray click could lose. Header names both sides, e.g.
   `"Diff: backup from {timestamp} vs. current {target path}"`; a single `Close` button.
   If the `read_backup` call rejected, the error is shown in place of the diff.
@@ -448,12 +448,12 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 ## 8. Visual design tokens
 
 Tailwind v3 (per the locked architecture decision), class-based dark mode
-(`darkMode: 'class'` or media-based - either works; tokens below are written as
+(`darkMode: 'class'` or media-based — either works; tokens below are written as
 light-value / dark-value pairs so either strategy applies them the same way).
 
 **Brand flag**: SPEC/PROJECT_PLAN define no existing brand colors, logo, or voice for
 Rustab. The palette below (slate neutrals + sky primary) is a reasonable
-dark-mode-friendly default, not a brand decision - **flagging this explicitly**: if the
+dark-mode-friendly default, not a brand decision — **flagging this explicitly**: if the
 user wants a specific primary/brand color or wordmark treatment later, that's a
 decision for them, not something to infer from this spec.
 
@@ -478,7 +478,7 @@ decision for them, not something to infer from this spec.
 | `success` | `emerald-600` | `emerald-400` | save/restore success state |
 
 Reused consistently: `danger` and `target-real` are deliberately the **same** red
-(`#dc2626`) - the brief asked for "a distinct danger/real-target accent color used
+(`#dc2626`) — the brief asked for "a distinct danger/real-target accent color used
 consistently," and using one red for both "this action is destructive" and "this is the
 real system file" keeps the semantic meaning ("real consequences") a single color
 teaches once, rather than splitting it into two reds the user has to learn separately.
@@ -501,7 +501,7 @@ padding `p-6`; vertical gap between stacked form fields `space-y-4`; standard bu
 ### Typography scale
 
 Font stack: `font-sans` = `Inter, ui-sans-serif, system-ui, -apple-system, sans-serif`
-(no custom brand typeface specified - system/Inter default, same brand-flag caveat as
+(no custom brand typeface specified — system/Inter default, same brand-flag caveat as
 color above). `font-mono` = `"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
 monospace`, used for every raw/technical value: source paths/UUIDs, mount points, the
 unparsed-row raw text, and the DiffRawText block.
@@ -509,7 +509,7 @@ unparsed-row raw text, and the DiffRawText block.
 | Token | Size / line-height | Weight | Used for |
 |---|---|---|---|
 | `text-xs` | 12px / 16px | normal | timestamps, helper text, chip labels |
-| `text-sm` | 14px / 20px | normal/medium | default body, table cells, form inputs & labels - the base UI density |
+| `text-sm` | 14px / 20px | normal/medium | default body, table cells, form inputs & labels — the base UI density |
 | `text-base` | 16px / 24px | medium | drawer/modal section sub-headings |
 | `text-lg` | 18px / 28px | semibold | drawer/modal titles ("Review changes before saving") |
 | `text-xl` | 20px / 28px | bold | app title in HeaderBar ("Rustab") |
@@ -522,7 +522,7 @@ visual weight stays a reliable signal (§2).
 - Radius: `rounded-md` (6px) default on inputs/buttons/table cells; `rounded-lg` (8px)
   on panels/drawer/modal; `rounded-full` on chips/badges/icon buttons.
 - Shadow: `shadow-lg` on drawer and modal surfaces; `shadow-sm` on hovered table rows
-  only if a lift effect is wanted - optional, not required.
+  only if a lift effect is wanted — optional, not required.
 - Motion: drawer slides in/out over 150–200ms ease-out; modal fades+scales in over
   150ms; respect `prefers-reduced-motion` by disabling the transform/scale and keeping
   only an opacity fade.
@@ -530,11 +530,11 @@ visual weight stays a reliable signal (§2).
 ### Accessibility baseline
 
 - All text/background pairs above meet WCAG AA (4.5:1 body text, 3:1 large text) in
-  both themes - verify `red-600`/white (≈4.8:1), `emerald-600`/white (≈3.9:1, used only
+  both themes — verify `red-600`/white (≈4.8:1), `emerald-600`/white (≈3.9:1, used only
   for large bold banner text at 18px+, which passes the 3:1 large-text threshold; do not
   reuse `emerald-600`-on-white for small body text).
 - Every interactive element has a visible `:focus-visible` ring using `focus-ring`
-  (§ above) - never remove the outline without replacing it.
+  (§ above) — never remove the outline without replacing it.
 - All icon-only buttons (Edit/Delete/Browse/remove-chip) carry an accessible label
   (`aria-label` equivalent in Yew) in addition to the icon.
 - Disabled buttons (e.g. Save while validation errors exist) are real `disabled`
@@ -545,7 +545,7 @@ visual weight stays a reliable signal (§2).
 - `< 760px` window width: EntriesTable drops Dump/Pass into a per-row overflow menu;
   EntryDetailDrawer becomes full-width instead of fixed 520px; DiffView modal becomes
   full-width/full-height instead of `max-w-4xl` centered.
-- `≥ 760px`: full layout as specified above. No further breakpoints are defined - this
+- `≥ 760px`: full layout as specified above. No further breakpoints are defined — this
   is a desktop app, not a target for phone-width layouts.
 
 ---
@@ -555,54 +555,54 @@ visual weight stays a reliable signal (§2).
 Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T12
 (diff + backup + target indicator wiring):
 
-1. `AppShell` - top-level layout: banner + header + tab content area
-2. `TargetBanner` - real-vs-sandbox indicator (§2)
-3. `HeaderBar` - app title, `Entries`/`Backups` tab nav, contextual action button
+1. `AppShell` — top-level layout: banner + header + tab content area
+2. `TargetBanner` — real-vs-sandbox indicator (§2)
+3. `HeaderBar` — app title, `Entries`/`Backups` tab nav, contextual action button
    (`Add Entry` on the `Entries` tab, `Create backup` on the `Backups` tab)
-4. `PendingChangesBar` - "N entries changed" + `Review & Save…` trigger (§6)
-5. `EntriesTable` - main entry list (§3)
-6. `EntryRow` - one parsed entry's row
-7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3)
-8. `EmptyState` - generic empty-list placeholder (entries or backups)
-9. `EntryDetailDrawer` - add/edit form container (§4)
-10. `SourceTypeSelect` - source-type dropdown
-11. `DevicePicker` - discovered-device list/combobox for source value
-12. `MountPointField` - text input + directory-picker trigger
-13. `DirectoryPickerButton` - native directory chooser trigger
-14. `FsTypeField` - free-text combobox with common-type suggestions
-15. `OptionsTagInput` - well-known toggle chips + systemd/vfat value chips + free tags,
+4. `PendingChangesBar` — "N entries changed" + `Review & Save…` trigger (§6)
+5. `EntriesTable` — main entry list (§3)
+6. `EntryRow` — one parsed entry's row
+7. `UnparsedEntryRow` — malformed-line row, raw text + warning (§3)
+8. `EmptyState` — generic empty-list placeholder (entries or backups)
+9. `EntryDetailDrawer` — add/edit form container (§4)
+10. `SourceTypeSelect` — source-type dropdown
+11. `DevicePicker` — discovered-device list/combobox for source value
+12. `MountPointField` — text input + directory-picker trigger
+13. `DirectoryPickerButton` — native directory chooser trigger
+14. `FsTypeField` — free-text combobox with common-type suggestions
+15. `OptionsTagInput` — well-known toggle chips + systemd/vfat value chips + free tags,
     one ordered chip list (§4)
-16. `DumpPassFields` - the two small numeric inputs
-17. `ValidationMessage` - generic per-field error/warning renderer (§5)
-18. `ValidationSummary` - drawer-top aggregate error banner (§5)
-19. `FormActionBar` - Cancel/Verify/Save buttons inside the drawer
-20. `DeleteConfirmDialog` - single-entry delete confirmation (§4)
-21. `DiffView` - the pending-changes/diff confirmation modal (§6)
-22. `DiffSummaryList` - structured per-field Added/Modified/Removed list (§6)
-23. `DiffRawText` - unified-diff monospace rendering (§6)
-24. `RealTargetConfirmCheckbox` - the extra "I understand..." gate, reused by DiffView
+16. `DumpPassFields` — the two small numeric inputs
+17. `ValidationMessage` — generic per-field error/warning renderer (§5)
+18. `ValidationSummary` — drawer-top aggregate error banner (§5)
+19. `FormActionBar` — Cancel/Verify/Save buttons inside the drawer
+20. `DeleteConfirmDialog` — single-entry delete confirmation (§4)
+21. `DiffView` — the pending-changes/diff confirmation modal (§6)
+22. `DiffSummaryList` — structured per-field Added/Modified/Removed list (§6)
+23. `DiffRawText` — unified-diff monospace rendering (§6)
+24. `RealTargetConfirmCheckbox` — the extra "I understand..." gate, reused by DiffView
     and BackupRestoreConfirmDialog
-25. `BackupPanel` - backup list view (§7); also hosts the once-per-panel
+25. `BackupPanel` — backup list view (§7); also hosts the once-per-panel
     "Open backup location" button (T25)
-26. `BackupListItem` - one backup's row + Restore/View diff/Delete buttons
-27. `BackupRestoreConfirmDialog` - restore confirmation modal (§7)
-28. `StatusToast` - transient success/error notification
-29. `LoadingSpinner` - inline loading indicator (buttons, panel loads)
-30. `BackupDeleteConfirmDialog` - backup delete confirmation modal (§7)
-31. `BackupDiffView` - read-only backup-vs-current-target diff overlay (§7)
+26. `BackupListItem` — one backup's row + Restore/View diff/Delete buttons
+27. `BackupRestoreConfirmDialog` — restore confirmation modal (§7)
+28. `StatusToast` — transient success/error notification
+29. `LoadingSpinner` — inline loading indicator (buttons, panel loads)
+30. `BackupDeleteConfirmDialog` — backup delete confirmation modal (§7)
+31. `BackupDiffView` — read-only backup-vs-current-target diff overlay (§7)
 
 ---
 
 ## SPEC §9 checklist (for reviewer sign-off)
 
 - [x] Table/list view of all current entries, including unparsed ones shown as raw
-  text + warning, never dropped - §3
+  text + warning, never dropped — §3
 - [x] Add/edit/delete form with structured source-type dropdown + device picker,
   mount point + directory picker, filesystem type, options checklist/tag-input with
-  toggles for common options, dump, pass - §4
+  toggles for common options, dump, pass — §4
 - [x] Inline validation feedback (duplicate mount point, mount point missing on disk,
-  malformed UUID) before save is allowed, and it blocks save - §5
-- [x] Clear pending-changes/diff view before committing a save - §6
-- [x] Visible, unambiguous indicator of real `/etc/fstab` vs. dev/sandbox target - §2
-- [x] Backup/restore UI: list of recent auto-backups with restore action - §7
-- [x] Tailwind styling, dark-mode friendly, modern/clean - §8
+  malformed UUID) before save is allowed, and it blocks save — §5
+- [x] Clear pending-changes/diff view before committing a save — §6
+- [x] Visible, unambiguous indicator of real `/etc/fstab` vs. dev/sandbox target — §2
+- [x] Backup/restore UI: list of recent auto-backups with restore action — §7
+- [x] Tailwind styling, dark-mode friendly, modern/clean — §8
