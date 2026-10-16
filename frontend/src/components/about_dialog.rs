@@ -150,7 +150,7 @@ pub fn about_dialog(props: &AboutDialogProps) -> Html {
                     </button>
                 </div>
                 <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">
-                    { "Author: Tomsk · " }
+                    { "Author: Tomáš \"tomsk\" Sabo · " }
                     <button type="button" class="hover:underline" onclick={on_email_click}>
                         { "opensource@tomsk.dev" }
                     </button>
