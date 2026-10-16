@@ -357,24 +357,33 @@ pub fn open_backup_location() -> Result<(), CommandErrorDto> {
 }
 
 /// `open_external_link(link) -> null` (API_CONTRACT.md §3.13). Opens one
-/// of this app's two known external links (used by the About dialog) in
-/// the host's default web browser via `xdg-open`.
+/// of this app's five known external links (used by the About dialog) via
+/// `xdg-open` - the GitHub repo and Sponsors links in the host's default web
+/// browser, the `Email` link's `mailto:` URI in the host's default mail
+/// client (`xdg-open` dispatches by URI scheme, so no separate code path is
+/// needed for that case).
 ///
-/// Deliberately takes a closed enum, not a raw URL string: the two URLs
-/// this command will ever open are a fixed, hardcoded pair baked into
+/// Deliberately takes a closed enum, not a raw URL string: the URLs/URIs
+/// this command will ever open are a fixed, hardcoded set baked into
 /// [`ExternalLinkDto::url`], never anything the frontend supplies -
 /// applying this project's minimal-dispatch-surface philosophy (compare
 /// `privileged.rs`'s own module doc) to a non-privileged case: there is no
 /// argument surface here for a caller to redirect this command at an
-/// arbitrary URL.
+/// arbitrary URL. This is also why the About dialog's email line goes
+/// through this command rather than a plain `<a href="mailto:...">` - an
+/// in-webview anchor navigation to a non-`http(s)` scheme is not guaranteed
+/// to be handled by the host webview at all (WebKitGTK shows "The URL can't
+/// be shown" for `mailto:` rather than falling back to the OS's own
+/// scheme handler), so this command's `xdg-open` dispatch is the only
+/// reliable way to reach the user's mail client from inside the app.
 ///
-/// **No privilege escalation.** Opening a web browser needs no elevated
-/// access, same reasoning as [`open_backup_location`].
+/// **No privilege escalation.** Opening a browser or mail client needs no
+/// elevated access, same reasoning as [`open_backup_location`].
 ///
 /// # Errors
 ///
-/// [`CommandErrorKindDto::OpenExternalLink`] if the browser could not be
-/// launched.
+/// [`CommandErrorKindDto::OpenExternalLink`] if the external program could
+/// not be launched.
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> {
     open_external_link_with(link, open_browser)
@@ -506,12 +515,15 @@ fn open_external_link_with(
     opener(url).map_err(|err| {
         CommandErrorDto::new(
             CommandErrorKindDto::OpenExternalLink,
-            format!("could not open {url} in a browser: {err}"),
+            format!("could not open {url}: {err}"),
         )
     })
 }
 
-/// Launches the host's default web browser on `url` via `xdg-open`.
+/// Launches the host's default handler for `url` via `xdg-open` - a web
+/// browser for an `http(s)` URL, the default mail client for a `mailto:`
+/// URI, dispatched by `xdg-open` itself based on the scheme; this function
+/// does not need to know which.
 /// Deliberately separate from [`open_in_file_manager`] rather than
 /// generalized over both (different argument types, `&Path` vs. `&str`,
 /// and each is a single one-line `spawn()` call - not worth sharing a
@@ -1057,7 +1069,13 @@ mod tests {
     /// variant - not re-derived or approximated here.
     #[test]
     fn open_external_link_opens_the_link_s_own_url() {
-        for link in [ExternalLinkDto::GithubRepo, ExternalLinkDto::GithubSponsors] {
+        for link in [
+            ExternalLinkDto::GithubRepo,
+            ExternalLinkDto::GithubSponsors,
+            ExternalLinkDto::Email,
+            ExternalLinkDto::Issues,
+            ExternalLinkDto::License,
+        ] {
             let calls = std::cell::RefCell::new(Vec::new());
             open_external_link_with(link, |opened| {
                 calls.borrow_mut().push(opened.to_string());

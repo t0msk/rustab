@@ -132,6 +132,20 @@ pub fn header_bar(props: &HeaderBarProps) -> Html {
                         <div>
                             <button
                                 type="button"
+                                class="px-4 py-2 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-sm font-medium inline-flex items-center gap-2 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2"
+                                onclick={on_open_location_click}
+                            >
+                                { "Open backup location" }
+                            </button>
+                            if let Some(error) = &props.open_location_error {
+                                <p class="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
+                                    { error.clone() }
+                                </p>
+                            }
+                        </div>
+                        <div>
+                            <button
+                                type="button"
                                 disabled={props.create_saving}
                                 class="px-4 py-2 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-sm font-medium inline-flex items-center gap-2 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 disabled:opacity-60 disabled:cursor-not-allowed"
                                 onclick={on_create_click}
@@ -144,20 +158,6 @@ pub fn header_bar(props: &HeaderBarProps) -> Html {
                                 }
                             </button>
                             if let Some(error) = &props.create_error {
-                                <p class="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
-                                    { error.clone() }
-                                </p>
-                            }
-                        </div>
-                        <div>
-                            <button
-                                type="button"
-                                class="px-3 py-1.5 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
-                                onclick={on_open_location_click}
-                            >
-                                { "Open backup location" }
-                            </button>
-                            if let Some(error) = &props.open_location_error {
                                 <p class="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
                                     { error.clone() }
                                 </p>

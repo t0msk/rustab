@@ -406,23 +406,41 @@ Error kinds: `target_resolution`, `open_location`.
 open_external_link(link: ExternalLinkDto) -> null   (rejects with CommandErrorDto)
 ```
 
-Opens one of this app's two known external links (the GitHub repo or GitHub
-Sponsors page, used by the About dialog) in the host's default web browser
-(`xdg-open`). `link` is a closed enum (`github_repo` or `github_sponsors`),
-never a raw URL string: the two URLs this command will ever open are a fixed,
-hardcoded pair on the backend side, not anything the frontend supplies.
+Opens one of this app's five known external links (the GitHub repo page, the
+GitHub issues page, the GitHub Sponsors page, the license (repo root, since
+Rustab is dual MIT/Apache-2.0 - see `docs/SPEC.md` §10 - rather than one
+specific license file), or the `rustab@tomsk.dev` contact address, all used
+by the About dialog) via `xdg-open`. `link` is a closed enum (`github_repo`,
+`github_sponsors`, `email`, `issues` or `license`), never a raw URL string:
+the URL/URI this command will ever open for a given variant is fixed and
+hardcoded on the backend side, not anything the frontend supplies. Note that
+`license` resolves to the exact same URL as `github_repo` today (the repo
+root) - it is a separate enum variant anyway because the two buttons
+represent distinct user intent and may point elsewhere independently later.
 
-**No privilege escalation.** Opening a web browser needs no elevated access,
-the same reasoning §3.12 already gives for opening a file manager. This
-command never prompts.
+For every variant except `email`, `xdg-open` launches the host's default web
+browser on the `https:` URL. For `email`, `xdg-open` is given a
+`mailto:rustab@tomsk.dev` URI instead, which it dispatches to the host's
+default mail client - the same `xdg-open` call handles both cases, since it
+resolves the right handler from the URI's scheme. The About dialog
+deliberately does not use a plain `<a href="mailto:...">` for the email
+link: an in-webview anchor navigation to a non-`http(s)` scheme is not
+guaranteed to be handled by the host webview (WebKitGTK shows "The URL
+can't be shown" for `mailto:` rather than falling back to the OS's scheme
+handler), so this command is the only reliable way to reach the user's mail
+client from inside the app.
+
+**No privilege escalation.** Opening a browser or mail client needs no
+elevated access, the same reasoning §3.12 already gives for opening a file
+manager. This command never prompts.
 
 Unlike `open_backup_location`, this command's only failure mode is the
-browser launch itself: it does not touch the active target at all, so there
-is no target-resolution step and no `target_resolution` error kind.
+launch itself: it does not touch the active target at all, so there is no
+target-resolution step and no `target_resolution` error kind.
 
-On success the promise resolves with `null`; the browser window is not
-waited on. On failure (most commonly `xdg-open` missing) the rejection names
-the URL that could not be opened.
+On success the promise resolves with `null`; the opened program's window is
+not waited on. On failure (most commonly `xdg-open` missing) the rejection
+names the URL/URI that could not be opened.
 
 Error kinds: `open_external_link`.
 

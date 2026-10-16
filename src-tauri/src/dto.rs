@@ -726,7 +726,7 @@ impl CommandErrorDto {
 // External links
 // ---------------------------------------------------------------------------
 
-/// Which of this app's two known external links to open
+/// Which of this app's five known external links to open
 /// ([`crate::commands::open_external_link`]) - a closed set, not a raw
 /// URL, by design: see that command's own doc comment for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -736,15 +736,34 @@ pub enum ExternalLinkDto {
     GithubRepo,
     /// `https://github.com/sponsors/t0msk`.
     GithubSponsors,
+    /// `mailto:rustab@tomsk.dev`. `xdg-open` dispatches a `mailto:` URI to
+    /// the host's default mail client, the same way it dispatches an
+    /// `https:` URL to the default browser - no separate code path needed.
+    Email,
+    /// `https://github.com/t0msk/rustab/issues`.
+    Issues,
+    /// `https://github.com/t0msk/rustab` - the repo root, not a path to one
+    /// specific license file. Rustab is dual-licensed (`LICENSE-MIT` and
+    /// `LICENSE-APACHE`, the standard Rust ecosystem choice, `docs/SPEC.md`
+    /// §10); the repo root is where GitHub itself surfaces both, rather
+    /// than this link arbitrarily picking one of the two to point at.
+    /// Deliberately a distinct variant from `GithubRepo`, even though the
+    /// URL is identical today, because the two buttons represent different
+    /// user intent (browse the project vs. check the license) and may
+    /// reasonably point elsewhere independently in the future.
+    License,
 }
 
 impl ExternalLinkDto {
-    /// The literal URL for this link. Hardcoded here, not supplied by the
-    /// frontend - see the command's doc comment.
+    /// The literal URL (or URI, for `Email`) for this link. Hardcoded here,
+    /// not supplied by the frontend - see the command's doc comment.
     pub(crate) fn url(self) -> &'static str {
         match self {
             ExternalLinkDto::GithubRepo => "https://github.com/t0msk/rustab",
             ExternalLinkDto::GithubSponsors => "https://github.com/sponsors/t0msk",
+            ExternalLinkDto::Email => "mailto:rustab@tomsk.dev",
+            ExternalLinkDto::Issues => "https://github.com/t0msk/rustab/issues",
+            ExternalLinkDto::License => "https://github.com/t0msk/rustab",
         }
     }
 }
