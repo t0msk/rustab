@@ -233,6 +233,23 @@ pub struct EntryDto {
     /// Text of a trailing `#` comment on the same line, without the `#`, or
     /// `null` if there is none.
     pub trailing_comment: Option<String>,
+    /// An optional human-readable note about what this entry is *for*, or
+    /// `null` if there is none.
+    ///
+    /// Distinct from [`Self::trailing_comment`] - two different mechanisms,
+    /// stored separately. A trailing comment is inline, on the entry's *own*
+    /// physical line, after the six fields; a description instead round-trips
+    /// to and from a comment line of its own, immediately *above* the entry,
+    /// carrying rustab's `# // <text>` marker. See
+    /// [`fstab_core::model::FstabEntry::description`] and `fstab-core`'s
+    /// `parser.rs` for the exact marker-recognition and serialization rules;
+    /// they are not restated here.
+    ///
+    /// Normalized on the way in: see [`From<EntryDto> for FstabEntry`] below,
+    /// which is where a value arriving over IPC is held to the same
+    /// "empty-after-trim is not a description" standard as one arriving via
+    /// the text parser.
+    pub description: Option<String>,
 }
 
 impl From<&FstabEntry> for EntryDto {
@@ -250,6 +267,7 @@ impl From<&FstabEntry> for EntryDto {
             dump: entry.dump,
             pass: entry.pass,
             trailing_comment: entry.trailing_comment.clone(),
+            description: entry.description.clone(),
         }
     }
 }
@@ -264,6 +282,22 @@ impl From<EntryDto> for FstabEntry {
             dump: dto.dump,
             pass: dto.pass,
             trailing_comment: dto.trailing_comment,
+            // The one normalization this module performs, and deliberately so.
+            // `fstab_core::model` does no normalization itself and documents
+            // that an empty or whitespace-only description is turned into
+            // `None` "by whoever constructs the entry"; for anything arriving
+            // from the frontend, this IPC boundary is that place. The parser
+            // already enforces the same rule on text read from a file (a
+            // `# //` marker whose payload is empty after trimming is not a
+            // description at all), so a description typed into the UI and one
+            // read from disk are held to the same standard - otherwise a
+            // whitespace-only value from the UI would be stored, then written
+            // out as a bare marker line, and silently vanish on the next
+            // parse.
+            description: dto
+                .description
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty()),
         }
     }
 }
@@ -406,6 +440,11 @@ pub enum ValidationFieldDto {
     Source,
     /// The entry's filesystem type.
     FsType,
+    /// The entry's human-readable description ([`EntryDto::description`]) -
+    /// not one of the six fstab fields, but an editable per-entry value the
+    /// UI can focus just the same. Set by the `description_contains_newline`
+    /// check.
+    Description,
 }
 
 impl From<FindingField> for ValidationFieldDto {
@@ -414,6 +453,7 @@ impl From<FindingField> for ValidationFieldDto {
             FindingField::MountPoint => ValidationFieldDto::MountPoint,
             FindingField::Source => ValidationFieldDto::Source,
             FindingField::FsType => ValidationFieldDto::FsType,
+            FindingField::Description => ValidationFieldDto::Description,
         }
     }
 }
@@ -1054,7 +1094,7 @@ mod tests {
                 r#""source":{"kind":"uuid","value":"1111"},"#,
                 r#""mount_point":"/mnt/d","fs_type":"ext4","#,
                 r#""options":[{"key":"noauto","value":null},{"key":"fmask","value":"0022"}],"#,
-                r#""dump":0,"pass":2,"trailing_comment":" note"}},"#,
+                r#""dump":0,"pass":2,"trailing_comment":" note","description":null}},"#,
                 r#"{"kind":"malformed","raw":"/dev/sdb1"}"#,
                 r#"]}"#,
             )
@@ -1266,6 +1306,7 @@ mod tests {
             (ValidationFieldDto::MountPoint, "mount_point"),
             (ValidationFieldDto::Source, "source"),
             (ValidationFieldDto::FsType, "fs_type"),
+            (ValidationFieldDto::Description, "description"),
         ];
         for (field, spelling) in field_kinds {
             assert_eq!(
@@ -1374,6 +1415,132 @@ mod tests {
             panic!("expected an entry");
         };
         assert_eq!(entry.mount_point, "/mnt/My\\040Backup");
+    }
+
+    /// A description is carried across the boundary in both directions, and
+    /// serializes under its own key - not merged into `trailing_comment`.
+    ///
+    /// The marker line itself is `fstab-core`'s concern (and is pinned by its
+    /// own tests plus `fixtures_round_trip_through_the_dto_layer_byte_for_byte`
+    /// in `commands.rs`, which runs the `description_marker.fstab` fixture
+    /// through this very layer); what is pinned here is only the wire shape.
+    #[test]
+    fn a_description_round_trips_separately_from_a_trailing_comment() {
+        let document = parser::parse(
+            "# // photo archive, only mounted for backups\n\
+             /dev/sdc1 /mnt/photos ext4 noauto 0 2 # inline\n",
+        );
+        let dto = DocumentDto::from(&document);
+
+        let LineDto::Entry { entry } = &dto.lines[0] else {
+            panic!("expected the marker line to have been absorbed into the entry");
+        };
+        assert_eq!(
+            entry.description.as_deref(),
+            Some("photo archive, only mounted for backups")
+        );
+        assert_eq!(
+            entry.trailing_comment.as_deref(),
+            Some(" inline"),
+            "the two mechanisms must stay independent"
+        );
+        assert_eq!(
+            serde_json::to_string(&entry.description).expect("serialize"),
+            r#""photo archive, only mounted for backups""#
+        );
+
+        assert_eq!(Document::from(dto), document);
+    }
+
+    /// The IPC boundary normalizes a description the same way the text parser
+    /// does: surrounding whitespace is dropped, and a value that is empty
+    /// after trimming is not a description at all.
+    ///
+    /// This is the only normalization this module performs, and it exists
+    /// because `fstab_core::model` deliberately performs none itself. Without
+    /// it, a whitespace-only value typed into the UI would be stored, written
+    /// out as a bare `# //` marker line, and then silently vanish on the next
+    /// parse - the marker form with an empty payload is not recognized.
+    #[test]
+    fn a_description_arriving_over_ipc_is_trimmed_and_emptied_to_none() {
+        let entry_with = |description: Option<&str>| EntryDto {
+            source: SourceDto {
+                kind: SourceKindDto::Path,
+                value: "/dev/sdc1".to_string(),
+            },
+            mount_point: "/mnt/photos".to_string(),
+            fs_type: "ext4".to_string(),
+            options: Vec::new(),
+            dump: 0,
+            pass: 2,
+            trailing_comment: None,
+            description: description.map(str::to_string),
+        };
+
+        assert_eq!(
+            FstabEntry::from(entry_with(Some("  padded note  "))).description,
+            Some("padded note".to_string()),
+            "surrounding whitespace must be trimmed"
+        );
+        for empty in ["", "   ", "\t", "\n"] {
+            assert_eq!(
+                FstabEntry::from(entry_with(Some(empty))).description,
+                None,
+                "{empty:?} is empty after trimming and must not be stored"
+            );
+        }
+        assert_eq!(FstabEntry::from(entry_with(None)).description, None);
+
+        // Internal whitespace is content, not padding, and stays verbatim -
+        // the same rule `fstab-core`'s parser documents for a marker line.
+        assert_eq!(
+            FstabEntry::from(entry_with(Some("two  inner   spaces"))).description,
+            Some("two  inner   spaces".to_string())
+        );
+    }
+
+    /// A description that survives normalization but still carries a newline
+    /// is left for `validate.rs` to reject, not silently mangled here.
+    ///
+    /// The two layers have different jobs: this boundary normalizes what is
+    /// safely normalizable (padding), while a value that cannot be written as
+    /// a single comment line is a *blocking validation error* the user is told
+    /// about - not something to quietly rewrite behind their back.
+    #[test]
+    fn an_embedded_newline_is_left_for_validation_to_reject() {
+        let entry = FstabEntry::from(EntryDto {
+            source: SourceDto {
+                kind: SourceKindDto::Path,
+                value: "/dev/sdc1".to_string(),
+            },
+            mount_point: "/mnt/photos".to_string(),
+            fs_type: "ext4".to_string(),
+            options: Vec::new(),
+            dump: 0,
+            pass: 2,
+            trailing_comment: None,
+            description: Some("  first line\nsecond line  ".to_string()),
+        });
+
+        assert_eq!(
+            entry.description.as_deref(),
+            Some("first line\nsecond line"),
+            "trimming must not strip an interior newline"
+        );
+
+        // `fstab-core`'s own tests cover that its `description_contains_newline`
+        // check fires for exactly this entry; what this layer owes the frontend
+        // is that the field tag it produces survives the trip unchanged.
+        let finding = Finding {
+            severity: Severity::Error,
+            message: "has a description containing an embedded newline".to_string(),
+            field: Some(FindingField::Description),
+            line_index: Some(0),
+        };
+        assert_eq!(
+            FindingDto::from(&finding).field,
+            Some(ValidationFieldDto::Description)
+        );
     }
 
     #[test]

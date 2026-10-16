@@ -708,7 +708,8 @@ trip byte-faithful.
                { "key": "fmask", "value": "0022" } ],
   "dump": 0,
   "pass": 2,
-  "trailing_comment": " a note after the six fields, without the #"
+  "trailing_comment": " a note after the six fields, without the #",
+  "description": "photo archive, only mounted when backing up"
 }
 ```
 
@@ -728,6 +729,21 @@ trip byte-faithful.
 - `dump` and `pass` are unsigned integers. fstab imposes no tighter range, so
   neither does this contract; validation flags the odd ones.
 - `trailing_comment` is `null` when there is none.
+- `description` is an optional human-readable note about what the entry is
+  *for*, and is `null` when there is none. It is **a different mechanism from
+  `trailing_comment`**, carried in a separate field: a trailing comment is
+  inline on the entry's own line, after the six fields, whereas a description
+  round-trips to and from a comment line of its own, immediately *above* the
+  entry, carrying rustab's `# // <text>` marker. See
+  `fstab-core`'s `model.rs` and `parser.rs` doc comments for the exact
+  marker-recognition and serialization rules. Two consequences for a caller:
+  a marked comment line absorbed this way does **not** also appear as a
+  `{"kind":"comment"}` line (so `DocumentDto.lines` can be shorter than the
+  file's physical line count), and a value sent *in* is normalized at the
+  boundary - trimmed at both ends, and treated as `null` if empty after
+  trimming, exactly as the text parser treats a marker line with an empty
+  payload. A description must be a single line; one containing a newline is a
+  blocking validation error (§7), not something the backend silently rewrites.
 
 ### `DocumentViewDto`
 
@@ -779,10 +795,14 @@ precomputed so the UI's "can I save?" test cannot disagree with the backend's.
 `field` and `line_index` let the UI render a finding next to the specific
 input it is about, instead of only in a flat list:
 
-- `field` is `"mount_point"`, `"source"`, or `"fs_type"` when the finding is
-  about exactly one of those fields on one entry, and `null` otherwise.
-  `mount_point_missing` sets `"mount_point"`; `malformed_uuid` and
-  `malformed_partuuid` set `"source"`; `empty_fs_type` sets `"fs_type"`.
+- `field` is `"mount_point"`, `"source"`, `"fs_type"`, or `"description"` when
+  the finding is about exactly one of those fields on one entry, and `null`
+  otherwise. `mount_point_missing` sets `"mount_point"`; `malformed_uuid` and
+  `malformed_partuuid` set `"source"`; `empty_fs_type` sets `"fs_type"`;
+  `description_contains_newline` sets `"description"`. Note that
+  `"description"` is not one of the six fstab fields but rustab's own
+  per-entry note (§5) - from the UI's point of view it is just another
+  editable input a finding can be attached to.
 - `line_index` is the 0-based index, into the `DocumentDto.lines` array that
   was sent to `validate_candidate`, of the single line the finding is about -
   the same identity scheme `LineDto` already uses elsewhere in this
@@ -801,9 +821,10 @@ both missing their mount point) - a caller must key off *both* `field` and
 `field` alone.
 
 Typical findings: duplicate mount point, empty filesystem type, malformed
-`UUID=`/`PARTUUID=` value, mount point missing on disk (warning), malformed
-lines present (warning), `findmnt --verify` output, and a warning that the
-semantic check ran in degraded mode because `findmnt` is unavailable.
+`UUID=`/`PARTUUID=` value, a description containing an embedded newline,
+mount point missing on disk (warning), malformed lines present (warning),
+`findmnt --verify` output, and a warning that the semantic check ran in
+degraded mode because `findmnt` is unavailable.
 
 ---
 

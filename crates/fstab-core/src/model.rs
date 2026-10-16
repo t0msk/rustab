@@ -304,12 +304,39 @@ pub struct FstabEntry {
     /// including the `#` itself. `None` if the line has no trailing
     /// comment.
     pub trailing_comment: Option<String>,
+    /// An optional human-readable note about this entry - what the mount
+    /// point is *for*, in the user's own words (e.g. "photo archive, only
+    /// mounted when backing up").
+    ///
+    /// This is deliberately **not** the same mechanism as
+    /// [`Self::trailing_comment`], and the two are stored separately. A
+    /// trailing comment lives on the *same physical line*, after the six
+    /// fields. A description instead round-trips to and from a comment
+    /// occupying its **own physical line immediately above** this entry,
+    /// carrying Rustab's app-level marker: `# // <text>`. The leading `#`
+    /// is fstab's required comment syntax; the `//` after it is Rustab's
+    /// own marker, which is what distinguishes "this comment is this
+    /// entry's description" from any ordinary, unrelated `#` comment that
+    /// merely happens to sit directly above an entry (such a comment stays
+    /// a [`Line::Comment`] and is never absorbed). Note that the marker is
+    /// the slashes *plus* the whitespace after them, not the slashes alone:
+    /// `#//server/share ...` is an ordinary comment (a hand-commented-out
+    /// CIFS mount, see [`SourceId::Network`]), never a description. The exact
+    /// marker recognition and serialization rules are documented in
+    /// `parser.rs`.
+    ///
+    /// `None` means the entry has no description. An empty or
+    /// whitespace-only value is never stored here - it is normalized to
+    /// `None` by whoever constructs the entry. This field performs no
+    /// normalization itself, consistent with the rest of this module doing
+    /// no validation.
+    pub description: Option<String>,
 }
 
 impl FstabEntry {
-    /// Constructs a new entry with no trailing comment. All fields are
-    /// taken verbatim; no validation, normalization, or escaping is
-    /// performed (that is `validate.rs`'s and `parser.rs`'s job
+    /// Constructs a new entry with no trailing comment and no description.
+    /// All fields are taken verbatim; no validation, normalization, or
+    /// escaping is performed (that is `validate.rs`'s and `parser.rs`'s job
     /// respectively).
     pub fn new(
         source: SourceId,
@@ -327,6 +354,7 @@ impl FstabEntry {
             dump,
             pass,
             trailing_comment: None,
+            description: None,
         }
     }
 
@@ -335,6 +363,16 @@ impl FstabEntry {
     #[must_use]
     pub fn with_trailing_comment(mut self, comment: impl Into<String>) -> Self {
         self.trailing_comment = Some(comment.into());
+        self
+    }
+
+    /// Returns a copy of this entry with `description` attached as its
+    /// human-readable description. Builder-style helper for use alongside
+    /// [`Self::new`]; see [`Self::description`] for what the value means and
+    /// how it is round-tripped to text.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 }
@@ -353,7 +391,11 @@ pub enum Line {
     /// `#`, not including the `#` itself. Distinct from
     /// [`FstabEntry::trailing_comment`], which is an inline comment
     /// attached to an entry line rather than a comment occupying its own
-    /// line.
+    /// line. Also distinct from [`FstabEntry::description`]: a comment line
+    /// carrying the `# //` description marker directly above an entry is
+    /// absorbed into that entry's `description` by the parser and therefore
+    /// never appears as a `Comment` line - every *other* comment line,
+    /// marked or not, does (see `parser.rs` for the exact rule).
     Comment(String),
     /// A blank (whitespace-only or empty) line, preserved so that visual
     /// spacing between sections of the original file survives a round
@@ -601,6 +643,7 @@ mod tests {
 
         assert_eq!(entry, same);
         assert_eq!(entry.trailing_comment, None);
+        assert_eq!(entry.description, None);
     }
 
     #[test]
@@ -612,6 +655,20 @@ mod tests {
             entry.trailing_comment,
             Some("encrypted swap, see notes".to_string())
         );
+    }
+
+    #[test]
+    fn fstab_entry_with_description_builder() {
+        let entry = FstabEntry::new(SourceId::None, "none", "swap", Options::new(), 0, 0)
+            .with_description("swap space on the second disk");
+
+        assert_eq!(
+            entry.description,
+            Some("swap space on the second disk".to_string())
+        );
+        // The two comment mechanisms are independent: setting one must not
+        // populate the other.
+        assert_eq!(entry.trailing_comment, None);
     }
 
     #[test]

@@ -20,6 +20,7 @@ const FIXTURE_NAMES: &[&str] = &[
     "uuid_label_partuuid_partlabel.fstab",
     "bind_swap_systemd_escaped.fstab",
     "network_and_malformed.fstab",
+    "description_marker.fstab",
 ];
 
 /// Each fixture is written in the parser's own canonical output format, so
