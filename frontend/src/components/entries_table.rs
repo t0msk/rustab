@@ -5,6 +5,7 @@
 use yew::prelude::*;
 
 use crate::components::empty_state::EmptyState;
+use crate::components::icons::{DeleteIcon, EditIcon};
 use crate::dto::{EntryDto, OptionDto, SourceKind};
 
 /// One table row's content, independent of `candidate::CandidateDocument`
@@ -208,7 +209,7 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                     class="p-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500"
                     onclick={props.on_edit.clone()}
                 >
-                    <span aria-hidden="true">{ "✎" }</span>
+                    <EditIcon />
                 </button>
                 <button
                     type="button"
@@ -216,7 +217,7 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                     class="p-2 rounded-md text-slate-600 dark:text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 focus-visible:ring-2 focus-visible:ring-sky-500"
                     onclick={props.on_delete.clone()}
                 >
-                    <span aria-hidden="true">{ "🗑" }</span>
+                    <DeleteIcon />
                 </button>
             </td>
         </tr>
@@ -252,7 +253,7 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
                             class="p-2 rounded-md hover:bg-amber-100 dark:hover:bg-amber-900/40 focus-visible:ring-2 focus-visible:ring-sky-500"
                             onclick={props.on_edit.clone()}
                         >
-                            <span aria-hidden="true">{ "✎" }</span>
+                            <EditIcon />
                         </button>
                         <button
                             type="button"
@@ -260,7 +261,7 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
                             class="p-2 rounded-md text-slate-600 dark:text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 focus-visible:ring-2 focus-visible:ring-sky-500"
                             onclick={props.on_delete.clone()}
                         >
-                            <span aria-hidden="true">{ "🗑" }</span>
+                            <DeleteIcon />
                         </button>
                     </div>
                 </div>

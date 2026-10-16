@@ -135,7 +135,7 @@ and blanks are never dropped, just not given their own row in this list view).
 | Options | first ~3 options as small chips + `+N more` overflow; full ordered list visible on hover tooltip and always fully editable in the drawer |
 | Dump | single digit |
 | Pass | single digit |
-| Actions | Edit (pencil icon button) · Delete (trash icon button, `text-red-600` on hover) |
+| Actions | Edit (`EditIcon` button) · Delete (`DeleteIcon` button, `text-red-600` on hover) |
 
 Row styling: `bg-white dark:bg-slate-800`, alternating/zebra optional (`odd:bg-slate-50
 dark:odd:bg-slate-800/60`), hover `hover:bg-sky-50 dark:hover:bg-slate-700/60`, row
@@ -676,6 +676,13 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 31. `BackupDiffView` - read-only backup-vs-current-target diff overlay (§7)
 32. `AboutDialog` - static "About Rustab" overlay: name, logo, version, external
     links, author/contact line (§10, T26)
+33. `icons` module (`EditIcon`/`DeleteIcon`) - small reusable inline-SVG icon
+    components (Lucide-derived path data, ISC license, no crate dependency - see
+    the module's own doc comment for why a whole icon-set crate was rejected for
+    just two icons), replacing the `✎`/`🗑` Unicode glyphs `EntryRow`/
+    `UnparsedEntryRow`'s Edit/Delete buttons used before. `stroke="currentColor"`
+    so hover/dark-mode color changes already applied to the button apply to the
+    icon too, same as `AboutDialog`'s own icons.
 
 ---
 
