@@ -28,7 +28,8 @@ Single-window desktop app, no page routing — view switching is in-memory state
 │ TargetBanner  (always on top, full width, never hidden)  │  <- safety-critical, §2
 ├─────────────────────────────────────────────────────────┤
 │ HeaderBar: "Rustab" · [Entries] [Backups] tabs · Add Entry│
-│ (Entries tab) / Create backup (Backups tab)               │
+│ (Entries tab) / Create backup + Open backup location       │
+│ (Backups tab) · always-visible About trigger (far right)  │
 ├─────────────────────────────────────────────────────────┤
 │ PendingChangesBar (only visible once ≥1 staged change)   │
 ├─────────────────────────────────────────────────────────┤
@@ -42,6 +43,9 @@ Single-window desktop app, no page routing — view switching is in-memory state
    EntryDetailDrawer (add/edit)
         ↕ (centered modal overlay, blocking)
    DiffView / DeleteConfirmDialog / BackupRestoreConfirmDialog
+        ↕ (centered modal overlay, dismissible by backdrop click)
+   BackupDiffView / AboutDialog — read-only, so unlike the overlays above
+   these two are dismissible by clicking the backdrop
 ```
 
 **Layout decisions and justification:**
@@ -369,21 +373,21 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   loading state and an inline error are the whole of its UI. On failure, the message is
   shown as a small red error line directly beneath the button (no dialog, no toast); on
   success, a success toast (`"Backup created."`) and the list reloads.
-- **"Open backup location" button** (T25, `docs/API_CONTRACT.md` §3.12), living inside
-  `BackupPanel`'s own content area (not `HeaderBar`'s contextual action slot, which stays
-  dedicated to `"Create backup"`), in a small bar near the top of the panel, rendered
-  **once per panel, not once per row** — every backup lives in the same directory as the
-  active target (`backups.rs`'s own module docs: "in that directory the name *is* the
-  identity"), so a per-row button would just duplicate the same action. Rendered
-  unconditionally, even when the backup list is empty, since the directory still exists
-  in the overwhelmingly common case. Secondary styling, identical treatment to
-  `BackupListItem`'s `Restore`/`View diff` buttons, label `"Open backup location"`.
-  Deliberately **no confirm dialog** (opening a directory for viewing is not a write or a
+- **"Open backup location" button** (T25, `docs/API_CONTRACT.md` §3.12), now living in
+  `HeaderBar`'s contextual action slot, next to `"Create backup"` (relocated there by
+  T26 per direct user request — superseding T25's own placement choice of a small bar
+  inside `BackupPanel`'s content area). Rendered **once, not once per row** — every
+  backup lives in the same directory as the active target (`backups.rs`'s own module
+  docs: "in that directory the name *is* the identity"), so a per-row button would just
+  duplicate the same action. The relocation changes only where the button lives; its
+  behavior is otherwise unchanged: secondary styling, identical treatment to
+  `BackupListItem`'s `Restore`/`View diff` buttons, label `"Open backup location"`,
+  deliberately **no confirm dialog** (opening a directory for viewing is not a write or a
   privileged action) and **no loading/disabled state** (the call is a near-instant
   `spawn()` of the host file manager, not a slow operation, unlike every other backup
   action in this panel). On failure, a small red error line directly beneath the button
   (no dialog, no toast), the same treatment as the "Create backup" button's own
-  `create_error` above. On success, **no toast and no list reload**: unlike
+  `create_error`. On success, **no toast and no list reload**: unlike
   `create_backup`/`restore_backup`/`delete_backup`, this action does not change the
   backup list or the target, so there is nothing to refresh — the file manager window
   appearing is its own visible confirmation.
@@ -392,7 +396,9 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   backup is automatic or manual (same rounded-pill shape as `EntriesTable`'s source-kind
   badge: `"Automatic"` in the same neutral slate styling, `"Manual"` in the sky tones
   used elsewhere for non-destructive emphasis — distinct but not alarming), file size,
-  which target path it was backed up from, and three row-level actions: `Restore`
+  which target path it was backed up from (prefixed with a literal `"Target: "` label,
+  e.g. `"Target: /home/tomsk/.local/share/rustab/fstab.sandbox · 1.2 KB"`), and three
+  row-level actions: `Restore`
   (secondary styling, not primary — restoring is not the app's main action), `View diff`
   (secondary styling, identical treatment to `Restore`), and `Delete` (destructive but
   still a row-level secondary button — red text, `text-red-600 hover:bg-red-50
@@ -558,7 +564,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 1. `AppShell` — top-level layout: banner + header + tab content area
 2. `TargetBanner` — real-vs-sandbox indicator (§2)
 3. `HeaderBar` — app title, `Entries`/`Backups` tab nav, contextual action button
-   (`Add Entry` on the `Entries` tab, `Create backup` on the `Backups` tab)
+   (`Add Entry` on the `Entries` tab, `Create backup` + `Open backup location` on the
+   `Backups` tab, T26), plus an always-visible `About` trigger (both tabs, T26)
 4. `PendingChangesBar` — "N entries changed" + `Review & Save…` trigger (§6)
 5. `EntriesTable` — main entry list (§3)
 6. `EntryRow` — one parsed entry's row
@@ -582,14 +589,41 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 23. `DiffRawText` — unified-diff monospace rendering (§6)
 24. `RealTargetConfirmCheckbox` — the extra "I understand..." gate, reused by DiffView
     and BackupRestoreConfirmDialog
-25. `BackupPanel` — backup list view (§7); also hosts the once-per-panel
-    "Open backup location" button (T25)
+25. `BackupPanel` — backup list view (§7)
 26. `BackupListItem` — one backup's row + Restore/View diff/Delete buttons
 27. `BackupRestoreConfirmDialog` — restore confirmation modal (§7)
 28. `StatusToast` — transient success/error notification
 29. `LoadingSpinner` — inline loading indicator (buttons, panel loads)
 30. `BackupDeleteConfirmDialog` — backup delete confirmation modal (§7)
 31. `BackupDiffView` — read-only backup-vs-current-target diff overlay (§7)
+32. `AboutDialog` — static "About Rustab" overlay: name, logo, version, external
+    links, author/contact line (§10, T26)
+
+---
+
+## 10. About dialog (T26)
+
+Component: **AboutDialog**, triggered by an always-visible `"About"` text button at
+the far right of `HeaderBar`, present on both the `Entries` and `Backups` tabs (unlike
+every other button in that component, which is tab-conditional).
+
+- **Trigger placement**: a plain text button, not an icon glyph — this avoids any
+  font-rendering ambiguity around which glyph should mean "about" (ⓘ vs. ⋯ vs. a
+  question mark all have different conventions across platforms), and this app has no
+  footer today to put it in instead, so the header's always-visible far-right corner is
+  the next most discoverable, always-on location.
+- **Content**, stacked and centered in a small modal panel: the app logo, the name
+  `"Rustab"`, the live app version (read from the frontend crate's own `Cargo.toml` at
+  compile time via `env!("CARGO_PKG_VERSION")` — never a hardcoded string, so it can
+  never drift from the shipped build), two links that call the `open_external_link`
+  command (`docs/API_CONTRACT.md` §3.13) rather than a plain `<a href>` — a GitHub
+  repository link and a GitHub Sponsors link — and an author/contact line matching this
+  project's own existing public-facing convention (`CONTRIBUTORS.md` /
+  README.md's "Contact & Support" section).
+- **Dismiss behavior**: like `BackupDiffView`, this dialog is purely read-only and
+  informational, so — the same judgment call as that component — it **is dismissible by
+  clicking the backdrop**, unlike the non-dismissible write/delete confirm dialogs. A
+  `Close` button is also present, styled identically to `BackupDiffView`'s.
 
 ---
 

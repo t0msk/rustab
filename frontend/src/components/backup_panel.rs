@@ -50,38 +50,12 @@ pub struct BackupPanelProps {
     pub on_restore: Callback<usize>,
     pub on_view_diff: Callback<usize>,
     pub on_delete: Callback<usize>,
-    /// "Open backup location" (T25, `API_CONTRACT.md` §3.12) — rendered
-    /// once per panel, not once per row: every backup lives in the same
-    /// directory as the target, so a per-row button would just duplicate
-    /// the same action.
-    pub on_open_location: Callback<()>,
-    #[prop_or_default]
-    pub open_location_error: Option<AttrValue>,
 }
 
 #[function_component(BackupPanel)]
 pub fn backup_panel(props: &BackupPanelProps) -> Html {
-    let on_open_location = {
-        let cb = props.on_open_location.clone();
-        Callback::from(move |_: MouseEvent| cb.emit(()))
-    };
-
     html! {
         <div class="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
-            <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-700">
-                <button
-                    type="button"
-                    class="px-3 py-1.5 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
-                    onclick={on_open_location}
-                >
-                    { "Open backup location" }
-                </button>
-                if let Some(error) = &props.open_location_error {
-                    <p class="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
-                        { error.clone() }
-                    </p>
-                }
-            </div>
             if props.backups.is_empty() {
                 <EmptyState
                     icon="🗄"
@@ -151,7 +125,7 @@ pub fn backup_list_item(props: &BackupListItemProps) -> Html {
                     }
                 </p>
                 <p class="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                    { backup.target_path.clone() }{ " · " }{ size_kb }
+                    { "Target: " }{ backup.target_path.clone() }{ " · " }{ size_kb }
                 </p>
             </div>
             <div class="flex items-center gap-2">

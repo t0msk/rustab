@@ -3,8 +3,8 @@
 //! `discover_devices` (T11), plus `render_candidate`, `save`,
 //! `list_backups` and `restore_backup` (T12), plus `read_backup` and
 //! `delete_backup` (T20), plus `create_backup` (T21.1), plus
-//! `open_backup_location` (T25). See `docs/API_CONTRACT.md` for the exact
-//! contract.
+//! `open_backup_location` (T25), plus `open_external_link` (T26). See
+//! `docs/API_CONTRACT.md` for the exact contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -21,7 +21,8 @@ use wasm_bindgen::prelude::*;
 use crate::dto::DocumentDto;
 use crate::dto::{
     BackupInfoDto, CommandErrorDto, CreateBackupErrorDto, DeleteBackupErrorDto, DeviceDiscoveryDto,
-    DocumentViewDto, TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteOutcomeDto,
+    DocumentViewDto, ExternalLink, TargetInfoDto, ValidationReportDto, WriteErrorDto,
+    WriteOutcomeDto,
 };
 
 #[wasm_bindgen]
@@ -326,4 +327,15 @@ pub async fn create_backup() -> Result<BackupInfoDto, CreateError> {
 /// never writes.
 pub async fn open_backup_location() -> Result<(), String> {
     invoke("open_backup_location", &EmptyArgs {}).await
+}
+
+/// `open_external_link(link) -> null` (API_CONTRACT.md §3.13). Opens one
+/// of this app's two known external links in the host's default browser.
+/// Never escalates privilege, never writes.
+pub async fn open_external_link(link: ExternalLink) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct OpenExternalLinkArgs {
+        link: ExternalLink,
+    }
+    invoke("open_external_link", &OpenExternalLinkArgs { link }).await
 }

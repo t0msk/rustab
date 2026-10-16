@@ -201,6 +201,15 @@ pub struct BackupInfoDto {
     pub is_manual: bool,
 }
 
+/// Which of this app's two known external links to open
+/// (`open_external_link`, §3.13). Mirrors the backend's `ExternalLinkDto`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalLink {
+    GithubRepo,
+    GithubSponsors,
+}
+
 /// `CreateBackupErrorDto` (§8), the rejection shape of `create_backup`.
 /// Same two-field shape as `DeleteBackupErrorDto`, for the same reason:
 /// `create_backup` never opens, renames or writes the active target, so

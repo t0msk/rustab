@@ -20,6 +20,7 @@ use yew::prelude::*;
 
 use crate::api;
 use crate::candidate::CandidateDocument;
+use crate::components::about_dialog::AboutDialog;
 use crate::components::backup_delete_confirm_dialog::BackupDeleteConfirmDialog;
 use crate::components::backup_diff_view::BackupDiffView;
 use crate::components::backup_panel::{format_timestamps, BackupPanel};
@@ -121,6 +122,10 @@ pub fn app_shell() -> Html {
     // success toast/reload either, since it doesn't change the backup list
     // or the target; only a failure needs to be surfaced, inline.
     let open_location_error: UseStateHandle<Option<String>> = use_state(|| None);
+
+    // About-dialog flow state (T26): purely static/informational content,
+    // no fetch, so a single open/closed flag is the whole of its state.
+    let about_open: UseStateHandle<bool> = use_state(|| false);
 
     // View-diff flow state: which backup's diff overlay is open, its
     // fetched raw text (`None` = loading or not open), and the last
@@ -608,6 +613,15 @@ pub fn app_shell() -> Html {
         })
     };
 
+    let on_about_click = {
+        let about_open = about_open.clone();
+        Callback::from(move |()| about_open.set(true))
+    };
+    let on_about_close = {
+        let about_open = about_open.clone();
+        Callback::from(move |()| about_open.set(false))
+    };
+
     let on_view_diff = {
         let view_diff_target = view_diff_target.clone();
         let view_diff_text = view_diff_text.clone();
@@ -748,6 +762,9 @@ pub fn app_shell() -> Html {
                 on_create_backup={on_create_backup.clone()}
                 create_saving={*backup_create_saving}
                 create_error={(*backup_create_error).clone().map(AttrValue::from)}
+                on_open_location={on_open_location.clone()}
+                open_location_error={(*open_location_error).clone().map(AttrValue::from)}
+                on_about_click={on_about_click.clone()}
             />
             <PendingChangesBar count={pending_count} on_review={on_review} />
 
@@ -775,8 +792,6 @@ pub fn app_shell() -> Html {
                         on_restore={on_restore}
                         on_view_diff={on_view_diff}
                         on_delete={on_backup_delete}
-                        on_open_location={on_open_location.clone()}
-                        open_location_error={(*open_location_error).clone().map(AttrValue::from)}
                     />
                 }
             </main>
@@ -854,6 +869,10 @@ pub fn app_shell() -> Html {
                     error={(*view_diff_error).clone().map(AttrValue::from)}
                     on_close={on_view_diff_close}
                 />
+            }
+
+            if *about_open {
+                <AboutDialog on_close={on_about_close} />
             }
 
             if let Some((kind, message)) = (*toast).clone() {
