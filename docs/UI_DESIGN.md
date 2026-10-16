@@ -28,8 +28,8 @@ Single-window desktop app, no page routing - view switching is in-memory state
 │ TargetBanner  (always on top, full width, never hidden)  │  <- safety-critical, §2
 ├─────────────────────────────────────────────────────────┤
 │ HeaderBar: "Rustab" · [Entries] [Backups] tabs · Add Entry│
-│ (Entries tab) / Create backup + Open backup location       │
-│ (Backups tab) · always-visible Raw view + About triggers  │
+│ + Raw view (Entries tab) / Create backup + Open backup     │
+│ location (Backups tab) · always-visible About trigger      │
 │ (far right)                                                │
 ├─────────────────────────────────────────────────────────┤
 │ PendingChangesBar (only visible once ≥1 staged change)   │
@@ -717,14 +717,17 @@ every other button in that component, which is tab-conditional).
 
 ## 11. Raw view dialog
 
-Component: **RawViewDialog**, triggered by an always-visible `"Raw view"` text button in
-`HeaderBar`, placed immediately before `About` (same always-on, both-tabs treatment,
-same plain-text-button reasoning - §10). Added per direct user request after a live
-real-target session surfaced a real need: there was no way to see the active target's
-exact current raw content without either opening `DiffView` (which always computes a
-diff against a pending edit - meaningless/unavailable with zero staged changes) or
-`BackupDiffView` (which is about a *backup*, not the live target). This fills that gap:
-no diff, no comparison, just "what does this file actually contain right now."
+Component: **RawViewDialog**, triggered by a `"Raw view"` button in `HeaderBar`,
+**Entries tab only** (unlike `About`) - on `Backups`, a per-row `View diff` already shows
+the same live target content as one side of a comparison, so a second, separate
+always-visible trigger there was judged redundant clutter (changed from an initial
+both-tabs placement per direct follow-up request, after the user tried it live). Added
+per direct user request after a live real-target session surfaced a real need: there
+was no way to see the active target's exact current raw content without either opening
+`DiffView` (which always computes a diff against a pending edit - meaningless/
+unavailable with zero staged changes) or `BackupDiffView` (which is about a *backup*,
+not the live target). This fills that gap: no diff, no comparison, just "what does this
+file actually contain right now."
 
 - **Content**: the target's current raw text - the exact same `original_text` state
   `AppShell` already holds for `DiffView`'s own raw-text tab (`docs/API_CONTRACT.md`
