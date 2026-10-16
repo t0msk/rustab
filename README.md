@@ -93,6 +93,20 @@ The workspace layout:
 - `src-tauri/` - Tauri 2 application shell, command IPC layer, privilege escalation
 - `frontend/` - Yew/WASM user interface (compiled via Trunk, not a workspace member due to target conflicts)
 
+#### Troubleshooting: blank/white window on launch
+
+If `cargo tauri dev` (or the built binary) opens a completely blank or white window instead of the UI, this is a known WebKitGTK issue on some GPU/driver combinations (common under certain Nvidia drivers, Wayland sessions, and virtual machines) - WebKitGTK's hardware compositing/DMA-BUF renderer fails silently instead of falling back. Force software rendering by setting these two environment variables before launching:
+
+```bash
+WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
+```
+
+If you're on a pure Wayland session and the window fails to open at all (rather than opening blank), also try forcing X11/XWayland:
+
+```bash
+GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
+```
+
 ### Release Build
 
 From the `src-tauri/` directory:
