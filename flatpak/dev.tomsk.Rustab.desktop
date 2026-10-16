@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rustab
+GenericName=Fstab Editor
+Comment=Safely view, edit, and validate /etc/fstab
+Exec=rustab
+Icon=dev.tomsk.Rustab
+Terminal=false
+StartupNotify=true
+Categories=System;
+Keywords=fstab;mount;filesystem;partition;disk;uuid;

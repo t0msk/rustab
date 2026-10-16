@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Tomáš Sabo -->
+<component type="desktop-application">
+  <id>dev.tomsk.Rustab</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Rustab</name>
+  <summary>Safely view, edit, and validate /etc/fstab</summary>
+
+  <developer id="dev.tomsk">
+    <name>Tomáš Sabo</name>
+  </developer>
+
+  <description>
+    <p>
+      Rustab is a modern, native Linux desktop GUI for viewing, editing,
+      adding, and removing entries in /etc/fstab, built with stability and
+      data safety as the top priority.
+    </p>
+    <p>Rustab combines a clean, intuitive interface with a safety-first architecture:</p>
+    <ul>
+      <li>Full fstab syntax support: UUIDs, LABELs, device paths, network sources, bind mounts, swap entries, and systemd-generator options (x-systemd.*), with comments and formatting round-tripping perfectly</li>
+      <li>Atomic writes and automatic timestamped backups on every save, with mandatory findmnt --verify validation before anything is written to disk</li>
+      <li>A clear real-vs-sandbox target indicator and a mandatory diff review before saving, so every change is visible and reviewed before it persists</li>
+      <li>Device and mount-point pickers to make entry creation easier, with graceful fallback to manual entry if the underlying system tools are unavailable</li>
+      <li>A dev sandbox by default - pointing the app at the real /etc/fstab is an explicit, auditable choice, never the default</li>
+    </ul>
+    <p>
+      Editing the real /etc/fstab requires administrator privileges and shows
+      an explicit confirmation step; sandbox edits never require elevation.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">dev.tomsk.Rustab.desktop</launchable>
+
+  <!--
+    SUBMISSION BLOCKER - do not submit without fixing this first.
+
+    Flathub requires at least one real <screenshots> entry for every
+    graphical application, pointing at an image hosted at a stable tagged
+    commit/release URL (not a branch, which can change). This project has
+    no real screenshots yet - README.md's own "Screenshot Placeholder"
+    section (as of this writing) is literally an HTML comment with no
+    image. Take real screenshots of the running app (table view, entry
+    drawer, diff view, backup panel are the obvious candidates - see
+    README's Features list), host them at a tagged release/commit URL, and
+    add a block like this before submitting:
+
+    <screenshots>
+      <screenshot type="default">
+        <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/main-table.png</image>
+        <caption>The main entries table</caption>
+      </screenshot>
+    </screenshots>
+
+    appstreamcli validate (and therefore flatpak-builder-lint) will reject
+    this file outright without it - this is not optional polish.
+  -->
+
+  <!--
+    SUBMISSION BLOCKER - do not submit without fixing this first.
+
+    Flathub also requires a <releases> tag to pass validation. This
+    project has not cut its first tagged release yet (every crate and
+    tauri.conf.json are at 0.0.0 per PROJECT_PLAN.md's versioning policy;
+    see docs/SPEC.md §12 and the release-publish.yml workflow in
+    docs/SPEC.md §13). The entry below is a placeholder "development"
+    release (the same release type AppStream itself uses for its own
+    in-development builds) so this file is well-formed today; replace it
+    with a real dated entry for the actual version once the first tag is
+    cut, and add a new <release> entry (newest first) on every subsequent
+    tagged release from then on - see docs/FLATPAK.md's "keeping this file
+    in sync" best-practice note.
+  -->
+  <releases>
+    <release version="0.0.0" type="development" date="2026-10-16">
+      <description>
+        <p>Pre-release development snapshot. No tagged version has been cut yet.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+
+  <url type="homepage">https://github.com/t0msk/rustab</url>
+  <url type="bugtracker">https://github.com/t0msk/rustab/issues</url>
+  <url type="vcs-browser">https://github.com/t0msk/rustab</url>
+  <url type="donation">https://github.com/sponsors/t0msk</url>
+
+  <!--
+    PLACEHOLDER, not a verified brand color: frontend/tailwind.config.js
+    has no custom theme (empty `extend: {}`), so there is no established
+    Rustab brand palette to draw from. These are a neutral light/dark pair
+    picked only so this optional tag is well-formed; replace with real
+    brand colors (or drop this tag entirely) if/when one is chosen - see
+    https://docs.flathub.org/banner-preview to preview before submitting.
+  -->
+  <branding>
+    <color type="primary" scheme_preference="light">#f3f4f6</color>
+    <color type="primary" scheme_preference="dark">#111827</color>
+  </branding>
+</component>
