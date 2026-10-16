@@ -110,7 +110,7 @@ pub fn about_dialog(props: &AboutDialogProps) -> Html {
                 aria-modal="true"
                 aria-label="About Rustab"
             >
-                <img src="128x128.png" alt="Rustab logo" class="w-16 h-16 rounded-md" />
+                <img src="128x128.png" alt="Rustab logo" class="w-20 h-20 rounded-md" />
                 <h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100">{ "Rustab" }</h2>
                 <p class="text-sm text-slate-500 dark:text-slate-400">
                     { format!("Version {}", env!("CARGO_PKG_VERSION")) }
