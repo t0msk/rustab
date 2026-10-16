@@ -33,3 +33,12 @@ node_modules/
 
 # Env files (see CONTRIBUTING.md for the .env.example convention)
 .env
+
+# Local-only, not part of the public repo (by the maintainer's own choice):
+# CLAUDE.md carries project instructions for AI coding assistants, and
+# PROJECT_PLAN.md is the maintainer's private orchestration log for their
+# own agents. Both are kept on disk for local use but deliberately excluded
+# from git history/tracking so no one else who clones this repo sees or can
+# modify them.
+/CLAUDE.md
+/PROJECT_PLAN.md
