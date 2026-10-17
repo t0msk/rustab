@@ -31,18 +31,21 @@
 //! previous session left there. Within one run, every later resolution -
 //! and [`active_target`] is called fresh by every command - leaves the file
 //! completely alone, so the user's own edits and saves survive the session
-//! that made them.
+//! that made them. Because two commands resolve the target concurrently on
+//! every launch, [`SandboxRefreshState`] is a completion *barrier*: the
+//! resolutions that do not perform the refresh wait for the one that does,
+//! so no command can read the target while the refresh is still in flight.
 //!
 //! The refresh is a plain copy of bytes, never a parse and re-serialize
 //! round trip: a copy cannot drift from its source, a round trip can
 //! (`docs/SPEC.md` §5). It is published with the same same-directory
-//! temp-file-plus-`rename` swap `fstab_core::writer` uses for real saves,
-//! because the two commands racing to resolve the target at startup mean a
-//! reader really can hit a non-atomic write mid-truncate (see
-//! [`refresh_sandbox_from`]). It is also strictly best-effort - an
-//! unreadable `/etc/fstab` (missing, or no permission) leaves target
-//! resolution working on the seed/previous content rather than failing,
-//! the same soft-failure stance this project takes towards absent
+//! temp-file-plus-`rename` swap `fstab_core::writer` uses for real saves, so
+//! that any reader outside this process's barrier - a second Rustab launching
+//! at the same moment, say - still sees whole content rather than a
+//! mid-truncate file (see [`refresh_sandbox_from`]). It is also strictly
+//! best-effort - an unreadable `/etc/fstab` (missing, or no permission)
+//! leaves target resolution working on the seed/previous content rather than
+//! failing, the same soft-failure stance this project takes towards absent
 //! `lsblk`/`findmnt`.
 //!
 //! Rule 2 deliberately applies to **release builds too**. `docs/SPEC.md` §7
@@ -72,7 +75,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Environment variable that overrides the target file. Documented in
 /// `docs/API_CONTRACT.md` and `.env.example`.
@@ -108,18 +111,38 @@ const SANDBOX_SEED: &str = "\
 # UUID=00000000-0000-0000-0000-000000000000 /mnt/example ext4 noauto 0 2
 ";
 
-/// One-shot latch deciding whether a sandbox resolution is the one that
-/// refreshes the file from the real `/etc/fstab`.
+/// Completion barrier for the once-per-process sandbox refresh: it both
+/// elects the one resolution that refreshes the file from the real
+/// `/etc/fstab` *and* holds every concurrent resolution back until that
+/// refresh has actually finished.
 ///
 /// Exactly one instance lives for the lifetime of the app process (inside
 /// [`active_target`]), which is what makes "refresh once per launch" mean
 /// what it says. It is a *parameter* of [`resolve`] rather than a static
 /// [`resolve`] reads itself, for the same reason `env_value` and
-/// `sandbox_dir` are: a module-level latch would be shared by every test in
+/// `sandbox_dir` are: a module-level barrier would be shared by every test in
 /// the binary, and "the first resolution" would then depend on test
 /// execution order. Each test builds its own, and one fresh instance *is*
 /// one simulated process launch.
-struct SandboxRefreshState(AtomicBool);
+///
+/// ## Why a barrier and not just a latch
+///
+/// Electing a writer is only half the problem. The frontend fires
+/// `get_target_info` and `list_entries` as two independent tasks on mount, so
+/// two commands resolve the target simultaneously on every launch, and each
+/// one then reads the target's bytes *separately*, after resolution returns
+/// (see `crate::commands::list_entries`). A plain "did I win the race?" latch
+/// let the loser return immediately - while the winner was still reading
+/// `/etc/fstab`, writing its temp file and renaming - and hand the frontend
+/// the pre-refresh content (an empty entries table on a machine with a
+/// perfectly populated `/etc/fstab`).
+///
+/// [`OnceLock::get_or_init`] solves both halves with one primitive: the
+/// closure runs for the first caller only, every other caller *blocks* until
+/// it has fully returned, and all of them then get the same outcome. So no
+/// resolution can return - and therefore no command can read the target -
+/// before the refresh (or its seed fallback) has completed.
+struct SandboxRefreshState(OnceLock<Result<(), SandboxSetupFailure>>);
 
 impl SandboxRefreshState {
     /// A state that has not refreshed anything yet - i.e. a fresh process.
@@ -127,17 +150,56 @@ impl SandboxRefreshState {
     /// `const` so the production instance can be a plain `static` with no
     /// lazy-initialization machinery.
     const fn new() -> Self {
-        SandboxRefreshState(AtomicBool::new(false))
+        SandboxRefreshState(OnceLock::new())
     }
 
-    /// Returns `true` for the first caller only, `false` for every caller
-    /// after it.
+    /// Runs `setup` exactly once for the lifetime of this state, blocking
+    /// every concurrent caller until it has returned, and hands all callers
+    /// - the one that ran it included - the same outcome.
+    fn ensure_once<F>(&self, setup: F) -> Result<(), SandboxSetupFailure>
+    where
+        F: FnOnce() -> Result<(), SandboxSetupFailure>,
+    {
+        self.0.get_or_init(setup).clone()
+    }
+
+    /// Whether the one-time setup has already run (and so will never run
+    /// again for this state).
     ///
-    /// A single atomic swap rather than a load-then-store, so that two
-    /// commands resolving the target concurrently at startup can never both
-    /// see "I am the first" and copy the file twice.
-    fn claim_first_refresh(&self) -> bool {
-        !self.0.swap(true, Ordering::SeqCst)
+    /// Test-only: production code asks [`ensure_once`](Self::ensure_once) to
+    /// do the right thing rather than inspecting the barrier.
+    #[cfg(test)]
+    fn has_already_run(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+/// A clonable record of the one failure the once-per-process sandbox setup
+/// can report: [`seed_sandbox_file_if_missing`] could not create or stat the
+/// sandbox file.
+///
+/// [`SandboxRefreshState`] has to hand the *same* cached outcome to every
+/// caller after the first, and `io::Error` is not [`Clone`], so the error is
+/// kept behind an [`Arc`] and a fresh equivalent `io::Error` is rebuilt per
+/// caller by [`as_io_error`](Self::as_io_error). This is purely internal
+/// bookkeeping: what leaves this module is still
+/// [`TargetError::SandboxSetup`] with an `io::Error` source, exactly as
+/// before.
+#[derive(Debug, Clone)]
+struct SandboxSetupFailure(Arc<io::Error>);
+
+impl SandboxSetupFailure {
+    /// An `io::Error` equivalent to the one that failed: same
+    /// [`io::ErrorKind`], same message. A copy rather than the original
+    /// because the original has to stay in the barrier for the next caller.
+    fn as_io_error(&self) -> io::Error {
+        io::Error::new(self.0.kind(), self.0.to_string())
+    }
+}
+
+impl From<io::Error> for SandboxSetupFailure {
+    fn from(error: io::Error) -> Self {
+        SandboxSetupFailure(Arc::new(error))
     }
 }
 
@@ -215,8 +277,9 @@ impl std::error::Error for TargetError {
 /// a target that does not exist yet is a perfectly valid first-save target
 /// and [`fstab_core::writer::write_document`] handles it.
 pub fn active_target() -> Result<ActiveTarget, TargetError> {
-    /// The one real process-lifetime latch: whichever command resolves the
-    /// target first does the per-launch sandbox refresh.
+    /// The one real process-lifetime barrier: whichever command resolves the
+    /// target first does the per-launch sandbox refresh, and the others wait
+    /// for it.
     static SANDBOX_REFRESH_STATE: SandboxRefreshState = SandboxRefreshState::new();
 
     resolve(
@@ -229,15 +292,15 @@ pub fn active_target() -> Result<ActiveTarget, TargetError> {
 
 /// The env-independent core of [`active_target`], parameterized on the raw
 /// env value, the directory the sandbox would live in, the file the sandbox
-/// is refreshed from, and the once-per-process refresh latch.
+/// is refreshed from, and the once-per-process refresh barrier.
 ///
 /// Split out so tests can exercise every branch of the policy without
 /// mutating process-global environment state (which races with other tests
 /// in the same process) - and, for the same reason, without reading or
-/// writing the machine's real `/etc/fstab` or a shared refresh latch.
+/// writing the machine's real `/etc/fstab` or a shared refresh barrier.
 /// Production passes `Path::new(REAL_FSTAB_PATH)` and the single static
-/// latch in [`active_target`]; tests pass a temp file and a latch of their
-/// own.
+/// barrier in [`active_target`]; tests pass a temp file and a barrier of
+/// their own.
 fn resolve(
     env_value: Option<&OsStr>,
     sandbox_dir: &Path,
@@ -310,13 +373,32 @@ pub(crate) fn is_same_file(path: &Path, other: &Path) -> bool {
 
 /// Prepares the sandbox file (and its parent directory) for use.
 ///
-/// On the one resolution that claims the per-process refresh it replaces the
-/// sandbox with a byte-for-byte copy of `real_fstab_path`, deliberately
-/// discarding whatever a previous session left there. On every other
-/// resolution - and whenever the copy could not be made - it falls back to
-/// the long-standing behaviour: create the file with [`SANDBOX_SEED`] if it
-/// does not exist yet, and leave a file that does exist completely alone,
-/// including an empty one.
+/// The first resolution of a process replaces the sandbox with a
+/// byte-for-byte copy of `real_fstab_path`, deliberately discarding whatever
+/// a previous session left there; if that copy could not be made it falls
+/// back to the long-standing behaviour instead - create the file with
+/// [`SANDBOX_SEED`] if it does not exist yet, and leave a file that does
+/// exist completely alone, including an empty one.
+///
+/// Every *other* resolution does not redo any of that, and - this is the
+/// point of [`SandboxRefreshState`] being a barrier rather than a latch -
+/// does not return until the first one has finished, so no command can read
+/// the target mid-refresh.
+///
+/// "Does not redo any of that" now includes the existence check: the one-time
+/// work runs exactly once per process, where the previous latch-based version
+/// still re-ran [`seed_sandbox_file_if_missing`] (a no-op once the file
+/// exists) on every single resolution. The one narrow consequence: if
+/// something *outside* Rustab deletes the sandbox file mid-session - the app
+/// itself never does - it is no longer silently reseeded on the next
+/// resolution, and the following read simply reports a missing file, which
+/// `crate::commands::list_entries` already renders as an empty, non-existent
+/// target rather than an error.
+///
+/// The parent directory is created on every call, outside the barrier: it is
+/// an idempotent no-op once the directory exists, and keeping it unguarded
+/// means a resolution still reports a genuinely unusable sandbox directory
+/// even if the one-time refresh already happened.
 fn ensure_sandbox_file(
     path: &Path,
     real_fstab_path: &Path,
@@ -328,10 +410,18 @@ fn ensure_sandbox_file(
             source,
         })?;
     }
-    if refresh_state.claim_first_refresh() && refresh_sandbox_from(path, real_fstab_path) {
-        return Ok(());
-    }
-    seed_sandbox_file_if_missing(path)
+    refresh_state
+        .ensure_once(|| {
+            if refresh_sandbox_from(path, real_fstab_path) {
+                Ok(())
+            } else {
+                seed_sandbox_file_if_missing(path).map_err(SandboxSetupFailure::from)
+            }
+        })
+        .map_err(|failure| TargetError::SandboxSetup {
+            path: path.to_path_buf(),
+            source: failure.as_io_error(),
+        })
 }
 
 /// Copies `real_fstab_path` over the sandbox file verbatim, returning whether
@@ -345,13 +435,13 @@ fn ensure_sandbox_file(
 ///
 /// Writing the bytes straight onto `sandbox_path` would be an
 /// open-truncate-write, which is *not* atomic with respect to a concurrent
-/// reader of the same path. And there is a guaranteed concurrent reader: the
-/// frontend fires `get_target_info` and `list_entries` as two independent
-/// tasks on mount, so two commands resolve the target at once on every single
-/// launch. Only one of them claims the refresh latch; the other walks straight
-/// on to read the sandbox's content for the first paint. With a plain write,
-/// that reader can land between the truncate and the completed write and
-/// render an empty document.
+/// reader of the same path. Within this process [`SandboxRefreshState`]
+/// already keeps the other startup resolution from reading until this
+/// function has returned, but that barrier only binds callers that share it:
+/// a second Rustab process launching at the same moment, or anything else
+/// reading the sandbox, has no such ordering. With a plain write such a
+/// reader can land between the truncate and the completed write and see an
+/// empty document.
 ///
 /// So the bytes go to a sibling temp file in the sandbox's own directory and
 /// are then `rename`d onto it, the same way [`fstab_core::writer`] publishes
@@ -421,19 +511,16 @@ fn refresh_temp_path(sandbox_path: &Path) -> Option<PathBuf> {
 
 /// Creates the sandbox file with [`SANDBOX_SEED`] if it does not exist yet,
 /// leaving an existing one (even an empty one) completely alone.
-fn seed_sandbox_file_if_missing(path: &Path) -> Result<(), TargetError> {
+///
+/// Reports the bare `io::Error`; its caller is the one that knows the path
+/// belongs in a [`TargetError::SandboxSetup`] (and has to park the failure in
+/// the refresh barrier first, where a non-`Clone` error cannot live - see
+/// [`SandboxSetupFailure`]).
+fn seed_sandbox_file_if_missing(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::write(path, SANDBOX_SEED).map_err(|source| TargetError::SandboxSetup {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-        Err(source) => Err(TargetError::SandboxSetup {
-            path: path.to_path_buf(),
-            source,
-        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => fs::write(path, SANDBOX_SEED),
+        Err(err) => Err(err),
     }
 }
 
@@ -468,6 +555,10 @@ fn non_empty_env(name: &str) -> Option<OsString> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     /// A realistic refresh source: content a parse-and-reserialize round trip
     /// could plausibly normalize (tabs, runs of spaces, no trailing newline),
@@ -509,8 +600,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
     /// The env-override branch must not touch the sandbox *even on a fresh
     /// process with a perfectly readable refresh source*: the per-launch
     /// refresh is part of choosing the sandbox, not something that happens on
-    /// the side. It also proves the latch is left unclaimed, so a later
-    /// resolution that does fall through to the sandbox still gets its
+    /// the side. It also proves the refresh barrier is left untriggered, so a
+    /// later resolution that does fall through to the sandbox still gets its
     /// refresh.
     #[test]
     fn an_env_override_never_refreshes_the_sandbox() {
@@ -531,8 +622,17 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
 
         assert!(!sandbox_dir.exists(), "the sandbox must not be touched");
         assert!(
-            refresh_state.claim_first_refresh(),
-            "the refresh must still be unclaimed"
+            !refresh_state.has_already_run(),
+            "the refresh must still be pending"
+        );
+        // And the proof that "pending" means it is still available: a later
+        // sandbox resolution sharing this state does get its refresh.
+        let target = resolve(None, &sandbox_dir, &real_fstab, &refresh_state)
+            .expect("the sandbox must resolve");
+        assert_eq!(
+            fs::read(&target.path).expect("read"),
+            REAL_FSTAB_SAMPLE.as_bytes(),
+            "a sandbox resolution after an env-override one must still refresh"
         );
     }
 
@@ -829,18 +929,154 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         );
     }
 
-    /// The latch itself: `true` exactly once, however often it is asked.
-    /// Two concurrent commands resolving at startup must not both decide they
-    /// are the one doing the copy.
+    /// The barrier itself, first half: the work runs exactly once per state,
+    /// however often it is asked. Two concurrent commands resolving at
+    /// startup must not both decide they are the one doing the copy.
     #[test]
-    fn the_refresh_is_claimable_exactly_once() {
+    fn the_refresh_runs_exactly_once_per_state() {
         let state = SandboxRefreshState::new();
-        assert!(state.claim_first_refresh());
-        for _ in 0..5 {
-            assert!(!state.claim_first_refresh());
+        let runs = AtomicUsize::new(0);
+        let count_one_run = || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+
+        assert!(!state.has_already_run());
+        for _ in 0..6 {
+            state
+                .ensure_once(count_one_run)
+                .expect("setup must succeed");
+            assert!(state.has_already_run());
         }
-        // A separate state is a separate process and claims its own refresh.
-        assert!(SandboxRefreshState::new().claim_first_refresh());
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the refresh must run once, not once per resolution"
+        );
+
+        // A separate state is a separate process and runs its own refresh.
+        SandboxRefreshState::new()
+            .ensure_once(count_one_run)
+            .expect("setup must succeed");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// The barrier itself, second half - and the deterministic proof of the
+    /// bug this whole mechanism exists to prevent: a caller that does *not*
+    /// perform the refresh must not return until the caller that does has
+    /// finished it. Electing one writer is not enough; the losers used to
+    /// fall straight through and let their command read the target
+    /// mid-refresh.
+    ///
+    /// Deterministic rather than luck-dependent: the one-time work sleeps a
+    /// fixed 50ms before stamping its completion instant, and every thread
+    /// stamps its own instant the moment its call returns. If any thread were
+    /// allowed past the barrier early, its instant would land *before* the
+    /// completion stamp, which no scheduling order can disguise.
+    #[test]
+    fn every_caller_waits_until_the_refresh_has_finished() {
+        const THREADS: usize = 8;
+        const WORK_DURATION: Duration = Duration::from_millis(50);
+
+        let state = SandboxRefreshState::new();
+        let runs = AtomicUsize::new(0);
+        let finished_at: Mutex<Option<Instant>> = Mutex::new(None);
+        let all_ready = Barrier::new(THREADS);
+
+        let returned_at: Vec<Instant> = thread::scope(|scope| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        // Maximize the overlap: nobody calls in until
+                        // everybody is at the start line.
+                        all_ready.wait();
+                        state
+                            .ensure_once(|| {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                thread::sleep(WORK_DURATION);
+                                *finished_at.lock().expect("the stamp slot must lock") =
+                                    Some(Instant::now());
+                                Ok(())
+                            })
+                            .expect("setup must succeed");
+                        Instant::now()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("no thread may panic"))
+                .collect()
+        });
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "concurrent callers must not each run the refresh"
+        );
+        let finished = finished_at
+            .lock()
+            .expect("the stamp slot must lock")
+            .expect("the refresh must have run");
+        for (index, returned) in returned_at.iter().enumerate() {
+            assert!(
+                *returned >= finished,
+                "caller {index} returned before the refresh had finished"
+            );
+        }
+    }
+
+    /// The regression test shaped like the actual bug: `get_target_info` and
+    /// `list_entries` resolve the target concurrently on every launch, and
+    /// each then reads the resolved path *separately*. Before the barrier,
+    /// the resolution that did not perform the refresh could return while the
+    /// other was still mid-copy, and its command handed the frontend the
+    /// pre-refresh content - an empty entries table on a machine with a
+    /// populated `/etc/fstab`.
+    ///
+    /// Honest about its own limits: this test alone would not have failed on
+    /// every single run against the old code. The losing path was a single
+    /// cheap `symlink_metadata` call, so whether it actually overtook the
+    /// winner's read-write-rename depended on scheduling.
+    /// `every_caller_waits_until_the_refresh_has_finished` is the
+    /// deterministic proof; this one is the readable statement of what the
+    /// user-visible bug was.
+    #[test]
+    fn concurrent_resolutions_all_read_the_complete_refreshed_sandbox() {
+        const THREADS: usize = 8;
+
+        let dir = TempDir::new("target-refresh-concurrent");
+        let sandbox_dir = dir.join("data/rustab");
+        let real_fstab = dir.join("real-fstab");
+        fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
+        let refresh_state = SandboxRefreshState::new();
+        let all_ready = Barrier::new(THREADS);
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    all_ready.wait();
+                    let target = resolve(None, &sandbox_dir, &real_fstab, &refresh_state)
+                        .expect("every concurrent resolution must succeed");
+                    // Exactly what `commands::list_entries` does: its own
+                    // read of the path, after resolution returned.
+                    let content = fs::read(&target.path).expect("the sandbox must be readable");
+                    assert_eq!(
+                        content,
+                        REAL_FSTAB_SAMPLE.as_bytes(),
+                        "a concurrent resolution saw {} bytes instead of the refreshed file",
+                        content.len()
+                    );
+                });
+            }
+        });
+
+        // And the refresh really was the one-per-launch copy, not a seed.
+        assert_eq!(
+            entry_names(&sandbox_dir),
+            vec![SANDBOX_FILE_NAME.to_owned()],
+            "the concurrent refresh must leave no staging temp file behind"
+        );
     }
 
     #[test]
