@@ -523,7 +523,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
     html! {
         <div class="fixed inset-0 z-50 flex justify-end bg-black/40">
             <div
-                class="h-full w-full sm:w-[520px] shrink-0 flex flex-col bg-white dark:bg-slate-800 shadow-lg"
+                class="h-full w-full sm:w-[36rem] shrink-0 flex flex-col bg-white dark:bg-slate-800 shadow-lg"
                 role="dialog"
                 aria-modal="true"
                 aria-label={title}

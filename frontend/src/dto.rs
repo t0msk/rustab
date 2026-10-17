@@ -188,6 +188,26 @@ pub struct WriteErrorDto {
     pub report: Option<ValidationReportDto>,
     pub path: Option<String>,
     pub backup: Option<String>,
+    /// For `kind == "external_change"` (T36): the two file bodies the UI
+    /// diffs to show the user what changed outside Rustab before deciding.
+    /// `None` for every other kind - additive on the wire, so a response
+    /// produced without it (or by a pre-T36 backend) still deserializes.
+    #[serde(default)]
+    pub external_change: Option<ExternalChangeDto>,
+}
+
+/// `ExternalChangeDto` (§8, T36): the two file bodies a
+/// `kind: "external_change"` `WriteErrorDto` carries, so the UI can show
+/// *what* changed outside Rustab before the user decides whether to write
+/// anyway.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExternalChangeDto {
+    /// What Rustab last knew the real `/etc/fstab` to hold - the **old**
+    /// side of the diff.
+    pub last_known_content: String,
+    /// What the real `/etc/fstab` holds **right now** - the new side, i.e.
+    /// the content the refused write would have replaced.
+    pub current_content: String,
 }
 
 /// `DeleteBackupErrorDto` (§8), the rejection shape of `delete_backup`.

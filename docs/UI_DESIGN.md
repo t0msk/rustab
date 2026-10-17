@@ -824,6 +824,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
     applied to the button apply to the icon too, same as `AboutDialog`'s own icons.
 34. `RawViewDialog` - read-only overlay showing the active target's exact current
     raw text, no diff (§11)
+35. `ExternalChangeDialog` - external-change/drift warning modal shown after a
+    `save`/`restore_backup` rejection (§12, T36)
 
 ---
 
@@ -878,6 +880,61 @@ file actually contain right now."
   also present, styled identically to those two.
 - Reuses the identical modal shell (`max-w-4xl max-h-[85vh]`, header/body/footer
   structure) `BackupDiffView` already established, rather than inventing a new one.
+
+---
+
+## 12. External-change warning dialog (T36)
+
+Component: **ExternalChangeDialog**, shown when a `save` or `restore_backup` call is
+rejected with `WriteErrorDto{ kind: "external_change", ... }` (`docs/API_CONTRACT.md` §8)
+- the real `/etc/fstab` changed outside Rustab since this session last synced with it,
+so nothing was written.
+
+- **Trigger and flow placement**: Shared by both the save flow (via DiffView, §6) and
+  the restore flow (via BackupRestoreConfirmDialog, §7). When the rejection is detected,
+  `AppShell` diverts into this dialog instead of showing a plain error banner - the
+  prior dialog is hidden and the new dialog is shown, since this is a real-write gate
+  that requires user review and explicit re-confirmation. Documented choice: `Cancel`
+  closes the whole flow back to the pending-changes state (save) or Backups panel
+  (restore), not back to the intermediate dialog - simpler state management and leaves
+  the user exactly where they would be if they had cancelled from DiffView/
+  BackupRestoreConfirmDialog themselves.
+
+- **Modal shell**: Centered, `max-w-4xl max-h-[85vh]`, same non-dismissible-by-backdrop
+  treatment as DiffView/BackupRestoreConfirmDialog (this is also a real-write gate).
+  `bg-white dark:bg-slate-800 shadow-lg rounded-lg`, backdrop `bg-black/50`.
+
+- **Header and body copy**: Header `"This file changed outside Rustab"`. Body names the
+  target path and explains: `"{path} changed outside Rustab since this session last
+  synced with it. Nothing was written. Review what changed below before deciding."`.
+
+- **Diff rendering**: Raw diff only (no Summary tab - just two raw file bodies), computed
+  via `compute_raw_diff(last_known_content, current_content)` from the error's
+  `ExternalChangeDto`, rendered via the reused `DiffRawText` component (same treatment
+  as BackupDiffView, §7).
+
+- **Confirmation gate**: A second `RealTargetConfirmCheckbox` - `"I understand this
+  overwrites a change that happened outside Rustab, discarding what is on disk right
+  now."` - gates the "Write anyway" button. This is **layered on top** of whichever
+  first-level `RealTargetConfirmCheckbox` (from DiffView/BackupRestoreConfirmDialog,
+  §6/§7) the user already passed to reach this point, not a replacement for it.
+  `RealTargetConfirmCheckbox` is always required here (the dialog only appears after
+  a save/restore that would write the real `/etc/fstab`), so the "requires confirmation"
+  flag is always true.
+
+- **Action buttons**: `Cancel` (secondary, `bg-slate-100 dark:bg-slate-700`) closes
+  the whole flow back to the state before DiffView/BackupRestoreConfirmDialog opened -
+  nothing is written, pending changes remain staged (save) or nothing happens (restore).
+  Disabled while saving. `"Write anyway"` (destructive, `bg-red-600 hover:bg-red-700
+  text-white`) retries the original call with `allow_external_change: true`, disabled
+  until the checkbox is checked and while saving. Loading state: `"Writing changes…"` +
+  spinner, identical to DiffView/BackupRestoreConfirmDialog.
+
+- **Outcomes**: On success, same success/`draft_sync_warning` handling as DiffView/
+  BackupRestoreConfirmDialog (§6 points 4-5). On re-drift (file changed again mid-retry):
+  the dialog stays open with a refreshed diff and the checkbox re-required, recursively
+  if external changes keep drifting. On any other failure: shown inline in the still-open
+  dialog's error slot, with `Cancel`/retry remaining available.
 
 ---
 

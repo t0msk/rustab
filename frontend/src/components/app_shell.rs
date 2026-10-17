@@ -37,6 +37,7 @@ use crate::components::delete_confirm_dialog::DeleteConfirmDialog;
 use crate::components::diff_view::DiffView;
 use crate::components::entries_table::{source_badge, EntriesTable, RowEntry};
 use crate::components::entry_detail_drawer::{DrawerMode, DrawerSaveResult, EntryDetailDrawer};
+use crate::components::external_change_dialog::ExternalChangeDialog;
 use crate::components::header_bar::{HeaderBar, Tab};
 use crate::components::pending_changes_bar::PendingChangesBar;
 use crate::components::raw_view_dialog::RawViewDialog;
@@ -44,8 +45,8 @@ use crate::components::status_toast::{StatusToast, ToastKind};
 use crate::components::target_banner::TargetBanner;
 use crate::diff::compute_summary_diff;
 use crate::dto::{
-    BackupInfoDto, DocumentDto, FindingSeverity, LineDto, TargetInfoDto, TargetSource,
-    ValidationReportDto,
+    BackupInfoDto, DocumentDto, ExternalChangeDto, FindingSeverity, LineDto, TargetInfoDto,
+    TargetSource, ValidationReportDto,
 };
 
 /// Reloads `original_document`/`original_text`/`candidate` from
@@ -102,9 +103,44 @@ fn success_toast(draft_sync_warning: Option<String>, fallback: &str) -> (ToastKi
     }
 }
 
+/// The data `ExternalChangeDialog` needs, extracted from a failed `save`/
+/// `restore_backup` call once [`external_change_info`] has recognized it as
+/// T36's external-change outcome: the real path that drifted
+/// (`WriteErrorDto::path`) plus the two file bodies to diff
+/// (`WriteErrorDto::external_change`). Kept as its own small struct rather
+/// than storing the bare `ExternalChangeDto` (as the DTO alone has no path)
+/// or the whole `WriteErrorDto` (which carries fields - `report`, `backup` -
+/// that make no sense for this kind).
+#[derive(Clone, Debug, PartialEq)]
+struct ExternalChangeInfo {
+    path: String,
+    external_change: ExternalChangeDto,
+}
+
+/// Recognizes T36's external-change outcome (`docs/API_CONTRACT.md` §8) in
+/// a failed `save`/`restore_backup` call - the signal `AppShell` branches on
+/// to divert into `ExternalChangeDialog` instead of the plain error banner,
+/// rather than treating it like any other save failure. `None` for every
+/// other `WriteError`, including a structurally malformed `external_change`
+/// kind that is missing its payload (fail safe: without a diff to show,
+/// this is not a divertible outcome).
+fn external_change_info(error: &api::WriteError) -> Option<ExternalChangeInfo> {
+    match error {
+        api::WriteError::Write(dto) if dto.kind == "external_change" => dto
+            .external_change
+            .clone()
+            .map(|external_change| ExternalChangeInfo {
+                path: dto.path.clone().unwrap_or_default(),
+                external_change,
+            }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::WriteErrorDto;
 
     #[test]
     fn a_clean_save_shows_the_plain_success_line() {
@@ -121,6 +157,53 @@ mod tests {
         let (kind, message) = success_toast(Some(warning.clone()), "Changes saved.");
         assert!(matches!(kind, ToastKind::Warning));
         assert_eq!(message, warning);
+    }
+
+    fn write_error_dto(kind: &str) -> WriteErrorDto {
+        WriteErrorDto {
+            kind: kind.to_string(),
+            message: "m".to_string(),
+            target_unchanged: true,
+            report: None,
+            path: Some("/etc/fstab".to_string()),
+            backup: None,
+            external_change: None,
+        }
+    }
+
+    #[test]
+    fn an_external_change_error_with_its_payload_is_recognized() {
+        let mut dto = write_error_dto("external_change");
+        dto.external_change = Some(ExternalChangeDto {
+            last_known_content: "# old\n".to_string(),
+            current_content: "# new\n".to_string(),
+        });
+        let error = api::WriteError::Write(dto);
+
+        let info = external_change_info(&error).expect("should be recognized");
+        assert_eq!(info.path, "/etc/fstab");
+        assert_eq!(info.external_change.last_known_content, "# old\n");
+        assert_eq!(info.external_change.current_content, "# new\n");
+    }
+
+    #[test]
+    fn a_normal_write_error_is_not_an_external_change() {
+        let error = api::WriteError::Write(write_error_dto("validation"));
+        assert_eq!(external_change_info(&error), None);
+    }
+
+    #[test]
+    fn an_external_change_kind_missing_its_payload_is_not_divertible() {
+        // Structurally malformed (shouldn't happen per the contract), but
+        // handled conservatively rather than unwrapped.
+        let error = api::WriteError::Write(write_error_dto("external_change"));
+        assert_eq!(external_change_info(&error), None);
+    }
+
+    #[test]
+    fn an_unstructured_rejection_is_not_an_external_change() {
+        let error = api::WriteError::Other("boom".to_string());
+        assert_eq!(external_change_info(&error), None);
     }
 }
 
@@ -239,6 +322,24 @@ pub fn app_shell() -> Html {
     let diff_error: UseStateHandle<Option<String>> = use_state(|| None);
     let restore_saving = use_state(|| false);
     let restore_error: UseStateHandle<Option<String>> = use_state(|| None);
+
+    // T36: the external-change outcome for each flow, if its last `save`/
+    // `restore_backup` attempt hit one (`docs/API_CONTRACT.md` §8), plus
+    // the "write anyway" checkbox state for `ExternalChangeDialog`'s own,
+    // second confirmation - distinct from `diff_confirm_checked`/
+    // `restore_confirm_checked` above, which gate the *first*
+    // `RealTargetConfirmCheckbox` the user already passed to reach here.
+    // `Some(_)` here means `DiffView`/`BackupRestoreConfirmDialog` is
+    // closed and `ExternalChangeDialog` is shown instead - see
+    // `on_diff_confirm`/`on_restore_confirm` below for why that is this
+    // component's documented choice for "go back" on Cancel. `diff_saving`/
+    // `diff_error` and `restore_saving`/`restore_error` are reused for
+    // `ExternalChangeDialog`'s own loading/error slot in each flow, since
+    // the dialog they came from is never shown at the same time.
+    let diff_external_change: UseStateHandle<Option<ExternalChangeInfo>> = use_state(|| None);
+    let diff_external_change_confirm_checked = use_state(|| false);
+    let restore_external_change: UseStateHandle<Option<ExternalChangeInfo>> = use_state(|| None);
+    let restore_external_change_confirm_checked = use_state(|| false);
 
     // Transient success notification (§6 point 4 / §7's "same ... success
     // ... pattern"); auto-dismissed a few seconds after it's shown. A
@@ -456,6 +557,8 @@ pub fn app_shell() -> Html {
         let diff_confirm_checked = diff_confirm_checked.clone();
         let diff_saving = diff_saving.clone();
         let diff_error = diff_error.clone();
+        let diff_external_change = diff_external_change.clone();
+        let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
         let show_toast = show_toast.clone();
         Callback::from(move |()| {
             if *diff_saving {
@@ -472,11 +575,13 @@ pub fn app_shell() -> Html {
             let diff_confirm_checked = diff_confirm_checked.clone();
             let diff_saving = diff_saving.clone();
             let diff_error = diff_error.clone();
+            let diff_external_change = diff_external_change.clone();
+            let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
             let show_toast = show_toast.clone();
             diff_saving.set(true);
             diff_error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
-                match api::save(&document).await {
+                match api::save(&document, false).await {
                     Ok(outcome) => {
                         reload_entries(candidate, original_document, original_text, list_error)
                             .await;
@@ -488,11 +593,123 @@ pub fn app_shell() -> Html {
                             .emit(success_toast(outcome.draft_sync_warning, "Changes saved."));
                     }
                     Err(write_error) => {
+                        if let Some(info) = external_change_info(&write_error) {
+                            // T36: refused before anything was written - not
+                            // a normal save failure, so divert into
+                            // `ExternalChangeDialog` instead of the plain
+                            // error banner. `target_unchanged` is always
+                            // `true` for this kind (API_CONTRACT.md §8), so
+                            // there is nothing to `reload_entries` for.
+                            // Documented choice: close the whole flow back
+                            // to the pending-changes bar rather than
+                            // stacking a second modal on top of `DiffView` -
+                            // less state to juggle here, and `Cancel` on the
+                            // new dialog leaves the user exactly there.
+                            diff_view_open.set(false);
+                            diff_confirm_checked.set(false);
+                            diff_saving.set(false);
+                            diff_external_change_confirm_checked.set(false);
+                            diff_external_change.set(Some(info));
+                            return;
+                        }
                         // API_CONTRACT.md §8: "target_unchanged is the
                         // field to branch on" - `true` keeps the user's
                         // pending changes in place and offers retry;
                         // `false` means the write's guarantee can't be
                         // made, so reload what's actually on disk instead.
+                        let unchanged = write_error.target_unchanged();
+                        diff_error.set(Some(write_error.message()));
+                        if !unchanged {
+                            reload_entries(candidate, original_document, original_text, list_error)
+                                .await;
+                        }
+                        diff_saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+    let on_diff_external_change_cancel = {
+        let diff_external_change = diff_external_change.clone();
+        let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
+        let diff_error = diff_error.clone();
+        let diff_saving = diff_saving.clone();
+        Callback::from(move |()| {
+            // Not reachable while `*diff_saving` is true (the Cancel button
+            // is disabled then), but guard anyway, same as `on_diff_cancel`.
+            if *diff_saving {
+                return;
+            }
+            // Nothing is written; the pending changes stay staged, same as
+            // `on_diff_cancel` - the user can click "Review & Save…" again
+            // to reopen a fresh `DiffView`.
+            diff_external_change.set(None);
+            diff_external_change_confirm_checked.set(false);
+            diff_error.set(None);
+        })
+    };
+    let on_diff_write_anyway = {
+        let candidate = candidate.clone();
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
+        let list_error = list_error.clone();
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
+        let diff_saving = diff_saving.clone();
+        let diff_error = diff_error.clone();
+        let diff_external_change = diff_external_change.clone();
+        let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
+        let show_toast = show_toast.clone();
+        Callback::from(move |()| {
+            if *diff_saving {
+                return;
+            }
+            let document = candidate.to_document();
+            let candidate = candidate.clone();
+            let original_document = original_document.clone();
+            let original_text = original_text.clone();
+            let list_error = list_error.clone();
+            let backups = backups.clone();
+            let backups_error = backups_error.clone();
+            let diff_saving = diff_saving.clone();
+            let diff_error = diff_error.clone();
+            let diff_external_change = diff_external_change.clone();
+            let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
+            let show_toast = show_toast.clone();
+            diff_saving.set(true);
+            diff_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                // Repeats the exact same candidate, this time with
+                // `allow_external_change: true` - the user has seen the
+                // diff and confirmed the write anyway.
+                match api::save(&document, true).await {
+                    Ok(outcome) => {
+                        // Same success path as any other save - no
+                        // special-casing the happy path here.
+                        reload_entries(candidate, original_document, original_text, list_error)
+                            .await;
+                        reload_backups(backups, backups_error).await;
+                        diff_saving.set(false);
+                        diff_external_change_confirm_checked.set(false);
+                        diff_external_change.set(None);
+                        show_toast
+                            .emit(success_toast(outcome.draft_sync_warning, "Changes saved."));
+                    }
+                    Err(write_error) => {
+                        if let Some(info) = external_change_info(&write_error) {
+                            // Re-drifted again between the retry and this
+                            // call - treat it the same way, recursively:
+                            // refresh the dialog's payload and require the
+                            // checkbox again rather than assuming this
+                            // cannot happen.
+                            diff_saving.set(false);
+                            diff_external_change_confirm_checked.set(false);
+                            diff_external_change.set(Some(info));
+                            return;
+                        }
+                        // A different failure (validation, another write
+                        // error, ...): shown inside this still-open dialog,
+                        // same treatment as `DiffView`'s own error slot.
                         let unchanged = write_error.target_unchanged();
                         diff_error.set(Some(write_error.message()));
                         if !unchanged {
@@ -533,6 +750,9 @@ pub fn app_shell() -> Html {
         let restore_confirm_checked = restore_confirm_checked.clone();
         let restore_saving = restore_saving.clone();
         let restore_error = restore_error.clone();
+        let restore_external_change = restore_external_change.clone();
+        let restore_external_change_confirm_checked =
+            restore_external_change_confirm_checked.clone();
         let backups = backups.clone();
         let backups_error = backups_error.clone();
         let candidate = candidate.clone();
@@ -554,6 +774,9 @@ pub fn app_shell() -> Html {
             let restore_confirm_checked = restore_confirm_checked.clone();
             let restore_saving = restore_saving.clone();
             let restore_error = restore_error.clone();
+            let restore_external_change = restore_external_change.clone();
+            let restore_external_change_confirm_checked =
+                restore_external_change_confirm_checked.clone();
             let backups = backups.clone();
             let backups_error = backups_error.clone();
             let candidate = candidate.clone();
@@ -564,7 +787,7 @@ pub fn app_shell() -> Html {
             restore_saving.set(true);
             restore_error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
-                match api::restore_backup(&backup_path).await {
+                match api::restore_backup(&backup_path, false).await {
                     Ok(outcome) => {
                         reload_entries(candidate, original_document, original_text, list_error)
                             .await;
@@ -578,6 +801,130 @@ pub fn app_shell() -> Html {
                         ));
                     }
                     Err(write_error) => {
+                        if let Some(info) = external_change_info(&write_error) {
+                            // T36: refused before anything was written.
+                            // Documented choice (mirroring the save flow):
+                            // deliberately does *not* clear `restore_target`
+                            // here - `BackupRestoreConfirmDialog` is hidden
+                            // (see the render below) rather than closed, so
+                            // "write anyway" can resolve the same
+                            // `backup_path` again, and `on_restore_
+                            // external_change_cancel` is what actually
+                            // closes the whole flow back to the Backups
+                            // panel. `target_unchanged` is always `true`
+                            // for this kind, so there is nothing to
+                            // `reload_entries` for.
+                            restore_confirm_checked.set(false);
+                            restore_saving.set(false);
+                            restore_external_change_confirm_checked.set(false);
+                            restore_external_change.set(Some(info));
+                            return;
+                        }
+                        let unchanged = write_error.target_unchanged();
+                        restore_error.set(Some(write_error.message()));
+                        if !unchanged {
+                            reload_entries(candidate, original_document, original_text, list_error)
+                                .await;
+                        }
+                        restore_saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+    let on_restore_external_change_cancel = {
+        let restore_target = restore_target.clone();
+        let restore_confirm_checked = restore_confirm_checked.clone();
+        let restore_external_change = restore_external_change.clone();
+        let restore_external_change_confirm_checked =
+            restore_external_change_confirm_checked.clone();
+        let restore_error = restore_error.clone();
+        let restore_saving = restore_saving.clone();
+        Callback::from(move |()| {
+            if *restore_saving {
+                return;
+            }
+            // Nothing is written; closes the whole flow back to the
+            // Backups panel (same destination `on_restore_cancel` leaves
+            // the user at) - the user can click `Restore` again to reopen
+            // a fresh `BackupRestoreConfirmDialog`.
+            restore_target.set(None);
+            restore_confirm_checked.set(false);
+            restore_external_change.set(None);
+            restore_external_change_confirm_checked.set(false);
+            restore_error.set(None);
+        })
+    };
+    let on_restore_write_anyway = {
+        let restore_target = restore_target.clone();
+        let restore_saving = restore_saving.clone();
+        let restore_error = restore_error.clone();
+        let restore_external_change = restore_external_change.clone();
+        let restore_external_change_confirm_checked =
+            restore_external_change_confirm_checked.clone();
+        let backups = backups.clone();
+        let backups_error = backups_error.clone();
+        let candidate = candidate.clone();
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
+        let list_error = list_error.clone();
+        let show_toast = show_toast.clone();
+        Callback::from(move |()| {
+            if *restore_saving {
+                return;
+            }
+            let Some(idx) = *restore_target else {
+                return;
+            };
+            let Some(backup_path) = backups.get(idx).map(|b| b.path.clone()) else {
+                return;
+            };
+            let restore_target = restore_target.clone();
+            let restore_saving = restore_saving.clone();
+            let restore_error = restore_error.clone();
+            let restore_external_change = restore_external_change.clone();
+            let restore_external_change_confirm_checked =
+                restore_external_change_confirm_checked.clone();
+            let backups = backups.clone();
+            let backups_error = backups_error.clone();
+            let candidate = candidate.clone();
+            let original_document = original_document.clone();
+            let original_text = original_text.clone();
+            let list_error = list_error.clone();
+            let show_toast = show_toast.clone();
+            restore_saving.set(true);
+            restore_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                // Repeats the exact same `backup_path`, this time with
+                // `allow_external_change: true`.
+                match api::restore_backup(&backup_path, true).await {
+                    Ok(outcome) => {
+                        // Same success path as any other restore - no
+                        // special-casing the happy path here.
+                        reload_entries(candidate, original_document, original_text, list_error)
+                            .await;
+                        reload_backups(backups, backups_error).await;
+                        restore_saving.set(false);
+                        restore_target.set(None);
+                        restore_external_change_confirm_checked.set(false);
+                        restore_external_change.set(None);
+                        show_toast.emit(success_toast(
+                            outcome.draft_sync_warning,
+                            "Backup restored.",
+                        ));
+                    }
+                    Err(write_error) => {
+                        if let Some(info) = external_change_info(&write_error) {
+                            // Re-drifted again between the retry and this
+                            // call - treat it the same way, recursively.
+                            restore_saving.set(false);
+                            restore_external_change_confirm_checked.set(false);
+                            restore_external_change.set(Some(info));
+                            return;
+                        }
+                        // A different failure, shown inside this still-open
+                        // dialog, same treatment as `BackupRestoreConfirmDialog`'s
+                        // own error slot.
                         let unchanged = write_error.target_unchanged();
                         restore_error.set(Some(write_error.message()));
                         if !unchanged {
@@ -973,18 +1320,68 @@ pub fn app_shell() -> Html {
                 />
             }
 
-            if let Some((backup_timestamp, backup_target_path)) = restore_dialog_data {
-                <BackupRestoreConfirmDialog
-                    backup_timestamp={backup_timestamp}
-                    target_path={backup_target_path}
-                    writes_real_file={writes_real_file}
-                    confirm_checked={*restore_confirm_checked}
+            if let Some(info) = &*diff_external_change {
+                <ExternalChangeDialog
+                    target_path={AttrValue::from(info.path.clone())}
+                    lines={crate::diff::compute_raw_diff(
+                        &info.external_change.last_known_content,
+                        &info.external_change.current_content,
+                    )}
+                    confirm_checked={*diff_external_change_confirm_checked}
                     on_confirm_checked_change={{
-                        let restore_confirm_checked = restore_confirm_checked.clone();
-                        Callback::from(move |checked: bool| restore_confirm_checked.set(checked))
+                        let diff_external_change_confirm_checked =
+                            diff_external_change_confirm_checked.clone();
+                        Callback::from(move |checked: bool| {
+                            diff_external_change_confirm_checked.set(checked)
+                        })
                     }}
-                    on_cancel={on_restore_cancel}
-                    on_confirm={on_restore_confirm}
+                    on_cancel={on_diff_external_change_cancel}
+                    on_write_anyway={on_diff_write_anyway}
+                    saving={*diff_saving}
+                    error={(*diff_error).clone().map(AttrValue::from)}
+                />
+            }
+
+            // Hidden (rather than closed - see `on_restore_confirm`) while
+            // the external-change dialog below is showing for the same
+            // restore attempt, so "write anyway" can resolve the same
+            // `backup_path` again.
+            if restore_external_change.is_none() {
+                if let Some((backup_timestamp, backup_target_path)) = restore_dialog_data {
+                    <BackupRestoreConfirmDialog
+                        backup_timestamp={backup_timestamp}
+                        target_path={backup_target_path}
+                        writes_real_file={writes_real_file}
+                        confirm_checked={*restore_confirm_checked}
+                        on_confirm_checked_change={{
+                            let restore_confirm_checked = restore_confirm_checked.clone();
+                            Callback::from(move |checked: bool| restore_confirm_checked.set(checked))
+                        }}
+                        on_cancel={on_restore_cancel}
+                        on_confirm={on_restore_confirm}
+                        saving={*restore_saving}
+                        error={(*restore_error).clone().map(AttrValue::from)}
+                    />
+                }
+            }
+
+            if let Some(info) = &*restore_external_change {
+                <ExternalChangeDialog
+                    target_path={AttrValue::from(info.path.clone())}
+                    lines={crate::diff::compute_raw_diff(
+                        &info.external_change.last_known_content,
+                        &info.external_change.current_content,
+                    )}
+                    confirm_checked={*restore_external_change_confirm_checked}
+                    on_confirm_checked_change={{
+                        let restore_external_change_confirm_checked =
+                            restore_external_change_confirm_checked.clone();
+                        Callback::from(move |checked: bool| {
+                            restore_external_change_confirm_checked.set(checked)
+                        })
+                    }}
+                    on_cancel={on_restore_external_change_cancel}
+                    on_write_anyway={on_restore_write_anyway}
                     saving={*restore_saving}
                     error={(*restore_error).clone().map(AttrValue::from)}
                 />

@@ -175,24 +175,59 @@ async fn invoke_write<A: Serialize>(cmd: &str, args: &A) -> Result<WriteOutcomeD
 #[derive(Serialize)]
 struct SaveArgs<'a> {
     candidate: &'a DocumentDto,
+    allow_external_change: bool,
 }
 
-/// `save(candidate: DocumentDto) -> WriteOutcomeDto` (API_CONTRACT.md
-/// §3.5). The only write path in the application.
-pub async fn save(candidate: &DocumentDto) -> Result<WriteOutcomeDto, WriteError> {
-    invoke_write("save", &SaveArgs { candidate }).await
+/// `save(candidate: DocumentDto, allow_external_change: bool) ->
+/// WriteOutcomeDto` (API_CONTRACT.md §3.5). The only write path in the
+/// application.
+///
+/// `allow_external_change` is T36's "write anyway" signal: send `false` on
+/// the normal path, and `true` only to repeat a call that has just rejected
+/// with `kind: "external_change"`, after the user has been shown the diff
+/// (`ExternalChangeDialog`) and asked for the write regardless. It is
+/// layered on top of the existing real-target confirmation, never a
+/// replacement for it.
+pub async fn save(
+    candidate: &DocumentDto,
+    allow_external_change: bool,
+) -> Result<WriteOutcomeDto, WriteError> {
+    invoke_write(
+        "save",
+        &SaveArgs {
+            candidate,
+            allow_external_change,
+        },
+    )
+    .await
 }
 
 #[derive(Serialize)]
 struct RestoreBackupArgs<'a> {
     backup_path: &'a str,
+    allow_external_change: bool,
 }
 
-/// `restore_backup(backup_path: string) -> WriteOutcomeDto`
-/// (API_CONTRACT.md §3.7). `backup_path` must be a `path` value from a
-/// `list_backups` result for the current target.
-pub async fn restore_backup(backup_path: &str) -> Result<WriteOutcomeDto, WriteError> {
-    invoke_write("restore_backup", &RestoreBackupArgs { backup_path }).await
+/// `restore_backup(backup_path: string, allow_external_change: bool) ->
+/// WriteOutcomeDto` (API_CONTRACT.md §3.7). `backup_path` must be a `path`
+/// value from a `list_backups` result for the current target.
+///
+/// `allow_external_change` means exactly what it means for `save` (T36):
+/// `false` on the normal path, `true` only to repeat a call that has just
+/// rejected with `kind: "external_change"`, after the user has seen the
+/// diff and confirmed the write anyway.
+pub async fn restore_backup(
+    backup_path: &str,
+    allow_external_change: bool,
+) -> Result<WriteOutcomeDto, WriteError> {
+    invoke_write(
+        "restore_backup",
+        &RestoreBackupArgs {
+            backup_path,
+            allow_external_change,
+        },
+    )
+    .await
 }
 
 #[derive(Serialize)]

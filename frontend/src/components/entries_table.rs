@@ -473,7 +473,7 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                                 </p>
                                 <span class="text-sm">{ format!("{} / {}", entry.dump, entry.pass) }</span>
                             </div>
-                            <div>
+                            <div class="col-span-2">
                                 <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
                                     { "Options" }
                                 </p>

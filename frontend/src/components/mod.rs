@@ -12,6 +12,7 @@ pub mod diff_view;
 pub mod empty_state;
 pub mod entries_table;
 pub mod entry_detail_drawer;
+pub mod external_change_dialog;
 pub mod header_bar;
 pub mod icons;
 pub mod loading_spinner;
