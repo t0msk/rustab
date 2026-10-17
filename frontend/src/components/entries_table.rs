@@ -79,6 +79,13 @@ fn format_option(option: &OptionDto) -> String {
 
 #[function_component(EntriesTable)]
 pub fn entries_table(props: &EntriesTableProps) -> Html {
+    // Hooks must run unconditionally on every render (Rules of Hooks) - this
+    // has to come before the empty-rows early return below, not after it,
+    // or the hook count differs between an empty-then-populated transition
+    // (the normal case on startup, before `list_entries` resolves) and Yew
+    // panics with "Hooks are called conditionally".
+    let expanded: UseStateHandle<HashSet<usize>> = use_state(HashSet::new);
+
     if props.rows.is_empty() {
         let on_add = {
             let cb = props.on_add_entry.clone();
@@ -102,8 +109,6 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
             </div>
         };
     }
-
-    let expanded: UseStateHandle<HashSet<usize>> = use_state(HashSet::new);
 
     html! {
         <div class="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
@@ -201,6 +206,62 @@ pub struct EntryRowProps {
     pub show_toast: Callback<(ToastKind, String)>,
 }
 
+/// Builds a "copy `value` to the clipboard" click handler, flashing
+/// `just_copied` for ~1.5s on success. Shared by Source and Mount point's
+/// copy buttons in the row detail panel (T32).
+fn make_copy_callback(
+    value: String,
+    just_copied: UseStateHandle<bool>,
+    show_toast: Callback<(ToastKind, String)>,
+    error_message: &'static str,
+) -> Callback<MouseEvent> {
+    Callback::from(move |e: MouseEvent| {
+        e.stop_propagation();
+        let just_copied = just_copied.clone();
+        let show_toast = show_toast.clone();
+        // The clipboard-write call itself must happen synchronously in this
+        // handler, before any `.await`, to stay inside the user-gesture
+        // context the webview requires for clipboard permission - only the
+        // *result* is awaited inside the spawned future below.
+        let Some(window) = web_sys::window() else {
+            show_toast.emit((ToastKind::Error, error_message.to_string()));
+            return;
+        };
+        let promise = window.navigator().clipboard().write_text(&value);
+        wasm_bindgen_futures::spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(_) => {
+                    just_copied.set(true);
+                    gloo_timers::future::TimeoutFuture::new(1500).await;
+                    just_copied.set(false);
+                }
+                Err(_) => {
+                    show_toast.emit((ToastKind::Error, error_message.to_string()));
+                }
+            }
+        });
+    })
+}
+
+/// Builds an "open `path` in the system file manager" click handler. Shared
+/// by Source (only when its kind is `Path`) and Mount point's open-folder
+/// buttons in the row detail panel (T32).
+fn make_open_folder_callback(
+    path: String,
+    show_toast: Callback<(ToastKind, String)>,
+) -> Callback<MouseEvent> {
+    Callback::from(move |e: MouseEvent| {
+        e.stop_propagation();
+        let path = path.clone();
+        let show_toast = show_toast.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(message) = api::open_path_in_file_manager(&path).await {
+                show_toast.emit((ToastKind::Error, message));
+            }
+        });
+    })
+}
+
 #[function_component(EntryRow)]
 pub fn entry_row(props: &EntryRowProps) -> Html {
     let entry = &props.entry;
@@ -245,61 +306,31 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
     // Clipboard "just copied" flash, local to this row (T32 §6 of the
     // task): flips to `true` right after a successful `write_text`, then
     // back to `false` ~1.5s later, swapping the copy icon for a checkmark
-    // in between.
-    let just_copied = use_state(|| false);
-    let on_copy = {
-        let mount_point = entry.mount_point.clone();
-        let just_copied = just_copied.clone();
-        let show_toast = props.show_toast.clone();
-        Callback::from(move |e: MouseEvent| {
-            e.stop_propagation();
-            let just_copied = just_copied.clone();
-            let show_toast = show_toast.clone();
-            // The clipboard-write call itself must happen synchronously in
-            // this handler, before any `.await`, to stay inside the
-            // user-gesture context the webview requires for clipboard
-            // permission - only the *result* is awaited inside the spawned
-            // future below.
-            let Some(window) = web_sys::window() else {
-                show_toast.emit((
-                    ToastKind::Error,
-                    "Could not copy the mount point to the clipboard.".to_string(),
-                ));
-                return;
-            };
-            let promise = window.navigator().clipboard().write_text(&mount_point);
-            wasm_bindgen_futures::spawn_local(async move {
-                match wasm_bindgen_futures::JsFuture::from(promise).await {
-                    Ok(_) => {
-                        just_copied.set(true);
-                        gloo_timers::future::TimeoutFuture::new(1500).await;
-                        just_copied.set(false);
-                    }
-                    Err(_) => {
-                        show_toast.emit((
-                            ToastKind::Error,
-                            "Could not copy the mount point to the clipboard.".to_string(),
-                        ));
-                    }
-                }
-            });
-        })
-    };
+    // in between. Source and Mount point each get their own flash state so
+    // copying one doesn't flash the other's button.
+    let source_just_copied = use_state(|| false);
+    let mount_just_copied = use_state(|| false);
+    let on_copy_source = make_copy_callback(
+        entry.source.value.clone(),
+        source_just_copied.clone(),
+        props.show_toast.clone(),
+        "Could not copy the source to the clipboard.",
+    );
+    let on_copy_mount = make_copy_callback(
+        entry.mount_point.clone(),
+        mount_just_copied.clone(),
+        props.show_toast.clone(),
+        "Could not copy the mount point to the clipboard.",
+    );
 
-    let on_open_folder = {
-        let mount_point = entry.mount_point.clone();
-        let show_toast = props.show_toast.clone();
-        Callback::from(move |e: MouseEvent| {
-            e.stop_propagation();
-            let mount_point = mount_point.clone();
-            let show_toast = show_toast.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Err(message) = api::open_path_in_file_manager(&mount_point).await {
-                    show_toast.emit((ToastKind::Error, message));
-                }
-            });
-        })
-    };
+    // Only a `Path` source names something that can actually be opened in a
+    // file manager (e.g. a bind mount's source directory) - a UUID/LABEL/
+    // network source etc. isn't a path on this filesystem at all, so those
+    // get a copy button only.
+    let on_open_folder_source = (entry.source.kind == SourceKind::Path)
+        .then(|| make_open_folder_callback(entry.source.value.clone(), props.show_toast.clone()));
+    let on_open_folder_mount =
+        make_open_folder_callback(entry.mount_point.clone(), props.show_toast.clone());
 
     let description = entry.description.clone();
     let trailing_comment = entry.trailing_comment.clone();
@@ -366,44 +397,38 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
             if props.expanded {
                 <tr class="bg-slate-50 dark:bg-slate-900/40 border-l-4 border-l-sky-400 dark:border-l-sky-500 border-b border-slate-200 dark:border-slate-700">
                     <td colspan="8" class="px-6 py-5">
-                        <div class="grid grid-cols-2 gap-x-8 gap-y-5">
+                        <div class="grid grid-cols-[minmax(0,1fr)_minmax(200px,auto)] gap-x-8 gap-y-5">
                             <div>
                                 <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
                                     { "Source" }
                                 </p>
-                                <div class="flex items-center gap-2 font-mono text-sm">
+                                <div class="flex items-center gap-1.5 font-mono text-sm">
                                     <span class="shrink-0 inline-block rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-medium px-2 py-0.5">
                                         { source_badge(entry.source.kind) }
                                     </span>
                                     <span class="break-all">{ entry.source.value.clone() }</span>
-                                </div>
-                            </div>
-                            <div>
-                                <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
-                                    { "Mount point" }
-                                </p>
-                                <div class="flex items-center gap-1.5 font-mono text-sm">
-                                    <span class="break-all">{ entry.mount_point.clone() }</span>
                                     <button
                                         type="button"
-                                        aria-label="Copy mount point to clipboard"
+                                        aria-label="Copy source to clipboard"
                                         class="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500 shrink-0"
-                                        onclick={on_copy}
+                                        onclick={on_copy_source}
                                     >
-                                        if *just_copied {
+                                        if *source_just_copied {
                                             <CheckIcon />
                                         } else {
                                             <CopyIcon />
                                         }
                                     </button>
-                                    <button
-                                        type="button"
-                                        aria-label="Open mount point in file manager"
-                                        class="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500 shrink-0"
-                                        onclick={on_open_folder}
-                                    >
-                                        <FolderOpenIcon />
-                                    </button>
+                                    if let Some(on_open_folder_source) = on_open_folder_source {
+                                        <button
+                                            type="button"
+                                            aria-label="Open source in file manager"
+                                            class="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500 shrink-0"
+                                            onclick={on_open_folder_source}
+                                        >
+                                            <FolderOpenIcon />
+                                        </button>
+                                    }
                                 </div>
                             </div>
                             <div>
@@ -416,11 +441,39 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                             </div>
                             <div>
                                 <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
+                                    { "Mount point" }
+                                </p>
+                                <div class="flex items-center gap-1.5 font-mono text-sm">
+                                    <span class="break-all">{ entry.mount_point.clone() }</span>
+                                    <button
+                                        type="button"
+                                        aria-label="Copy mount point to clipboard"
+                                        class="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500 shrink-0"
+                                        onclick={on_copy_mount}
+                                    >
+                                        if *mount_just_copied {
+                                            <CheckIcon />
+                                        } else {
+                                            <CopyIcon />
+                                        }
+                                    </button>
+                                    <button
+                                        type="button"
+                                        aria-label="Open mount point in file manager"
+                                        class="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500 shrink-0"
+                                        onclick={on_open_folder_mount}
+                                    >
+                                        <FolderOpenIcon />
+                                    </button>
+                                </div>
+                            </div>
+                            <div>
+                                <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
                                     { "Dump / Pass" }
                                 </p>
                                 <span class="text-sm">{ format!("{} / {}", entry.dump, entry.pass) }</span>
                             </div>
-                            <div class="col-span-2">
+                            <div>
                                 <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
                                     { "Options" }
                                 </p>

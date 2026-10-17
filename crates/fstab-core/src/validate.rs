@@ -450,15 +450,13 @@ fn looks_like_fat_volume_id(value: &str) -> bool {
 /// [`Severity::Error`].
 ///
 /// Skipped entirely for the literal `none` mount point (swap entries have no
-/// real mount point to check). Checks `mount_point` exactly as stored by the
-/// model, i.e. without decoding any octal-escaped whitespace (`\040` etc.)
-/// it may contain - per `docs/SPEC.md`'s escaped-whitespace policy, this
-/// crate never decodes that text, so a mount point containing an escaped
-/// space will not match the real on-disk path and will be (harmlessly, since
-/// this is advisory-only) reported as "missing" even if it exists. Decoding
-/// before the existence check would need a decode/encode helper pair this
-/// crate does not currently expose (see `model.rs`'s module docs); not worth
-/// adding for an advisory-only check unless a concrete need arises.
+/// real mount point to check). `mount_point` is decoded via
+/// [`crate::model::decode_escaped_whitespace`] before the existence check -
+/// the model stores it raw (octal escapes and all, per `docs/SPEC.md`'s
+/// escaped-whitespace policy), but a literal `\040` in that text would never
+/// match the real on-disk path, which has an actual space. The *finding*
+/// still reports the raw, as-stored text, so it reads like the rest of the
+/// document and like something the user can find by eye.
 fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
@@ -468,7 +466,9 @@ fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
             _ => None,
         })
         .filter(|(_, entry)| entry.mount_point != SWAP_NONE_MOUNT_POINT)
-        .filter(|(_, entry)| !Path::new(&entry.mount_point).exists())
+        .filter(|(_, entry)| {
+            !Path::new(&crate::model::decode_escaped_whitespace(&entry.mount_point)).exists()
+        })
         .map(|(idx, entry)| {
             Finding::warning_at(
                 format!(
@@ -1069,6 +1069,33 @@ mod tests {
             1,
         ));
         assert!(mount_point_missing_findings(&doc).is_empty());
+    }
+
+    /// Regression test: a mount point containing an octal-escaped space
+    /// (`\040`) must be decoded before the existence check, or a path that
+    /// genuinely exists on disk is wrongly reported as missing because the
+    /// literal text `\040` never matches a real space in a filesystem path.
+    #[test]
+    fn escaped_space_in_an_existing_mount_point_produces_no_finding() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustab-fstab-core-escaped-space-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("My Backup")).expect("create the test directory");
+        let mount_point = format!("{}/My\\040Backup", dir.display());
+
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Path("/dev/sda1".into()),
+            &mount_point,
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let findings = mount_point_missing_findings(&doc);
+
+        fs::remove_dir_all(&dir).expect("clean up the test directory");
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]

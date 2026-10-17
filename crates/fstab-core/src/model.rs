@@ -21,13 +21,97 @@
 //! stop. Rationale: decoding would require the model to track "was this
 //! field escaped or not" out-of-band to re-encode correctly on write, which
 //! is exactly the kind of lossy round-trip SPEC §5 forbids. Keeping the raw
-//! text is simple, unambiguous, and correct by construction. Any future UI
-//! code that wants to *display* a decoded path for human readability must
-//! decode on the way out and re-encode on the way back in - this crate does
-//! not do that translation, and does not currently expose a decode/encode
-//! helper pair since one is not needed to satisfy round-trip fidelity.
+//! text is simple, unambiguous, and correct by construction.
+//!
+//! This crate still never *re-encodes* a literal space back into `\040` -
+//! nothing in this crate writes decoded text back into a model field, so
+//! that half of a decode/encode pair genuinely is not needed. Decoding
+//! *is* needed in more than one place that treats a field as a real
+//! filesystem path rather than model text - e.g. checking whether a mount
+//! point exists on disk ([`crate::validate`]), or a frontend's "open this
+//! path in the file manager" action - so this module exposes
+//! [`decode_escaped_whitespace`] as that one narrow, one-way translation.
+//! Every other consumer of `mount_point`/`SourceId::Path` keeps using the
+//! raw text untouched.
 
 use std::fmt;
+
+/// Decodes `/etc/fstab`'s `\NNN` octal-escape convention (three octal
+/// digits, e.g. `\040` for a space, `\011` for a tab) into the literal bytes
+/// they represent. See this module's "Escaped-whitespace policy" docs above
+/// for why the model itself never does this, and when callers should.
+///
+/// A backslash not followed by exactly three octal digits (`0`-`7`) is left
+/// untouched, verbatim - fstab only ever uses this escape for whitespace and
+/// the backslash itself (see util-linux's `mangle()`/`unmangle_to_buffer()`
+/// in `lib/mangle.c`, the reference implementation this matches), so an
+/// unrecognized sequence is far more likely to be a literal backslash in the
+/// path than a malformed escape.
+pub fn decode_escaped_whitespace(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_octal_escape = bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..=i + 3]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b));
+        if is_octal_escape {
+            let value =
+                (bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
+            out.push(value as char);
+            i += 4;
+        } else {
+            // Always lands on a UTF-8 char boundary: every byte skipped by
+            // this branch was just checked and is not part of a multi-byte
+            // sequence consumed above.
+            let ch = raw[i..].chars().next().expect("i < bytes.len()");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod decode_escaped_whitespace_tests {
+    use super::decode_escaped_whitespace as decode;
+
+    #[test]
+    fn decodes_a_space() {
+        assert_eq!(decode("/mnt/My\\040Backup"), "/mnt/My Backup");
+    }
+
+    #[test]
+    fn decodes_every_escape_fstab_itself_uses() {
+        // space, tab, newline, backslash - the four fstab(5) documents.
+        assert_eq!(decode("\\040"), " ");
+        assert_eq!(decode("\\011"), "\t");
+        assert_eq!(decode("\\012"), "\n");
+        assert_eq!(decode("\\134"), "\\");
+    }
+
+    #[test]
+    fn leaves_a_path_with_no_escapes_untouched() {
+        assert_eq!(decode("/mnt/data"), "/mnt/data");
+    }
+
+    #[test]
+    fn leaves_a_lone_backslash_untouched() {
+        // Not followed by three octal digits, so not a recognized escape.
+        assert_eq!(decode("/mnt/a\\b"), "/mnt/a\\b");
+        assert_eq!(decode("/mnt/a\\99"), "/mnt/a\\99");
+    }
+
+    #[test]
+    fn handles_consecutive_escapes() {
+        assert_eq!(
+            decode("Local\\040Extension\\040Settings"),
+            "Local Extension Settings"
+        );
+    }
+}
 
 /// The source identifier of an fstab entry - the first whitespace-separated
 /// field on a line (traditionally called "device" even though it is not
