@@ -842,6 +842,7 @@ pub fn app_shell() -> Html {
                             on_edit={on_edit_entry}
                             on_delete={on_delete_entry}
                             on_add_entry={on_add_entry}
+                            show_toast={show_toast.clone()}
                         />
                     }
                 } else if let Some(err) = &*backups_error {

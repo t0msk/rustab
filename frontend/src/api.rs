@@ -4,7 +4,8 @@
 //! `list_backups` and `restore_backup` (T12), plus `read_backup` and
 //! `delete_backup` (T20), plus `create_backup` (T21.1), plus
 //! `open_backup_location` (T25), plus `open_external_link` (T26), plus
-//! `pick_directory`. See `docs/API_CONTRACT.md` for the exact contract.
+//! `pick_directory`, plus `open_path_in_file_manager` (T32). See
+//! `docs/API_CONTRACT.md` for the exact contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -348,6 +349,23 @@ struct PickDirectoryOptions {
 #[derive(Serialize)]
 struct PickDirectoryArgs {
     options: PickDirectoryOptions,
+}
+
+/// `open_path_in_file_manager(path: string) -> null` (API_CONTRACT.md §3.14).
+/// Opens an arbitrary frontend-supplied path - today, always an entry's own
+/// Mount point value already visible in the table - in the host file
+/// manager. Never escalates privilege, never writes; see §2 of the contract
+/// for why a raw path is safe to send here unlike every other command.
+pub async fn open_path_in_file_manager(path: &str) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct OpenPathInFileManagerArgs<'a> {
+        path: &'a str,
+    }
+    invoke(
+        "open_path_in_file_manager",
+        &OpenPathInFileManagerArgs { path },
+    )
+    .await
 }
 
 /// `plugin:dialog|open` (tauri-plugin-dialog) - opens a native directory

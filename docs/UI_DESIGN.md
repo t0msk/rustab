@@ -130,17 +130,50 @@ and blanks are never dropped, just not given their own row in this list view).
 
 | Column | Content |
 |---|---|
+| *(leading, narrow)* | A chevron (`ChevronRightIcon`), rotated 90° when the row is expanded - the discoverability hint for row expansion below. Header cell is `sr-only`-labeled, not blank-looking-blank. |
 | Source | Small type badge (`UUID`, `LABEL`, `PARTUUID`, `PARTLABEL`, `PATH`, `NET`, `NONE`) + the value, `font-mono text-sm` |
-| Mount point | `font-mono text-sm`; no description indicator here (removed per direct request - it took up row space), description text is only visible by opening the entry's drawer |
+| Mount point | `font-mono text-sm`, truncated with a hover tooltip; the full, untruncated value - plus copy/open-in-file-manager actions - lives in the row's own expanded detail panel below, not here |
 | FS type | plain text badge, `text-sm` |
-| Options | first ~3 options as small chips + `+N more` overflow; full ordered list visible on hover tooltip and always fully editable in the drawer |
+| Options | first ~3 options as small chips + `+N more` overflow; the full ordered list is visible on hover tooltip, in the expanded detail panel below, and always fully editable in the drawer |
 | Dump | single digit |
 | Pass | single digit |
 | Actions | Edit (`EditIcon` button) · Delete (`DeleteIcon` button, `text-red-600` on hover) |
 
 Row styling: `bg-white dark:bg-slate-800`, alternating/zebra optional (`odd:bg-slate-50
 dark:odd:bg-slate-800/60`), hover `hover:bg-sky-50 dark:hover:bg-slate-700/60`, row
-height ~44px, `border-b border-slate-200 dark:border-slate-700`.
+height ~44px, `border-b border-slate-200 dark:border-slate-700`, `cursor-pointer` (see
+click-to-expand below).
+
+**Click-to-expand row detail:** clicking anywhere on an `EntryRow`'s own `<tr>` (except
+the Edit/Delete buttons, which stop the click from propagating) toggles an inline detail
+panel for that row, replacing the only-visible-in-the-drawer description gap called out
+above - this is the deliberate, permanent way to see an entry's full data, including its
+description, without opening Edit. Any number of rows can be expanded at once (not an
+accordion); the chevron in the leading column rotates 90° to reflect each row's own
+state.
+
+The expanded panel is a full-width row, structurally like `UnparsedEntryRow`'s own
+colspan pattern (a single `colspan={8}` `<td>`) but with its own, distinct visual
+treatment so it reads as "an open detail view," not a warning: `bg-slate-50
+dark:bg-slate-900/40` background, `border-l-4 border-l-sky-400 dark:border-l-sky-500`
+left accent (the app's `accent` token, §8), laid out as a labeled two-column grid
+(`text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide` labels
+above each value, matching this table's own header typography). It shows, fully
+untruncated: Source (value + type badge), Mount point (value + the two icon buttons
+below), FS type, Dump/Pass, the complete Options chip list (no `+N more` truncation),
+Description (only rendered if `Some`) and Trailing comment (only rendered if `Some`).
+
+Immediately after the Mount point value in the expanded panel sit two icon buttons:
+
+- **Copy to clipboard** (`CopyIcon`, swapping to `CheckIcon` for ~1.5s after a
+  successful copy) - uses the Web Clipboard API (`navigator.clipboard.write_text`)
+  directly, not a Tauri plugin. On failure, an error toast reads `"Could not copy the
+  mount point to the clipboard."`.
+- **Open in file manager** (`FolderOpenIcon`) - calls the `open_path_in_file_manager`
+  command (`docs/API_CONTRACT.md` §3.14) with the entry's mount point. On failure, the
+  command's own message is shown as an error toast; on success, nothing (the file
+  manager window appearing is its own confirmation, the same pattern
+  `open_backup_location` already uses).
 
 **Document-wide warning indicator**: `AppShell` runs `validate_candidate` against the
 *whole* candidate document independently of whether any drawer is open (debounced only
@@ -646,8 +679,9 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
    `Backups` tab, T26), plus an always-visible `About` trigger (both tabs, T26)
 4. `PendingChangesBar` - "N entries changed" + `Review & Save…` trigger (§6)
 5. `EntriesTable` - main entry list (§3)
-6. `EntryRow` - one parsed entry's row (§3); no inline description indicator - see
-   that field's own value only in the entry's detail drawer. Does get a left-border
+6. `EntryRow` - one parsed entry's row (§3); click-to-expand reveals every field,
+   untruncated, including the description, in an inline detail panel (no separate
+   inline description indicator in the collapsed row itself). Does get a left-border
    accent + title tooltip when a document-wide warning is tagged to this row
 7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3)
 8. `EmptyState` - generic empty-list placeholder (entries or backups)
@@ -678,13 +712,14 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 31. `BackupDiffView` - read-only backup-vs-current-target diff overlay (§7)
 32. `AboutDialog` - static "About Rustab" overlay: name, logo, version, external
     links, author/contact line (§10, T26)
-33. `icons` module (`EditIcon`/`DeleteIcon`) - small reusable inline-SVG icon
-    components (Lucide-derived path data, ISC license, no crate dependency - see
-    the module's own doc comment for why a whole icon-set crate was rejected for
-    just two icons), replacing the `✎`/`🗑` Unicode glyphs `EntryRow`/
-    `UnparsedEntryRow`'s Edit/Delete buttons used before. `stroke="currentColor"`
-    so hover/dark-mode color changes already applied to the button apply to the
-    icon too, same as `AboutDialog`'s own icons.
+33. `icons` module (`EditIcon`/`DeleteIcon`/`ChevronRightIcon`/`CopyIcon`/`CheckIcon`/
+    `FolderOpenIcon`) - small reusable inline-SVG icon components (Lucide-derived path
+    data, ISC license, no crate dependency - see the module's own doc comment for why
+    a whole icon-set crate was rejected), replacing the `✎`/`🗑` Unicode glyphs
+    `EntryRow`/`UnparsedEntryRow`'s Edit/Delete buttons used before, plus the
+    expand-chevron and the expanded Mount point row's copy/open-in-file-manager
+    buttons (§3). `stroke="currentColor"` so hover/dark-mode color changes already
+    applied to the button apply to the icon too, same as `AboutDialog`'s own icons.
 34. `RawViewDialog` - read-only overlay showing the active target's exact current
     raw text, no diff (§11)
 

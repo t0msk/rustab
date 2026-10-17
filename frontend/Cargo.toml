@@ -20,6 +20,9 @@ web-sys = { version = "0.3", features = [
   "HtmlInputElement",
   "HtmlSelectElement",
   "HtmlTextAreaElement",
+  "Window",
+  "Navigator",
+  "Clipboard",
 ] }
 js-sys = "0.3"
 serde = { version = "1.0", features = ["derive"] }

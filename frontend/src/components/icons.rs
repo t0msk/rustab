@@ -12,6 +12,12 @@
 //! license - permissive, explicitly allows this), picked for its
 //! consistent, modern stroke-based style; nothing here pulls in Lucide as
 //! an actual dependency.
+//!
+//! `ChevronRightIcon`, `CopyIcon`, `CheckIcon` and `FolderOpenIcon` were
+//! added for the entries-table row-expand panel (T32): the expand/collapse
+//! disclosure chevron, and the Mount point value's copy-to-clipboard /
+//! open-in-file-manager buttons (the latter swaps to `CheckIcon` briefly
+//! after a successful copy).
 
 use yew::prelude::*;
 
@@ -59,5 +65,39 @@ pub fn delete_icon() -> Html {
             <line x1="10" x2="10" y1="11" y2="17" />
             <line x1="14" x2="14" y1="11" y2="17" />
         </>
+    })
+}
+
+/// A single chevron, pointing right at rest; the caller rotates it 90°
+/// (`rotate-90` utility) to indicate the expanded state rather than
+/// swapping in a second icon.
+#[function_component(ChevronRightIcon)]
+pub fn chevron_right_icon() -> Html {
+    icon_svg!(html! {
+        <path d="m9 18 6-6-6-6" />
+    })
+}
+
+#[function_component(CopyIcon)]
+pub fn copy_icon() -> Html {
+    icon_svg!(html! {
+        <>
+            <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+            <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+        </>
+    })
+}
+
+#[function_component(CheckIcon)]
+pub fn check_icon() -> Html {
+    icon_svg!(html! {
+        <path d="M20 6 9 17l-5-5" />
+    })
+}
+
+#[function_component(FolderOpenIcon)]
+pub fn folder_open_icon() -> Html {
+    icon_svg!(html! {
+        <path d="m6 14 1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5c0-1.1.9-2 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2" />
     })
 }

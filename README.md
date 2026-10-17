@@ -56,11 +56,6 @@ promise.
   step since early in the project.
 - **Search/filter and column sorting** in the entries table - becomes genuinely useful
   once a real fstab has many entries (containers, lots of bind mounts).
-- **Click-to-expand row detail** - today, a long mount point or an options list with
-  many entries gets truncated in the table, and seeing the full untruncated data means
-  opening Edit. An expandable row (click anywhere on a row to reveal all of that
-  entry's fields inline, read-only, without entering edit mode) would let you inspect
-  the real full data without committing to editing anything.
 - **systemd unit preview** - show what `systemd-fstab-generator` would actually
   produce for a given line, read-only, useful for debugging boot/mount behavior.
 
