@@ -150,6 +150,40 @@ pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
     })
 }
 
+/// Re-syncs the working draft - and its last-known-real marker - from the
+/// real `/etc/fstab`'s *current* content, without writing to `/etc/fstab`
+/// itself.
+///
+/// This is T37's "Reload and re-sync" action inside `ExternalChangeDialog`
+/// (`docs/UI_DESIGN.md` §12, `docs/API_CONTRACT.md` §3.15): when a `save` or
+/// `restore_backup` has just been refused with `kind: "external_change"`
+/// (T36), the user can ask Rustab to adopt the real file's current content as
+/// its new baseline - without discarding their pending edits (the frontend's
+/// `candidate`, which this command never touches) and without writing
+/// anything to `/etc/fstab`. It reuses [`target::sync_sandbox_after_save`]
+/// unchanged - the same primitive a successful save already calls to publish
+/// fresh bytes onto the draft and the marker, atomically, as one event
+/// ("Rustab now knows this is reality") - from a new, explicit,
+/// user-initiated entry point rather than only from a successful write.
+///
+/// See [`resync_external_change_with`] for the full behaviour, including the
+/// fail-closed guard this command needs because, unlike every other reader in
+/// this module, it *writes* a file (the local draft) as a side effect of a
+/// read of a different one (the real `/etc/fstab`).
+///
+/// # Errors
+///
+/// [`CommandErrorKindDto::TargetResolution`] if the target could not be
+/// determined; [`CommandErrorKindDto::Resync`] if the active target is not
+/// the default working draft, or if the fresh content could not be published
+/// onto it; [`CommandErrorKindDto::ReadTarget`] if the real file exists but
+/// could not be read; [`CommandErrorKindDto::NotUtf8`] if its bytes are not
+/// valid UTF-8.
+#[tauri::command(async)]
+pub fn resync_external_change() -> Result<DocumentViewDto, CommandErrorDto> {
+    resync_external_change_with(&resolve_target()?, real_fstab())
+}
+
 /// Validates a candidate document without writing anything.
 ///
 /// Runs the identical [`validate::validate`] call a save runs, so the
@@ -578,6 +612,108 @@ fn list_backups_for(
 ) -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
     backups::list(&backup_target_path(target, real_fstab))
         .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::ListBackups, err.to_string()))
+}
+
+/// The body of [`resync_external_change`], with the real-file path passed in
+/// (see [`backup_target_path`]/[`save_document_with`] for why: `cargo test`
+/// must never read the machine's own `/etc/fstab`, so production passes
+/// [`real_fstab`] and the tests pass a temp file).
+///
+/// **Fails closed - touching neither the draft nor the marker - unless
+/// `target.source == TargetSource::SandboxDefault`.** In normal operation this
+/// command is only ever called while the frontend's `ExternalChangeDialog` is
+/// showing, which per T36 only happens for that one dispatch case, but the
+/// guard is load-bearing on its own, not merely defensive dead code: without
+/// it, this command would read the real `/etc/fstab` and overwrite *any*
+/// resolved target's draft with it, which for an explicit
+/// `RUSTAB_TARGET_PATH` test target - a file that is not a mirror of
+/// `/etc/fstab` at all - would be a genuine data-safety bug, not a cosmetic
+/// one. Nothing is read or written when this guard fires.
+///
+/// Otherwise, reads `real_fstab`'s current bytes:
+///
+/// - Missing (`io::ErrorKind::NotFound`) is not an error - the same
+///   `exists: false`, empty-text handling [`list_entries`] already gives a
+///   missing target, which here means the draft and marker are synced to
+///   empty too.
+/// - Non-UTF-8 bytes are refused outright, touching nothing, for the same
+///   reason [`list_entries`] refuses them for its own target: loading them
+///   here could only write mangled content back over a file that was fine.
+/// - Any other read error is [`CommandErrorKindDto::ReadTarget`].
+///
+/// On a successful read (missing file included), the result is published
+/// onto the working draft and its last-known-real marker, atomically, with
+/// [`target::sync_sandbox_after_save`] - the exact primitive a successful
+/// save already uses. An `io::Error` from that call is
+/// [`CommandErrorKindDto::Resync`], distinct from the fail-closed guard above
+/// only in the message, not the kind: the frontend treats both identically
+/// (`PROJECT_PLAN.md` §T37).
+///
+/// The returned [`DocumentViewDto`] is a direct construction from `text`, not
+/// a second read-back: the draft *now holds* exactly this text, by
+/// construction of the call just made.
+fn resync_external_change_with(
+    target: &ActiveTarget,
+    real_fstab: &Path,
+) -> Result<DocumentViewDto, CommandErrorDto> {
+    if target.source != TargetSource::SandboxDefault {
+        return Err(CommandErrorDto::new(
+            CommandErrorKindDto::Resync,
+            format!(
+                "{} is not the default working draft, so it has no last-known-real marker to \
+                 re-sync from the real /etc/fstab; nothing was touched",
+                target.path.display()
+            ),
+        ));
+    }
+
+    let (exists, text) = match fs::read(real_fstab) {
+        Ok(bytes) => {
+            // Deliberately *not* `from_utf8_lossy` - see `list_entries`, whose
+            // reasoning applies identically here: a lossy load would publish
+            // mangled content onto the draft and the marker both.
+            let text = String::from_utf8(bytes).map_err(|err| {
+                CommandErrorDto::new(
+                    CommandErrorKindDto::NotUtf8,
+                    format!(
+                        "{} is not valid UTF-8 ({err}), so Rustab will not re-sync from it - \
+                         doing so could only publish corrupted content onto the working draft. \
+                         Fix the encoding with a text editor first.",
+                        real_fstab.display()
+                    ),
+                )
+            })?;
+            (true, text)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (false, String::new()),
+        Err(err) => {
+            return Err(CommandErrorDto::new(
+                CommandErrorKindDto::ReadTarget,
+                format!("could not read {}: {err}", real_fstab.display()),
+            ))
+        }
+    };
+
+    target::sync_sandbox_after_save(&target.path, text.as_bytes()).map_err(|err| {
+        CommandErrorDto::new(
+            CommandErrorKindDto::Resync,
+            format!(
+                "{} was read successfully, but the local working draft {} could not be updated \
+                 to match it ({err}); try again",
+                real_fstab.display(),
+                target.path.display()
+            ),
+        )
+    })?;
+
+    let document = parser::parse(&text);
+    Ok(DocumentViewDto {
+        target: TargetInfoDto::from(target),
+        exists,
+        text,
+        has_malformed_lines: document.has_malformed_lines(),
+        document: DocumentDto::from(&document),
+    })
 }
 
 /// The body of [`restore_backup`], with the real-file path and the elevated
@@ -1161,6 +1297,15 @@ mod tests {
 
     const ORIGINAL: &str = "# the content a save must back up\n\
                             UUID=11111111-2222-3333-4444-555555555555 /mnt/original ext4 noauto 0 2\n";
+
+    /// A realistic real-`/etc/fstab` stand-in for the `resync_external_change`
+    /// tests - content a parse-and-reserialize round trip could plausibly
+    /// normalize (tabs, a trailing comment), so asserting byte equality
+    /// against it really does prove a literal copy, not a round trip.
+    const REAL_FSTAB_FOR_RESYNC: &str = "\
+# /etc/fstab: static file system information.
+UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\t/\text4\trw,relatime\t0 1
+LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     /// A non-real target at `path`, as `active_target()` would have produced
     /// for an explicit `RUSTAB_TARGET_PATH` pointing at a scratch file.
@@ -2181,6 +2326,210 @@ mod tests {
 
         assert_eq!(listed, backups::list(&draft).expect("the draft's listing"));
         assert_eq!(listed.len(), 2);
+    }
+
+    // -- resync_external_change (T37) ---------------------------------------
+    //
+    // `resync_external_change_with` never takes an `elevate` closure and
+    // never calls into `crate::privileged` anywhere in its body (see its own
+    // definition, a few hundred lines up) - unlike every write path in this
+    // module, it needs no privilege escalation at all, which these tests
+    // confirm by construction: none of them passes, or could pass, a
+    // privileged stand-in, because the function being tested has no such
+    // parameter to receive one.
+
+    /// The marker path belonging to `sandbox_path`, for asserting what
+    /// [`target::sync_sandbox_after_save`] did or did not do to it.
+    fn marker_of(sandbox_path: &Path) -> PathBuf {
+        target::last_known_real_marker(sandbox_path).expect("a named file has a marker sibling")
+    }
+
+    /// The headline case: a `SandboxDefault` target's resync publishes exactly
+    /// the real file's current bytes onto both the draft and the marker,
+    /// replacing whatever stale content either held before - byte-exact, which
+    /// is what proves this is a copy and not a parse/reserialize round trip.
+    #[test]
+    fn a_sandbox_default_resync_publishes_the_real_fstabs_bytes_onto_draft_and_marker() {
+        let dir = TempDir::new("resync-sandbox-default");
+        let real = dir.join("real-fstab");
+        fs::write(&real, REAL_FSTAB_FOR_RESYNC).expect("seed the real stand-in");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, "# stale draft content from before the drift\n").expect("seed draft");
+        fs::write(marker_of(&draft), "# stale marker content\n").expect("seed marker");
+        let target = default_draft_target(draft.clone());
+
+        let view = resync_external_change_with(&target, &real)
+            .expect("a sandbox-default resync must succeed");
+
+        assert!(view.exists);
+        assert_eq!(view.text, REAL_FSTAB_FOR_RESYNC);
+        assert_eq!(
+            fs::read(&draft).expect("read the draft"),
+            REAL_FSTAB_FOR_RESYNC.as_bytes(),
+            "the draft must become a byte-for-byte copy of the real file"
+        );
+        assert_eq!(
+            fs::read(marker_of(&draft)).expect("read the marker"),
+            REAL_FSTAB_FOR_RESYNC.as_bytes(),
+            "the marker must be moved forward to the same bytes"
+        );
+    }
+
+    /// Fail-closed guard, non-real-override half: an explicit
+    /// `RUSTAB_TARGET_PATH` naming some other file must never have its draft
+    /// silently replaced with the real `/etc/fstab`'s content - that target is
+    /// not a mirror of the real file at all. Nothing is touched: the draft and
+    /// the marker (even one set up in advance) are left exactly as they were.
+    #[test]
+    fn an_explicit_non_real_override_fails_closed_and_touches_nothing() {
+        let dir = TempDir::new("resync-env-non-real");
+        let real = dir.join("real-fstab");
+        fs::write(&real, REAL_FSTAB_FOR_RESYNC).expect("seed the real stand-in");
+        let draft = dir.join("fstab.custom");
+        fs::write(&draft, "# this is not a mirror of /etc/fstab\n").expect("seed draft");
+        fs::write(
+            marker_of(&draft),
+            "# a marker that should never be touched\n",
+        )
+        .expect("seed marker");
+        let target = override_target(draft.clone());
+
+        let error = resync_external_change_with(&target, &real)
+            .expect_err("a non-SandboxDefault target must be refused");
+
+        assert_eq!(error.kind, CommandErrorKindDto::Resync);
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            "# this is not a mirror of /etc/fstab\n",
+            "the draft must be left exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_of(&draft)).expect("read the marker"),
+            "# a marker that should never be touched\n",
+            "the marker must be left exactly as it was"
+        );
+    }
+
+    /// Fail-closed guard, explicit-real-override half: `RUSTAB_TARGET_PATH`
+    /// pointed straight at the real `/etc/fstab` (`is_real: true`) is still
+    /// `TargetSource::Environment`, not `SandboxDefault`, and must be refused
+    /// for the identical reason - this command's authority is "the default
+    /// working draft", not "any target that happens to be real".
+    #[test]
+    fn an_explicit_real_override_fails_closed_and_touches_nothing() {
+        let dir = TempDir::new("resync-env-real");
+        let real = dir.join("real-fstab");
+        fs::write(&real, REAL_FSTAB_FOR_RESYNC).expect("seed the real stand-in");
+        let draft = dir.join("fstab");
+        fs::write(&draft, "# the real file, named explicitly\n").expect("seed draft");
+        fs::write(
+            marker_of(&draft),
+            "# a marker that should never be touched\n",
+        )
+        .expect("seed marker");
+        let target = ActiveTarget {
+            path: draft.clone(),
+            is_real: true,
+            source: TargetSource::Environment,
+        };
+
+        let error = resync_external_change_with(&target, &real)
+            .expect_err("an is_real: true, Environment-sourced target must still be refused");
+
+        assert_eq!(error.kind, CommandErrorKindDto::Resync);
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            "# the real file, named explicitly\n",
+            "the draft must be left exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_of(&draft)).expect("read the marker"),
+            "# a marker that should never be touched\n",
+            "the marker must be left exactly as it was"
+        );
+    }
+
+    /// A missing real file is not an error - the same non-error handling
+    /// `list_entries` already gives a missing target - and it resyncs the
+    /// draft and marker to empty, not to whatever stale content they held.
+    #[test]
+    fn a_missing_real_fstab_resyncs_to_empty_rather_than_erroring() {
+        let dir = TempDir::new("resync-missing-real");
+        let real = dir.join("this-file-does-not-exist");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, "# stale content that must be cleared\n").expect("seed draft");
+        fs::write(marker_of(&draft), "# a stale marker\n").expect("seed marker");
+        let target = default_draft_target(draft.clone());
+
+        let view = resync_external_change_with(&target, &real)
+            .expect("a missing real file must not be an error");
+
+        assert!(!view.exists);
+        assert_eq!(view.text, "");
+        assert_eq!(
+            fs::read(&draft).expect("read the draft"),
+            b"",
+            "a missing real file must clear the draft, not leave it stale"
+        );
+        assert_eq!(
+            fs::read(marker_of(&draft)).expect("read the marker"),
+            b"",
+            "and clear the marker the same way"
+        );
+    }
+
+    /// A non-UTF-8 real file is refused outright, exactly as `list_entries`
+    /// refuses one for its own target - and, because nothing was read
+    /// successfully, nothing is published: the draft and the marker are left
+    /// exactly as they were.
+    #[test]
+    fn a_non_utf8_real_fstab_is_refused_and_touches_nothing() {
+        let dir = TempDir::new("resync-not-utf8");
+        let real = dir.join("real-fstab");
+        fs::write(&real, [0xff, 0xfe, 0x00, 0x01]).expect("seed invalid-UTF-8 bytes");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, "# valid content that must survive\n").expect("seed draft");
+        fs::write(marker_of(&draft), "# a marker that must survive\n").expect("seed marker");
+        let target = default_draft_target(draft.clone());
+
+        let error = resync_external_change_with(&target, &real)
+            .expect_err("non-UTF-8 content must be refused");
+
+        assert_eq!(error.kind, CommandErrorKindDto::NotUtf8);
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            "# valid content that must survive\n",
+            "the draft must be left exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_of(&draft)).expect("read the marker"),
+            "# a marker that must survive\n",
+            "the marker must be left exactly as it was"
+        );
+    }
+
+    /// The test that proves this feature actually closes the loop a plain
+    /// retry depends on, not just that bytes landed somewhere: after a
+    /// successful resync, comparing the (now moved-forward) marker against the
+    /// same real content the resync just read reports no external change at
+    /// all - the exact guard a subsequent `save`/`restore_backup` consults.
+    #[test]
+    fn a_successful_resync_makes_the_external_change_guard_report_no_drift() {
+        let dir = TempDir::new("resync-closes-the-loop");
+        let real = dir.join("real-fstab");
+        fs::write(&real, REAL_FSTAB_FOR_RESYNC).expect("seed the real stand-in");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, "# a draft that disagrees with the real file\n").expect("seed draft");
+        let target = default_draft_target(draft.clone());
+
+        resync_external_change_with(&target, &real).expect("the resync must succeed");
+
+        let guard = target::ExternalChangeGuard::from_marker(&target.path, false);
+        assert_eq!(
+            guard.detect(&real),
+            None,
+            "the marker the resync just recorded must agree with the real file it was read from"
+        );
     }
 
     /// `read_backup` follows the same list: on a default launch a backup of

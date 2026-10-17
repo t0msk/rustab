@@ -212,6 +212,11 @@ Error kinds: `target_resolution`, `read_target`,
 lossily, because loading it with replacement characters and then saving would
 corrupt a file that was fine.
 
+See also `resync_external_change` (§3.15), a close relative added by T37: it
+reads the *real* `/etc/fstab` rather than the active target and, on success,
+publishes what it read onto the active target's draft and marker - a sibling
+read/publish command rather than a plain read like this one.
+
 ### 3.3 `validate_candidate`
 
 ```
@@ -686,6 +691,67 @@ waited on. On failure (most commonly `xdg-open` missing) the rejection names
 the path that could not be opened.
 
 Error kinds: `open_path`.
+
+### 3.15 `resync_external_change`
+
+```
+resync_external_change() -> DocumentViewDto   (rejects with CommandErrorDto)
+```
+
+**Added in T37.** Re-syncs the active target's working draft - and its
+last-known-real marker (§2) - from the real `/etc/fstab`'s *current* content,
+without writing to `/etc/fstab` itself. This is the third way forward
+`ExternalChangeDialog` offers once a `save`/`restore_backup` has been refused
+with `kind: "external_change"` (§8, T36): besides Cancel (discard the pending
+write) and Write anyway (overwrite the external change), the user can ask
+Rustab to adopt the real file's current content as the new baseline and
+re-review their still-pending edits against it, via `DiffView`, rather than
+being forced to choose between discarding their edits or steamrolling someone
+else's. Takes no arguments: like every other command, which file this reads
+from and writes to is resolved server-side, never supplied by the frontend.
+
+- It reuses the exact [`target::sync_sandbox_after_save`] primitive a
+  successful save already calls to publish fresh bytes onto the draft *and*
+  the marker, atomically, as one event ("Rustab now knows this is reality") -
+  just from a new, explicit, user-initiated entry point instead of only from a
+  successful write.
+- It never touches the user's pending edits - there is nothing in this
+  command's request *or* response that could, since `DocumentViewDto` only
+  ever describes the target's own content, never a frontend-held candidate.
+- **It fails closed, touching nothing, unless the active target's `source` is
+  `"sandbox_default"`.** This command only makes sense for the default
+  working draft, whose marker records what Rustab last knew the real
+  `/etc/fstab` to hold; an explicit `RUSTAB_TARGET_PATH` target - real or not -
+  is not a mirror of `/etc/fstab` at all, and silently overwriting its draft
+  with the real file's content would be a data-safety bug, not a cosmetic
+  one. In normal frontend use this guard should never actually fire, because
+  `ExternalChangeDialog` (and so this command) only ever appears for the
+  `sandbox_default` dispatch case of §3.5 - it exists for the same reason a
+  seatbelt exists for a car that signals before it turns.
+- Reads the real `/etc/fstab`'s current bytes. A missing file is **not** an
+  error - the same `exists: false`, empty-`text` handling `list_entries`
+  (§3.2) already gives a missing target - and the draft and marker are synced
+  to empty right along with it. Bytes that are not valid UTF-8 are refused
+  outright (`not_utf8`), for the identical reason `list_entries` refuses them
+  for its own target: publishing mangled content onto the draft could only
+  make things worse.
+- **No privilege escalation, ever.** Reading `/etc/fstab` is already
+  unprivileged everywhere else in this contract (`list_entries`, `list_backups`
+  §3.6), and writing the local draft in `$XDG_DATA_HOME` is the same
+  unprivileged primitive the once-per-launch draft refresh (§2) already uses.
+  This command never prompts, which is also why the frontend gates it on
+  nothing - no `RealTargetConfirmCheckbox`, unlike `save` and `restore_backup`.
+- On success, the returned `DocumentViewDto` describes the real file's content
+  exactly as read - not a second read-back, since the draft now *is* this
+  text by construction of the call that just ran.
+
+Error kinds: `target_resolution`, `resync`, `read_target`, `not_utf8`.
+`resync` covers two distinct situations under one kind, deliberately: the
+fail-closed guard above, and a `sync_sandbox_after_save` publish failure once
+the real file *was* read successfully. The frontend's treatment of either is
+identical - show the message in `ExternalChangeDialog`'s existing error slot
+and leave Cancel/Write-anyway/Reload all available - so a second kind would
+describe a distinction nothing branches on.
 
 ---
 
@@ -1249,20 +1315,25 @@ as a failed save - nothing was attempted.
 
 `kind` is one of `target_resolution`, `read_target`, `not_utf8`,
 `list_backups`, `invalid_backup`, `read_backup`, `open_location`,
-`open_external_link`, `open_path`. These commands never wrote anything, so
-there is no `target_unchanged` field.
+`open_external_link`, `open_path`, `resync`. None of these commands run the
+backup/validate/atomic-rename sequence `WriteErrorDto`'s `target_unchanged`
+exists to describe, so there is no such field here - not even for
+`resync_external_change` (§3.15), whose own local-draft publish is the same
+lightweight copy-and-marker primitive the once-per-launch draft refresh (§2)
+already uses, never `write_document`.
 
 | `kind` | Meaning | Raised by |
 | --- | --- | --- |
 | `target_resolution` | The active target could not be determined | every read-side command |
 | `read_target` | The target exists but could not be read | `list_entries` |
-| `not_utf8` | The bytes read are not valid UTF-8 and are refused rather than mangled | `list_entries` (the target), `read_backup` (a backup) |
+| `not_utf8` | The bytes read are not valid UTF-8 and are refused rather than mangled | `list_entries` (the target), `read_backup` (a backup), `resync_external_change` (the real `/etc/fstab`) |
 | `list_backups` | The target's directory could not be listed | `list_backups` |
 | `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read. Nothing was read. | `read_backup` |
 | `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
 | `open_location` | The host file manager could not be launched | `open_backup_location` |
 | `open_external_link` | The browser could not be launched | `open_external_link` |
 | `open_path` | The host file manager could not be launched for the frontend-supplied path | `open_path_in_file_manager` |
+| `resync` | (T37) Either the active target is not the default working draft (fail-closed guard; nothing touched), or the real file's current content was read but could not be published onto the draft and its marker | `resync_external_change` |
 
 ### `DeleteBackupErrorDto` (`delete_backup` only)
 
@@ -1401,7 +1472,7 @@ frontend matches these strings exhaustively:
   `external_change`.
 - `CommandErrorKindDto`: `target_resolution`, `read_target`, `not_utf8`,
   `list_backups`, `invalid_backup`, `read_backup`, `open_location`,
-  `open_external_link`, `open_path`.
+  `open_external_link`, `open_path`, `resync`.
 - `DeleteBackupErrorKindDto`: `target_resolution`, `invalid_backup`,
   `privilege_escalation`, `delete`.
 - `CreateBackupErrorKindDto`: `target_resolution`, `target_missing`,

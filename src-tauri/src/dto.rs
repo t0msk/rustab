@@ -861,6 +861,14 @@ pub enum CommandErrorKindDto {
     /// (the `xdg-open` binary is missing, or starting it failed for some
     /// other reason).
     OpenPath,
+    /// [`crate::commands::resync_external_change`] could not re-sync the
+    /// working draft from the real `/etc/fstab` (T37). Covers two distinct
+    /// situations, deliberately under one kind because the frontend treats
+    /// them identically: the active target is not the default working draft
+    /// at all (fail-closed guard, nothing touched), or the real file was read
+    /// successfully but publishing it onto the draft and its last-known-real
+    /// marker failed.
+    Resync,
 }
 
 /// A failed read-only command.
@@ -1435,6 +1443,7 @@ mod tests {
             (CommandErrorKindDto::OpenLocation, "open_location"),
             (CommandErrorKindDto::OpenExternalLink, "open_external_link"),
             (CommandErrorKindDto::OpenPath, "open_path"),
+            (CommandErrorKindDto::Resync, "resync"),
         ];
         for (kind, spelling) in command_kinds {
             assert_eq!(
