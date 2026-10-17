@@ -993,7 +993,7 @@ pub fn app_shell() -> Html {
             if let Some(backup_timestamp) = backup_delete_dialog_data {
                 <BackupDeleteConfirmDialog
                     backup_timestamp={backup_timestamp}
-                    is_real={is_real}
+                    writes_real_file={writes_real_file}
                     confirm_checked={*backup_delete_confirm_checked}
                     on_confirm_checked_change={{
                         let backup_delete_confirm_checked = backup_delete_confirm_checked.clone();

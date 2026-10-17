@@ -90,53 +90,62 @@ the app and is designed to be *impossible to miss*, not a subtle label.
   The full path is always shown in full (truncated with an ellipsis + tooltip only if
   genuinely too long for the window), never abbreviated to just a filename - ambiguity
   between two similarly-named files is exactly what this banner exists to prevent.
-- **Three states since T34, deliberately asymmetric in alarm level** - the explicit
-  requirement is that a mode whose Save reaches the real system file must look more
-  "alarming" than one whose Save does not, not just differently colored. Before T34
-  that was two states, because the only way to reach `/etc/fstab` was to *be* pointed
+- **Three states since T34, only one of them alarming (revised in T35)** - before T34
+  there were two states, because the only way to reach `/etc/fstab` was to *be* pointed
   at `/etc/fstab`. T34 broke that equivalence: a default, unconfigured launch edits a
   local working draft but every save from it writes the real `/etc/fstab` and then
   mirrors back into the draft (`docs/SPEC.md` §7,
-  `src-tauri/src/commands.rs::save_document_with`). The old green "Sandbox target"
-  banner is now the single most misleading thing this app could show - most users see
-  that state most of the time - so it is gone, replaced by the middle column below:
+  `src-tauri/src/commands.rs::save_document_with`). T34 initially answered that by making
+  the middle column amber/hazard-striped/alarmed, on the theory that the banner should
+  also signal *what a future save will do*. T35 reverted that call, at the repo owner's
+  explicit request (`PROJECT_PLAN.md`'s T35 section): the ambient banner now reports only
+  *what file you are currently looking at* - a calm fact, true for the whole time you are
+  editing - not *what saving will do*, which is a separate, future, one-time event with
+  its own dedicated risk signal elsewhere (see below the table). Nothing here is the
+  pre-T34 "Sandbox target" lie, though: the copy for the middle column still names the
+  real file by path and does not claim it is untouched.
 
   | | **Real file** (`is_real`) | **Working draft, saves through to the real file** (`source == SandboxDefault`) | **Isolated test target** (`source == Environment`, not real) |
   |---|---|---|---|
   | When | explicit `RUSTAB_TARGET_PATH=/etc/fstab` | the default launch, no env var set | explicit `RUSTAB_TARGET_PATH=/some/other/file` |
   | Does Save write `/etc/fstab`? | yes | **yes** (then updates the draft to match) | no, never |
-  | Background | `bg-red-600` (`#dc2626`) | `bg-amber-600` (`#d97706`) | `bg-emerald-600` (`#059669`) |
-  | Text | `text-white`, `font-bold`, `uppercase`, `tracking-wide` | `text-white`, `font-semibold`; the lead clause only is `font-bold uppercase tracking-wide` | `text-white`, `font-semibold`, normal case |
-  | Icon | triangle-exclamation (hazard), filled | triangle-exclamation (hazard), filled - deliberately the *same* glyph | flask/beaker (sandbox/test), outline |
-  | Extra texture | subtle 8px diagonal hazard-stripe pattern at ~8% white opacity across the banner background (`repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, transparent 8px 16px)`) | the same hazard stripes | none - flat color, calm |
-  | Border | `border-b-2 border-red-800` | `border-b-2 border-amber-800` | `border-b-2 border-emerald-800` |
-  | Copy | `"REAL SYSTEM FILE - {path}"` | `"Saving writes the real /etc/fstab"` + `" - editing working draft {path}"` | `"Test target - {path} · your real /etc/fstab is never written"` |
-  | ARIA role | `alert` | `alert` | `status` |
+  | Background | `bg-red-600` (`#dc2626`) | `bg-emerald-600` (`#059669`) | `bg-emerald-600` (`#059669`) |
+  | Text | `text-white`, `font-bold`, `uppercase`, `tracking-wide` | `text-white`, `font-semibold`, normal case | `text-white`, `font-semibold`, normal case |
+  | Icon | triangle-exclamation (hazard), filled | flask/beaker (sandbox/test), outline | flask/beaker (sandbox/test), outline |
+  | Extra texture | subtle 8px diagonal hazard-stripe pattern at ~8% white opacity across the banner background (`repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, transparent 8px 16px)`) | none - flat color, calm | none - flat color, calm |
+  | Border | `border-b-2 border-red-800` | `border-b-2 border-emerald-800` | `border-b-2 border-emerald-800` |
+  | Copy | `"REAL SYSTEM FILE - {path}"` | `"Working draft - {path}"` | `"Test target - {path} · your real /etc/fstab is never written"` |
+  | ARIA role | `alert` | `status` | `status` |
 
-  Why this split, rather than making the default case identical to the real-file one:
-  the two signals the banner carries are *"what am I looking at"* and *"what happens if
-  I save"*, and T34 is exactly the case where they diverge. So they are encoded
-  separately: the **hazard stripes + ⚠ glyph** mean "a save from here lands in
-  `/etc/fstab`" (shared by the first two columns, and absent from the third), while the
-  **hue** says which file is on screen - red for `/etc/fstab` itself, amber for a draft
-  that is written through to it. Collapsing the two into one red banner would make the
-  path shown (the draft's) contradict the banner's own lead word, which is the
-  ambiguity SPEC §9 asks this element to prevent; using a calmer treatment for the
-  draft would under-report the consequence. Amber is this app's existing `warning`
-  token (§8), already meaning "real but non-blocking concern" everywhere else.
+  Why the ambient banner is deliberately calm for the middle column, rather than keeping
+  it visually distinct from the third column's genuinely-safe state: the two signals in
+  play are *"what am I looking at"* and *"what happens if I save"*, and T34 made this
+  banner try to carry both at once, permanently, for a state most users sit in most of
+  the time. That duplicated a risk signal this app already has, placed at a better
+  moment: `DiffView`'s Review Changes step and `BackupRestoreConfirmDialog`/
+  `BackupDeleteConfirmDialog`'s confirmation dialogs each require an explicit
+  acknowledgement checkbox - gated on the same `writes_real_file` predicate described
+  below - at the one point a real write is actually about to happen, not for the entire
+  session beforehand. An always-on, uppercase, striped alarm for a state that, by itself,
+  has written nothing yet trains users to tune the banner out, which is worse for the
+  state that still deserves full alarm (`RealFile`, unchanged by this revision). So the
+  middle and third columns now share the same calm visual language; the path string
+  itself, always shown in full, is what still lets a user tell the working draft apart
+  from an isolated override by its text, same as before.
 
   The red/striped/uppercase/bold treatment for the real-file mode is still a dedicated
   design decision, not reused anywhere else in the app at this intensity - nowhere else
   should a full-width striped red banner appear, so the user's pattern-match of "this
-  specific look = I am looking at the real system file" stays reliable. The amber
-  striped variant is likewise unique to this banner.
+  specific look = I am looking at the real system file" stays reliable.
 
-  The third column is the *only* state in the app allowed to say "your real
+  The third column remains the *only* state in the app allowed to say "your real
   `/etc/fstab` is never written", because it is the only state where that is true
   (`README.md`'s Safety Notes, `CONTRIBUTING.md`'s "Safety-first contribution notes").
-  The word "sandbox" is deliberately not used in any banner copy any more: it now names
-  a *file* (`fstab.sandbox`, the persistent working draft), not a safe *mode*, and
-  reusing it as a reassurance is what made the pre-T34 copy wrong.
+  The middle column's copy must not say or imply that, and must not use the word
+  "sandbox": that word now names a *file* (`fstab.sandbox`, the persistent working
+  draft), not a safe *mode*, and reusing it as reassurance here is what made the
+  pre-T34 copy wrong in the first place - "Working draft" names the file being edited
+  without claiming anything about where a save ends up.
 - **Data need (not a backend decision)**: TargetBanner needs `{ path: String, is_real:
   bool, source: "environment" | "sandbox_default" }` from the "get active target" call
   (`TargetInfoDto`, `docs/API_CONTRACT.md` §6). `source` is not redundant with
@@ -604,14 +613,12 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
     for an isolated test target, a backup deletion is irreversible either way, so there
     is no "safe" variant to signal with a calmer color. Label `"Delete backup"` while
     idle, `"Deleting…"` + spinner while in flight.
-  - This dialog is the one place still gated on raw `is_real` rather than §2's
-    `writes_real_file`, and that is correct, not an oversight: `delete_backup` was
-    deliberately left dispatching on `is_real` alone by T34
-    (`src-tauri/src/commands.rs`'s module docs and `delete_backup_with`'s own), so on a
-    default launch it acts on the working draft's backups, and the checkbox's
-    `"...requires administrator privileges"` sentence would be false there. The
-    inconsistency is a recorded T34 gap to be closed as its own task - when it is, this
-    dialog moves onto the same derived predicate as the other two.
+  - This dialog is no longer gated on raw `is_real` - it now takes `writes_real_file`
+    (computed once in `AppShell`, same as `DiffView` and `BackupRestoreConfirmDialog`),
+    because T35 made `delete_backup` and `create_backup` dispatch on the same
+    `is_real || source == sandbox_default` predicate as a save does (§2). On a default
+    launch, backup deletion is now also `pkexec`-elevated, and the checkbox's
+    `"...requires administrator privileges"` copy is accurate for that case too.
   - On confirm: same loading → success/error handling pattern as
     BackupRestoreConfirmDialog; on success, only the backup list is reloaded (a backup
     deletion never touches the live target, so there is nothing else to refresh).

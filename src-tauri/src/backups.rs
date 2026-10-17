@@ -1,5 +1,13 @@
-//! Listing the active target's backups - automatic and manual alike - and
-//! resolving a frontend-supplied backup path against that list.
+//! Listing a file's backups - automatic and manual alike - and resolving a
+//! frontend-supplied backup path against that list.
+//!
+//! Every function here takes the file whose backups are wanted as a `&Path`
+//! parameter and has no opinion about which file that should be. Since T35
+//! that is deliberately *not* always the resolved [`crate::target`]: the
+//! commands pass the **backup-owning** path
+//! (`crate::commands`'s `backup_target_path`), which for a default launch is
+//! the real `/etc/fstab` rather than the working draft. Read "the target"
+//! below as "the file whose backups these are".
 //!
 //! ## Why a frontend-supplied path is safe here
 //!
@@ -9,7 +17,8 @@
 //! are the only exceptions, and they are safe for a structural reason rather
 //! than a careful-string-checking reason: the path they are given is never
 //! used as a path until it has been found in the list
-//! [`fstab_core::writer::list_backups`] reports for *the active target*.
+//! [`fstab_core::writer::list_backups`] reports for *the backup-owning file
+//! this session is working on*.
 //! That list is built by `fstab-core` from the backup naming scheme it owns,
 //! and only from the target's own directory. So `/etc/shadow`,
 //! `../../etc/fstab`, a backup of a *different* target sitting in the same

@@ -1,17 +1,25 @@
-//! `TargetBanner` - the always-on-top "which file does a save actually
-//! write" indicator.
+//! `TargetBanner` - the always-on-top "which file am I looking at right
+//! now" indicator.
 //!
 //! Per `docs/UI_DESIGN.md` §2, this is the single most safety-critical
 //! visual element in the app: full-width, fixed above everything else, and
-//! deliberately asymmetric in alarm level - calm only for the one launch
-//! mode that genuinely cannot touch the real `/etc/fstab`.
+//! the one state that is *not* calm (`RealFile`) deliberately stands out
+//! from the other two.
 //!
-//! Since T34 that is three states, not two (`docs/SPEC.md` §7,
+//! Since T34 this distinguishes three states, not two (`docs/SPEC.md` §7,
 //! `src-tauri/src/commands.rs::save_document_with`): a save from a default,
 //! unconfigured launch writes the real `/etc/fstab` too, even though the
-//! file being *edited* is the local working draft. A calm green "sandbox"
-//! banner for that case - which is what this component showed before T34 -
-//! would now be telling the user something false.
+//! file being *edited* is the local working draft. T35 (per the repo
+//! owner's own call, recorded in `PROJECT_PLAN.md`) reverted that state's
+//! ambient treatment back to calm: this banner reports *what you are
+//! currently looking at* (a local draft, nothing written yet), not *what
+//! a future save will do*. The Review Changes and backup-delete/restore
+//! confirmation dialogs already carry an explicit checkbox at the one
+//! moment a real write is actually about to happen
+//! (`crate::components::real_target_confirm_checkbox::confirm_disabled`,
+//! gated on the same `writes_real_file` predicate) - duplicating that as a
+//! second, permanent, high-alarm ambient banner would just be noise, not
+//! an extra safety signal.
 
 use yew::prelude::*;
 
@@ -38,13 +46,18 @@ pub struct TargetBannerProps {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BannerState {
     /// Explicit `RUSTAB_TARGET_PATH=/etc/fstab`: the file on screen is the
-    /// real one. Most alarming treatment; unchanged by T34.
+    /// real one. Most alarming treatment; unchanged since T34.
     RealFile,
-    /// Default launch: editing the local working draft, but every save
-    /// writes the real `/etc/fstab` and mirrors back into the draft.
+    /// Default launch: editing the local working draft, which every save
+    /// writes through to the real `/etc/fstab` (then mirrors back into the
+    /// draft). Calm treatment as of T35: this banner describes the *current*
+    /// state (a local draft, nothing written yet), not the consequence of a
+    /// future save - that risk is communicated explicitly, with a checkbox,
+    /// at the one moment it actually applies (Review Changes, backup
+    /// delete/restore), not as a second permanent ambient alarm here.
     DraftWritingReal,
     /// Explicit non-real `RUSTAB_TARGET_PATH`: the only launch mode that
-    /// never touches `/etc/fstab`, and the only one allowed to look calm.
+    /// never touches `/etc/fstab`.
     IsolatedOverride,
 }
 
@@ -59,9 +72,9 @@ pub fn target_banner(props: &TargetBannerProps) -> Html {
     };
 
     let base = "w-full h-10 shrink-0 flex items-center px-6 border-b-2 relative z-50";
-    // Shared by the two states a save writes `/etc/fstab` from, so the
-    // hazard texture reads as "a save from here is real" rather than as
-    // "this path is /etc/fstab" (§2).
+    // `RealFile` only, as of T35: the hazard texture now means "the path on
+    // screen *is* `/etc/fstab`," not "a save from here is real" - the latter
+    // is no longer something this ambient banner signals at all (§2).
     let hazard_stripes =
         "background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, \
          transparent 8px 16px);";
@@ -81,16 +94,12 @@ pub fn target_banner(props: &TargetBannerProps) -> Html {
         },
         BannerState::DraftWritingReal => html! {
             <div
-                class={classes!(base, "bg-amber-600", "border-amber-800", "text-white", "font-semibold")}
-                style={hazard_stripes}
-                role="alert"
+                class={classes!(base, "bg-emerald-600", "border-emerald-800", "text-white", "font-semibold")}
+                role="status"
             >
-                <span class="mr-2 text-base" aria-hidden="true">{ "⚠" }</span>
+                <span class="mr-2 text-base" aria-hidden="true">{ "🧪" }</span>
                 <span class="truncate text-sm" title={props.path.clone()}>
-                    <span class="font-bold uppercase tracking-wide">
-                        { "Saving writes the real /etc/fstab" }
-                    </span>
-                    { format!(" - editing working draft {}", props.path) }
+                    { format!("Working draft - {}", props.path) }
                 </span>
             </div>
         },

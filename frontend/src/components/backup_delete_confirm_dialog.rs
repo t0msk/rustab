@@ -17,7 +17,15 @@ use crate::components::real_target_confirm_checkbox::{
 #[derive(Properties, PartialEq)]
 pub struct BackupDeleteConfirmDialogProps {
     pub backup_timestamp: AttrValue,
-    pub is_real: bool,
+    /// "Will confirming this delete reach the real `/etc/fstab`?" - the same
+    /// `is_real || source == SandboxDefault` predicate `AppShell` computes
+    /// once and already passes to `DiffView`/`BackupRestoreConfirmDialog`
+    /// (`docs/UI_DESIGN.md` §2). Deliberately not raw `is_real`: since T35
+    /// a default, unconfigured launch's backups live beside - and are
+    /// deleted from - `/etc/`, elevated the same way an explicit
+    /// `RUSTAB_TARGET_PATH=/etc/fstab` launch's always were, so this gate
+    /// must fire for both.
+    pub writes_real_file: bool,
     pub confirm_checked: bool,
     pub on_confirm_checked_change: Callback<bool>,
     pub on_cancel: Callback<()>,
@@ -45,7 +53,8 @@ pub fn backup_delete_confirm_dialog(props: &BackupDeleteConfirmDialogProps) -> H
     };
     let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
 
-    let confirm_disabled = confirm_disabled(props.is_real, props.confirm_checked, props.saving);
+    let confirm_disabled =
+        confirm_disabled(props.writes_real_file, props.confirm_checked, props.saving);
 
     html! {
         // Intentionally no `onclick` here: deleting a backup is an
@@ -71,7 +80,7 @@ pub fn backup_delete_confirm_dialog(props: &BackupDeleteConfirmDialogProps) -> H
                         { error.clone() }
                     </div>
                 }
-                if props.is_real {
+                if props.writes_real_file {
                     <div class="mb-4">
                         <RealTargetConfirmCheckbox
                             checked={props.confirm_checked}

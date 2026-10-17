@@ -128,9 +128,11 @@ a save reach `/etc/fstab`?" - a `sandbox_default` target has
 `is_real == false` and its saves go there anyway. What it answers exactly is
 "is the resolved path itself the real file", which is what the `environment`
 branch of a save needs in order to know whether writing *that path* requires
-escalation. The UI's danger banner and confirmation checkbox
-(`docs/UI_DESIGN.md` §2, §6) therefore cannot be gated on this flag alone
-any more; every save is now a real write.
+escalation. The UI's confirmation checkboxes (`docs/UI_DESIGN.md` §2, §6, §7)
+therefore cannot be gated on this flag alone any more; every save is now a
+real write, and since T35 so is every backup create/delete. The predicate to
+use is `is_real || source == "sandbox_default"`, which the frontend calls
+`writes_real_file`.
 
 **No command accepts a target path.** The only paths the frontend may ever
 send are the `backup_path` arguments of `restore_backup` (§3.7),
@@ -311,10 +313,13 @@ On failure, **always read `target_unchanged`** before writing UI copy:
 list_backups() -> BackupInfoDto[]           (rejects with CommandErrorDto)
 ```
 
-The active target's backups, **newest first** (ready for
-`docs/UI_DESIGN.md` §7's list order), automatic and manual alike. Only files
-in the target's own directory whose names match `fstab-core`'s backup scheme
-for *that* target are reported - a backup of a different target in the same
+The backups of **the file this session's saves write**, newest first (ready
+for `docs/UI_DESIGN.md` §7's list order), automatic and manual alike. Which
+file that is follows §2/§3.5's dispatch, not the resolved target: the real
+`/etc/fstab`'s backups, in `/etc/`, for a default launch, and the named
+path's own backups for an explicit `RUSTAB_TARGET_PATH`. Only files in that
+file's own directory whose names match `fstab-core`'s backup scheme for
+*that* file are reported - a backup of a different target in the same
 directory, or a hand-made `fstab.bak`, is not.
 
 `created_unix_secs` is the backup file's mtime, i.e. when the backup was
@@ -334,19 +339,25 @@ backup is `delete_backup` (§3.10).
 
 Error kinds: `target_resolution`, `list_backups`.
 
-> **T34 gap, recorded deliberately.** This command - and `read_backup`
+> **T35 closed T34's gap here.** T34 left this command - and `read_backup`
 > (§3.9), `delete_backup` (§3.10), `create_backup` (§3.11),
 > `open_backup_location` (§3.12) and `restore_backup`'s resolution of its
-> `backup_path` - still act on the **resolved target's** directory, which on
-> a default launch is the working draft's. A default-launch *save*, however,
-> now writes `/etc/fstab` and so creates its automatic backups beside
-> `/etc/fstab` (§3.5). The backup surface therefore describes a different
-> file than the one a save writes. Re-pointing it at `/etc/fstab` is a
-> decision about what the Backups panel *means* after T34, and it would make
-> deleting and creating backups newly privileged (a `pkexec` prompt, plus the
-> same confirmation gate a save has) - a frontend change as much as a backend
-> one. It is required follow-up work, not settled here; nothing about §3.5's
-> dual write depends on it.
+> `backup_path` - acting on the **resolved target's** directory, which on a
+> default launch is the working draft's, while a default-launch *save* had
+> already moved to writing `/etc/fstab` and leaving its automatic backups
+> beside it (§3.5). The backup surface therefore described a different file
+> than the one a save wrote.
+>
+> Since T35 all six resolve the backup-owning path the same way a save
+> resolves its write target, so a **default launch's backups are
+> `/etc/fstab`'s, in `/etc/`** - exactly the files a save backs up, listed
+> where a save puts them. That is what the Backups panel is for
+> (`PROJECT_PLAN.md` §T35: a real copy of the real fstab, restorable from a
+> rescue CD). Two consequences carried into the sections below: `delete_backup`
+> and `create_backup` are now `pkexec`-elevated for a default launch too
+> (§3.10, §3.11), and the frontend gates the delete behind the same
+> `writes_real_file` confirmation checkbox a save has (`docs/UI_DESIGN.md` §2).
+> Listing and reading stayed unprivileged - `/etc/` is world-readable.
 
 ### 3.7 `restore_backup`
 
@@ -376,7 +387,11 @@ Consequences the UI should state plainly
 `backup_path` is never used as a path until it has been found in the real
 backup list, so `/etc/shadow`, `../../etc/fstab`, a different target's backup
 and a near-miss file name all fail closed with `invalid_backup` - nothing is
-read and nothing is written. (A file in the target's own directory whose name
+read and nothing is written. Since T35 the list it is matched against is
+`list_backups`'s (§3.6), i.e. the real `/etc/fstab`'s on a default launch, so
+resolution and the write finally agree about which file this session is
+working on; before T35 the resolution looked in the draft's directory while
+the write went to `/etc/fstab`. (A file in the target's own directory whose name
 matches the scheme *exactly* does count as a backup of that target, even if
 Rustab did not create it: in that directory the name is the identity. No
 privilege is gained by that - creating such a file next to `/etc/fstab`
@@ -415,10 +430,16 @@ Intended for a backup-diff view: diff this against `list_entries`'s `text` to
 show what restoring this backup would change. There is no `render_candidate`
 step involved - both sides are already raw text.
 
-**No privilege escalation, for either target kind.** `/etc/fstab` and the
-backups beside it are world-readable, which is the same reason `list_entries`
-and `list_backups` already work against the real target without a password
-prompt. This command never prompts and never writes.
+Since T35 that list is `list_backups`'s (§3.6) for every launch kind, so on a
+**default launch this resolves against the real `/etc/fstab`'s backups**, in
+`/etc/`, not the working draft's. The backup-diff view therefore diffs a
+restore point of the file a save writes against what `list_entries` shows.
+
+**No privilege escalation, for either target kind - including the default
+launch's newly `/etc/`-rooted case.** `/etc/fstab` and the backups beside it
+are world-readable, which is the same reason `list_entries` and `list_backups`
+already work against the real target without a password prompt. This command
+never prompts and never writes.
 
 Error kinds: `target_resolution`, `invalid_backup`, `read_backup`, `not_utf8`.
 A backup that is not valid UTF-8 is **refused** (`not_utf8`) rather than
@@ -432,20 +453,27 @@ error), so the UI can say the same thing in both places.
 delete_backup(backup_path: string) -> null   (rejects with DeleteBackupErrorDto)
 ```
 
-Deletes one of the active target's backups. `backup_path` must be a `path`
+Deletes one of this session's backups. `backup_path` must be a `path`
 value from a `list_backups` result for the **current** target; it is resolved
-exactly as in §3.7 and §3.9, so the same set of near misses and arbitrary
+exactly as in §3.7 and §3.9 - against §3.6's list, so the real `/etc/fstab`'s
+backups on a default launch - and the same set of near misses and arbitrary
 paths fail closed with `invalid_backup` and nothing is removed.
 
 - **It only ever removes a backup file.** The active target is never one of
   its own backups, so it can never be the file removed here - asserted in both
   halves of the implementation, including inside the elevated process.
-- **It escalates for the real target, exactly like `save` and
-  `restore_backup`.** The backups of `/etc/fstab` live beside it in
-  root-owned `/etc/` (`<target>.rustab-backup.<secs>.<nanos>`), which an
-  unprivileged process cannot unlink, so a real-target deletion goes through
-  the same single `pkexec` re-exec - see §4. A non-real target's backups live
-  in a user-owned directory and are removed in-process with no prompt.
+- **It escalates whenever this session's backups are `/etc/fstab`'s, exactly
+  like `save` and `restore_backup`.** Since T35 that means a **default launch
+  too**, not only an explicit `RUSTAB_TARGET_PATH=/etc/fstab`: a default
+  launch's backups now live in root-owned `/etc/`
+  (`<target>.rustab-backup.<secs>.<nanos>`), which an unprivileged process
+  cannot unlink, so the deletion goes through the same single `pkexec`
+  re-exec - see §4. The predicate is the same `is_real || source ==
+  sandbox_default` shape §3.5 uses and the frontend calls `writes_real_file`;
+  only an explicit override naming some *other*, user-owned file is removed
+  in-process with no prompt. The frontend's delete confirmation is gated on
+  that same predicate, so a default launch's delete now carries the explicit
+  acknowledgement checkbox too (`docs/UI_DESIGN.md` §2).
 - Resolution happens *before* the dispatch in both branches, so a
   `backup_path` that cannot work is refused without costing the user a
   password prompt. That is a courtesy only: the elevated process re-resolves
@@ -471,11 +499,14 @@ governs *pruning* (§3.6), never whether the user may remove a backup.
 create_backup() -> BackupInfoDto   (rejects with CreateBackupErrorDto)
 ```
 
-Copies the active target's **current** content to a new backup beside it and
-returns that backup as a `BackupInfoDto` - the same row shape `list_backups`
-produces, with `is_manual: true`. Takes no arguments: like every other
-command, which file it acts on is resolved server-side and never supplied by
-the frontend.
+Copies the **current** content of the file this session's saves write to a new
+backup beside it and returns that backup as a `BackupInfoDto` - the same row
+shape `list_backups` produces, with `is_manual: true`. Takes no arguments:
+like every other command, which file it acts on is resolved server-side and
+never supplied by the frontend - and since T35 that is §3.6's backup-owning
+file, so a **default launch backs up the real `/etc/fstab`**, not the working
+draft. That is the point of the button: a real copy of the real file, which a
+copy of the draft could not be.
 
 - **It never changes the target.** No temp file, no rename, no validation -
   the target is only ever *read*. That is why the rejection is a
@@ -487,11 +518,13 @@ the frontend.
   a manual backup is neither counted towards that bound nor removed to honour
   it, so a later flurry of saves cannot silently discard a snapshot the user
   deliberately took. Only `delete_backup` removes it.
-- **It escalates for the real target, exactly like `save` and
-  `delete_backup`.** A backup of `/etc/fstab` has to be created *in*
-  root-owned `/etc/`, so a real-target backup goes through the same single
-  `pkexec` re-exec - see §4. A non-real target's backups live in a user-owned
-  directory and are created in-process with no prompt.
+- **It escalates whenever this session's backups are `/etc/fstab`'s, exactly
+  like `save` and `delete_backup`.** Since T35 that includes a **default
+  launch**, not only an explicit `RUSTAB_TARGET_PATH=/etc/fstab`: a backup of
+  `/etc/fstab` has to be created *in* root-owned `/etc/`, so it goes through
+  the same single `pkexec` re-exec - see §4, and the same `is_real || source
+  == sandbox_default` predicate as §3.10. Only an explicit override naming
+  some other, user-owned file is copied in-process with no prompt.
 - **A target that does not exist yet is an error, not a no-op.** The kind is
   `target_missing`, and the UI should say what the message says: there is no
   file to back up yet, save once first. An explicit "back this up now" must
@@ -510,15 +543,21 @@ Error kinds: `target_resolution`, `target_missing`, `invalid_target`,
 open_backup_location() -> null   (rejects with CommandErrorDto)
 ```
 
-Opens the directory containing the active target in the host file manager
-(`xdg-open`). That directory is also where the target's backups live - there
-is no separate backup folder (`src-tauri/src/backups.rs`'s module docs) - so
-this is the one button the Backups panel needs to let the user browse the
-backup files directly. Takes no arguments: like every other command, which
-directory it opens is resolved server-side and never supplied by the
-frontend.
+Opens the directory holding **this session's backups** in the host file
+manager (`xdg-open`). A file's own directory is also where its backups live -
+there is no separate backup folder (`src-tauri/src/backups.rs`'s module
+docs) - so this is the one button the Backups panel needs to let the user
+browse the backup files directly. Takes no arguments: like every other
+command, which directory it opens is resolved server-side and never supplied
+by the frontend.
 
-**No privilege escalation.** `/etc/` is world-readable and
+Which directory that is follows §3.6, not the resolved target: since T35 a
+**default launch opens `/etc/`**, where the backups `list_backups` just
+listed actually are, rather than the working draft's own directory, which
+holds none of them. An explicit `RUSTAB_TARGET_PATH` opens that path's own
+directory, unchanged.
+
+**No privilege escalation, for either case.** `/etc/` is world-readable and
 world-executable, the same reasoning §3.9 already gives for reading a
 backup's content - listing a directory needs strictly less access than
 reading a file inside it. This command never prompts.
@@ -610,12 +649,16 @@ can leave `/etc/fstab` in a state nobody planned. The elevated process must
 
 ### 4.2 Three operations, one flag
 
-Three things need root. Since T34 the condition is no longer "only when
-`is_real == true`": a `write` escalates whenever the save dispatch of §3.5
-says so, which includes every **default-launch** save (where `is_real` is
-`false` and the file written is `/etc/fstab` all the same). `delete_backup`
-and `create_backup` are still gated on `is_real` alone - see §3.6's recorded
-T34 gap.
+Three things need root, and since T35 all three share **one** condition:
+`is_real || source == sandbox_default` - the same predicate §3.5's save
+dispatch encodes and the frontend calls `writes_real_file`. The condition is
+no longer "only when `is_real == true`" for any of them: a **default launch**
+has `is_real == false` and yet writes `/etc/fstab`, and (since T35) keeps its
+backups beside it, so all three operations land in root-owned `/etc/` in that
+case. T34 moved `write` onto this predicate and left `delete_backup`/
+`create_backup` on raw `is_real` as a recorded gap; T35 closed that - see
+§3.6. Only an explicit `RUSTAB_TARGET_PATH` naming some other, user-owned
+file escalates nothing.
 
 | Operation | Used by | What the elevated process does |
 | --- | --- | --- |
@@ -632,8 +675,9 @@ property stays a one-flag check.
 ### 4.3 The mechanism
 
 When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
-`delete_backup`/`create_backup` runs against a target with
-`is_real == true`:
+`delete_backup`/`create_backup` runs in a session whose backups are
+`/etc/fstab`'s per §4.2's predicate (a default launch, or an explicit
+`RUSTAB_TARGET_PATH=/etc/fstab`):
 
 1. The unprivileged side does its cheap pre-check first - purely to avoid
    asking for a password for an operation that cannot succeed. For a write
@@ -776,9 +820,12 @@ Because the path arrives as data, the elevated side refuses to act on anything
 except `/etc/fstab` (literally, or via a symlink that resolves to it), using
 the *same* comparison that decided `is_real` in the first place. Escalation
 only ever happens for the real file - a default-launch save passes the
-hardcoded `/etc/fstab`, never its own draft path (§3.5) - so this costs
-nothing in normal operation and bounds the elevated write to exactly one
-file.
+hardcoded `/etc/fstab`, never its own draft path (§3.5), and since T35 a
+default-launch `delete_backup`/`create_backup` passes the same hardcoded
+`/etc/fstab` as the backup-owning target (§3.6) - so this costs nothing in
+normal operation and bounds the elevated write to exactly one file. No
+signature change was needed for either backup helper: they already took a
+bare path and already refused anything but `/etc/fstab`.
 
 `delete_backup`'s `backup_path` arrives as data for the same reason and is
 re-checked the same way, with one extra step on top of the target check: the
@@ -930,10 +977,11 @@ trip byte-faithful.
 ```
 
 `source` is `"environment"` or `"sandbox_default"` (see §2). Read **both**
-fields since T34: `source` is what decides where a save goes (§3.5), while
-`is_real` says only whether `path` itself is the real file. A
-`"sandbox_default"` target with `is_real: false` - the shape above, the
-default launch - is still one whose saves write `/etc/fstab`.
+fields since T34: `source` is what decides where a save goes (§3.5) and,
+since T35, whose backups this session acts on (§3.6), while `is_real` says
+only whether `path` itself is the real file. A `"sandbox_default"` target
+with `is_real: false` - the shape above, the default launch - is still one
+whose saves write `/etc/fstab` and whose backups are `/etc/fstab`'s.
 
 ---
 
@@ -1122,7 +1170,7 @@ only question this error answers is "is the backup still there", and the
 | --- | --- | --- |
 | `target_resolution` | The active target could not be determined, so its backups could not be identified | yes |
 | `invalid_backup` | The requested path is not one of this target's backups, or the list could not be read. The path was never used as a path. | yes (and it may never have existed) |
-| `privilege_escalation` | Real target only: `pkexec` missing, prompt dismissed or refused, or the elevated helper gave no usable response | yes for dismissed/refused/not-launched; **unknown** when the helper exited without a usable response - the message says so, and the fix is to re-call `list_backups` |
+| `privilege_escalation` | Elevated cases only (§4.2 - a default launch, or an explicit `/etc/fstab` override): `pkexec` missing, prompt dismissed or refused, or the elevated helper gave no usable response | yes for dismissed/refused/not-launched; **unknown** when the helper exited without a usable response - the message says so, and the fix is to re-call `list_backups` |
 | `delete` | The file is a genuine backup of this target but could not be removed (permissions, I/O error, or the elevated helper refusing a target other than `/etc/fstab`) | yes |
 
 `message` is written for a user and is safe to display verbatim.
@@ -1145,7 +1193,7 @@ message say it.
 | `target_missing` | The target does not exist on disk yet (a first-ever-save state). Tell the user to save once first - this is an ordinary state, not a fault. | no |
 | `invalid_target` | The target cannot be backed up at all: it is a directory, a dangling symlink, or has no file-name component. Also how the elevated helper refuses a target other than `/etc/fstab`. | no |
 | `backup` | The copy, its `fsync`, or the read-back of the created backup failed (permissions, I/O, no space). The target itself was only ever read. | no, or it exists but could not be described - the message says which |
-| `privilege_escalation` | Real target only: `pkexec` missing, prompt dismissed or refused, or the elevated helper gave no usable response | no for dismissed/refused/not-launched; **unknown** when the helper exited without a usable response - the message says so, and the fix is to re-call `list_backups` |
+| `privilege_escalation` | Elevated cases only (§4.2 - a default launch, or an explicit `/etc/fstab` override): `pkexec` missing, prompt dismissed or refused, or the elevated helper gave no usable response | no for dismissed/refused/not-launched; **unknown** when the helper exited without a usable response - the message says so, and the fix is to re-call `list_backups` |
 
 ---
 
@@ -1164,6 +1212,11 @@ message say it.
 
 `path` is the exact string to hand back to `restore_backup` (§3.7),
 `read_backup` (§3.9) and `delete_backup` (§3.10).
+`target_path` is the file this is a backup *of* - the backup-owning file of
+§3.6, so since T35 it reads `/etc/fstab` on a default launch (as in the
+example above) rather than the working draft's path. It will therefore differ
+from `TargetInfoDto.path` (§6) in exactly that case; do not assume the two
+match.
 `created_unix_secs` may be `null` if the platform could not report an mtime.
 
 `is_manual` is `true` for a backup the user asked for with `create_backup`

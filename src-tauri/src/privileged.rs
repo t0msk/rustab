@@ -98,8 +98,14 @@
 //!
 //! Because the path arrives as data, the child refuses to act on anything
 //! except the real `/etc/fstab` (literally, or via a symlink that resolves to
-//! it). Escalation only ever happens when the unprivileged side resolved
-//! `is_real == true`, so this costs nothing in normal operation, and it means
+//! it). Escalation only ever happens when the unprivileged side is acting on
+//! the real file - which since T34/T35 means `is_real || source ==
+//! SandboxDefault`, not `is_real` alone (a default launch writes `/etc/fstab`
+//! and keeps its backups beside it, while resolving to a draft of its own;
+//! see [`crate::commands`]'s `save_document_with` and `backup_target_path`) -
+//! and in every one of those cases the path handed to this helper is the
+//! hardcoded [`target::REAL_FSTAB_PATH`], never a draft path. So this costs
+//! nothing in normal operation, and it means
 //! a bug on the unprivileged side cannot turn the elevated write into "write
 //! arbitrary content to an arbitrary root-owned path". The allowed target is a
 //! parameter of [`handle_privileged_request`] purely so tests exercise the
