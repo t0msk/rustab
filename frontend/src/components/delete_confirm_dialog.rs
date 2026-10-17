@@ -44,10 +44,10 @@ pub fn delete_confirm_dialog(props: &DeleteConfirmDialogProps) -> Html {
                 aria-modal="true"
                 aria-label="Remove entry"
             >
-                <h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-2">
+                <h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-2 break-all">
                     { format!("Remove this entry from {}?", props.mount_point) }
                 </h2>
-                <dl class="text-sm font-mono bg-slate-100 dark:bg-slate-950/40 rounded-md px-3 py-2 mb-4 space-y-1 text-slate-700 dark:text-slate-300">
+                <dl class="text-sm font-mono bg-slate-100 dark:bg-slate-950/40 rounded-md px-3 py-2 mb-4 space-y-1 text-slate-700 dark:text-slate-300 break-all">
                     <div><dt class="inline text-slate-500 dark:text-slate-400">{ "Source: " }</dt><dd class="inline">{ props.source_summary.clone() }</dd></div>
                     <div><dt class="inline text-slate-500 dark:text-slate-400">{ "Mount point: " }</dt><dd class="inline">{ props.mount_point.clone() }</dd></div>
                     <div><dt class="inline text-slate-500 dark:text-slate-400">{ "FS type: " }</dt><dd class="inline">{ props.fs_type.clone() }</dd></div>

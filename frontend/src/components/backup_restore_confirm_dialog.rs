@@ -79,7 +79,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                 <h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-2">
                     { format!("Restore the backup from {}?", props.backup_timestamp) }
                 </h2>
-                <p class="text-sm text-slate-600 dark:text-slate-300 mb-3">
+                <p class="text-sm text-slate-600 dark:text-slate-300 mb-3 break-all">
                     { format!("This will overwrite the current contents of {}.", props.target_path) }
                 </p>
                 if props.writes_real_file {
