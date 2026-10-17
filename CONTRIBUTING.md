@@ -29,9 +29,12 @@ Tauri 2 on Linux requires several system packages. See [Tauri's official Linux p
 sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf build-essential curl wget file
 ```
 
-### Optional: `pkexec` and polkit
+### `pkexec` and polkit
 
-Only needed if you plan to test against a real `/etc/fstab` (which you should almost never do - see the safety section below). On most Linux distributions, these are already installed. If not:
+Needed for almost any manual testing now (see below - as of T34, a normal
+unscoped `cargo tauri dev` run saves to the real `/etc/fstab` too, not just
+a sandbox copy). On most Linux distributions these are already installed.
+If not:
 
 ```sh
 sudo apt-get install policykit-1  # or equivalent on your distro
@@ -50,30 +53,63 @@ This automatically:
 2. Launches the Tauri window connected to that dev server.
 3. Watches Rust source files in `src-tauri/` and `crates/fstab-core/` for changes.
 
-By default, the app targets a **sandbox file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`) for safety - see "Safety-first contribution notes" below.
+**Read "Safety-first contribution notes" below before you run this and click
+Save.** Unlike before T34, an unscoped `cargo tauri dev` is no longer a safe
+default for manual testing - it now writes your real `/etc/fstab` on every
+save.
 
 ## Safety-first contribution notes
 
 Rustab edits `/etc/fstab`, a critical system file. Preventing data corruption is the project's top non-negotiable priority. Please follow these rules:
 
-### Never test against the real `/etc/fstab` unless you deliberately choose to
+### As of T34, a normal (unscoped) run writes your real `/etc/fstab` on every save
 
-- By default, in both debug and release builds, Rustab uses a **per-user sandbox file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`). This is deliberate and safe.
-- Automated tests run against synthetic sample files in `tests/fixtures/` - never against a real `/etc/fstab` or any personal copy.
-- `dev-data/` is in `.gitignore` and is for manual smoke testing only. Its contents must never be committed and must never be read by automated tests.
+Rustab's whole purpose is editing the real `/etc/fstab`, and as of T34 that
+is what it does by default: the local sandbox file
+(`$XDG_DATA_HOME/rustab/fstab.sandbox`) is now a **persistent working
+draft/session** - something that survives a restart so you don't lose
+in-progress edits, not an isolated "nothing I do here is real" mode. Every
+save (the "Review Changes" confirm step) writes the real `/etc/fstab`
+through the `pkexec`-elevated path **and** mirrors the same content into the
+sandbox file, regardless of whether `RUSTAB_TARGET_PATH` is set. There is no
+build-time or default-launch mode in which Save is "safe" against the real
+file anymore - **do not** run a plain `cargo tauri dev` and click through
+Save while developing unless you specifically mean to edit your own real
+`/etc/fstab`.
 
-### To point at `/etc/fstab` (only when you explicitly mean to)
+On launch, the sandbox is refreshed from the real `/etc/fstab` only if the
+real file has changed since Rustab last knew about it (not unconditionally
+on every launch as before T34) - so a draft you were mid-edit on survives
+restarting the app, as long as nothing external touched `/etc/fstab` in the
+meantime.
 
-The **only** way to make Rustab target the real system file is to explicitly export the environment variable before running:
+### For development/testing: always point `RUSTAB_TARGET_PATH` at a throwaway file
+
+The **only** way to develop or manually test Rustab without ever touching
+your real `/etc/fstab` is to point it at some other file entirely - a
+fixture, a scratch copy, anything that is not `/etc/fstab` itself:
 
 ```sh
-RUSTAB_TARGET_PATH=/etc/fstab cargo tauri dev
+RUSTAB_TARGET_PATH=/path/to/some/test-fstab cargo tauri dev
 ```
 
-This:
-- Turns on the UI's danger banner and extra save confirmation.
-- Activates the real `pkexec`-elevated write path.
-- **Does not** happen by accident. If you run this, you understand you are editing the actual system file.
+`dev-data/` (in `.gitignore`, for manual smoke testing only - its contents
+must never be committed and must never be read by automated tests) is a
+convenient place to keep such a file. Whatever path you point
+`RUSTAB_TARGET_PATH` at becomes the target outright, with no sandbox mirror
+involved - the T34 dual-write behavior only applies to the default,
+unscoped-launch sandbox/real pair, not to an explicit override.
+
+### Automated tests never touch the real `/etc/fstab`
+
+Automated tests run against synthetic sample files in `tests/fixtures/` and
+temp-directory copies of them - never against a real `/etc/fstab`, any
+personal copy, or `dev-data/`. This is unaffected by T34: the T30/T34 sandbox
+refresh/dual-write behavior lives entirely behind `target::active_target()`'s
+production call site and the real collaborators it injects there;
+`fstab-core` and the test suites for `target.rs`/`commands.rs` exercise the
+same logic against temp files and injected stand-ins, exactly as they did
+before.
 
 ### Use synthetic test fixtures
 

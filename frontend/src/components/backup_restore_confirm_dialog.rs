@@ -15,7 +15,14 @@ use crate::components::real_target_confirm_checkbox::{
 pub struct BackupRestoreConfirmDialogProps {
     pub backup_timestamp: AttrValue,
     pub target_path: AttrValue,
-    pub is_real: bool,
+    /// `true` when confirming here writes the real `/etc/fstab` - which,
+    /// since T34, is every launch except an explicit non-real
+    /// `RUSTAB_TARGET_PATH` override. A restore is literally a save of the
+    /// backup's content (`restore_backup` delegates to the very same
+    /// dispatch, `src-tauri/src/commands.rs`), so it is gated, colored and
+    /// labelled exactly like `DiffView`'s save, from the one value
+    /// `AppShell` derives.
+    pub writes_real_file: bool,
     pub confirm_checked: bool,
     pub on_confirm_checked_change: Callback<bool>,
     pub on_cancel: Callback<()>,
@@ -44,16 +51,17 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
     };
     let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
 
-    let confirm_disabled = confirm_disabled(props.is_real, props.confirm_checked, props.saving);
-    let confirm_classes = if props.is_real {
+    let confirm_disabled =
+        confirm_disabled(props.writes_real_file, props.confirm_checked, props.saving);
+    let confirm_classes = if props.writes_real_file {
         classes!("bg-red-600", "hover:bg-red-700", "text-white")
     } else {
         classes!("bg-sky-600", "hover:bg-sky-700", "text-white")
     };
-    let confirm_label = if props.is_real {
+    let confirm_label = if props.writes_real_file {
         "Restore to /etc/fstab"
     } else {
-        "Restore to sandbox file"
+        "Restore to test file"
     };
 
     html! {
@@ -74,6 +82,15 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                 <p class="text-sm text-slate-600 dark:text-slate-300 mb-3">
                     { format!("This will overwrite the current contents of {}.", props.target_path) }
                 </p>
+                if props.writes_real_file {
+                    // Stated explicitly because `target_path` above is the
+                    // backup's own target - the local working draft, on a
+                    // default launch - which on its own would read as if
+                    // the real file were out of scope here (§7).
+                    <p class="text-sm font-semibold text-amber-700 dark:text-amber-400 mb-3">
+                        { "Like a save, this restore writes the real /etc/fstab and will ask for administrator access." }
+                    </p>
+                }
                 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">
                     { "Restoring itself creates a fresh backup of the current file first, following the same atomic write guarantee used everywhere else - but any unsaved pending edits in this session will be discarded." }
                 </p>
@@ -82,7 +99,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
                         { error.clone() }
                     </div>
                 }
-                if props.is_real {
+                if props.writes_real_file {
                     <div class="mb-4">
                         <RealTargetConfirmCheckbox
                             checked={props.confirm_checked}

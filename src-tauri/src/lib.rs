@@ -1,6 +1,7 @@
 //! Rustab's Tauri application crate: the command layer that wires the
-//! GUI-free `fstab-core` library to a concrete target file and, when that
-//! target is the real `/etc/fstab`, to a single privilege-escalated write.
+//! GUI-free `fstab-core` library to a concrete target file and, for every
+//! write that reaches the real `/etc/fstab` - which since T34 is every save
+//! of the default target - to a single privilege-escalated write.
 //!
 //! The frozen contract every command here honours - names, argument shapes,
 //! return shapes, error shapes, the target-resolution policy, and the
@@ -10,7 +11,8 @@
 //! Module map:
 //!
 //! - [`target`]: which file is the active target (the only place that
-//!   decides).
+//!   decides), plus the working draft's conditional refresh from - and
+//!   post-save sync with - the real `/etc/fstab`.
 //! - [`dto`]: the serializable types crossing the Tauri boundary, and their
 //!   lossless conversions to and from `fstab-core`'s domain types.
 //! - [`backups`]: listing backups of the active target and resolving a
@@ -58,6 +60,7 @@ pub fn run() {
             commands::discover_devices,
             commands::open_backup_location,
             commands::open_external_link,
+            commands::open_path_in_file_manager,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

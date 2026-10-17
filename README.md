@@ -7,8 +7,8 @@ A modern, native Linux desktop GUI for viewing, editing, adding, and removing en
 Rustab combines a clean, intuitive interface with a powerful safety-first architecture:
 - **Full fstab syntax support**: UUIDs, LABELs, device paths, network sources, bind mounts, swap entries, systemd-generator options (`x-systemd.*`), comments - everything fstab and systemd support, round-tripping perfectly.
 - **Atomic writes & automatic backups**: Every save uses write-ahead semantics with mandatory `findmnt --verify` validation, atomic filesystem rename, and automatic timestamped backups.
-- **Clear target indicator & mandatory diff review**: A prominent real-vs-sandbox banner and a required diff-before-save step ensure you always know what you're changing and can review every modification before it persists.
-- **Dev sandbox by default**: Rustab defaults to a safe per-user sandbox file; pointing at the real `/etc/fstab` is an explicit, auditable choice.
+- **Mandatory diff review before every save**: see exactly what's changing in a side-by-side Summary or unified Raw view, with an explicit confirmation step, before anything reaches `/etc/fstab`.
+- **A persistent working draft, not a throwaway sandbox**: your in-progress edits live in a local draft file that survives an app restart, so you never lose work mid-edit - and every save still writes straight to your real `/etc/fstab`, which is the whole point of the app.
 
 ![Discord Badge](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white) · [GitHub Sponsors](https://github.com/sponsors/t0msk) · [X / Twitter](https://x.com/TomskDEV)
 
@@ -36,8 +36,8 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Mandatory diff review before saving** - see exactly what will change in a side-by-side Summary or unified Raw format
 - **Automatic backup management** - every save creates a timestamped backup; restore any previous state with one click
 - **Comment and blank-line preservation** - your existing comments and formatting survive edits and round-trip without loss
-- **Real vs. sandbox visibility** - a clear, unmissable banner indicates whether you're viewing the real system file or a sandbox copy
-- **Privilege escalation gating** - when editing `/etc/fstab`, an explicit confirmation checkbox and danger banner appear; sandbox edits never require elevation
+- **Persistent working draft** - your in-progress edits survive restarting the app; the draft only gets overwritten from the real file if the real file itself changed since Rustab last looked
+- **Privilege escalation gating** - an explicit confirmation checkbox and danger banner appear before every save, which always writes `/etc/fstab` through a single privilege-escalated (`pkexec`) call
 
 ## Screenshot Placeholder
 
@@ -50,10 +50,6 @@ already built. None of these are committed or scheduled - this is a wishlist, no
 promise.
 
 **Most natural next steps:**
-- **In-GUI real/sandbox target switch** - today, pointing Rustab at the real
-  `/etc/fstab` requires restarting it with `RUSTAB_TARGET_PATH` set; a toggle inside
-  the app (with the same confirmation/banner safeguards) has been the planned "next"
-  step since early in the project.
 - **Search/filter and column sorting** in the entries table - becomes genuinely useful
   once a real fstab has many entries (containers, lots of bind mounts).
 - **systemd unit preview** - show what `systemd-fstab-generator` would actually
@@ -83,9 +79,13 @@ Have an idea not listed here, or want to weigh in on priority? Open an issue - s
 
 ## Safety Notes
 
-**Sandbox-by-default behavior:**
+**Every save writes your real `/etc/fstab`:**
 
-By design, Rustab **never touches the real `/etc/fstab` by default**, even in release builds. Instead, it reads and writes a per-user sandbox file at:
+Rustab's purpose is editing the real `/etc/fstab`, and by default that is exactly what it does. It does not require any special environment variable to do so - a plain, unconfigured launch saves to `/etc/fstab`, through a single privilege-escalated (`pkexec`) helper call, with a mandatory confirmation step first (see below).
+
+**A persistent local draft, kept in sync - not a separate "safe" target:**
+
+Alongside the real file, Rustab keeps a local working draft at:
 
 ```
 $XDG_DATA_HOME/rustab/fstab.sandbox
@@ -93,17 +93,11 @@ $XDG_DATA_HOME/rustab/fstab.sandbox
 
 (falling back to `$HOME/.local/share/rustab/fstab.sandbox` if `$XDG_DATA_HOME` is not set).
 
-**Sandbox refresh on launch:**
+This draft is what you're actually editing day to day - its job is to protect your in-progress edits across an app restart or crash, not to isolate you from the real file. On launch, Rustab checks whether `/etc/fstab` has changed since it last knew about it; if so, the draft is refreshed from the real file (your unsaved draft edits are only ever discarded when the real file has genuinely moved out from under you - e.g. you or another tool edited it outside Rustab). If nothing changed, your draft - including anything not yet saved - is left exactly as you left it. Every successful save writes `/etc/fstab` first, then updates this draft to match, so the two never drift apart under normal use.
 
-So that the sandbox reflects your actual system, Rustab refreshes it from your real `/etc/fstab` **once per application launch**: the first time the target is resolved in a run, the sandbox becomes a byte-for-byte copy of `/etc/fstab`. `/etc/fstab` itself is only ever read, never written, by this. Note what this implies: starting Rustab again **discards** whatever you left in the sandbox during a previous session - it is a fresh practice ground each time, not a saved scratch file. Within one run your sandbox edits and saves are left alone (and still backed up as usual). If `/etc/fstab` cannot be read, the refresh is skipped and a harmless comment-only sandbox file is created instead.
+**Before you save, review the diff.** Every save goes through a mandatory confirmation step: a side-by-side Summary or unified Raw diff of exactly what's about to change, an explicit checkbox, and a clearly red "Write to /etc/fstab" button - there is no accidental or silent write path.
 
-To point Rustab at the real system file, set the environment variable `RUSTAB_TARGET_PATH=/etc/fstab` before starting the application. This is the **only** way to enable real-file editing. When enabled:
-
-- A red danger banner is always visible
-- An extra confirmation checkbox appears before any save
-- The save is routed through a single privilege-escalated (`pkexec`) helper call
-
-See `.env.example` in the repository root for environment variable details and an example of how to configure it for development testing.
+**For development and testing without touching the real file**, point Rustab at a throwaway file instead via `RUSTAB_TARGET_PATH` - see `CONTRIBUTING.md`'s "Safety-first contribution notes" and `.env.example` in the repository root for details. Setting `RUSTAB_TARGET_PATH` to anything other than `/etc/fstab` makes that path the target outright, with no dual-write to the real file and no draft-mirroring involved.
 
 ## Prerequisites
 
@@ -117,7 +111,7 @@ You need:
 - **Linux system dependencies** for Tauri - see [Tauri's official Linux prerequisites documentation](https://v2.tauri.app/start/prerequisites/#linux); notably:
   - `libwebkit2gtk-4.1` and build tools (on Debian/Ubuntu: `libwebkit2gtk-4.1-dev`)
   - `libssl-dev`, `libgtk-3-dev`, and others (exact packages depend on your distro)
-- **`pkexec` and polkit** - required only for writing to the real `/etc/fstab`; not needed for sandbox-target saves
+- **`pkexec` and polkit** - required for every save by default (writing to the real `/etc/fstab`); only unneeded when `RUSTAB_TARGET_PATH` points at a non-real file for development/testing (see Safety Notes)
 
 ## Building & Running
 

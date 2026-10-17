@@ -162,6 +162,19 @@ pub struct WriteOutcomeDto {
     pub validation_warnings: Vec<FindingDto>,
     pub notes: Vec<String>,
     pub elevated: bool,
+    /// The one **non-fatal warning** a *successful* save/restore can carry
+    /// (T34): the real `/etc/fstab` was written, but the local working draft
+    /// beside it could not be updated to match. `None` whenever there is
+    /// nothing to say - every save that never mirrored into a draft at all
+    /// (an explicit `RUSTAB_TARGET_PATH` target) and every one whose mirror
+    /// succeeded.
+    ///
+    /// The write that mattered succeeded, so this must never be rendered as
+    /// a failed save; it carries a ready-to-show message (the backend owns
+    /// the underlying I/O detail) and `AppShell` shows it as a non-blocking
+    /// warning toast in place of the plain success line.
+    #[serde(default)]
+    pub draft_sync_warning: Option<String>,
 }
 
 /// `WriteErrorDto` (§8), the rejection shape of `save`/`restore_backup`.

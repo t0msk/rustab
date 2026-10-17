@@ -12,8 +12,8 @@ names are given as concrete design tokens (per the brief's instruction to be
 implementable, not a mood board), not as a literal implementation.
 
 **Priority reminder (SPEC §2):** nothing in this document may obscure, shortcut, or
-let the user bypass the diff-before-save step or the real-vs-sandbox target
-indicator. Every flow below treats those two as hard gates, not optional
+let the user bypass the diff-before-save step or the "which file does a save actually
+write" target indicator. Every flow below treats those two as hard gates, not optional
 affordances.
 
 ---
@@ -84,35 +84,74 @@ the app and is designed to be *impossible to miss*, not a subtle label.
 - **Position**: full-width, fixed at the very top of the window, above the HeaderBar.
   Height 40px. Never scrolls away, never covered by any overlay (highest z-index in the
   app, drawers/modals render below it or the banner re-renders on top).
-- **Content**: an icon + bold uppercase lead word + the literal resolved file path, e.g.
-  `⚠ REAL SYSTEM FILE - /etc/fstab` or `🧪 SANDBOX - /home/user/rustab/dev-data/fstab.sandbox`.
+- **Content**: an icon + bold lead clause + the literal resolved file path, e.g.
+  `⚠ REAL SYSTEM FILE - /etc/fstab` or
+  `⚠ SAVING WRITES THE REAL /ETC/FSTAB - editing working draft /home/user/.local/share/rustab/fstab.sandbox`.
   The full path is always shown in full (truncated with an ellipsis + tooltip only if
   genuinely too long for the window), never abbreviated to just a filename - ambiguity
   between two similarly-named files is exactly what this banner exists to prevent.
-- **Two states, deliberately asymmetric in alarm level** - this is the explicit
-  requirement that real-target mode must look more "alarming" than sandbox mode, not
-  just differently colored:
+- **Three states since T34, deliberately asymmetric in alarm level** - the explicit
+  requirement is that a mode whose Save reaches the real system file must look more
+  "alarming" than one whose Save does not, not just differently colored. Before T34
+  that was two states, because the only way to reach `/etc/fstab` was to *be* pointed
+  at `/etc/fstab`. T34 broke that equivalence: a default, unconfigured launch edits a
+  local working draft but every save from it writes the real `/etc/fstab` and then
+  mirrors back into the draft (`docs/SPEC.md` §7,
+  `src-tauri/src/commands.rs::save_document_with`). The old green "Sandbox target"
+  banner is now the single most misleading thing this app could show - most users see
+  that state most of the time - so it is gone, replaced by the middle column below:
 
-  | | **Real target** | **Sandbox / dev target** |
-  |---|---|---|
-  | Background | `bg-red-600` (`#dc2626`) | `bg-emerald-600` (`#059669`) |
-  | Text | `text-white`, `font-bold`, `uppercase`, `tracking-wide` | `text-white`, `font-semibold`, normal case |
-  | Icon | triangle-exclamation (hazard), filled | flask/beaker (sandbox/test), outline |
-  | Extra texture | subtle 8px diagonal hazard-stripe pattern at ~8% white opacity across the banner background (`repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, transparent 8px 16px)`) | none - flat color, calm |
-  | Border | `border-b-2 border-red-800` | `border-b-2 border-emerald-800` |
-  | Copy | `"REAL SYSTEM FILE - {path}"` | `"Sandbox target - {path}"` |
+  | | **Real file** (`is_real`) | **Working draft, saves through to the real file** (`source == SandboxDefault`) | **Isolated test target** (`source == Environment`, not real) |
+  |---|---|---|---|
+  | When | explicit `RUSTAB_TARGET_PATH=/etc/fstab` | the default launch, no env var set | explicit `RUSTAB_TARGET_PATH=/some/other/file` |
+  | Does Save write `/etc/fstab`? | yes | **yes** (then updates the draft to match) | no, never |
+  | Background | `bg-red-600` (`#dc2626`) | `bg-amber-600` (`#d97706`) | `bg-emerald-600` (`#059669`) |
+  | Text | `text-white`, `font-bold`, `uppercase`, `tracking-wide` | `text-white`, `font-semibold`; the lead clause only is `font-bold uppercase tracking-wide` | `text-white`, `font-semibold`, normal case |
+  | Icon | triangle-exclamation (hazard), filled | triangle-exclamation (hazard), filled - deliberately the *same* glyph | flask/beaker (sandbox/test), outline |
+  | Extra texture | subtle 8px diagonal hazard-stripe pattern at ~8% white opacity across the banner background (`repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 8px, transparent 8px 16px)`) | the same hazard stripes | none - flat color, calm |
+  | Border | `border-b-2 border-red-800` | `border-b-2 border-amber-800` | `border-b-2 border-emerald-800` |
+  | Copy | `"REAL SYSTEM FILE - {path}"` | `"Saving writes the real /etc/fstab"` + `" - editing working draft {path}"` | `"Test target - {path} · your real /etc/fstab is never written"` |
+  | ARIA role | `alert` | `alert` | `status` |
 
-  The red/striped/uppercase/bold treatment for real-target mode is a dedicated design
-  decision, not reused anywhere else in the app at this intensity - it exists only here
-  and nowhere else should a full-width striped red banner appear, so the user's
-  pattern-match of "this specific look = I am touching the real system" stays reliable.
+  Why this split, rather than making the default case identical to the real-file one:
+  the two signals the banner carries are *"what am I looking at"* and *"what happens if
+  I save"*, and T34 is exactly the case where they diverge. So they are encoded
+  separately: the **hazard stripes + ⚠ glyph** mean "a save from here lands in
+  `/etc/fstab`" (shared by the first two columns, and absent from the third), while the
+  **hue** says which file is on screen - red for `/etc/fstab` itself, amber for a draft
+  that is written through to it. Collapsing the two into one red banner would make the
+  path shown (the draft's) contradict the banner's own lead word, which is the
+  ambiguity SPEC §9 asks this element to prevent; using a calmer treatment for the
+  draft would under-report the consequence. Amber is this app's existing `warning`
+  token (§8), already meaning "real but non-blocking concern" everywhere else.
+
+  The red/striped/uppercase/bold treatment for the real-file mode is still a dedicated
+  design decision, not reused anywhere else in the app at this intensity - nowhere else
+  should a full-width striped red banner appear, so the user's pattern-match of "this
+  specific look = I am looking at the real system file" stays reliable. The amber
+  striped variant is likewise unique to this banner.
+
+  The third column is the *only* state in the app allowed to say "your real
+  `/etc/fstab` is never written", because it is the only state where that is true
+  (`README.md`'s Safety Notes, `CONTRIBUTING.md`'s "Safety-first contribution notes").
+  The word "sandbox" is deliberately not used in any banner copy any more: it now names
+  a *file* (`fstab.sandbox`, the persistent working draft), not a safe *mode*, and
+  reusing it as a reassurance is what made the pre-T34 copy wrong.
 - **Data need (not a backend decision)**: TargetBanner needs `{ path: String, is_real:
-  bool }` from whatever "get active target" call T8 exposes. It re-renders live if that
-  value ever changes during the session (e.g. a future settings change) - never cached
-  at startup only.
-- The same `is_real` flag is reused (not re-invented) to color-code the confirm button
-  in DiffView and BackupRestoreConfirmDialog (§6, §7), so the "danger" signal is
-  consistent end-to-end through the save flow, not just on the banner.
+  bool, source: "environment" | "sandbox_default" }` from the "get active target" call
+  (`TargetInfoDto`, `docs/API_CONTRACT.md` §6). `source` is not redundant with
+  `is_real`: the two non-real cases above are opposites in consequence and `is_real`
+  alone cannot tell them apart. It re-renders live if those values ever change during
+  the session (e.g. a future settings change) - never cached at startup only.
+- The derived predicate **`writes_real_file = is_real || source == SandboxDefault`**
+  ("will confirming write the real `/etc/fstab`?") is computed **once**, in `AppShell`,
+  and is what color-codes and gates the confirm button in DiffView and
+  BackupRestoreConfirmDialog (§6, §7) - so the "danger" signal is consistent end-to-end
+  through the save flow, not just on the banner, and the formula cannot drift between
+  call sites. Before T34 this role was played by raw `is_real`; anything still gating on
+  `is_real` alone would silently skip the confirmation checkbox on the default launch,
+  which is the one regression T34 could not ship with
+  (`PROJECT_PLAN.md`'s T34 non-negotiables).
 
 ---
 
@@ -395,10 +434,21 @@ reason of not silently discarding unsaved work on a stray click.
 
 **Contents, top to bottom:**
 
-1. Header: `"Review changes before saving"` + a small inline reuse of the TargetBanner
-   color coding (a compact badge, same red/emerald logic from §2) showing which file
-   will actually be written - the danger signal must carry through to this final
-   screen, not just live on the top banner.
+1. Header: `"Review changes before saving"`, the resolved target path, and a small
+   inline reuse of the TargetBanner color coding (a compact badge, the same
+   three-state red/amber/emerald logic from §2) showing **which file will actually be
+   written** - the danger signal must carry through to this final screen, not just
+   live on the top banner. The badge describes the *destination*, which since T34 is
+   not always the path printed next to it:
+
+   | State (§2) | Badge | Why |
+   |---|---|---|
+   | Real file (`is_real`) | `REAL`, `bg-red-600` | the path beside it already is `/etc/fstab` |
+   | Working draft (`SandboxDefault`) | `WRITES /etc/fstab`, `bg-amber-600` | names the destination explicitly, *because* it differs from the draft path shown beside it - a bare `REAL` here would read as "this path is the real file" |
+   | Isolated test target | `TEST FILE`, `bg-emerald-600` | the only state where the save stops at the path shown |
+
+   The pre-T34 `SANDBOX` badge is gone for the same reason the green banner is: it
+   told the user the save was contained when it no longer is.
 2. Two tabs, **Summary** (default) and **Raw diff** - both are required, satisfying
    both halves of the brief ("structured per-field change list" and "exact textual
    diff"):
@@ -422,19 +472,44 @@ reason of not silently discarding unsaved work on a stray click.
 3. Footer action bar:
    - `Cancel` (secondary) - closes the modal, pending changes remain staged (nothing is
      lost, nothing is written).
-   - Confirm button, styled by the same `is_real` flag as TargetBanner:
-     - **Sandbox**: `bg-sky-600 hover:bg-sky-700 text-white`, label `"Save changes to
-       sandbox file"`, enabled as soon as the modal opens.
-     - **Real target**: `bg-red-600 hover:bg-red-700 text-white`, label `"Write to
-       /etc/fstab"`, **disabled until** an explicit checkbox directly above the footer
-       is checked: `"I understand this modifies my system's real fstab and takes
-       effect on next mount/boot."` - this extra friction step exists only for
-       real-target saves, mirroring the asymmetric alarm treatment from §2.
+   - Confirm button, styled and gated by the single `writes_real_file` predicate from
+     §2 - **two** states, not the badge's three, deliberately: a button's appearance
+     should describe the consequence of pressing it, and pressing it writes
+     `/etc/fstab` in both of the first two states above. Whether the file on screen is
+     `/etc/fstab` itself or the draft it is saved through is a *"what am I looking at"*
+     distinction, which the banner and the badge already carry.
+     - **Isolated test target** (`writes_real_file == false`): `bg-sky-600
+       hover:bg-sky-700 text-white`, label `"Save changes to test file"`, enabled as
+       soon as the modal opens.
+     - **Any save that reaches `/etc/fstab`** (`writes_real_file == true`, i.e. an
+       explicit real target *or* the default working-draft launch): `bg-red-600
+       hover:bg-red-700 text-white`, label `"Write to /etc/fstab"`, **disabled until**
+       an explicit checkbox directly above the footer is checked: `"I understand this
+       modifies my system's real fstab and takes effect on next mount/boot."` - that
+       sentence is accurate in both cases, since both do modify the real fstab. The
+       checkbox is not rendered at all in the isolated-target state, where it would be
+       false. This extra friction step is what §2's asymmetric alarm treatment buys
+       the user at the point of no return, and `confirm_disabled` in
+       `real_target_confirm_checkbox.rs` is the one implementation of the rule, shared
+       with §7's restore dialog.
 4. On confirm: button becomes a loading state (`"Writing changes…"` + spinner). On
-   success: toast/StatusMessage success notice, modal closes, EntriesTable refreshes
-   from the new saved state. On failure: the error is shown **inside the still-open
-   modal** (not only as a transient toast), since a failed save is safety-relevant and
-   the user must not lose the context of what failed; `Cancel`/retry remain available.
+   success: toast/StatusMessage success notice (`"Changes saved."`), modal closes,
+   EntriesTable refreshes from the new saved state. On failure: the error is shown
+   **inside the still-open modal** (not only as a transient toast), since a failed save
+   is safety-relevant and the user must not lose the context of what failed;
+   `Cancel`/retry remain available.
+5. One in-between outcome, T34-specific: a save can succeed *and* carry
+   `draft_sync_warning` (`docs/API_CONTRACT.md` §8) - `/etc/fstab` was written, but the
+   local working draft could not be updated to match it. The modal still closes (the
+   write the user asked for did happen), and the backend's ready-to-show message
+   replaces the plain success line in the toast, as `StatusToast`'s **`Warning`** kind:
+   amber + `⚠`, wrapped at `max-w-md` since it is a sentence rather than a label. It is
+   deliberately *not* the `Error` kind - a red `✕` on a save that actually wrote
+   `/etc/fstab` would be read as "my fstab write failed", prompting a retry or a panic
+   over a cosmetic, self-repairing problem (the next launch refreshes the draft from the
+   real file on its own) - and deliberately not silent either, per `PROJECT_PLAN.md`'s
+   T34 non-negotiable "a toast, not a silent swallow". The same handling applies to
+   `restore_backup` (§7), which goes through the identical save dispatch.
 
 ---
 
@@ -498,10 +573,19 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
     `"Restoring itself creates a fresh backup of the current file first, following the
     same atomic write guarantee used everywhere else - but any unsaved pending edits in
     this session will be discarded."`
-  - Confirm button follows the identical real/sandbox color + checkbox-gate pattern
-    from §6 (red + required understanding checkbox for a real target, plain sky blue
-    with no extra gate for sandbox).
-  - On confirm: same loading → success/error handling pattern as DiffView's save.
+  - When `writes_real_file` (§2), one extra line sits between those two, in the
+    `warning` amber: `"Like a save, this restore writes the real /etc/fstab and will
+    ask for administrator access."` It is there because `{target path}` above is the
+    *backup's* target - the local working draft, on a default launch - which on its own
+    would read as if the real file were out of scope here. `restore_backup` delegates to
+    the very same save dispatch (`src-tauri/src/commands.rs`), so it has exactly the
+    three cases §2 lists, not a safer set of its own.
+  - Confirm button follows the identical `writes_real_file` color + checkbox-gate
+    pattern from §6 (red + required understanding checkbox for any restore that reaches
+    `/etc/fstab`, including the default working-draft launch; plain sky blue with no
+    extra gate and the label `"Restore to test file"` only for an isolated test target).
+  - On confirm: same loading → success/error/`draft_sync_warning` handling pattern as
+    DiffView's save (§6 points 4-5).
 - **BackupDeleteConfirmDialog**: centered modal, triggered by a row's `Delete` button.
   Deliberately **non-dismissible by backdrop click**, the same as
   `BackupRestoreConfirmDialog` and for the same reason: unlike `DeleteConfirmDialog`'s
@@ -517,9 +601,17 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
     deletes a backup of /etc/fstab and requires administrator privileges."`
   - The confirm button is styled destructively (`bg-red-600 hover:bg-red-700
     text-white`) **regardless of `is_real`** - unlike restore/save, which are sky-blue
-    for a sandbox target, a backup deletion is irreversible either way, so there is no
-    "safe" variant to signal with a calmer color. Label `"Delete backup"` while idle,
-    `"Deleting…"` + spinner while in flight.
+    for an isolated test target, a backup deletion is irreversible either way, so there
+    is no "safe" variant to signal with a calmer color. Label `"Delete backup"` while
+    idle, `"Deleting…"` + spinner while in flight.
+  - This dialog is the one place still gated on raw `is_real` rather than §2's
+    `writes_real_file`, and that is correct, not an oversight: `delete_backup` was
+    deliberately left dispatching on `is_real` alone by T34
+    (`src-tauri/src/commands.rs`'s module docs and `delete_backup_with`'s own), so on a
+    default launch it acts on the working draft's backups, and the checkbox's
+    `"...requires administrator privileges"` sentence would be false there. The
+    inconsistency is a recorded T34 gap to be closed as its own task - when it is, this
+    dialog moves onto the same derived predicate as the other two.
   - On confirm: same loading → success/error handling pattern as
     BackupRestoreConfirmDialog; on success, only the backup list is reloaded (a backup
     deletion never touches the live target, so there is nothing else to refresh).
@@ -571,9 +663,10 @@ decision for them, not something to infer from this spec.
 | `focus-ring` | `sky-500` `#0ea5e9` | `sky-500` `#0ea5e9` | `:focus-visible` ring, 2px + 2px offset |
 | `danger` | `red-600` `#dc2626` | `red-600` `#dc2626` | destructive buttons (Delete, real-target Write/Restore) |
 | `danger-hover` | `red-700` `#b91c1c` | `red-500` `#ef4444` | hover of the above |
-| `target-real` | `red-600` `#dc2626` bg / `red-800` `#991b1b` border | same | TargetBanner real mode only (§2) |
-| `target-sandbox` | `emerald-600` `#059669` bg / `emerald-800` `#065f46` border | same | TargetBanner sandbox mode only (§2) |
-| `warning` | `amber-500`/`amber-600` | `amber-400` | unparsed-row accents, non-blocking validation |
+| `target-real` | `red-600` `#dc2626` bg / `red-800` `#991b1b` border | same | TargetBanner real-file mode only (§2) |
+| `target-draft` | `amber-600` `#d97706` bg / `amber-800` `#92400e` border | same | TargetBanner working-draft mode, and the matching DiffView badge (§2, T34) |
+| `target-isolated` | `emerald-600` `#059669` bg / `emerald-800` `#065f46` border | same | TargetBanner isolated-test-target mode only (§2) |
+| `warning` | `amber-500`/`amber-600` | `amber-400` | unparsed-row accents, non-blocking validation, the working-draft banner/badge (§2), `StatusToast`'s `Warning` kind (§6 point 5) |
 | `success` | `emerald-600` | `emerald-400` | save/restore success state |
 
 Reused consistently: `danger` and `target-real` are deliberately the **same** red
@@ -673,7 +766,7 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 (diff + backup + target indicator wiring):
 
 1. `AppShell` - top-level layout: banner + header + tab content area
-2. `TargetBanner` - real-vs-sandbox indicator (§2)
+2. `TargetBanner` - three-state "which file does a save write" indicator (§2)
 3. `HeaderBar` - app title, `Entries`/`Backups` tab nav, contextual action button
    (`Add Entry` on the `Entries` tab, `Create backup` + `Open backup location` on the
    `Backups` tab, T26), plus an always-visible `About` trigger (both tabs, T26)
@@ -701,12 +794,14 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 21. `DiffView` - the pending-changes/diff confirmation modal (§6)
 22. `DiffSummaryList` - structured per-field Added/Modified/Removed list (§6)
 23. `DiffRawText` - unified-diff monospace rendering (§6)
-24. `RealTargetConfirmCheckbox` - the extra "I understand..." gate, reused by DiffView
-    and BackupRestoreConfirmDialog
+24. `RealTargetConfirmCheckbox` - the extra "I understand..." gate for any write that
+    reaches the real `/etc/fstab` (§2's `writes_real_file`, not raw `is_real`), reused
+    by DiffView and BackupRestoreConfirmDialog
 25. `BackupPanel` - backup list view (§7)
 26. `BackupListItem` - one backup's row + Restore/View diff/Delete buttons
 27. `BackupRestoreConfirmDialog` - restore confirmation modal (§7)
-28. `StatusToast` - transient success/error notification
+28. `StatusToast` - transient success/warning/error notification (`Warning` carries a
+    successful save's `draft_sync_warning`, §6 point 5)
 29. `LoadingSpinner` - inline loading indicator (buttons, panel loads)
 30. `BackupDeleteConfirmDialog` - backup delete confirmation modal (§7)
 31. `BackupDiffView` - read-only backup-vs-current-target diff overlay (§7)
@@ -789,6 +884,7 @@ file actually contain right now."
 - [x] Inline validation feedback (duplicate mount point, mount point missing on disk,
   malformed UUID) before save is allowed, and it blocks save - §5
 - [x] Clear pending-changes/diff view before committing a save - §6
-- [x] Visible, unambiguous indicator of real `/etc/fstab` vs. dev/sandbox target - §2
+- [x] Visible, unambiguous indicator of which file a save writes - real `/etc/fstab`,
+  the working draft that is saved through to it, or an isolated test target - §2
 - [x] Backup/restore UI: list of recent auto-backups with restore action - §7
 - [x] Tailwind styling, dark-mode friendly, modern/clean - §8

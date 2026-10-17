@@ -12,29 +12,56 @@
 //! ## The policy
 //!
 //! 1. If `RUSTAB_TARGET_PATH` is set to a non-empty value, that is the
-//!    target, verbatim, in both debug and release builds. This is the only
-//!    way to point Rustab at the real `/etc/fstab`.
-//! 2. Otherwise the target is a per-user sandbox file,
+//!    target, verbatim, in both debug and release builds. Such a target is
+//!    written **outright**: whatever path it names is the only file a save
+//!    touches (elevated if it happens to *be* `/etc/fstab`, in-process
+//!    otherwise), with no second write anywhere - see
+//!    `crate::commands::save_document_with`. This is the one way to run
+//!    Rustab without it writing the real `/etc/fstab`.
+//! 2. Otherwise the target is the per-user **working draft**,
 //!    `$XDG_DATA_HOME/rustab/fstab.sandbox` (falling back to
 //!    `$HOME/.local/share/rustab/fstab.sandbox`, and to a temp-dir path if
-//!    neither variable is set). The first time it is resolved in a given
-//!    process it is refreshed from the real `/etc/fstab` - a literal
-//!    byte-for-byte copy - so every launch starts from current reality; if
-//!    `/etc/fstab` cannot be read it falls back to a harmless comment-only
-//!    seed, so a fresh checkout still has something safe and valid to load.
+//!    neither variable is set). This is the file the GUI reads and edits, but
+//!    since T34 it is *not* where a save ends up: a save writes the real
+//!    `/etc/fstab` and the draft is then updated to match it. The draft's
+//!    purpose is to keep in-progress, not-yet-saved edits across a restart or
+//!    crash (`docs/SPEC.md` §7), not to withhold writes from the real file.
+//!    If `/etc/fstab` cannot be read at all, a missing draft falls back to a
+//!    harmless comment-only seed, so a fresh checkout still has something
+//!    safe and valid to load.
 //!
-//! ## Sandbox refresh
+//! ## Draft refresh: conditional, not once-per-launch (T34)
 //!
-//! The sandbox is a practice ground, not a persisted fixture. It is
-//! re-synced from `/etc/fstab` **once per process launch** (see
-//! [`SandboxRefreshState`]), which deliberately discards whatever the
-//! previous session left there. Within one run, every later resolution -
-//! and [`active_target`] is called fresh by every command - leaves the file
-//! completely alone, so the user's own edits and saves survive the session
-//! that made them. Because two commands resolve the target concurrently on
-//! every launch, [`SandboxRefreshState`] is a completion *barrier*: the
-//! resolutions that do not perform the refresh wait for the one that does,
-//! so no command can read the target while the refresh is still in flight.
+//! The draft is re-synced from `/etc/fstab` at most **once per process
+//! launch** (see [`SandboxRefreshState`]), and only **if the real file's
+//! current content differs from the content Rustab last knew it to have**.
+//! "Last knew" is persisted in a marker file beside the draft (see
+//! [`last_known_real_marker`]) and is updated at both events that mean
+//! "Rustab now knows this is reality": a refresh, and a successful save of
+//! the real file ([`sync_sandbox_after_save`]).
+//!
+//! That conditionality is the whole point: refreshing unconditionally - what
+//! this module did before T34 - would discard an unsaved draft on every
+//! single restart, which is exactly the work the draft exists to protect. So:
+//!
+//! - real content == marker content, and the draft file exists: do nothing at
+//!   all, the draft (unsaved edits included) is left byte-for-byte as it was.
+//! - real content != marker content, or there is no marker (fresh install, or
+//!   a pre-T34 draft), or the draft file is gone: copy `/etc/fstab` over the
+//!   draft and record the copied bytes in the marker. A missing marker is
+//!   deliberately treated like a differing one - the same shape as the older
+//!   "seed if missing" fallback, and the safe direction to be wrong in (the
+//!   draft is replaced by current reality rather than kept stale forever).
+//! - `/etc/fstab` unreadable: nothing is compared; a missing draft is seeded,
+//!   an existing one is left alone.
+//!
+//! Within one run, every later resolution - and [`active_target`] is called
+//! fresh by every command - skips the whole check, so the user's own edits
+//! and saves survive the session that made them. Because two commands
+//! resolve the target concurrently on every launch,
+//! [`SandboxRefreshState`] is a completion *barrier*: the resolutions that do
+//! not perform the one-time work wait for the one that does, so no command
+//! can read the draft while a refresh is still in flight.
 //!
 //! The refresh is a plain copy of bytes, never a parse and re-serialize
 //! round trip: a copy cannot drift from its source, a round trip can
@@ -42,20 +69,16 @@
 //! temp-file-plus-`rename` swap `fstab_core::writer` uses for real saves, so
 //! that any reader outside this process's barrier - a second Rustab launching
 //! at the same moment, say - still sees whole content rather than a
-//! mid-truncate file (see [`refresh_sandbox_from`]). It is also strictly
+//! mid-truncate file (see [`publish_bytes`]). It is also strictly
 //! best-effort - an unreadable `/etc/fstab` (missing, or no permission)
 //! leaves target resolution working on the seed/previous content rather than
 //! failing, the same soft-failure stance this project takes towards absent
 //! `lsblk`/`findmnt`.
 //!
-//! Rule 2 deliberately applies to **release builds too**. `docs/SPEC.md` §7
-//! only mandates the sandbox default for debug builds, but defaulting a
-//! release build to `/etc/fstab` would mean the app's very first screen is
-//! already pointed at the file whose corruption §2.1 calls the one
-//! unacceptable outcome - before the user has agreed to anything. Making
-//! "edit the real file" an explicit, deliberate act (setting the env var)
-//! costs an informed user one line and protects an uninformed one from the
-//! worst case. See `docs/API_CONTRACT.md` for the full reasoning and for the
+//! Rule 2 deliberately applies to **release builds too**, and the real file
+//! is still only ever *read* here, never written: the elevated writer
+//! (`crate::privileged`) is the one and only thing that writes `/etc/fstab`.
+//! See `docs/API_CONTRACT.md` §2 for the full reasoning and for the
 //! follow-up UX decision this implies (an in-GUI target switch is a future
 //! task, not something this layer invents).
 //!
@@ -68,6 +91,13 @@
 //! with the env var naming the destination) - in both directions the answer
 //! has to be "yes, this is the real thing", because the banner driven by
 //! this flag is the user's only warning (`docs/UI_DESIGN.md` §2).
+//!
+//! Since T34 the flag no longer answers "does a save reach `/etc/fstab`?" -
+//! a [`TargetSource::SandboxDefault`] target has `is_real == false` and its
+//! saves go to the real file anyway. What it still answers exactly is "is the
+//! path in [`ActiveTarget::path`] itself the real file?", which is what the
+//! [`TargetSource::Environment`] branch of a save needs in order to know
+//! whether writing *that path* requires elevation.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -87,37 +117,57 @@ pub const REAL_FSTAB_PATH: &str = "/etc/fstab";
 /// Directory, relative to the user's data dir, holding the sandbox target.
 const SANDBOX_DIR_NAME: &str = "rustab";
 
-/// File name of the default sandbox target.
+/// File name of the default sandbox target - the working draft.
 const SANDBOX_FILE_NAME: &str = "fstab.sandbox";
+
+/// Suffix of the marker file that records the real `/etc/fstab`'s content as
+/// of the last time Rustab synced with it (see [`last_known_real_marker`]).
+///
+/// Deliberately distinct from every other naming scheme in play around these
+/// files: `fstab_core::writer`'s backup grammar
+/// (`<name>.rustab-backup.<secs>.<nanos>`, which `list_backups` scans for and
+/// `prune_backups` deletes from), that module's save temp file
+/// (`.<name>.rustab.tmp.<pid>`) and this module's publish temp file
+/// (`.<name>.rustab-refresh.tmp.<pid>`). A marker can therefore never be
+/// mistaken for a backup the user might restore or Rustab might prune.
+const LAST_KNOWN_REAL_SUFFIX: &str = ".rustab-lastknown";
 
 /// Content the sandbox file falls back to when the real `/etc/fstab` could
 /// not be read: comments only, so it parses cleanly, validates without a
 /// single finding, and mounts nothing if a user ever copied it somewhere real
 /// by accident.
 const SANDBOX_SEED: &str = "\
-# Rustab development sandbox - NOT your real /etc/fstab.
+# Rustab working draft - this file is NOT your /etc/fstab.
 #
-# Rustab normally refreshes this sandbox from your real /etc/fstab once per
-# launch, so it starts out as an exact copy of the real file. You are seeing
-# this blank template instead because /etc/fstab could not be read the last
-# time Rustab started - it is missing, or not readable by this user.
+# Rustab normally fills this draft with a copy of your real /etc/fstab. You
+# are seeing this blank template instead because /etc/fstab could not be read
+# the last time Rustab started - it is missing, or not readable by this user.
 #
-# Editing and saving here never touches the real /etc/fstab. To point Rustab
-# at the real file instead, start it with:
+# This draft is where your in-progress edits live between app restarts.
+# Saving in Rustab writes your real /etc/fstab (through a single pkexec
+# prompt) and then updates this draft to match. To edit some other file
+# instead - and leave the real /etc/fstab completely untouched - start Rustab
+# with:
 #
-#     RUSTAB_TARGET_PATH=/etc/fstab rustab
+#     RUSTAB_TARGET_PATH=/path/to/some/test-fstab rustab
 #
 # Add entries below in normal fstab syntax, e.g.:
 # UUID=00000000-0000-0000-0000-000000000000 /mnt/example ext4 noauto 0 2
 ";
 
-/// Completion barrier for the once-per-process sandbox refresh: it both
-/// elects the one resolution that refreshes the file from the real
-/// `/etc/fstab` *and* holds every concurrent resolution back until that
-/// refresh has actually finished.
+/// Completion barrier for the once-per-process draft sync: it both elects the
+/// one resolution that performs the sync *and* holds every concurrent
+/// resolution back until that sync has actually finished.
+///
+/// "Sync" rather than "refresh" since T34: the elected resolution compares the
+/// real `/etc/fstab` against the marker holding what Rustab last knew its
+/// content to be and *then decides* whether a refresh is needed at all (see
+/// [`refresh_sandbox_if_real_changed`]). The mechanism below is unchanged -
+/// it is the T33 race fix and is deliberately kept exactly as it was; only
+/// what the one-time closure decides to do changed.
 ///
 /// Exactly one instance lives for the lifetime of the app process (inside
-/// [`active_target`]), which is what makes "refresh once per launch" mean
+/// [`active_target`]), which is what makes "at most one sync per launch" mean
 /// what it says. It is a *parameter* of [`resolve`] rather than a static
 /// [`resolve`] reads itself, for the same reason `env_value` and
 /// `sandbox_dir` are: a module-level barrier would be shared by every test in
@@ -264,11 +314,12 @@ impl std::error::Error for TargetError {
 /// Resolves the active target from the process environment, creating,
 /// refreshing or seeding the sandbox file if that is what the policy selects.
 ///
-/// The first call in a process refreshes the sandbox from the real
-/// `/etc/fstab`; later calls leave it alone (see the module docs). The
-/// refresh source is deliberately the hardcoded [`REAL_FSTAB_PATH`] and not
-/// configurable - [`TARGET_PATH_ENV`] chooses the *target*, never where a
-/// sandbox is seeded from.
+/// The first call in a process refreshes the draft from the real
+/// `/etc/fstab` *if the real file has changed since Rustab last looked*;
+/// later calls in the same process do nothing to it at all (see the module
+/// docs). The refresh source is deliberately the hardcoded
+/// [`REAL_FSTAB_PATH`] and not configurable - [`TARGET_PATH_ENV`] chooses the
+/// *target*, never where a draft is seeded from.
 ///
 /// # Errors
 ///
@@ -278,8 +329,8 @@ impl std::error::Error for TargetError {
 /// and [`fstab_core::writer::write_document`] handles it.
 pub fn active_target() -> Result<ActiveTarget, TargetError> {
     /// The one real process-lifetime barrier: whichever command resolves the
-    /// target first does the per-launch sandbox refresh, and the others wait
-    /// for it.
+    /// target first does the per-launch draft sync (refresh-if-changed), and
+    /// the others wait for it.
     static SANDBOX_REFRESH_STATE: SandboxRefreshState = SandboxRefreshState::new();
 
     resolve(
@@ -371,22 +422,28 @@ pub(crate) fn is_same_file(path: &Path, other: &Path) -> bool {
     }
 }
 
-/// Prepares the sandbox file (and its parent directory) for use.
+/// Prepares the sandbox file - the working draft - (and its parent directory)
+/// for use.
 ///
-/// The first resolution of a process replaces the sandbox with a
-/// byte-for-byte copy of `real_fstab_path`, deliberately discarding whatever
-/// a previous session left there; if that copy could not be made it falls
-/// back to the long-standing behaviour instead - create the file with
-/// [`SANDBOX_SEED`] if it does not exist yet, and leave a file that does
-/// exist completely alone, including an empty one.
+/// The first resolution of a process performs the one-time draft sync: it
+/// replaces the draft with a byte-for-byte copy of `real_fstab_path` **only
+/// if** that file's content differs from the marker recording what Rustab
+/// last knew it to be (or there is no marker, or the draft file is gone) -
+/// see [`refresh_sandbox_if_real_changed`] and the module docs. If the two
+/// already agree, the draft is left completely alone, unsaved edits included;
+/// that is the T34 behaviour change, and the reason the draft can be trusted
+/// to survive a restart. If the real file could not be read or the copy could
+/// not be made, it falls back to the long-standing behaviour instead - create
+/// the file with [`SANDBOX_SEED`] if it does not exist yet, and leave a file
+/// that does exist completely alone, including an empty one.
 ///
 /// Every *other* resolution does not redo any of that, and - this is the
 /// point of [`SandboxRefreshState`] being a barrier rather than a latch -
 /// does not return until the first one has finished, so no command can read
 /// the target mid-refresh.
 ///
-/// "Does not redo any of that" now includes the existence check: the one-time
-/// work runs exactly once per process, where the previous latch-based version
+/// "Does not redo any of that" includes the existence check: the one-time
+/// work runs exactly once per process, where the pre-T33 latch-based version
 /// still re-ran [`seed_sandbox_file_if_missing`] (a no-op once the file
 /// exists) on every single resolution. The one narrow consequence: if
 /// something *outside* Rustab deletes the sandbox file mid-session - the app
@@ -398,7 +455,7 @@ pub(crate) fn is_same_file(path: &Path, other: &Path) -> bool {
 /// The parent directory is created on every call, outside the barrier: it is
 /// an idempotent no-op once the directory exists, and keeping it unguarded
 /// means a resolution still reports a genuinely unusable sandbox directory
-/// even if the one-time refresh already happened.
+/// even if the one-time sync already happened.
 fn ensure_sandbox_file(
     path: &Path,
     real_fstab_path: &Path,
@@ -412,7 +469,7 @@ fn ensure_sandbox_file(
     }
     refresh_state
         .ensure_once(|| {
-            if refresh_sandbox_from(path, real_fstab_path) {
+            if refresh_sandbox_if_real_changed(path, real_fstab_path) {
                 Ok(())
             } else {
                 seed_sandbox_file_if_missing(path).map_err(SandboxSetupFailure::from)
@@ -424,89 +481,220 @@ fn ensure_sandbox_file(
         })
 }
 
-/// Copies `real_fstab_path` over the sandbox file verbatim, returning whether
-/// it worked.
+/// The once-per-launch draft sync: copies `real_fstab_path` over the draft
+/// verbatim **if** it differs from what Rustab last recorded about it, and
+/// records the copied bytes as the new "last known real content".
 ///
-/// A literal byte copy, never a parse-and-reserialize round trip: the copy is
-/// then incapable of differing from its source, which is exactly the property
-/// `docs/SPEC.md` §5 cares about.
+/// Returns whether the draft can be considered dealt with - `true` both when
+/// a refresh happened and when none was needed - or `false` when the caller
+/// should fall back to [`seed_sandbox_file_if_missing`] (the real file is
+/// unreadable, or the copy could not be published).
+///
+/// ## What counts as "unchanged"
+///
+/// Exactly two things have to hold to skip the refresh: the marker beside the
+/// draft holds byte-for-byte what `real_fstab_path` holds *now*, and the
+/// draft file itself still exists. A missing or differing marker, or a
+/// missing draft, all mean "refresh" - see the module docs for why a missing
+/// marker deliberately errs that way.
+///
+/// ## Marker update ordering
+///
+/// The draft is published first and the marker only afterwards, and the
+/// marker's own failure is swallowed. That order is chosen so the *worse*
+/// inconsistency is impossible: a marker that is newer than the draft would
+/// make the next launch skip a refresh the draft actually needed (a stale
+/// draft, forever). A marker that is older than the draft - what a crash
+/// between the two leaves behind - only costs the next launch one redundant
+/// copy of bytes it already has, after which the marker is correct again.
+fn refresh_sandbox_if_real_changed(sandbox_path: &Path, real_fstab_path: &Path) -> bool {
+    let Ok(real_bytes) = fs::read(real_fstab_path) else {
+        return false;
+    };
+    if sandbox_is_in_sync(sandbox_path, &real_bytes) {
+        return true;
+    }
+    if publish_bytes(sandbox_path, &real_bytes).is_err() {
+        return false;
+    }
+    // Best-effort, deliberately: a marker that could not be written costs the
+    // next launch a redundant refresh, which is not worth failing a sync that
+    // otherwise succeeded over.
+    let _ = record_last_known_real(sandbox_path, &real_bytes);
+    true
+}
+
+/// Whether the draft is already in sync with `real_bytes`: the marker records
+/// exactly those bytes *and* the draft file still exists (see
+/// [`refresh_sandbox_if_real_changed`]).
+fn sandbox_is_in_sync(sandbox_path: &Path, real_bytes: &[u8]) -> bool {
+    let recorded = last_known_real_marker(sandbox_path).and_then(|marker| fs::read(marker).ok());
+    recorded.is_some_and(|recorded| recorded == real_bytes) && sandbox_path.exists()
+}
+
+/// The marker file recording the real `/etc/fstab`'s content as of Rustab's
+/// last sync point: `<sandbox file name>.rustab-lastknown`, in the sandbox's
+/// own directory.
+///
+/// ## Why a verbatim copy rather than a hash
+///
+/// The marker stores the bytes themselves, not a digest of them. The
+/// workspace has no hashing dependency at all (see the root `Cargo.toml`:
+/// `fstab-core` and `src-tauri` pull in serde, tauri and nothing
+/// cryptographic), and the two alternatives were both worse for this job:
+/// adding a crate to compare two ~1 KB files is disproportionate, and
+/// hand-rolling a hash means writing - and then having to justify - a
+/// collision story and a "this hash must stay stable across releases"
+/// invariant that a plain copy simply does not have. `std::hash`'s own
+/// hashers are explicitly *not* an option here: `DefaultHasher` is not
+/// guaranteed stable across Rust versions or even process runs, and this
+/// value has to be comparable across launches, which is the one thing it
+/// cannot promise.
+///
+/// A copy costs the size of an fstab (kilobytes) in the user's data
+/// directory, exposes nothing new (it is a copy of a world-readable file, and
+/// the draft right next to it already holds the same content), is exactly
+/// comparable with no false "unchanged" verdict possible, and is directly
+/// inspectable when someone wonders why a refresh did or did not happen.
+///
+/// `None` only for a path with no final file-name component, which the
+/// constructed sandbox path never is; returning it rather than panicking
+/// keeps every caller on its one best-effort failure route.
+pub(crate) fn last_known_real_marker(sandbox_path: &Path) -> Option<PathBuf> {
+    let file_name = sandbox_path.file_name()?;
+    let mut marker_name = OsString::from(file_name);
+    marker_name.push(LAST_KNOWN_REAL_SUFFIX);
+    Some(sandbox_path.with_file_name(marker_name))
+}
+
+/// Records `bytes` as the real `/etc/fstab`'s content as of now, i.e. moves
+/// Rustab's "last known reality" marker forward.
+fn record_last_known_real(sandbox_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let marker = last_known_real_marker(sandbox_path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} has no file-name component, so no last-known-content marker can be kept \
+                 beside it",
+                sandbox_path.display()
+            ),
+        )
+    })?;
+    publish_bytes(&marker, bytes)
+}
+
+/// Updates the working draft **and** the last-known-real marker to `bytes`,
+/// in that order - the one call `crate::commands`'s save path makes after the
+/// elevated writer has successfully put those same bytes into the real
+/// `/etc/fstab`.
+///
+/// Both halves are the same event: "Rustab now knows that this is reality."
+/// Doing them together here, rather than leaving the caller to remember both,
+/// is what keeps a save from being seen as external drift by the *next*
+/// launch - without the marker update, [`refresh_sandbox_if_real_changed`]
+/// would find the real file different from its stale marker and overwrite the
+/// draft Rustab had just mirrored into.
+///
+/// Order and atomicity: each file is published with the same
+/// temp-file-plus-`rename` swap a refresh uses, so no reader ever sees a
+/// partial one, and the draft is published before the marker for the reason
+/// spelled out in [`refresh_sandbox_if_real_changed`] - a crash in between
+/// leaves the marker merely *stale*, which self-heals into one redundant copy
+/// on the next launch, instead of leaving a marker that claims a draft is
+/// current when it is not.
+///
+/// # Errors
+///
+/// The first `io::Error` of the two publishes. A failure here is **not** a
+/// failed save: the real file already holds `bytes`. The caller surfaces it
+/// as a non-fatal warning (see `crate::commands::save_document_with`), and
+/// the next launch repairs the draft on its own, since the marker is then
+/// either absent or stale and the real file wins.
+pub(crate) fn sync_sandbox_after_save(sandbox_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    publish_bytes(sandbox_path, bytes)?;
+    record_last_known_real(sandbox_path, bytes)
+}
+
+/// Writes `bytes` onto `path` as a sibling temp file plus a `rename`,
+/// reporting the first `io::Error` of the sequence.
+///
+/// Used for both files this module owns: the working draft and its
+/// last-known-real marker.
 ///
 /// ## Why this is a temp file plus `rename`, not an `fs::write`
 ///
-/// Writing the bytes straight onto `sandbox_path` would be an
-/// open-truncate-write, which is *not* atomic with respect to a concurrent
-/// reader of the same path. Within this process [`SandboxRefreshState`]
-/// already keeps the other startup resolution from reading until this
-/// function has returned, but that barrier only binds callers that share it:
-/// a second Rustab process launching at the same moment, or anything else
-/// reading the sandbox, has no such ordering. With a plain write such a
-/// reader can land between the truncate and the completed write and see an
-/// empty document.
+/// Writing the bytes straight onto `path` would be an open-truncate-write,
+/// which is *not* atomic with respect to a concurrent reader of the same
+/// path. Within this process [`SandboxRefreshState`] already keeps the other
+/// startup resolution from reading until the sync has returned, but that
+/// barrier only binds callers that share it: a second Rustab process
+/// launching at the same moment, or anything else reading the draft, has no
+/// such ordering. With a plain write such a reader can land between the
+/// truncate and the completed write and see an empty document.
 ///
-/// So the bytes go to a sibling temp file in the sandbox's own directory and
+/// So the bytes go to a sibling temp file in the draft's own directory and
 /// are then `rename`d onto it, the same way [`fstab_core::writer`] publishes
 /// real saves (and for the same reason - `rename(2)` is atomic *within one
 /// filesystem*, which is precisely what "a sibling in the same directory"
 /// guarantees). A concurrent reader therefore observes either the complete
 /// previous content or the complete new content, never a partial file.
 ///
-/// This is deliberately *only* the atomicity half of a real save: no
-/// validation, no backup, no permission carry-over, no `fsync`. The refresh is
-/// a convenience copy into a scratch file, not a durable publish - if a crash
-/// mid-refresh loses it, the next launch simply refreshes again. It also means
-/// a sandbox path that is somehow a symlink gets replaced by a regular file
-/// rather than written *through*, which for a sandbox is the safer of the two.
+/// A literal byte copy, never a parse-and-reserialize round trip: the copy is
+/// then incapable of differing from its source, which is exactly the property
+/// `docs/SPEC.md` §5 cares about.
 ///
-/// Every step is best-effort and failure is silent by design. An unreadable
-/// `/etc/fstab` is the expected case on a machine that has none, and a failed
-/// copy leaves the sandbox exactly as it was - the caller falls back to the
-/// seed/leave-alone path, which reports a genuine setup failure if there is
-/// one. Target resolution must not die because a convenience refresh could not
-/// happen.
-fn refresh_sandbox_from(sandbox_path: &Path, real_fstab_path: &Path) -> bool {
-    let Ok(bytes) = fs::read(real_fstab_path) else {
-        return false;
-    };
-    let Some(temp_path) = refresh_temp_path(sandbox_path) else {
-        return false;
-    };
-    if fs::write(&temp_path, bytes).is_err() {
+/// This is deliberately *only* the atomicity half of a real save: no
+/// validation, no backup, no permission carry-over, no `fsync`. The draft is
+/// a convenience copy in a scratch directory, not a durable publish - if a
+/// crash mid-publish loses it, the next launch syncs again. It also means a
+/// draft path that is somehow a symlink gets replaced by a regular file
+/// rather than written *through*, which for a scratch file is the safer of
+/// the two.
+fn publish_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp_path = refresh_temp_path(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no final file-name component", path.display()),
+        )
+    })?;
+    if let Err(err) = fs::write(&temp_path, bytes) {
         // The temp file may or may not exist (create could have failed, or a
         // partial write could have left it behind); removing it is best-effort
         // and its own error is ignored so it cannot mask the real cause.
         let _ = fs::remove_file(&temp_path);
-        return false;
+        return Err(err);
     }
-    if fs::rename(&temp_path, sandbox_path).is_err() {
+    if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
-        return false;
+        return Err(err);
     }
-    true
+    Ok(())
 }
 
-/// The sibling temp file [`refresh_sandbox_from`] stages the copy in:
-/// `.<sandbox file name>.rustab-refresh.tmp.<pid>`, in the sandbox's own
-/// directory.
+/// The sibling temp file [`publish_bytes`] stages its copy in:
+/// `.<destination file name>.rustab-refresh.tmp.<pid>`, in the destination's
+/// own directory.
 ///
-/// Same directory, so the `rename` onto the sandbox cannot cross a filesystem
-/// boundary and is therefore atomic. Leading dot so a stray leftover stays out
-/// of the way. The `.rustab-refresh.tmp.` infix is deliberately distinct from
-/// both naming schemes `fstab_core::writer` owns - the backup grammar
-/// (`<name>.rustab-backup.<secs>.<nanos>`, which `list_backups` scans for) and
-/// that module's own save temp file (`.<name>.rustab.tmp.<pid>`) - so this file
-/// can never be mistaken for a backup the user might restore, nor for a save
-/// in flight. The pid keeps two Rustab processes launching at the same instant
-/// from staging into the same temp path.
+/// Same directory, so the `rename` onto the destination cannot cross a
+/// filesystem boundary and is therefore atomic. Leading dot so a stray
+/// leftover stays out of the way. The `.rustab-refresh.tmp.` infix is
+/// deliberately distinct from both naming schemes `fstab_core::writer` owns -
+/// the backup grammar (`<name>.rustab-backup.<secs>.<nanos>`, which
+/// `list_backups` scans for) and that module's own save temp file
+/// (`.<name>.rustab.tmp.<pid>`) - so this file can never be mistaken for a
+/// backup the user might restore, nor for a save in flight. The pid keeps two
+/// Rustab processes launching at the same instant from staging into the same
+/// temp path.
 ///
-/// `None` only for a path with no final file-name component, which the
-/// constructed sandbox path never is; returning it rather than panicking keeps
-/// the whole refresh on its one best-effort failure route.
-fn refresh_temp_path(sandbox_path: &Path) -> Option<PathBuf> {
-    let file_name = sandbox_path.file_name()?;
+/// `None` only for a path with no final file-name component, which neither
+/// the constructed sandbox path nor its marker ever is; returning it rather
+/// than panicking keeps the whole sync on its one best-effort failure route.
+fn refresh_temp_path(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?;
     let mut temp_name = OsString::from(".");
     temp_name.push(file_name);
     temp_name.push(format!(".rustab-refresh.tmp.{}", std::process::id()));
-    Some(sandbox_path.with_file_name(temp_name))
+    Some(path.with_file_name(temp_name))
 }
 
 /// Creates the sandbox file with [`SANDBOX_SEED`] if it does not exist yet,
@@ -691,9 +879,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         assert!(path.ends_with(SANDBOX_FILE_NAME));
     }
 
-    /// The core new behaviour: a fresh process starts the sandbox off as an
-    /// exact copy of the real file. Asserted on bytes, because the copy must
-    /// be a copy and not a parse/reserialize round trip.
+    /// The marker path a given sandbox path's sync state is recorded in.
+    fn marker_of(sandbox_path: &Path) -> PathBuf {
+        last_known_real_marker(sandbox_path).expect("a named file has a marker sibling")
+    }
+
+    /// A first run with no marker at all: the draft starts off as an exact
+    /// copy of the real file, and the marker is created holding the same
+    /// bytes. Asserted on bytes, because the copy must be a copy and not a
+    /// parse/reserialize round trip.
     #[test]
     fn the_first_resolution_of_a_process_copies_the_real_fstab_into_the_sandbox() {
         let dir = TempDir::new("target-refresh-first");
@@ -709,6 +903,11 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             fs::read(&target.path).expect("the sandbox must be readable"),
             REAL_FSTAB_SAMPLE.as_bytes(),
             "the sandbox must be a byte-for-byte copy of the real file"
+        );
+        assert_eq!(
+            fs::read(marker_of(&target.path)).expect("the marker must have been created"),
+            REAL_FSTAB_SAMPLE.as_bytes(),
+            "the refresh must record what it copied as the last known real content"
         );
     }
 
@@ -744,12 +943,12 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         }
     }
 
-    /// The other half of "once per launch": a genuinely new process - a brand
-    /// new refresh state over the same sandbox directory - re-syncs, throwing
-    /// away whatever the previous session left behind. That discard is the
-    /// intended behaviour, not a side effect.
+    /// T34, half one: a new process whose `/etc/fstab` **has** changed since
+    /// the last sync re-copies it, discarding the previous session's draft.
+    /// That discard is deliberate - the real file genuinely moved out from
+    /// under the draft, and current reality wins.
     #[test]
-    fn a_new_process_re_copies_the_real_fstab_over_the_previous_sessions_sandbox() {
+    fn a_new_process_re_copies_the_real_fstab_when_it_changed_since_the_last_sync() {
         let dir = TempDir::new("target-refresh-new-process");
         let sandbox_dir = dir.join("data/rustab");
         let real_fstab = dir.join("real-fstab");
@@ -759,7 +958,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             .expect("first process");
         fs::write(&first.path, "# left over from the previous session\n").expect("write");
 
-        // The real file has meanwhile changed, too.
+        // Something outside Rustab edited the real file between launches.
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
         let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
@@ -769,7 +968,188 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         assert_eq!(
             fs::read(&second.path).expect("read"),
             REAL_FSTAB_SAMPLE.as_bytes(),
-            "a new process must re-copy the current real file"
+            "a changed real file must be re-copied over the draft"
+        );
+        assert_eq!(
+            fs::read(marker_of(&second.path)).expect("read the marker"),
+            REAL_FSTAB_SAMPLE.as_bytes(),
+            "and the marker must move forward with it"
+        );
+    }
+
+    /// T34, half two - the behaviour change this task exists for: a new
+    /// process whose `/etc/fstab` has **not** changed since the last sync
+    /// leaves the draft completely alone, unsaved edits included. Before T34
+    /// this same scenario discarded them on every single restart.
+    #[test]
+    fn a_new_process_leaves_the_draft_alone_when_the_real_fstab_is_unchanged() {
+        let dir = TempDir::new("target-refresh-unchanged");
+        let sandbox_dir = dir.join("data/rustab");
+        let real_fstab = dir.join("real-fstab");
+        fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
+
+        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("first process");
+        // The user edits in that session and does not save.
+        let draft = "# an unsaved draft the user wants back after a restart\n";
+        fs::write(&first.path, draft).expect("write");
+
+        // A new launch. Nothing touched the real file in the meantime.
+        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("second process");
+
+        assert_eq!(second.path, first.path);
+        assert_eq!(
+            fs::read_to_string(&second.path).expect("read"),
+            draft,
+            "an unchanged real file must not cost the user their draft"
+        );
+    }
+
+    /// A pre-T34 sandbox - a draft with no marker beside it - is treated the
+    /// same as a changed real file: refreshed, and a marker created. That is
+    /// the deliberately safe direction for the unknown case.
+    #[test]
+    fn a_draft_with_no_marker_is_refreshed_and_gets_one() {
+        let dir = TempDir::new("target-refresh-no-marker");
+        let sandbox_dir = dir.join("data/rustab");
+        let sandbox_file = sandbox_dir.join(SANDBOX_FILE_NAME);
+        fs::create_dir_all(&sandbox_dir).expect("mkdir");
+        fs::write(&sandbox_file, "# a pre-T34 sandbox\n").expect("write");
+        let real_fstab = dir.join("real-fstab");
+        fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
+        assert!(!marker_of(&sandbox_file).exists());
+
+        let target = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("the sandbox must resolve");
+
+        assert_eq!(
+            fs::read(&target.path).expect("read"),
+            REAL_FSTAB_SAMPLE.as_bytes(),
+            "a missing marker must be treated as 'changed'"
+        );
+        assert_eq!(
+            fs::read(marker_of(&target.path)).expect("read the marker"),
+            REAL_FSTAB_SAMPLE.as_bytes()
+        );
+    }
+
+    /// The marker matching is not enough on its own: if the draft file itself
+    /// is gone (something outside Rustab deleted it between sessions), the
+    /// launch must still re-create it rather than skip the refresh and leave
+    /// the session with no file to read.
+    #[test]
+    fn a_deleted_draft_is_recreated_even_though_the_marker_still_matches() {
+        let dir = TempDir::new("target-refresh-deleted-draft");
+        let sandbox_dir = dir.join("data/rustab");
+        let real_fstab = dir.join("real-fstab");
+        fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
+
+        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("first process");
+        fs::remove_file(&first.path).expect("remove the draft");
+        assert!(
+            marker_of(&first.path).exists(),
+            "the marker must have survived"
+        );
+
+        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("second process");
+
+        assert_eq!(
+            fs::read(&second.path).expect("the draft must be back"),
+            REAL_FSTAB_SAMPLE.as_bytes()
+        );
+    }
+
+    /// The save side of the marker, and the bug it exists to prevent: after a
+    /// successful real write, [`sync_sandbox_after_save`] moves both the draft
+    /// and the marker forward, so the *next* launch does not mistake Rustab's
+    /// own save for external drift and blow away the draft it just mirrored
+    /// into - nor a further unsaved edit made after that save.
+    #[test]
+    fn a_saves_own_write_is_not_seen_as_external_drift_by_the_next_launch() {
+        let dir = TempDir::new("target-sync-after-save");
+        let sandbox_dir = dir.join("data/rustab");
+        let real_fstab = dir.join("real-fstab");
+        fs::write(&real_fstab, "# before the save\n").expect("write");
+
+        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("first process");
+
+        // A T34 save: the elevated writer puts these bytes into the real file
+        // (here: the stand-in for it), and the save path then calls this.
+        let saved = "# saved by Rustab\nLABEL=x /mnt/x ext4 defaults 0 2\n";
+        fs::write(&real_fstab, saved).expect("the elevated write");
+        sync_sandbox_after_save(&first.path, saved.as_bytes())
+            .expect("the draft sync must succeed");
+
+        assert_eq!(fs::read_to_string(&first.path).expect("read"), saved);
+        assert_eq!(
+            fs::read_to_string(marker_of(&first.path)).expect("read the marker"),
+            saved
+        );
+
+        // The user then edits again without saving, and restarts.
+        let unsaved = "# edited after the save, not saved yet\n";
+        fs::write(&first.path, unsaved).expect("write");
+        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
+            .expect("second process");
+
+        assert_eq!(
+            fs::read_to_string(&second.path).expect("read"),
+            unsaved,
+            "a save's own write must not be seen as drift on the next launch"
+        );
+    }
+
+    /// The marker is strictly best-effort: if it cannot be written, the
+    /// refresh itself still counts as done (the draft is current), and the
+    /// only consequence is that the next launch refreshes again.
+    #[test]
+    fn a_marker_that_cannot_be_written_does_not_fail_the_refresh() {
+        let dir = TempDir::new("target-marker-unwritable");
+        let sandbox_dir = dir.join("data/rustab");
+        let sandbox_file = sandbox_dir.join(SANDBOX_FILE_NAME);
+        fs::create_dir_all(&sandbox_dir).expect("mkdir");
+        // A directory where the marker file wants to be: the rename onto it
+        // fails on any Unix, whether or not the suite runs as root.
+        fs::create_dir_all(marker_of(&sandbox_file)).expect("mkdir");
+        let real_fstab = dir.join("real-fstab");
+        fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
+
+        assert!(
+            refresh_sandbox_if_real_changed(&sandbox_file, &real_fstab),
+            "an unwritable marker must not make the sync report failure"
+        );
+        assert_eq!(
+            fs::read(&sandbox_file).expect("read"),
+            REAL_FSTAB_SAMPLE.as_bytes(),
+            "the draft itself must still have been refreshed"
+        );
+        assert!(marker_of(&sandbox_file).is_dir(), "left as it was found");
+    }
+
+    /// `sync_sandbox_after_save` reports its failure rather than swallowing
+    /// it, because its caller turns that into the non-fatal "your save landed
+    /// but the draft did not follow" warning (`crate::commands`).
+    #[test]
+    fn a_draft_that_cannot_be_published_reports_the_sync_failure() {
+        let dir = TempDir::new("target-sync-failure");
+        let sandbox_dir = dir.join("data/rustab");
+        let sandbox_file = sandbox_dir.join(SANDBOX_FILE_NAME);
+        // A directory in the draft's place: the publish rename cannot succeed.
+        fs::create_dir_all(&sandbox_file).expect("mkdir");
+
+        let error = sync_sandbox_after_save(&sandbox_file, b"# saved\n")
+            .expect_err("an unpublishable draft must be reported");
+        assert!(
+            !marker_of(&sandbox_file).exists(),
+            "and the marker must not claim the draft is current"
+        );
+        assert!(
+            !error.to_string().is_empty(),
+            "the failure must carry a message for the warning"
         );
     }
 
@@ -848,10 +1228,21 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         names
     }
 
-    /// The refresh stages its copy in a sibling temp file and `rename`s it
+    /// The two file names a synced sandbox directory holds, sorted the way
+    /// [`entry_names`] returns them: the draft and its marker, and nothing
+    /// else.
+    fn synced_dir_entries() -> Vec<String> {
+        vec![
+            SANDBOX_FILE_NAME.to_owned(),
+            format!("{SANDBOX_FILE_NAME}{LAST_KNOWN_REAL_SUFFIX}"),
+        ]
+    }
+
+    /// Both publishes stage their copy in a sibling temp file and `rename` it
     /// into place; a successful refresh must leave no trace of that staging
-    /// behind, or the sandbox directory would accumulate one stray file per
-    /// launch.
+    /// behind, or the sandbox directory would accumulate stray files per
+    /// launch. What it *does* leave is exactly two files: the draft and its
+    /// marker.
     #[test]
     fn a_successful_refresh_leaves_no_temp_file_behind() {
         let dir = TempDir::new("target-refresh-no-temp");
@@ -862,10 +1253,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let target = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
             .expect("the sandbox must resolve");
 
-        assert_eq!(
-            entry_names(&sandbox_dir),
-            vec![SANDBOX_FILE_NAME.to_owned()]
-        );
+        assert_eq!(entry_names(&sandbox_dir), synced_dir_entries());
         assert_eq!(
             fs::read(&target.path).expect("read"),
             REAL_FSTAB_SAMPLE.as_bytes()
@@ -873,9 +1261,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
     }
 
     /// The failure path of the same staging: when the swap cannot happen the
-    /// temp file must be cleaned up, `refresh_sandbox_from` must report
-    /// `false` (so the caller falls back to seed/leave-alone), and the
-    /// sandbox path itself must be untouched.
+    /// temp file must be cleaned up, `refresh_sandbox_if_real_changed` must
+    /// report `false` (so the caller falls back to seed/leave-alone), and the
+    /// sandbox path itself must be untouched - marker included, since a
+    /// marker written after a failed copy would be a lie.
     ///
     /// The `rename` is made to fail by pointing the sandbox path at a
     /// directory - renaming a regular file onto a directory is an error on
@@ -891,14 +1280,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
         assert!(
-            !refresh_sandbox_from(&sandbox_path, &real_fstab),
+            !refresh_sandbox_if_real_changed(&sandbox_path, &real_fstab),
             "a refresh that cannot be swapped into place must report failure"
         );
 
         assert_eq!(
             entry_names(&sandbox_dir),
             vec![SANDBOX_FILE_NAME.to_owned()],
-            "the staging temp file must not survive a failed refresh"
+            "neither the staging temp file nor a marker may survive a failed refresh"
         );
         assert!(
             sandbox_path.is_dir(),
@@ -926,6 +1315,43 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         assert!(
             !name.contains(".rustab-backup."),
             "the temp file must not look like a backup: {name}"
+        );
+    }
+
+    /// The marker is a sibling of the draft and must not be mistakable for
+    /// one of `fstab_core::writer`'s backups - if it were, `list_backups`
+    /// would offer it as a restore point and `prune_backups` could delete it.
+    #[test]
+    fn the_marker_is_a_sibling_that_is_not_a_backup_name() {
+        let sandbox_path = Path::new("/data/rustab").join(SANDBOX_FILE_NAME);
+        let marker = marker_of(&sandbox_path);
+
+        assert_eq!(marker.parent(), sandbox_path.parent());
+        let name = marker
+            .file_name()
+            .expect("the marker has a file name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, format!("{SANDBOX_FILE_NAME}{LAST_KNOWN_REAL_SUFFIX}"));
+        assert!(
+            !name.contains(".rustab-backup."),
+            "the marker must not look like a backup: {name}"
+        );
+        assert!(
+            !name.contains(".rustab.tmp.") && !name.contains(".rustab-refresh.tmp."),
+            "nor like a write in flight: {name}"
+        );
+        // And `fstab-core`, which owns the backup grammar, agrees: a real
+        // marker sitting beside a real draft is not listed as a backup of it.
+        let dir = TempDir::new("target-marker-not-a-backup");
+        let draft = dir.join(SANDBOX_FILE_NAME);
+        fs::write(&draft, REAL_FSTAB_SAMPLE).expect("write");
+        fs::write(marker_of(&draft), REAL_FSTAB_SAMPLE).expect("write");
+        assert!(
+            fstab_core::writer::list_backups(&draft)
+                .expect("the directory must be readable")
+                .is_empty(),
+            "the marker must never be reported as a backup of the draft"
         );
     }
 
@@ -1074,7 +1500,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         // And the refresh really was the one-per-launch copy, not a seed.
         assert_eq!(
             entry_names(&sandbox_dir),
-            vec![SANDBOX_FILE_NAME.to_owned()],
+            synced_dir_entries(),
             "the concurrent refresh must leave no staging temp file behind"
         );
     }

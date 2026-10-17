@@ -163,18 +163,50 @@ original file byte-for-byte untouched).
 
 ## 7. Target file selection / test safety
 
-- The app must **never** default to writing the real `/etc/fstab` during
-  development. Support a configurable target path (env var or app setting),
-  defaulting in debug builds to a local sandbox file.
-- That sandbox file is a practice ground, not a persisted fixture: it is
-  refreshed from the real `/etc/fstab` once per application process launch
-  (a plain byte-for-byte file copy, never a parse/re-serialize round trip -
-  see §5), so each launch starts from current reality, deliberately
-  discarding whatever the previous session left there. Within one run the
-  sandbox is never touched again, so in-session edits and saves survive. The
-  refresh only ever *reads* `/etc/fstab`, and is best-effort: if it cannot be
-  read, the sandbox falls back to a comment-only seed when absent and is
-  otherwise left alone.
+**Revised 2026-10-17 (T34).** Rustab's purpose is editing the real
+`/etc/fstab` (§1), and its default, unconfigured behavior now reflects that
+directly: a save writes the real `/etc/fstab`, full stop. The sandbox file
+exists to protect in-progress work, not to withhold writes from the real
+file - see the rationale below. This supersedes this section's pre-T34
+text, which described the sandbox as an isolated, non-writing target
+selected in place of the real file; it is no longer that.
+
+- **Every save writes `/etc/fstab`, regardless of `RUSTAB_TARGET_PATH`.** A
+  save always goes through the single privilege-escalated (`pkexec`) write
+  path described in §6, gated by the same mandatory diff-review and explicit
+  confirmation checkbox the real target has always required (§9) - every
+  save is now the consequential kind, so that gate is no longer conditional
+  on "is this the real target."
+- **The local draft file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`, falling
+  back as before) is what the GUI actually reads and edits day to day. Its
+  purpose is purely to protect in-progress, not-yet-saved work across an app
+  restart or crash - it is a *session*, not an isolated test target. A
+  successful save writes `/etc/fstab` first, then updates the draft to
+  match, so they do not drift under normal use.
+- **Draft refresh on launch is now conditional, not unconditional.** Where
+  the pre-T34 design refreshed the draft from `/etc/fstab` on every single
+  launch (deliberately discarding whatever was there), that would now throw
+  away an unsaved draft on every restart - unacceptable once the draft's
+  entire purpose is protecting in-progress work. The launch-time check must
+  instead compare the real `/etc/fstab`'s current state against the state
+  Rustab last knew about it (as of the last refresh or the last successful
+  save) and refresh the draft **only if they differ** - i.e. only when
+  something changed `/etc/fstab` outside Rustab since it last looked. If
+  they match, the draft - including any unsaved edits - is left exactly as
+  it was. The comparison must not be fooled by Rustab's own last write to
+  `/etc/fstab` appearing as "external drift" (it isn't). As before, the
+  real file is only ever *read* for this, never written, and the whole
+  mechanism is best-effort: an unreadable `/etc/fstab` falls back to a
+  comment-only seed when the draft is absent, and otherwise leaves the
+  draft alone.
+- **Development and testing still need a way to never touch the real
+  file.** `RUSTAB_TARGET_PATH`, set to anything other than `/etc/fstab`
+  itself (a fixture, a scratch copy, `dev-data/fstab.real-copy`, etc.),
+  continues to make that path the target outright - no dual-write to
+  `/etc/fstab`, no draft-mirroring, exactly as a plain non-real target
+  worked before T34. This is now the **only** way to run or test Rustab
+  without touching the real file - see `CONTRIBUTING.md`'s "Safety-first
+  contribution notes", which must stay in sync with this.
 - `dev-data/fstab.real-copy` is a real, personal copy of the maintainer's
   actual `/etc/fstab`, kept **outside of version control** (already in
   `.gitignore`) purely so the app can be exercised by hand against a
@@ -189,7 +221,9 @@ original file byte-for-byte untouched).
   without containing anyone's real UUIDs, usernames, or paths. These are
   safe to publish and are what the automated test suite runs against.
 - All automated/integration tests must operate on temp-directory copies of
-  fixtures, never on `/etc/fstab` itself, and never on `dev-data/`.
+  fixtures and injected stand-ins for the real-file/elevated-write
+  collaborators, never on `/etc/fstab` itself, never invoking real `pkexec`,
+  and never on `dev-data/`.
 
 ## 8. Device/UUID/LABEL discovery helpers
 
@@ -234,7 +268,7 @@ manual text entry must still work if these tools are missing.
 - `README.md` (repo root): what it is, screenshot/GIF placeholder, build &
   run instructions (`trunk`, `cargo tauri dev`/`build`, the Tailwind CLI
   step), the dual-license note, and a clear safety note about the
-  dev-sandbox-by-default behavior from §7.
+  real-write-by-default / persistent-draft behavior from §7.
 - **README must also include an explicit, public "AI use" disclosure
   section.** Required content (the maintainer's own words, adapt phrasing
   but keep every point - this is a deliberate transparency statement, not

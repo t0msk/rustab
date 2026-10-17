@@ -63,39 +63,74 @@ and, authoritatively, the save itself.
 Decided and implemented in `src-tauri/src/target.rs`; summarized here because
 it determines what the UI must show and whether a save escalates.
 
+**Revised 2026-10-17 (T34).** The resolved target is still what the GUI reads
+and edits, but it is no longer the whole answer to "what does a save write" -
+see §3.5. This section describes resolution; the save dispatch that consumes
+it is spelled out there.
+
 1. If the environment variable **`RUSTAB_TARGET_PATH`** is set to a non-blank
    value, that path is the active target, verbatim, in **both debug and
-   release builds**. `source` is `"environment"`.
-2. Otherwise the target is a per-user sandbox file,
+   release builds**. `source` is `"environment"`. Such a target is written
+   **outright and alone**: no dual write, no draft mirror, whether or not the
+   path happens to be `/etc/fstab` itself (§3.5, case 2/3). This is the only
+   way to run Rustab without it writing the real `/etc/fstab`.
+2. Otherwise the target is the per-user **working draft**,
    `$XDG_DATA_HOME/rustab/fstab.sandbox` (falling back to
    `$HOME/.local/share/rustab/fstab.sandbox`, then to a temp-dir path).
-   `source` is `"sandbox_default"`. The sandbox is **refreshed from the real
-   `/etc/fstab` once per application process launch** - the first target
-   resolution of a run replaces it with a byte-for-byte copy of `/etc/fstab`
-   (a literal file copy, never a parse/re-serialize round trip), so every
-   launch starts from current reality; every later resolution in the same run
-   leaves the file alone, so the user's own sandbox edits and saves survive
-   the session that made them. If `/etc/fstab` cannot be read (missing, or no
-   permission) the refresh is skipped silently - best-effort, never a
-   resolution failure - and the sandbox is created, if it does not exist yet,
-   with a comment-only seed that parses and validates cleanly; an existing
-   sandbox is left as it is.
+   `source` is `"sandbox_default"`. This is the file `list_entries` reads and
+   the file the user edits between saves; a save of it writes `/etc/fstab`
+   and then mirrors the saved content back into it (§3.5, case 1).
 
-Rule 2 applies to release builds too. `docs/SPEC.md` §7 only *requires* the
-sandbox default in debug builds, but a release build that opens pointed at
-`/etc/fstab` would have the file whose corruption §2.1 calls the one
-unacceptable outcome loaded before the user has agreed to anything. Editing
-the real file is therefore an explicit act: start Rustab with
-`RUSTAB_TARGET_PATH=/etc/fstab`. (An in-GUI target switch is a future task,
-not something this layer invents. When it arrives it must go through
+**Draft refresh is conditional (T34), not once-per-launch.** At most once per
+process launch - on the first target resolution of a run - Rustab compares
+`/etc/fstab`'s **current content** against the content it last knew that file
+to have, and refreshes the draft from it **only if they differ**:
+
+- *They match, and the draft file exists*: nothing happens at all. The draft,
+  including edits that were never saved, is left byte-for-byte as it was.
+  This is what makes an in-progress edit survive a restart.
+- *They differ, or there is no record yet (fresh install, or a pre-T34
+  draft), or the draft file is missing*: the draft is replaced with a
+  byte-for-byte copy of `/etc/fstab` (a literal file copy, never a
+  parse/re-serialize round trip), and the new content is recorded as the
+  last known one. A missing record is deliberately treated as "differs" -
+  current reality wins when Rustab cannot tell.
+- *`/etc/fstab` cannot be read* (missing, or no permission): nothing is
+  compared, silently - best-effort, never a resolution failure. The draft is
+  created, if it does not exist yet, with a comment-only seed that parses and
+  validates cleanly; an existing draft is left as it is.
+
+Every later resolution in the same run skips the whole check, so the user's
+own edits and saves survive the session that made them.
+
+"What Rustab last knew `/etc/fstab` to hold" is persisted in a **marker file
+beside the draft**, `fstab.sandbox.rustab-lastknown`, holding a verbatim copy
+of those bytes (a copy, not a hash: the workspace has no hashing dependency,
+and an exact copy cannot produce a false "unchanged" verdict - see
+`target.rs`'s `last_known_real_marker` for the full reasoning). The marker
+moves forward at the two events that mean "Rustab now knows this is
+reality": a refresh, and a successful default-launch save (§3.5). The save
+case is what stops the next launch from reading Rustab's *own* write as
+external drift and discarding the draft it just mirrored into. The marker is
+not a backup: it does not match `fstab-core`'s backup grammar, so
+`list_backups` never offers it and backup pruning never deletes it.
+
+Rule 2 applies to release builds too, and `/etc/fstab` is only ever **read**
+during resolution, never written - the elevated helper (§4) is the one and
+only writer of that file. (An in-GUI target switch is a future task, not
+something this layer invents. When it arrives it must go through
 `target.rs`, not through a path argument on a command.)
 
 **`is_real`** is `true` only when the resolved path *is* `/etc/fstab` -
 literally, or because both paths canonicalize to the same file, so a symlink
-in either direction is still recognized. The flag drives three things at
-once, and they cannot disagree because they all read the same field: the UI's
-danger banner and the extra confirmation checkbox (`docs/UI_DESIGN.md` §2,
-§6), and whether a save escalates (§4 below).
+in either direction is still recognized. Since T34 it no longer answers "does
+a save reach `/etc/fstab`?" - a `sandbox_default` target has
+`is_real == false` and its saves go there anyway. What it answers exactly is
+"is the resolved path itself the real file", which is what the `environment`
+branch of a save needs in order to know whether writing *that path* requires
+escalation. The UI's danger banner and confirmation checkbox
+(`docs/UI_DESIGN.md` §2, §6) therefore cannot be gated on this flag alone
+any more; every save is now a real write.
 
 **No command accepts a target path.** The only paths the frontend may ever
 send are the `backup_path` arguments of `restore_backup` (§3.7),
@@ -216,19 +251,54 @@ frontend - would be a byte-for-byte fidelity risk for no benefit.)
 save(candidate: DocumentDto) -> WriteOutcomeDto     (rejects with WriteErrorDto)
 ```
 
-Atomically replaces the active target with `candidate`. **The only write path
-in the application.**
+Atomically writes `candidate`. **The only write path in the application.**
 
-- Non-real target (sandbox or any other file): performed in-process by
-  `fstab_core::writer::write_document`.
-- Real `/etc/fstab` (`is_real == true`): performed by a single
-  privilege-escalated call that runs the *entire* write as root - see §4.
+**Revised 2026-10-17 (T34): dispatch is on `source`, not on `is_real`.**
+Three cases, implemented in one place (`commands.rs::save_document_with`):
 
-Both paths run the same `write_document`, which means every save, regardless
-of target, gets the whole `docs/SPEC.md` §6 sequence: validate → back up the
+1. **`source == "sandbox_default"`** - the default, unconfigured launch, i.e.
+   how Rustab is normally used. The save is a **single elevated write of the
+   real `/etc/fstab`** (the hardcoded path, never the resolved draft path),
+   performed by one privilege-escalated call that runs the *entire* write as
+   root - see §4. That call's success or failure **is** the save's result. On
+   success, the working draft (the resolved `target` path) and its
+   last-known-real marker (§2) are then updated to the same content,
+   best-effort.
+2. **`source == "environment"`, path is not `/etc/fstab`** - the dev/test
+   escape hatch. One in-process write of that path by
+   `fstab_core::writer::write_document`. No escalation, no mirror, no marker;
+   byte-for-byte the pre-T34 behaviour, which is what keeps `cargo test` and
+   CI away from `pkexec` and from the real file.
+3. **`source == "environment"`, path *is* `/etc/fstab`** (`is_real == true`,
+   literally or through a symlink) - one elevated write of that path, and
+   **no draft mirror and no marker update**. An explicit override means "this
+   path, outright" for every value it can take; the dual write is a property
+   of the default draft/real pair, not of the real file (which is how
+   `README.md`'s Safety Notes and `CONTRIBUTING.md` both describe it).
+   Consequence worth knowing: because this case does not move the marker, a
+   later default launch sees `/etc/fstab` as changed and refreshes the draft -
+   correct, and the same answer Rustab gives for an edit made by any other
+   tool.
+
+Every case runs the same `write_document`, which means every save, regardless
+of case, gets the whole `docs/SPEC.md` §6 sequence: validate → back up the
 previous content and prune old backups → write a temp file in the target's own
 directory → `fsync` → `fsync` the directory → `rename` → `fsync` the
-directory → re-read and verify byte-for-byte.
+directory → re-read and verify byte-for-byte. Note where a case-1 save's
+**automatic backup** lands: beside `/etc/fstab`, because that is the file
+being written - not beside the draft.
+
+**The draft mirror is best-effort and never fails a save.** It is a plain
+atomic publish of the saved bytes (temp file plus `rename`), not a second
+`write_document`: no second validation pass, and no backup chain of its own
+beside the draft. If it cannot be done, the save still **succeeds** - the
+file the user asked to change already holds the new content - and the outcome
+carries `draft_sync_warning` (§8) with a ready-to-show message. Treat that as
+a toast, not an error; the next launch repairs the draft on its own, because
+the marker is then stale and `/etc/fstab` wins. The draft is published before
+the marker, deliberately: a stale marker costs one redundant copy on the next
+launch, whereas a marker ahead of the draft would make the next launch skip a
+refresh the draft actually needed.
 
 On failure, **always read `target_unchanged`** before writing UI copy:
 `true` means the file on disk is guaranteed to still hold its previous bytes
@@ -264,6 +334,20 @@ backup is `delete_backup` (§3.10).
 
 Error kinds: `target_resolution`, `list_backups`.
 
+> **T34 gap, recorded deliberately.** This command - and `read_backup`
+> (§3.9), `delete_backup` (§3.10), `create_backup` (§3.11),
+> `open_backup_location` (§3.12) and `restore_backup`'s resolution of its
+> `backup_path` - still act on the **resolved target's** directory, which on
+> a default launch is the working draft's. A default-launch *save*, however,
+> now writes `/etc/fstab` and so creates its automatic backups beside
+> `/etc/fstab` (§3.5). The backup surface therefore describes a different
+> file than the one a save writes. Re-pointing it at `/etc/fstab` is a
+> decision about what the Backups panel *means* after T34, and it would make
+> deleting and creating backups newly privileged (a `pkexec` prompt, plus the
+> same confirmation gate a save has) - a frontend change as much as a backend
+> one. It is required follow-up work, not settled here; nothing about §3.5's
+> dual write depends on it.
+
 ### 3.7 `restore_backup`
 
 ```
@@ -276,8 +360,11 @@ value from a `list_backups` result for the **current** target.
 A restore is not a copy and not a shortcut. The backup's text is parsed and
 then goes through *the same* save path as `save`: it is validated, the content
 it replaces is itself backed up first, and it is written through the same
-atomic temp-file/`fsync`/`rename`/verify sequence - elevated exactly once if
-the target is the real `/etc/fstab`. Consequences the UI should state plainly
+atomic temp-file/`fsync`/`rename`/verify sequence - elevated exactly once
+wherever a save would be. It therefore **inherits §3.5's dispatch in full**:
+on a default launch, restoring a backup writes the real `/etc/fstab` and then
+mirrors it into the working draft, `draft_sync_warning` included.
+Consequences the UI should state plainly
 (the copy in `docs/UI_DESIGN.md` §7 already does):
 
 - Restoring creates a fresh backup of what is currently in the file, so a
@@ -523,7 +610,12 @@ can leave `/etc/fstab` in a state nobody planned. The elevated process must
 
 ### 4.2 Three operations, one flag
 
-Three things need root, and only when `is_real == true`:
+Three things need root. Since T34 the condition is no longer "only when
+`is_real == true`": a `write` escalates whenever the save dispatch of §3.5
+says so, which includes every **default-launch** save (where `is_real` is
+`false` and the file written is `/etc/fstab` all the same). `delete_backup`
+and `create_backup` are still gated on `is_real` alone - see §3.6's recorded
+T34 gap.
 
 | Operation | Used by | What the elevated process does |
 | --- | --- | --- |
@@ -539,8 +631,9 @@ property stays a one-flag check.
 
 ### 4.3 The mechanism
 
-When `save`, `restore_backup`, `delete_backup` or `create_backup` runs against
-a target with `is_real == true`:
+When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
+`delete_backup`/`create_backup` runs against a target with
+`is_real == true`:
 
 1. The unprivileged side does its cheap pre-check first - purely to avoid
    asking for a password for an operation that cannot succeed. For a write
@@ -682,8 +775,10 @@ process at all), and it is why the path must travel inside the request.
 Because the path arrives as data, the elevated side refuses to act on anything
 except `/etc/fstab` (literally, or via a symlink that resolves to it), using
 the *same* comparison that decided `is_real` in the first place. Escalation
-only ever happens for a real target, so this costs nothing in normal
-operation and bounds the elevated write to exactly one file.
+only ever happens for the real file - a default-launch save passes the
+hardcoded `/etc/fstab`, never its own draft path (§3.5) - so this costs
+nothing in normal operation and bounds the elevated write to exactly one
+file.
 
 `delete_backup`'s `backup_path` arrives as data for the same reason and is
 re-checked the same way, with one extra step on top of the target check: the
@@ -834,8 +929,11 @@ trip byte-faithful.
   "source": "sandbox_default" }
 ```
 
-`source` is `"environment"` or `"sandbox_default"` (see §2). `is_real` is the
-one flag the danger banner and the escalation decision both read.
+`source` is `"environment"` or `"sandbox_default"` (see §2). Read **both**
+fields since T34: `source` is what decides where a save goes (§3.5), while
+`is_real` says only whether `path` itself is the real file. A
+`"sandbox_default"` target with `is_real: false` - the shape above, the
+default launch - is still one whose saves write `/etc/fstab`.
 
 ---
 
@@ -904,20 +1002,35 @@ degraded mode because `findmnt` is unavailable.
   "pruned_backups": [],
   "validation_warnings": [ /* FindingDto */ ],
   "notes": ["..."],
-  "elevated": true
+  "elevated": true,
+  "draft_sync_warning": null
 }
 ```
 
-- `target` differs from the active target's path only if that path was a
-  symlink, in which case this is its destination (the write goes *through*
-  the link, never replacing it).
-- `backup` is `null` when the target did not exist before (first-ever save).
+- `target` is the file that was actually written. For a default-launch save
+  (§3.5 case 1) that is `/etc/fstab`, **not** the active target's draft path.
+  It differs from the written path only if that path was a symlink, in which
+  case this is its destination (the write goes *through* the link, never
+  replacing it).
+- `backup` is `null` when the written file did not exist before (first-ever
+  save). It is a backup of the file named in `target` - so, for a
+  default-launch save, one that lives beside `/etc/fstab`.
 - `validation_warnings` are advisory findings that did not block the save -
   worth a toast or an expandable notice.
 - `notes` are non-fatal deviations (a symlink was resolved, ownership could
   not be carried over, an old backup could not be pruned). None of them
   affect the integrity of the file just written.
 - `elevated` is `true` if the write was performed through `pkexec`.
+- `draft_sync_warning` (T34) is the one **non-fatal warning** a *successful*
+  save can carry: the real `/etc/fstab` was written, but the local working
+  draft beside it could not be updated to match (§3.5). It is a complete,
+  ready-to-show message, or `null` when there is nothing to say - which is
+  every save that did not mirror into a draft at all (an explicit
+  `RUSTAB_TARGET_PATH` target) and every one whose mirror succeeded. Show it
+  as a warning toast on top of the success path; do **not** treat it as a
+  failed save, and do not fold it into `notes`, which are statements about
+  the file that *was* written rather than about a second file that was not.
+  Optional on the wire: a response without the field deserializes as `null`.
 
 ### `WriteErrorDto`
 

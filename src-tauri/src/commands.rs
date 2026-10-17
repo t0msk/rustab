@@ -13,13 +13,21 @@
 //! the active target's real backup list (see [`crate::backups`]).
 //!
 //! The genuinely interesting logic - "which save path do I take" - is
-//! [`save_document_with`], and it is a single `if` on purpose: both branches
-//! end in the same [`writer::write_document`] call, one of them simply has a
-//! `pkexec` re-exec in front of it (see [`crate::privileged`]).
-//! [`delete_backup_with`] is the same shape for the same reason: the real
-//! `/etc/fstab`'s backups live in root-owned `/etc/`, so removing one needs
-//! the same single escalation, while a sandbox target's backups live in a
-//! user-owned directory and need none.
+//! [`save_document_with`]. Since T34 it has three cases rather than two, all
+//! of them ending in the same [`writer::write_document`] call, some with a
+//! `pkexec` re-exec in front of it (see [`crate::privileged`]): the default
+//! target's save writes the real `/etc/fstab` and then mirrors the same
+//! content into the working draft, while an explicit `RUSTAB_TARGET_PATH`
+//! target is written outright and alone. Read that function's docs before
+//! changing anything here; it is where `docs/SPEC.md` §7's "every save writes
+//! `/etc/fstab`" is actually implemented.
+//!
+//! [`delete_backup_with`] and [`create_backup_with`] still dispatch on
+//! [`ActiveTarget::is_real`] alone, i.e. they still act on the backups of
+//! whatever `target.path` is - the draft's, for a default launch. That is a
+//! deliberate, documented **T34 gap**, not an oversight: see
+//! [`delete_backup_with`]'s own docs for exactly what is inconsistent about
+//! it and what closing it involves.
 //!
 //! Reading a backup, by contrast, needs no escalation at all in either case:
 //! `/etc/fstab` and the backups beside it are world-readable, which is the
@@ -54,7 +62,7 @@ use crate::dto::{
     TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
 use crate::privileged;
-use crate::target::{self, ActiveTarget};
+use crate::target::{self, ActiveTarget, TargetSource};
 use fstab_core::model::Document;
 use fstab_core::{discovery, parser, validate, writer};
 use std::fs;
@@ -155,12 +163,22 @@ pub fn render_candidate(candidate: DocumentDto) -> String {
     Document::from(candidate).to_string()
 }
 
-/// Saves `candidate` over the active target, atomically.
+/// Saves `candidate`, atomically.
 ///
-/// Dispatches on [`ActiveTarget::is_real`]: a sandbox (or any other
-/// non-`/etc/fstab`) target is written in-process; the real `/etc/fstab` is
-/// written by a single elevated re-exec that performs the whole operation as
-/// root. Both paths run the same [`writer::write_document`].
+/// Since T34 (`docs/SPEC.md` §7) "where" depends on how the active target was
+/// chosen, not on whether it happens to be the real file:
+///
+/// - Default launch (no `RUSTAB_TARGET_PATH`): writes the real `/etc/fstab`
+///   through a single elevated re-exec that performs the whole operation as
+///   root, then best-effort updates the local working draft to match. The
+///   elevated write is what succeeds or fails; a draft that could not be
+///   updated is reported in `draft_sync_warning` on an otherwise successful
+///   outcome.
+/// - `RUSTAB_TARGET_PATH` set: writes that path and only that path -
+///   in-process, or elevated if the path is `/etc/fstab` itself.
+///
+/// Every case runs the same [`writer::write_document`]. See
+/// [`save_document_with`] for the full reasoning.
 ///
 /// # Errors
 ///
@@ -196,9 +214,17 @@ pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
 /// text is parsed into a document and then goes through the very same
 /// [`save_document`] a normal save uses, so it is validated, backed up (the
 /// content being replaced is itself backed up first), written to a temp file,
-/// `fsync`ed, renamed, verified - and, for the real `/etc/fstab`, elevated
-/// exactly once. Restoring a broken backup is therefore refused for the same
+/// `fsync`ed, renamed, verified - and elevated exactly once wherever a normal
+/// save would be. Restoring a broken backup is therefore refused for the same
 /// reasons saving broken content is.
+///
+/// Because that delegation is the *only* write this command performs, it
+/// inherits T34's dual write with no code of its own: on a default launch,
+/// restoring a backup writes the real `/etc/fstab` and then mirrors it into
+/// the working draft, exactly as a save does (asserted in this module's
+/// tests). `backup_path` itself is still resolved against `target.path`'s
+/// backup list - see [`delete_backup_with`]'s docs for why that is currently
+/// the draft's list and what remains to be decided about it.
 ///
 /// # Errors
 ///
@@ -402,11 +428,23 @@ pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> 
 /// needs no privilege escalation, so there is no write or privileged read for
 /// a compromised frontend to redirect. The path itself is also never a
 /// secret or something the backend validates on the user's behalf - it is
-/// the Mount point text already visible in the table the user is looking at,
-/// either typed by them or picked via the directory-picker button - so a
-/// malicious frontend gains nothing here it could not already get by opening
-/// that same path in a terminal with Rustab's own unprivileged access. See
-/// `docs/API_CONTRACT.md` §2 for the full reasoning.
+/// the Source/Mount point text already visible in the table the user is
+/// looking at, either typed by them or picked via the directory-picker
+/// button - so a malicious frontend gains nothing here it could not already
+/// get by opening that same path in a terminal with Rustab's own
+/// unprivileged access. See `docs/API_CONTRACT.md` §2 for the full
+/// reasoning.
+///
+/// `path` is decoded via [`fstab_core::model::decode_escaped_whitespace`]
+/// first: `fstab_core`'s model deliberately stores a mount point/source path
+/// exactly as written, octal escapes (`\040` for a space, etc.) and all -
+/// see `crates/fstab-core/src/model.rs`'s "Escaped-whitespace policy" - so
+/// the text this command receives can contain a literal `\040` where the
+/// real path on disk has a space. `xdg-open` has no idea about fstab's
+/// escape convention, so without decoding first it looks for a file that
+/// does not exist instead of the one the user actually meant. The same
+/// decode is applied in `fstab_core::validate`'s mount-point-exists check,
+/// for the identical reason.
 ///
 /// # Errors
 ///
@@ -414,20 +452,20 @@ pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> 
 /// launched.
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn open_path_in_file_manager(path: String) -> Result<(), CommandErrorDto> {
-    open_path_in_file_manager_with(Path::new(&path), open_in_file_manager)
+    let decoded = fstab_core::model::decode_escaped_whitespace(&path);
+    open_path_in_file_manager_with(Path::new(&decoded), open_in_file_manager)
 }
 
 // ---------------------------------------------------------------------------
 // Shared internals
 // ---------------------------------------------------------------------------
 
-/// The one dispatch point between the two save paths.
+/// The one dispatch point between the save paths.
 ///
-/// Both branches end in [`writer::write_document`] - the in-process branch
+/// Every branch ends in [`writer::write_document`] - the in-process branch
 /// calls it directly, the elevated branch calls it inside a root process that
 /// does nothing else (see [`crate::privileged`]). There is deliberately no
-/// third branch, and no path that writes anything without going through
-/// `write_document`.
+/// path that writes a *target* without going through `write_document`.
 ///
 /// Takes the already-resolved [`ActiveTarget`] rather than resolving it
 /// itself so the tests can point a save at a temp file without mutating
@@ -440,26 +478,93 @@ fn save_document(
     save_document_with(target, candidate, privileged::save_elevated)
 }
 
-/// [`save_document`], with the elevated half injectable.
+/// [`save_document`], with the elevated half injectable - and, since T34, the
+/// place the whole "a save always writes the real `/etc/fstab`" decision
+/// lives (`docs/SPEC.md` §7, `docs/API_CONTRACT.md` §3.5).
 ///
-/// The seam exists for one reason: the dispatch decision ("a real target is
-/// never written by this process") has to be *asserted*, and asserting it
-/// against the production `elevate` would mean a unit test that launches
-/// `pkexec` and waits on an authentication prompt. The tests therefore pass a
-/// recording stand-in and check that a real target reaches it and never
-/// reaches the in-process writer; the production path is a one-line
-/// delegation that cannot diverge.
+/// The seam exists for one reason: the dispatch decisions ("the default
+/// target's save always escalates", "an explicit non-real override never
+/// does") have to be *asserted*, and asserting them against the production
+/// `elevate` would mean a unit test that launches `pkexec` and waits on an
+/// authentication prompt. The tests therefore pass a recording stand-in; the
+/// production path is a one-line delegation that cannot diverge.
+///
+/// ## The three cases, and why they are keyed on `source` and not `is_real`
+///
+/// 1. **[`TargetSource::SandboxDefault`]** - the unconfigured launch, which
+///    is how Rustab is normally used. The save goes to the real
+///    [`target::REAL_FSTAB_PATH`] through `elevate`, and that call's result
+///    is *the* result of the save. `target.path` (the working draft) is then
+///    best-effort updated to match, together with the marker that stops the
+///    next launch from reading this very save as external drift (see
+///    [`target::sync_sandbox_after_save`]).
+///
+///    Note what is passed to `elevate`: the hardcoded real path, never
+///    `target.path`. The resolved draft path is not a thing this branch ever
+///    elevates a write to - it is written in-process, unprivileged, where it
+///    lives in the user's own data directory.
+/// 2. **[`TargetSource::Environment`] naming some other file** - the
+///    dev/test escape hatch, and the only way to run Rustab without it
+///    writing `/etc/fstab`. Byte-for-byte the pre-T34 behaviour: one
+///    in-process write of `target.path`, no escalation, no mirroring, no
+///    marker. `cargo test` and CI depend on this branch existing.
+/// 3. **[`TargetSource::Environment`] naming `/etc/fstab` itself** (so
+///    `target.is_real`, literally or through a symlink) - one elevated write
+///    of `target.path`, and, deliberately, **no draft mirror and no marker
+///    update**.
+///
+/// Case 3 was a genuinely open question, so here is the reasoning rather
+/// than just the choice. Both `README.md`'s Safety Notes ("Setting
+/// `RUSTAB_TARGET_PATH` to anything other than `/etc/fstab` makes that path
+/// the target outright, with no dual-write ... involved") and
+/// `CONTRIBUTING.md` ("the T34 dual-write behavior only applies to the
+/// default, unscoped-launch sandbox/real pair, not to an explicit override")
+/// describe the dual write as a property of the *default pair*, not of the
+/// real file. Reading it that way makes `RUSTAB_TARGET_PATH` mean exactly one
+/// thing for every value it can take - "this path, outright" - instead of
+/// "this path, outright, unless it happens to be `/etc/fstab`, in which case
+/// also something else". The alternative (mirror this case too) would be
+/// harmless in the write it performs but would mean an explicit override
+/// silently writing a *second* file the user never named.
+///
+/// The one consequence worth knowing: because this case does not move the
+/// marker, a later default launch sees `/etc/fstab` differing from what it
+/// last recorded and refreshes the draft. That is correct - from the default
+/// session's point of view the file *did* change under it, by a run that was
+/// not keeping its draft in sync - and it is the same answer Rustab gives for
+/// an edit made with any other tool.
 fn save_document_with(
     target: &ActiveTarget,
     candidate: &Document,
     elevate: impl Fn(&Path, &Document) -> Result<WriteOutcomeDto, WriteErrorDto>,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
-    if target.is_real {
-        elevate(&target.path, candidate)
-    } else {
-        writer::write_document(&target.path, candidate)
+    match target.source {
+        TargetSource::SandboxDefault => {
+            let real_fstab = Path::new(target::REAL_FSTAB_PATH);
+            // Authoritative: if this fails, the save failed, and nothing is
+            // mirrored anywhere - the draft must not start showing content
+            // that is not in the real file.
+            let mut outcome = elevate(real_fstab, candidate)?;
+
+            // The exact bytes the elevated writer just put into the real file
+            // (`writer::write_document` writes `candidate.to_string()`), so
+            // the draft is a copy of reality and the marker records reality.
+            let saved = candidate.to_string();
+            if let Err(err) = target::sync_sandbox_after_save(&target.path, saved.as_bytes()) {
+                outcome.draft_sync_warning = Some(format!(
+                    "{} was saved successfully, but the local working draft {} could not be \
+                     updated to match it ({err}). Nothing is lost: the saved file is the real \
+                     one, and the draft is refreshed from it the next time Rustab starts.",
+                    real_fstab.display(),
+                    target.path.display()
+                ));
+            }
+            Ok(outcome)
+        }
+        TargetSource::Environment if target.is_real => elevate(&target.path, candidate),
+        TargetSource::Environment => writer::write_document(&target.path, candidate)
             .map(|outcome| WriteOutcomeDto::from_outcome(&outcome, false))
-            .map_err(|err| WriteErrorDto::from(&err))
+            .map_err(|err| WriteErrorDto::from(&err)),
     }
 }
 
@@ -610,6 +715,29 @@ fn delete_backup_from(
 /// authoritative check is the elevated process's own
 /// [`backups::resolve_requested`] call, which does not trust this one (see
 /// [`crate::privileged`]).
+///
+/// ## T34 scope note: this is still keyed on `is_real`, and that is a gap
+///
+/// [`save_document_with`] now keys off [`ActiveTarget::source`], because a
+/// default-launch save writes `/etc/fstab`. This function - and
+/// [`create_backup_with`], [`list_backups`], [`read_backup`] and
+/// [`open_backup_location`], all of which act on `target.path` - were
+/// deliberately left on the pre-T34 behaviour, so on a default launch they
+/// still operate on the *draft's* backups in the user's own data directory,
+/// unprivileged and unprompted.
+///
+/// That is internally consistent as far as it goes (the files they touch
+/// really are user-owned, so escalating would be wrong), but it leaves the
+/// backup surface describing a different file than the one a save writes:
+/// a default-launch save's own automatic backups land beside `/etc/fstab`,
+/// where nothing in the UI lists them, while the Backups panel lists
+/// restore points of the draft. Closing that gap is a decision about what the
+/// Backups panel *means* after T34, with a visible consequence either way -
+/// pointing it at `/etc/fstab` makes deleting and creating backups
+/// newly privileged operations (a `pkexec` prompt, and the same confirmation
+/// gate a save has), which is a frontend change as much as a backend one. It
+/// is therefore recorded as required follow-up work rather than decided here;
+/// `save_document_with`'s dual write does not depend on it either way.
 fn delete_backup_with(
     target: &ActiveTarget,
     backup_path: &str,
@@ -739,7 +867,6 @@ mod tests {
     use super::*;
     use crate::backups::BackupError;
     use crate::dto::{LineDto, SeverityDto, SourceKindDto, TargetSourceDto};
-    use crate::target::TargetSource;
     use crate::testutil::TempDir;
     use fstab_core::model::{FstabEntry, FstabOption, Line, Options, SourceId};
     use std::path::{Path, PathBuf};
@@ -748,12 +875,58 @@ mod tests {
                             UUID=11111111-2222-3333-4444-555555555555 /mnt/original ext4 noauto 0 2\n";
 
     /// A non-real target at `path`, as `active_target()` would have produced
-    /// for an explicit `RUSTAB_TARGET_PATH`.
-    fn sandbox_target(path: PathBuf) -> ActiveTarget {
+    /// for an explicit `RUSTAB_TARGET_PATH` pointing at a scratch file.
+    ///
+    /// This - not the default sandbox - is the shape most tests in here want:
+    /// it is the one case whose save stays entirely in-process, so a test can
+    /// exercise the real [`writer::write_document`] end to end without
+    /// `pkexec` and without an elevate stand-in. Post-T34 it is also the
+    /// dev/test escape hatch itself, so these tests double as proof that the
+    /// hatch still behaves exactly as it did (see
+    /// [`an_explicit_non_real_override_never_reaches_the_elevated_writer`]).
+    /// Named `override_target` rather than the pre-T34 `sandbox_target`
+    /// because "sandbox" now means the working draft, which is a *different*
+    /// case with a *different* dispatch.
+    fn override_target(path: PathBuf) -> ActiveTarget {
         ActiveTarget {
             path,
             is_real: false,
             source: TargetSource::Environment,
+        }
+    }
+
+    /// The default, unconfigured target: the working draft at `path`, with no
+    /// `RUSTAB_TARGET_PATH` set. A save of this writes the real `/etc/fstab`
+    /// (through the injected `elevate` stand-in, never for real) and mirrors
+    /// into `path`.
+    fn default_draft_target(path: PathBuf) -> ActiveTarget {
+        ActiveTarget {
+            path,
+            is_real: false,
+            source: TargetSource::SandboxDefault,
+        }
+    }
+
+    /// An elevate stand-in that records what it was asked to write and
+    /// reports the success the real helper would report - **without writing
+    /// anything at all**, which is what keeps these tests away from
+    /// `pkexec` and from the machine's own `/etc/fstab`.
+    fn recording_elevate(
+        calls: &std::cell::RefCell<Vec<(PathBuf, Document)>>,
+    ) -> impl Fn(&Path, &Document) -> Result<WriteOutcomeDto, WriteErrorDto> + '_ {
+        move |path, document| {
+            calls
+                .borrow_mut()
+                .push((path.to_path_buf(), document.clone()));
+            Ok(WriteOutcomeDto {
+                target: path.to_string_lossy().into_owned(),
+                backup: None,
+                pruned_backups: Vec::new(),
+                validation_warnings: Vec::new(),
+                notes: Vec::new(),
+                elevated: true,
+                draft_sync_warning: None,
+            })
         }
     }
 
@@ -778,18 +951,22 @@ mod tests {
         )
     }
 
-    // -- the sandbox save path ----------------------------------------------
+    // -- the in-process save path (an explicit non-real override) ----------
+    //
+    // Post-T34 this is the `RUSTAB_TARGET_PATH`-naming-a-scratch-file case
+    // (see `override_target`), not the default launch - the default launch's
+    // save elevates and is covered under "T34 save dispatch" below.
 
     /// End-to-end proof that a save of a non-real target calls through to
     /// `writer::write_document`: the file is replaced with the candidate's
     /// serialization *and* a backup of the previous content appears beside
     /// it, which only `write_document` creates.
     #[test]
-    fn saving_a_sandbox_target_writes_through_write_document() {
-        let dir = TempDir::new("save-sandbox");
-        let path = dir.join("fstab.sandbox");
+    fn saving_an_override_target_writes_through_write_document() {
+        let dir = TempDir::new("save-override");
+        let path = dir.join("fstab.custom");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let candidate = valid_candidate("/mnt/saved");
         let outcome = save_document(&target, &candidate).expect("the save should succeed");
@@ -808,7 +985,7 @@ mod tests {
         );
         assert!(
             !outcome.elevated,
-            "a sandbox save must never report itself as elevated"
+            "an in-process save must never report itself as elevated"
         );
         // The real backup list agrees with what the outcome claims.
         let listed = backups::list(&path).expect("listing must succeed");
@@ -819,10 +996,10 @@ mod tests {
     /// The same path, from the command's own entry point (DTO in, DTO out),
     /// to prove the conversions in between are lossless.
     #[test]
-    fn saving_a_sandbox_target_from_the_dto_shape_is_lossless() {
+    fn saving_an_override_target_from_the_dto_shape_is_lossless() {
         let dir = TempDir::new("save-dto");
         let path = dir.join("fstab.sandbox");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let candidate = parser::parse(
             "# header\n\
@@ -846,10 +1023,10 @@ mod tests {
 
     /// A first save creates the file and reports no backup.
     #[test]
-    fn saving_a_missing_sandbox_target_creates_it_without_a_backup() {
+    fn saving_a_missing_override_target_creates_it_without_a_backup() {
         let dir = TempDir::new("save-create");
         let path = dir.join("fstab.sandbox");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let outcome = save_document(&target, &valid_candidate("/mnt/first"))
             .expect("the save should succeed");
@@ -865,7 +1042,7 @@ mod tests {
         let dir = TempDir::new("save-invalid");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let error = save_document(&target, &invalid_candidate())
             .expect_err("an invalid candidate must be refused");
@@ -893,7 +1070,7 @@ mod tests {
     #[test]
     fn saving_into_an_unwritable_location_reports_a_typed_error() {
         let dir = TempDir::new("save-nodir");
-        let target = sandbox_target(dir.join("missing-dir/fstab"));
+        let target = override_target(dir.join("missing-dir/fstab"));
 
         let error = save_document(&target, &valid_candidate("/mnt/nope"))
             .expect_err("a missing directory must fail");
@@ -917,7 +1094,7 @@ mod tests {
         let dir = TempDir::new("restore");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         // First save: creates a backup holding ORIGINAL.
         save_document(&target, &valid_candidate("/mnt/second")).expect("first save");
@@ -1149,6 +1326,9 @@ mod tests {
         );
     }
 
+    // Octal-escape decoding itself is tested once, where it now lives:
+    // `fstab_core::model::decode_escaped_whitespace`'s own test module.
+
     // -- open_external_link --------------------------------------------------
 
     /// The happy path for both known links: a fake opener captures the URL
@@ -1201,7 +1381,7 @@ mod tests {
         let dir = TempDir::new("delete-backup");
         let path = dir.join("fstab.sandbox");
         seed_backups(&path, 3);
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
         let before = backups::list(&path).expect("listing");
         assert_eq!(before.len(), 3);
         let target_content = fs::read_to_string(&path).expect("read the target");
@@ -1228,7 +1408,7 @@ mod tests {
         let dir = TempDir::new("delete-backup-refuse");
         let path = dir.join("fstab.sandbox");
         seed_backups(&path, 1);
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
         let real_backup = backups::list(&path).expect("listing")[0].path.clone();
 
         for requested in [
@@ -1264,7 +1444,7 @@ mod tests {
         let dir = TempDir::new("delete-backup-twice");
         let path = dir.join("fstab.sandbox");
         seed_backups(&path, 1);
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
         let backup = backups::list(&path).expect("listing")[0].path.clone();
 
         delete_backup_from(&target, &backup).expect("the first delete must succeed");
@@ -1319,17 +1499,19 @@ mod tests {
 
     /// The other half of the dispatch guarantee: a non-real target's backup is
     /// removed in-process and must never escalate (no password prompt for a
-    /// sandbox file).
+    /// file in the user's own directory). Unchanged by T34 - see
+    /// `delete_backup_with`'s own "T34 scope note" for what that leaves
+    /// open about a default launch's backup surface.
     #[test]
-    fn a_sandbox_delete_never_reaches_the_elevated_deleter() {
+    fn a_non_real_target_delete_never_reaches_the_elevated_deleter() {
         let dir = TempDir::new("sandbox-delete-dispatch");
         let path = dir.join("fstab.sandbox");
         seed_backups(&path, 1);
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
         let backup = backups::list(&path).expect("listing")[0].path.clone();
 
         delete_backup_with(&target, &backup, |_, _| {
-            panic!("a sandbox backup deletion must never escalate");
+            panic!("a non-real target's backup deletion must never escalate");
         })
         .expect("the delete should succeed");
 
@@ -1368,7 +1550,7 @@ mod tests {
         let dir = TempDir::new("create-backup");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let info = create_backup_of(&target).expect("creating a backup must succeed");
 
@@ -1401,7 +1583,7 @@ mod tests {
         let dir = TempDir::new("create-backup-twice");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let first = create_backup_of(&target).expect("first backup");
         fs::write(&path, "# changed by hand\n").expect("change the target");
@@ -1427,7 +1609,7 @@ mod tests {
     fn creating_a_backup_of_a_missing_target_is_reported_as_target_missing() {
         let dir = TempDir::new("create-backup-missing");
         let path = dir.join("fstab.sandbox");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let error = create_backup_of(&target).expect_err("there is nothing to back up");
 
@@ -1444,7 +1626,7 @@ mod tests {
         let dir = TempDir::new("create-backup-retention");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let manual = create_backup_of(&target).expect("a manual backup");
         for i in 0..(writer::MAX_BACKUPS + 3) {
@@ -1517,17 +1699,18 @@ mod tests {
     }
 
     /// The other half of the dispatch guarantee: a non-real target is copied
-    /// in-process and must never escalate (no password prompt for a sandbox
-    /// file).
+    /// in-process and must never escalate (no password prompt for a file in
+    /// the user's own directory). Unchanged by T34, same scope note as the
+    /// delete path above.
     #[test]
-    fn a_sandbox_backup_never_reaches_the_elevated_helper() {
+    fn a_non_real_target_backup_never_reaches_the_elevated_helper() {
         let dir = TempDir::new("sandbox-create-dispatch");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let info = create_backup_with(&target, |_| {
-            panic!("a sandbox backup must never escalate");
+            panic!("a non-real target's backup must never escalate");
         })
         .expect("the backup should succeed");
 
@@ -1542,7 +1725,7 @@ mod tests {
         let dir = TempDir::new("create-then-delete");
         let path = dir.join("fstab.sandbox");
         fs::write(&path, ORIGINAL).expect("seed the target");
-        let target = sandbox_target(path.clone());
+        let target = override_target(path.clone());
 
         let manual = create_backup_of(&target).expect("a manual backup");
         delete_backup_from(&target, &manual.path).expect("deleting a manual backup must succeed");
@@ -1607,7 +1790,8 @@ mod tests {
 
     #[test]
     fn target_info_dto_mirrors_the_resolved_target() {
-        let info = TargetInfoDto::from(&sandbox_target(PathBuf::from("/tmp/rustab/fstab.sandbox")));
+        let info =
+            TargetInfoDto::from(&override_target(PathBuf::from("/tmp/rustab/fstab.sandbox")));
         assert_eq!(info.path, "/tmp/rustab/fstab.sandbox");
         assert!(!info.is_real);
         assert_eq!(info.source, TargetSourceDto::Environment);
@@ -1620,10 +1804,15 @@ mod tests {
         assert!(real.is_real);
     }
 
-    /// The dispatch guarantee: a target flagged real goes to the elevated
-    /// writer and is **never** written by this process. Asserted with a
-    /// recording stand-in for the elevated half, so the test neither launches
-    /// `pkexec` nor waits on an authentication prompt.
+    // -- T34 save dispatch ---------------------------------------------------
+
+    /// Case 3 of [`save_document_with`]: an explicit `RUSTAB_TARGET_PATH`
+    /// naming `/etc/fstab` itself goes to the elevated writer, is **never**
+    /// written by this process - and, the T34 decision this pins, gets
+    /// **no draft mirror and no marker**: the one path the user named is the
+    /// only file touched. Asserted with a recording stand-in for the elevated
+    /// half, so the test neither launches `pkexec` nor waits on an
+    /// authentication prompt.
     #[test]
     fn a_real_target_is_dispatched_to_the_elevated_writer_and_never_written_in_process() {
         let dir = TempDir::new("real-dispatch");
@@ -1636,22 +1825,14 @@ mod tests {
         let candidate = valid_candidate("/mnt/elevated");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome = save_document_with(&target, &candidate, |elevated_path, elevated_doc| {
-            calls
-                .borrow_mut()
-                .push((elevated_path.to_path_buf(), elevated_doc.clone()));
-            Ok(WriteOutcomeDto {
-                target: elevated_path.to_string_lossy().into_owned(),
-                backup: None,
-                pruned_backups: Vec::new(),
-                validation_warnings: Vec::new(),
-                notes: Vec::new(),
-                elevated: true,
-            })
-        })
-        .expect("the elevated stand-in succeeds");
+        let outcome = save_document_with(&target, &candidate, recording_elevate(&calls))
+            .expect("the elevated stand-in succeeds");
 
         assert!(outcome.elevated);
+        assert_eq!(
+            outcome.draft_sync_warning, None,
+            "an explicit override has no draft to warn about"
+        );
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
         assert_eq!(calls[0].0, path, "the elevated call must get the target");
@@ -1663,24 +1844,259 @@ mod tests {
             !path.exists(),
             "the in-process writer must not have touched a real target"
         );
+        assert!(
+            !target::last_known_real_marker(&path)
+                .expect("a named path has a marker sibling")
+                .exists(),
+            "an explicit real override must not start keeping a sync marker"
+        );
     }
 
-    /// The other half of the dispatch guarantee: a non-real target is written
-    /// in-process and must never escalate (no password prompt for a sandbox
-    /// file).
+    /// Case 2 of [`save_document_with`], unchanged by T34 and load-bearing
+    /// for the whole test suite: an explicit non-`/etc/fstab` override is
+    /// written in-process and must never escalate (no password prompt, no
+    /// `pkexec`, nothing mirrored anywhere). This branch is why `cargo test`
+    /// and CI can run a real save at all.
     #[test]
-    fn a_sandbox_target_never_reaches_the_elevated_writer() {
-        let dir = TempDir::new("sandbox-dispatch");
-        let path = dir.join("fstab.sandbox");
-        let target = sandbox_target(path.clone());
+    fn an_explicit_non_real_override_never_reaches_the_elevated_writer() {
+        let dir = TempDir::new("override-dispatch");
+        let path = dir.join("fstab.custom");
+        let target = override_target(path.clone());
 
-        let outcome = save_document_with(&target, &valid_candidate("/mnt/sandbox"), |_, _| {
-            panic!("a sandbox save must never escalate");
+        let outcome = save_document_with(&target, &valid_candidate("/mnt/custom"), |_, _| {
+            panic!("an explicit non-real override must never escalate");
         })
         .expect("the save should succeed");
 
         assert!(!outcome.elevated);
+        assert_eq!(outcome.draft_sync_warning, None);
         assert!(path.exists());
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .expect("the directory must be readable")
+                .count(),
+            1,
+            "no marker, no mirror, no second file of any kind"
+        );
+    }
+
+    /// Case 1, the T34 headline: a **default** launch's save always writes
+    /// the real `/etc/fstab` through the elevated path, even though the
+    /// resolved target is the draft and `is_real` is `false`. The elevated
+    /// call must be aimed at the hardcoded real path, never at the draft.
+    #[test]
+    fn a_default_launch_save_always_elevates_the_real_fstab() {
+        let dir = TempDir::new("default-save-elevates");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let target = default_draft_target(draft.clone());
+        let candidate = valid_candidate("/mnt/for-real");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = save_document_with(&target, &candidate, recording_elevate(&calls))
+            .expect("the elevated stand-in succeeds");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
+        assert_eq!(
+            calls[0].0,
+            Path::new(target::REAL_FSTAB_PATH),
+            "the elevated call must be aimed at the real /etc/fstab, not at the draft"
+        );
+        assert_eq!(
+            calls[0].1, candidate,
+            "the elevated call must get the candidate unchanged"
+        );
+        assert!(outcome.elevated);
+        assert_eq!(
+            outcome.target,
+            target::REAL_FSTAB_PATH,
+            "the reported outcome is the real write's, which is the authoritative one"
+        );
+    }
+
+    /// The other half of case 1: after the real write succeeds, the draft is
+    /// updated to exactly the bytes that went into the real file, and the
+    /// marker is moved with it so the next launch does not read this save as
+    /// external drift.
+    #[test]
+    fn a_default_launch_save_mirrors_into_the_draft_and_moves_the_marker() {
+        let dir = TempDir::new("default-save-mirrors");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let target = default_draft_target(draft.clone());
+        let candidate = valid_candidate("/mnt/mirrored");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = save_document_with(&target, &candidate, recording_elevate(&calls))
+            .expect("the elevated stand-in succeeds");
+
+        assert_eq!(outcome.draft_sync_warning, None, "{outcome:?}");
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            candidate.to_string(),
+            "the draft must hold exactly what the real file was given"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                target::last_known_real_marker(&draft).expect("a marker sibling exists")
+            )
+            .expect("read the marker"),
+            candidate.to_string(),
+            "the marker must record the just-saved content as the known reality"
+        );
+    }
+
+    /// The mirror is a plain publish of bytes, not a second save: it must not
+    /// create a backup chain of its own beside the draft. Backups of the file
+    /// that was actually written are made by the elevated writer, beside
+    /// `/etc/fstab`.
+    #[test]
+    fn the_draft_mirror_does_not_create_its_own_backups() {
+        let dir = TempDir::new("default-save-no-draft-backups");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let target = default_draft_target(draft.clone());
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        for i in 0..3 {
+            save_document_with(
+                &target,
+                &valid_candidate(&format!("/mnt/n{i}")),
+                recording_elevate(&calls),
+            )
+            .expect("the elevated stand-in succeeds");
+        }
+
+        assert!(
+            backups::list(&draft).expect("listing").is_empty(),
+            "mirroring must not back up the draft on every save"
+        );
+    }
+
+    /// A failed real write is authoritative: the save fails, and nothing is
+    /// mirrored - the draft must never show content the real file does not
+    /// have.
+    #[test]
+    fn a_failed_elevated_write_fails_the_save_and_mirrors_nothing() {
+        let dir = TempDir::new("default-save-elevate-fails");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let target = default_draft_target(draft.clone());
+
+        let error = save_document_with(&target, &valid_candidate("/mnt/nope"), |_, _| {
+            Err(WriteErrorDto::new(
+                WriteErrorKindDto::PrivilegeEscalation,
+                true,
+                "the user dismissed the password prompt; nothing was written",
+            ))
+        })
+        .expect_err("a refused escalation must fail the save");
+
+        assert_eq!(error.kind, WriteErrorKindDto::PrivilegeEscalation);
+        assert!(error.target_unchanged);
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            ORIGINAL,
+            "a failed save must leave the draft exactly as it was"
+        );
+        assert!(
+            !target::last_known_real_marker(&draft)
+                .expect("a marker sibling exists")
+                .exists(),
+            "and must not claim to know anything new about the real file"
+        );
+    }
+
+    /// A draft that cannot be updated is **not** a failed save: the real file
+    /// already holds the new content, which is what the user asked for. It is
+    /// reported as a distinguishable non-fatal warning instead, so the UI can
+    /// toast it rather than silently losing sync.
+    ///
+    /// The mirror is made to fail by putting a directory where the draft file
+    /// belongs - renaming a file onto a directory fails on any Unix, and
+    /// unlike a permission trick it behaves the same whether or not the suite
+    /// runs as root.
+    #[test]
+    fn a_draft_mirror_failure_is_a_warning_not_a_failed_save() {
+        let dir = TempDir::new("default-save-mirror-fails");
+        let draft = dir.join("fstab.sandbox");
+        fs::create_dir_all(&draft).expect("mkdir in the draft's place");
+        let target = default_draft_target(draft.clone());
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = save_document_with(
+            &target,
+            &valid_candidate("/mnt/warned"),
+            recording_elevate(&calls),
+        )
+        .expect("a draft-sync failure must not fail the save");
+
+        assert_eq!(calls.into_inner().len(), 1, "the real write still happened");
+        let warning = outcome
+            .draft_sync_warning
+            .expect("the draft failure must be surfaced, not swallowed");
+        assert!(
+            warning.contains(target::REAL_FSTAB_PATH)
+                && warning.contains(&draft.display().to_string()),
+            "the warning must name both files so the user knows which one is fine: {warning}"
+        );
+        assert!(
+            !target::last_known_real_marker(&draft)
+                .expect("a marker sibling exists")
+                .exists(),
+            "a marker written despite a failed mirror would keep the stale draft forever"
+        );
+    }
+
+    /// Obligation (f): `restore_backup` has no write of its own - it
+    /// delegates to `save_document` - so on a default launch a restore must
+    /// inherit the dual write exactly as a save gets it. Exercised through
+    /// the same steps the command performs, with the elevate seam injected
+    /// (the command itself resolves the target from the process environment,
+    /// which a unit test must not mutate).
+    #[test]
+    fn restoring_a_backup_inherits_the_default_launch_dual_write() {
+        let dir = TempDir::new("restore-dual-write");
+        let draft = dir.join("fstab.sandbox");
+        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        // A real backup of the draft, made the way a pre-restore save would.
+        writer::write_document(&draft, &valid_candidate("/mnt/newer")).expect("seed a backup");
+        let backup = backups::list(&draft).expect("listing")[0].path.clone();
+        let target = default_draft_target(draft.clone());
+
+        // Exactly `restore_backup`'s body, minus target resolution.
+        let resolved = backups::resolve_requested(&draft, &backup).expect("it is a real backup");
+        let text = backups::read_text(&resolved).expect("readable");
+        let restored = parser::parse(&text);
+        assert_eq!(text, ORIGINAL, "the backup holds the pre-save content");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = save_document_with(&target, &restored, recording_elevate(&calls))
+            .expect("the restore must succeed");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "a restore must elevate exactly once");
+        assert_eq!(
+            calls[0].0,
+            Path::new(target::REAL_FSTAB_PATH),
+            "a restore must write the real file, like any other save"
+        );
+        assert_eq!(calls[0].1, restored, "and the restored content verbatim");
+        assert_eq!(outcome.draft_sync_warning, None, "{outcome:?}");
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            ORIGINAL,
+            "and the draft must be mirrored to the restored content too"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                target::last_known_real_marker(&draft).expect("a marker sibling exists")
+            )
+            .expect("read the marker"),
+            ORIGINAL,
+            "marker included - a restore is a save and moves the sync point"
+        );
     }
 
     #[test]

@@ -86,8 +86,13 @@ pub enum TargetSourceDto {
 pub struct TargetInfoDto {
     /// Absolute (or as-configured) path of the active target.
     pub path: String,
-    /// `true` only for the real `/etc/fstab`. Drives the UI's danger banner
-    /// (`docs/UI_DESIGN.md` §2) *and* decides whether a save escalates.
+    /// `true` only when `path` itself is the real `/etc/fstab` - literally,
+    /// or because both paths canonicalize to the same file (a symlink in
+    /// either direction still counts). One of two inputs the UI's danger
+    /// banner needs, together with `source` (`docs/UI_DESIGN.md` §2); it no
+    /// longer decides by itself whether a save escalates - a
+    /// `sandbox_default` target has `is_real == false` and still escalates
+    /// (see `save_document_with` in `commands.rs`).
     pub is_real: bool,
     /// Where the path came from, so the UI can explain itself.
     pub source: TargetSourceDto,
@@ -533,6 +538,27 @@ pub struct WriteOutcomeDto {
     /// helper itself cannot know how it was launched, so it always emits
     /// `false` (see [`crate::privileged`]).
     pub elevated: bool,
+    /// The one **non-fatal warning** a successful save can carry (T34): the
+    /// real `/etc/fstab` was written, but the local working draft beside it
+    /// could not be updated to match. `null` whenever there is nothing to
+    /// say, which is every save that did not mirror into a draft at all (an
+    /// explicit `RUSTAB_TARGET_PATH` target - see
+    /// `crate::commands::save_document_with`) and every one whose mirror
+    /// succeeded.
+    ///
+    /// Deliberately **not** folded into `notes`: `notes` are deviations in
+    /// how the file just written was written, all of which are "the file is
+    /// fine, here is a detail". This one is about a *different* file than the
+    /// one the save was about, and it is the only thing in this struct the UI
+    /// should raise as a warning rather than describe. Deliberately not an
+    /// error either - the write that mattered succeeded, and the next launch
+    /// repairs the draft on its own (`crate::target`).
+    ///
+    /// Carries a ready-to-show message rather than a flag plus a path,
+    /// because the interesting part is the underlying I/O failure, which only
+    /// the backend has.
+    #[serde(default)]
+    pub draft_sync_warning: Option<String>,
 }
 
 impl WriteOutcomeDto {
@@ -554,6 +580,10 @@ impl WriteOutcomeDto {
                 .collect(),
             notes: outcome.notes.clone(),
             elevated,
+            // Set, if at all, by the save path after the draft mirror has
+            // been attempted - `fstab_core`'s outcome knows nothing about a
+            // draft.
+            draft_sync_warning: None,
         }
     }
 }
@@ -1163,11 +1193,30 @@ mod tests {
             validation_warnings: Vec::new(),
             notes: vec!["n".to_string()],
             elevated: true,
+            draft_sync_warning: None,
         };
         assert_eq!(
             serde_json::to_string(&outcome).expect("serialize"),
-            r#"{"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true}"#
+            r#"{"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true,"draft_sync_warning":null}"#
         );
+
+        // The one T34 addition, on the wire: a successful save that could not
+        // update the working draft (see `crate::commands::save_document_with`).
+        let warned = WriteOutcomeDto {
+            draft_sync_warning: Some("w".to_string()),
+            ..outcome
+        };
+        assert_eq!(
+            serde_json::to_string(&warned).expect("serialize"),
+            r#"{"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true,"draft_sync_warning":"w"}"#
+        );
+        // And it is optional on the way in, so a response produced by a build
+        // that predates the field still deserializes.
+        let without: WriteOutcomeDto = serde_json::from_str(
+            r#"{"target":"/p","backup":null,"pruned_backups":[],"validation_warnings":[],"notes":[],"elevated":false}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(without.draft_sync_warning, None);
 
         let error = WriteErrorDto::new(WriteErrorKindDto::PrivilegeEscalation, true, "m");
         assert_eq!(

@@ -5,7 +5,9 @@
 //! grouping (`crate::diff::compute_summary_diff`) and the raw unified diff
 //! (`crate::diff::compute_raw_diff`, fed by the real `render_candidate`
 //! call) and hands both down as props, along with the save-in-flight/error
-//! state for the confirm button (T12).
+//! state for the confirm button (T12) and the two target flags below
+//! (`writes_real_file`/`is_real`), which since T34 are not the same question:
+//! see `docs/UI_DESIGN.md` §2/§6.
 
 use yew::prelude::*;
 
@@ -23,6 +25,17 @@ enum DiffTab {
 
 #[derive(Properties, PartialEq)]
 pub struct DiffViewProps {
+    /// `true` when confirming here writes the real `/etc/fstab` - which,
+    /// since T34, is every launch except an explicit non-real
+    /// `RUSTAB_TARGET_PATH` override (`AppShell` derives it once; see
+    /// `real_target_confirm_checkbox::confirm_disabled`). Drives the
+    /// confirmation gate, the confirm button's color and its label: the
+    /// consequence of pressing the button is identical whether the file on
+    /// screen is `/etc/fstab` itself or the draft it is saved through.
+    pub writes_real_file: bool,
+    /// Whether `target_path` *is* the real `/etc/fstab`. Only ever used for
+    /// the header badge's wording, which has to describe the file being
+    /// shown, not the consequence of the button (§2/§6).
     pub is_real: bool,
     pub target_path: AttrValue,
     pub confirm_checked: bool,
@@ -63,24 +76,29 @@ pub fn diff_view(props: &DiffViewProps) -> Html {
     };
     let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
 
-    let confirm_disabled = confirm_disabled(props.is_real, props.confirm_checked, props.saving);
-    let confirm_classes = if props.is_real {
+    let confirm_disabled =
+        confirm_disabled(props.writes_real_file, props.confirm_checked, props.saving);
+    let confirm_classes = if props.writes_real_file {
         classes!("bg-red-600", "hover:bg-red-700", "text-white")
     } else {
         classes!("bg-sky-600", "hover:bg-sky-700", "text-white")
     };
-    let confirm_label = if props.is_real {
+    let confirm_label = if props.writes_real_file {
         "Write to /etc/fstab"
     } else {
-        "Save changes to sandbox file"
+        "Save changes to test file"
     };
 
-    let badge_classes = if props.is_real {
-        classes!("bg-red-600", "text-white")
-    } else {
-        classes!("bg-emerald-600", "text-white")
+    // Three states, matching the TargetBanner's (§2): the real file itself,
+    // a draft that is saved *through* to the real file, and an isolated
+    // override. The badge sits next to `target_path`, so it describes which
+    // file the save lands in - which for the middle case is deliberately
+    // not the path shown beside it.
+    let (badge_classes, badge_label) = match (props.is_real, props.writes_real_file) {
+        (true, _) => (classes!("bg-red-600", "text-white"), "REAL"),
+        (false, true) => (classes!("bg-amber-600", "text-white"), "WRITES /etc/fstab"),
+        (false, false) => (classes!("bg-emerald-600", "text-white"), "TEST FILE"),
     };
-    let badge_label = if props.is_real { "REAL" } else { "SANDBOX" };
 
     let tab_classes = |tab: DiffTab| -> Classes {
         if tab == *active_tab {
@@ -159,7 +177,7 @@ pub fn diff_view(props: &DiffViewProps) -> Html {
                 </div>
 
                 <div class="shrink-0 border-t border-slate-200 dark:border-slate-700 px-6 py-4 space-y-3">
-                    if props.is_real {
+                    if props.writes_real_file {
                         <RealTargetConfirmCheckbox
                             checked={props.confirm_checked}
                             on_change={props.on_confirm_checked_change.clone()}

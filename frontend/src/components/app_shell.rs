@@ -15,6 +15,14 @@
 //! `on_diff_confirm`/`on_restore_confirm`), so `CandidateDocument`'s own
 //! comparison helpers and `crate::diff` can build the diff view without any
 //! further bookkeeping here.
+//!
+//! **Safety-gate derivation (T34):** this component is also where
+//! `writes_real_file` - "would confirming write the real `/etc/fstab`?" - is
+//! computed, once, from the live `TargetInfoDto`, and threaded into every
+//! confirm step that goes through the save dispatch (`DiffView`,
+//! `BackupRestoreConfirmDialog`). See the comment on the binding itself near
+//! the bottom of `app_shell` for why it is not `is_real`, and
+//! `docs/UI_DESIGN.md` §2 for the three states it collapses.
 
 use yew::prelude::*;
 
@@ -36,7 +44,8 @@ use crate::components::status_toast::{StatusToast, ToastKind};
 use crate::components::target_banner::TargetBanner;
 use crate::diff::compute_summary_diff;
 use crate::dto::{
-    BackupInfoDto, DocumentDto, FindingSeverity, LineDto, TargetInfoDto, ValidationReportDto,
+    BackupInfoDto, DocumentDto, FindingSeverity, LineDto, TargetInfoDto, TargetSource,
+    ValidationReportDto,
 };
 
 /// Reloads `original_document`/`original_text`/`candidate` from
@@ -72,6 +81,46 @@ async fn reload_backups(
             backups_error.set(None);
         }
         Err(message) => backups_error.set(Some(message)),
+    }
+}
+
+/// Builds the toast for a *successful* `save`/`restore_backup`, given that
+/// call's `draft_sync_warning` (`docs/API_CONTRACT.md` §8, T34).
+///
+/// `Some(message)` means the real `/etc/fstab` was written but the local
+/// working draft beside it could not be updated to match. The write that
+/// mattered succeeded, so this is not an error - but it must not be
+/// swallowed either (`PROJECT_PLAN.md`'s T34 non-negotiables: "a toast, not
+/// a silent swallow"), so it *replaces* `fallback` rather than being shown
+/// alongside it: the backend's message already states that the save
+/// succeeded, and two sentences both claiming success would only bury the
+/// part the user has not already inferred from the dialog closing.
+fn success_toast(draft_sync_warning: Option<String>, fallback: &str) -> (ToastKind, String) {
+    match draft_sync_warning {
+        Some(message) => (ToastKind::Warning, message),
+        None => (ToastKind::Success, fallback.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_save_shows_the_plain_success_line() {
+        let (kind, message) = success_toast(None, "Changes saved.");
+        assert!(matches!(kind, ToastKind::Success));
+        assert_eq!(message, "Changes saved.");
+    }
+
+    #[test]
+    fn a_draft_sync_warning_replaces_the_success_line_verbatim() {
+        let warning = "/etc/fstab was saved successfully, but the local working draft \
+                       could not be updated to match it."
+            .to_string();
+        let (kind, message) = success_toast(Some(warning.clone()), "Changes saved.");
+        assert!(matches!(kind, ToastKind::Warning));
+        assert_eq!(message, warning);
     }
 }
 
@@ -428,14 +477,15 @@ pub fn app_shell() -> Html {
             diff_error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::save(&document).await {
-                    Ok(_outcome) => {
+                    Ok(outcome) => {
                         reload_entries(candidate, original_document, original_text, list_error)
                             .await;
                         reload_backups(backups, backups_error).await;
                         diff_saving.set(false);
                         diff_confirm_checked.set(false);
                         diff_view_open.set(false);
-                        show_toast.emit((ToastKind::Success, "Changes saved.".to_string()));
+                        show_toast
+                            .emit(success_toast(outcome.draft_sync_warning, "Changes saved."));
                     }
                     Err(write_error) => {
                         // API_CONTRACT.md §8: "target_unchanged is the
@@ -515,14 +565,17 @@ pub fn app_shell() -> Html {
             restore_error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::restore_backup(&backup_path).await {
-                    Ok(_outcome) => {
+                    Ok(outcome) => {
                         reload_entries(candidate, original_document, original_text, list_error)
                             .await;
                         reload_backups(backups, backups_error).await;
                         restore_saving.set(false);
                         restore_target.set(None);
                         restore_confirm_checked.set(false);
-                        show_toast.emit((ToastKind::Success, "Backup restored.".to_string()));
+                        show_toast.emit(success_toast(
+                            outcome.draft_sync_warning,
+                            "Backup restored.",
+                        ));
                     }
                     Err(write_error) => {
                         let unchanged = write_error.target_unchanged();
@@ -800,12 +853,40 @@ pub fn app_shell() -> Html {
         .map(|backup| crate::diff::compute_raw_diff(original_text.as_str(), backup));
 
     let is_real = target.as_ref().map(|t| t.is_real).unwrap_or(false);
+    // "Will confirming this action write the real `/etc/fstab`?" - the one
+    // predicate every consequential confirm step in this app is gated on
+    // since T34, derived here exactly once so the three dialogs below (and
+    // `confirm_disabled`) cannot drift apart on it.
+    //
+    // It is deliberately *not* `is_real`: per
+    // `src-tauri/src/commands.rs::save_document_with`, a save dispatches on
+    // the target's `source`, and a `SandboxDefault` target (the default,
+    // unconfigured launch - `is_real == false`) writes the real
+    // `/etc/fstab` through `pkexec` and then mirrors it into the local
+    // working draft. So every launch writes the real file except one: an
+    // explicit `RUSTAB_TARGET_PATH` naming some other file.
+    //
+    // `unwrap_or(false)` while the target is still loading is safe without
+    // being optimistic: no confirm dialog can be open before
+    // `get_target_info` has resolved (they are all reached through buttons
+    // rendered below the banner, which itself renders "Loading target…"
+    // until then), and a `false` here only ever *shows* a calmer state, it
+    // cannot send a write anywhere - the backend resolves the target for
+    // itself on every call.
+    let writes_real_file = target
+        .as_ref()
+        .map(|t| t.is_real || t.source == TargetSource::SandboxDefault)
+        .unwrap_or(false);
     let target_path = target.as_ref().map(|t| t.path.clone()).unwrap_or_default();
 
     html! {
         <div class="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100">
             if let Some(info) = &*target {
-                <TargetBanner path={AttrValue::from(info.path.clone())} is_real={info.is_real} />
+                <TargetBanner
+                    path={AttrValue::from(info.path.clone())}
+                    is_real={info.is_real}
+                    source={info.source}
+                />
             } else if let Some(err) = &*target_error {
                 <div class="w-full h-10 shrink-0 flex items-center px-6 bg-amber-600 text-white text-sm font-semibold" role="alert">
                     { format!("Could not determine the active target: {err}") }
@@ -875,6 +956,7 @@ pub fn app_shell() -> Html {
 
             if *diff_view_open {
                 <DiffView
+                    writes_real_file={writes_real_file}
                     is_real={is_real}
                     target_path={AttrValue::from(target_path.clone())}
                     confirm_checked={*diff_confirm_checked}
@@ -895,7 +977,7 @@ pub fn app_shell() -> Html {
                 <BackupRestoreConfirmDialog
                     backup_timestamp={backup_timestamp}
                     target_path={backup_target_path}
-                    is_real={is_real}
+                    writes_real_file={writes_real_file}
                     confirm_checked={*restore_confirm_checked}
                     on_confirm_checked_change={{
                         let restore_confirm_checked = restore_confirm_checked.clone();

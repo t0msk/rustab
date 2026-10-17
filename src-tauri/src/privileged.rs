@@ -1420,6 +1420,7 @@ mod tests {
             validation_warnings: Vec::new(),
             notes: Vec::new(),
             elevated: false,
+            draft_sync_warning: None,
         };
         let stdout = serde_json::to_vec(&PrivilegedResponse::Ok { outcome }).expect("json");
 
@@ -2118,6 +2119,7 @@ mod tests {
                 validation_warnings: Vec::new(),
                 notes: Vec::new(),
                 elevated: false,
+                draft_sync_warning: None,
             },
         })
         .expect("json");
