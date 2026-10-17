@@ -1,9 +1,11 @@
 //! `DeleteConfirmDialog` - single-entry delete confirmation (§4).
 //!
-//! Small centered modal. Unlike `DiffView`/`BackupRestoreConfirmDialog`
-//! this only stages a pending removal (no disk write), so - judgment call -
-//! it *is* dismissible by clicking the backdrop, same as the non-destructive
-//! `EntryDetailDrawer`.
+//! Centered modal, same `max-w-2xl` width as the backup confirm dialogs (a
+//! narrower `max-w-sm` made a long escaped path - no spaces for the browser
+//! to wrap on - break across many dense lines). Unlike
+//! `DiffView`/`BackupRestoreConfirmDialog` this only stages a pending
+//! removal (no disk write), so - judgment call - it *is* dismissible by
+//! clicking the backdrop, same as the non-destructive `EntryDetailDrawer`.
 
 use yew::prelude::*;
 
@@ -38,7 +40,7 @@ pub fn delete_confirm_dialog(props: &DeleteConfirmDialogProps) -> Html {
             onclick={on_backdrop_click}
         >
             <div
-                class="w-full max-w-sm rounded-lg bg-white dark:bg-slate-800 shadow-lg p-6"
+                class="w-full max-w-2xl rounded-lg bg-white dark:bg-slate-800 shadow-lg p-6"
                 onclick={stop_propagation}
                 role="dialog"
                 aria-modal="true"

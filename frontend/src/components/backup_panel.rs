@@ -124,8 +124,11 @@ pub fn backup_list_item(props: &BackupListItemProps) -> Html {
                         </span>
                     }
                 </p>
-                <p class="text-xs text-slate-500 dark:text-slate-400 font-mono">
+                <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">
                     { "Target: " }{ backup.target_path.clone() }{ " · " }{ size_kb }
+                </p>
+                <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">
+                    { "Location: " }{ backup.path.clone() }
                 </p>
             </div>
             <div class="flex items-center gap-2">

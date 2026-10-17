@@ -70,7 +70,7 @@ pub fn backup_restore_confirm_dialog(props: &BackupRestoreConfirmDialogProps) ->
         // not dismiss this dialog - only explicit Cancel/Escape should.
         <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
             <div
-                class="w-full max-w-lg rounded-lg bg-white dark:bg-slate-800 shadow-lg p-6"
+                class="w-full max-w-2xl rounded-lg bg-white dark:bg-slate-800 shadow-lg p-6"
                 onclick={stop_propagation}
                 role="dialog"
                 aria-modal="true"
