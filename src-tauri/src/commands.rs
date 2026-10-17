@@ -389,6 +389,34 @@ pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> 
     open_external_link_with(link, open_browser)
 }
 
+/// `open_path_in_file_manager(path) -> null` (API_CONTRACT.md §3.14). Opens
+/// an arbitrary frontend-supplied path in the host file manager, via
+/// `xdg-open`.
+///
+/// `path` is the project's **second** explicit exception to "no command
+/// accepts a target path" (`docs/API_CONTRACT.md` §2; the first is
+/// [`restore_backup`]'s `backup_path`). It is a different *kind* of
+/// exception, not a weakening of the same one: this command is read-only (it
+/// only launches a file-manager process pointed at a path, the same thing
+/// [`open_backup_location`] already does for a path it resolves itself) and
+/// needs no privilege escalation, so there is no write or privileged read for
+/// a compromised frontend to redirect. The path itself is also never a
+/// secret or something the backend validates on the user's behalf - it is
+/// the Mount point text already visible in the table the user is looking at,
+/// either typed by them or picked via the directory-picker button - so a
+/// malicious frontend gains nothing here it could not already get by opening
+/// that same path in a terminal with Rustab's own unprivileged access. See
+/// `docs/API_CONTRACT.md` §2 for the full reasoning.
+///
+/// # Errors
+///
+/// [`CommandErrorKindDto::OpenPath`] if the file manager could not be
+/// launched.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn open_path_in_file_manager(path: String) -> Result<(), CommandErrorDto> {
+    open_path_in_file_manager_with(Path::new(&path), open_in_file_manager)
+}
+
 // ---------------------------------------------------------------------------
 // Shared internals
 // ---------------------------------------------------------------------------
@@ -534,6 +562,27 @@ fn open_browser(url: &str) -> io::Result<()> {
         .arg(url)
         .spawn()
         .map(|_child| ())
+}
+
+/// [`open_path_in_file_manager`], with the actual launch of a GUI program
+/// injectable - same structural reason as [`open_backup_location_with`]: a
+/// unit test has to assert which path this command would open without truly
+/// spawning a file manager window.
+///
+/// Unlike [`open_backup_location_with`], there is no target to resolve here
+/// first: `path` comes straight from the frontend argument, never from
+/// [`target::active_target`], so this function does nothing before handing
+/// `path` to `opener`.
+fn open_path_in_file_manager_with(
+    path: &Path,
+    opener: impl Fn(&Path) -> io::Result<()>,
+) -> Result<(), CommandErrorDto> {
+    opener(path).map_err(|err| {
+        CommandErrorDto::new(
+            CommandErrorKindDto::OpenPath,
+            format!("could not open {} in a file manager: {err}", path.display()),
+        )
+    })
 }
 
 /// The body of [`delete_backup`], with the target passed in (see
@@ -1058,6 +1107,45 @@ mod tests {
         assert!(
             error.message.contains(&expected_dir.display().to_string()),
             "the message must name the directory that could not be opened: {error:?}"
+        );
+    }
+
+    // -- open_path_in_file_manager -------------------------------------------
+
+    /// The happy path: a fake opener captures the exact path it was given,
+    /// with no resolution or re-derivation applied to it first - unlike
+    /// `open_backup_location`, this command has no target to resolve.
+    #[test]
+    fn open_path_in_file_manager_opens_the_exact_path_it_was_given() {
+        let path = PathBuf::from("/mnt/data");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        open_path_in_file_manager_with(&path, |opened| {
+            calls.borrow_mut().push(opened.to_path_buf());
+            Ok(())
+        })
+        .expect("the opener stand-in succeeds");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls, vec![path]);
+    }
+
+    /// A failure to launch the file manager (binary missing, permission
+    /// denied, ...) is reported as `OpenPath`, with the path's own error
+    /// folded into the message.
+    #[test]
+    fn open_path_in_file_manager_reports_a_launch_failure() {
+        let path = PathBuf::from("/mnt/data");
+
+        let error = open_path_in_file_manager_with(&path, |_| {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .expect_err("a launch failure must be reported");
+
+        assert_eq!(error.kind, CommandErrorKindDto::OpenPath);
+        assert!(
+            error.message.contains(&path.display().to_string()),
+            "the message must name the path that could not be opened: {error:?}"
         );
     }
 

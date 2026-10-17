@@ -102,6 +102,39 @@ send are the `backup_path` arguments of `restore_backup` (§3.7),
 `read_backup` (§3.9) and `delete_backup` (§3.10), and each is matched against
 the active target's real backup list before being used as a path.
 
+**Second exception: `open_path_in_file_manager`'s `path` (§3.14).** This
+command takes a raw, frontend-supplied path and launches the host file
+manager on it via `xdg-open`, with no matching against any list first. That
+looks like a weakening of the rule above, so it is named here explicitly and
+held to the same bar `restore_backup`'s exception is held to, rather than
+slipped in quietly:
+
+- The policy this section opens with exists to stop a compromised or buggy
+  frontend from redirecting a *write* operation (or a privileged read) at a
+  file of the attacker's choosing - `save`, `restore_backup` and the
+  `/etc/fstab` case of `delete_backup` are exactly the operations a
+  frontend-chosen path could otherwise point somewhere unintended.
+  `open_path_in_file_manager` is categorically different from all of those:
+  it is **read-only**. It does nothing but start a GUI file-manager process
+  and point it at a path; it never opens, writes, renames or deletes
+  anything itself.
+- It is **unprivileged** for every target, not just the sandbox: there is no
+  `privileged.rs` involvement and no `pkexec` anywhere in this command's
+  path, so there is no elevated capability for a malicious argument to ride
+  on.
+- The path itself is **never a secret, and never something the backend
+  validates on the user's behalf**. It is the Mount point text already
+  rendered in the table the user is looking at - either typed by the user
+  directly or filled in via the existing native directory-picker button
+  (`docs/UI_DESIGN.md`) - so the frontend is, at most, relaying back a
+  string the user already produced.
+- Putting those three together: there is no attacker model in which a
+  malicious frontend can use this command to show the user something they
+  do not already have full, unprivileged visibility into. They could open
+  that exact path in a terminal or a file manager themselves, with the
+  exact same access Rustab itself runs with - this command does not grant,
+  bypass or reveal anything beyond that.
+
 ---
 
 ## 3. Commands
@@ -452,6 +485,29 @@ not waited on. On failure (most commonly `xdg-open` missing) the rejection
 names the URL/URI that could not be opened.
 
 Error kinds: `open_external_link`.
+
+### 3.14 `open_path_in_file_manager`
+
+```
+open_path_in_file_manager(path: string) -> null   (rejects with CommandErrorDto)
+```
+
+Opens an arbitrary frontend-supplied path in the host file manager
+(`xdg-open`). `path` is this project's **second** explicit exception to §2's
+"no command accepts a target path" rule (the first is `restore_backup`'s
+`backup_path`, §3.7) - see §2 for why it is safe: this command is read-only,
+needs no privilege escalation for either target, and `path` is never a
+secret or something the backend validates, only the Mount point text the
+user already sees and typed or picked themselves.
+
+**No privilege escalation.** Same reasoning as §3.12 and §3.13: launching a
+GUI program needs no elevated access. This command never prompts.
+
+On success the promise resolves with `null`; the file manager window is not
+waited on. On failure (most commonly `xdg-open` missing) the rejection names
+the path that could not be opened.
+
+Error kinds: `open_path`.
 
 ---
 
@@ -921,8 +977,8 @@ message, reload the target with `list_entries`, and point at the backup panel.
 
 `kind` is one of `target_resolution`, `read_target`, `not_utf8`,
 `list_backups`, `invalid_backup`, `read_backup`, `open_location`,
-`open_external_link`. These commands never wrote anything, so there is no
-`target_unchanged` field.
+`open_external_link`, `open_path`. These commands never wrote anything, so
+there is no `target_unchanged` field.
 
 | `kind` | Meaning | Raised by |
 | --- | --- | --- |
@@ -934,6 +990,7 @@ message, reload the target with `list_entries`, and point at the backup panel.
 | `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
 | `open_location` | The host file manager could not be launched | `open_backup_location` |
 | `open_external_link` | The browser could not be launched | `open_external_link` |
+| `open_path` | The host file manager could not be launched for the frontend-supplied path | `open_path_in_file_manager` |
 
 ### `DeleteBackupErrorDto` (`delete_backup` only)
 
@@ -1057,7 +1114,7 @@ frontend matches these strings exhaustively:
 
 - `CommandErrorKindDto`: `target_resolution`, `read_target`, `not_utf8`,
   `list_backups`, `invalid_backup`, `read_backup`, `open_location`,
-  `open_external_link`.
+  `open_external_link`, `open_path`.
 - `DeleteBackupErrorKindDto`: `target_resolution`, `invalid_backup`,
   `privilege_escalation`, `delete`.
 - `CreateBackupErrorKindDto`: `target_resolution`, `target_missing`,
@@ -1077,6 +1134,11 @@ individually by `dto::tests::every_validation_field_spelling_is_exactly_as_docum
   given against the real backup list, so a mangled string fails closed with
   `invalid_backup` rather than reading, writing or deleting somewhere
   unintended. Non-UTF-8 target paths are not a supported configuration.
+  `open_path_in_file_manager`'s `path` is the second kind of path the
+  frontend may send (§2) and is not matched against any list - it is
+  deliberately safe to send as-is, for the reasons §2 gives in full; a
+  non-UTF-8 value there is rendered lossily like any other path, and the
+  file manager is launched on whatever that lossy string names.
 - **Reload after every save.** `WriteOutcomeDto` intentionally does not carry
   the new document. Call `list_entries` again so the UI shows what is
   actually on disk, not what it hoped to put there.

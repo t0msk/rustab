@@ -741,6 +741,11 @@ pub enum CommandErrorKindDto {
     /// ([`crate::commands::open_external_link`]) - the `xdg-open` binary is
     /// missing, or starting it failed for some other reason.
     OpenExternalLink,
+    /// [`crate::commands::open_path_in_file_manager`]'s own kind - the host
+    /// file manager could not be launched for the frontend-supplied path
+    /// (the `xdg-open` binary is missing, or starting it failed for some
+    /// other reason).
+    OpenPath,
 }
 
 /// A failed read-only command.
@@ -1248,6 +1253,7 @@ mod tests {
             (CommandErrorKindDto::ReadBackup, "read_backup"),
             (CommandErrorKindDto::OpenLocation, "open_location"),
             (CommandErrorKindDto::OpenExternalLink, "open_external_link"),
+            (CommandErrorKindDto::OpenPath, "open_path"),
         ];
         for (kind, spelling) in command_kinds {
             assert_eq!(
