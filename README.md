@@ -97,6 +97,8 @@ This draft is what you're actually editing day to day - its job is to protect yo
 
 **Before you save, review the diff.** Every save goes through a mandatory confirmation step: a side-by-side Summary or unified Raw diff of exactly what's about to change, an explicit checkbox, and a clearly red "Write to /etc/fstab" button - there is no accidental or silent write path.
 
+**Backups are backups of the real file, too.** The Backups panel lists, creates, and deletes backups of `/etc/fstab` itself, not the local draft - so if your system won't boot, you can restore one from a rescue CD/USB straight onto the real file. By default (no `RUSTAB_TARGET_PATH`), creating or deleting a backup is a privileged operation: expect a `pkexec` prompt, same as a save.
+
 **For development and testing without touching the real file**, point Rustab at a throwaway file instead via `RUSTAB_TARGET_PATH` - see `CONTRIBUTING.md`'s "Safety-first contribution notes" and `.env.example` in the repository root for details. Setting `RUSTAB_TARGET_PATH` to anything other than `/etc/fstab` makes that path the target outright, with no dual-write to the real file and no draft-mirroring involved.
 
 ## Prerequisites
@@ -111,7 +113,7 @@ You need:
 - **Linux system dependencies** for Tauri - see [Tauri's official Linux prerequisites documentation](https://v2.tauri.app/start/prerequisites/#linux); notably:
   - `libwebkit2gtk-4.1` and build tools (on Debian/Ubuntu: `libwebkit2gtk-4.1-dev`)
   - `libssl-dev`, `libgtk-3-dev`, and others (exact packages depend on your distro)
-- **`pkexec` and polkit** - required for every save by default (writing to the real `/etc/fstab`); only unneeded when `RUSTAB_TARGET_PATH` points at a non-real file for development/testing (see Safety Notes)
+- **`pkexec` and polkit** - required for every save by default (writing to the real `/etc/fstab`), and for creating/deleting a backup; only unneeded when `RUSTAB_TARGET_PATH` points at a non-real file for development/testing (see Safety Notes)
 
 ## Building & Running
 
