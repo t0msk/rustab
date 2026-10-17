@@ -75,6 +75,19 @@
 //! failing, the same soft-failure stance this project takes towards absent
 //! `lsblk`/`findmnt`.
 //!
+//! ## The marker's second job: external-change detection (T36)
+//!
+//! The same marker answers a second question, at the other end of a session:
+//! "has the real `/etc/fstab` changed outside Rustab since we last synced with
+//! it, right now, as a write is about to commit?" That is
+//! [`ExternalChangeGuard`], and it compares the marker's recorded bytes
+//! against `/etc/fstab`'s current bytes - never the draft against the real
+//! file, since a draft differing from the marker is just unsaved edits. A
+//! detected difference blocks the write and is reported to the frontend with
+//! both sides of the diff (`crate::dto::WriteErrorKindDto::ExternalChange`);
+//! the user can cancel, or ask for the write anyway, which threads
+//! `allow_external_change` through and skips the check for that one request.
+//!
 //! Rule 2 deliberately applies to **release builds too**, and the real file
 //! is still only ever *read* here, never written: the elevated writer
 //! (`crate::privileged`) is the one and only thing that writes `/etc/fstab`.
@@ -613,6 +626,145 @@ fn record_last_known_real(sandbox_path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub(crate) fn sync_sandbox_after_save(sandbox_path: &Path, bytes: &[u8]) -> io::Result<()> {
     publish_bytes(sandbox_path, bytes)?;
     record_last_known_real(sandbox_path, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// External-change detection (T36)
+// ---------------------------------------------------------------------------
+
+/// What a real-file write knows about `/etc/fstab`'s content before it starts,
+/// and whether the user has already chosen to overwrite an external change
+/// (T36).
+///
+/// This is the whole input of the "did the real file change under us?" check,
+/// travelling - as two flat fields - inside `crate::privileged`'s
+/// `PrivilegedRequest::Write` so the check can be performed *again*, inside
+/// the elevated process, immediately before
+/// [`fstab_core::writer::write_document`] runs. That re-check is the
+/// authoritative one: `pkexec` blocks on a human typing a password, and the
+/// file can change during exactly that wait, so a check made only before the
+/// prompt would leave the largest part of the window uncovered (see
+/// `crate::commands::save_document_with` and `crate::privileged::handle_write`).
+///
+/// ## What is compared, and what is deliberately not
+///
+/// The comparison is "the **marker**'s recorded bytes vs. `/etc/fstab`'s
+/// current bytes" - never the working draft against the real file. A draft
+/// that differs from the marker is the ordinary state of having unsaved edits
+/// and says nothing about anything outside Rustab; only a real file that no
+/// longer matches what Rustab last recorded means someone else wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalChangeGuard {
+    /// The content Rustab last knew the real `/etc/fstab` to hold - the
+    /// [`last_known_real_marker`]'s content, as recorded by the last refresh
+    /// or the last successful save ([`sync_sandbox_after_save`]).
+    ///
+    /// `None` means Rustab has **no usable record** (no marker yet, an
+    /// unreadable one, non-UTF-8 content, or a target kind that keeps no
+    /// marker at all - see [`ExternalChangeGuard::unchecked`]). With nothing
+    /// to compare against, no external change can be established and the
+    /// write proceeds, which is exactly the pre-T36 behaviour. The
+    /// alternative - blocking every write a best-effort marker write had
+    /// failed for - would make the file uneditable for a reason the user can
+    /// neither see nor fix.
+    pub last_known_real_content: Option<String>,
+    /// `true` only when the user has been shown the diff of what changed
+    /// externally and explicitly asked for the write anyway. It makes
+    /// [`ExternalChangeGuard::detect`] report nothing, on both sides, for this
+    /// one request.
+    ///
+    /// Deliberately a separate signal from
+    /// [`Self::last_known_real_content`] rather than "send no expectation":
+    /// "the user confirmed" and "Rustab never knew" are different states, and
+    /// collapsing them would make the confirmed case indistinguishable from a
+    /// lost marker in a bug report.
+    pub allow_external_change: bool,
+}
+
+/// An external change to the real `/etc/fstab`, as detected by
+/// [`ExternalChangeGuard::detect`]: both sides of the diff the user is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalChange {
+    /// What Rustab last knew the file to hold - the "old" side.
+    pub last_known: String,
+    /// What the file holds right now - the "new" side, i.e. the content the
+    /// write would replace.
+    pub current: String,
+}
+
+impl ExternalChangeGuard {
+    /// The guard for a default-launch write: the recorded marker content
+    /// beside `sandbox_path`, plus the user's explicit "write anyway" answer.
+    ///
+    /// Every failure to read the marker lands on `None` (no record) rather
+    /// than on an error, for the reason spelled out on
+    /// [`Self::last_known_real_content`].
+    pub fn from_marker(sandbox_path: &Path, allow_external_change: bool) -> Self {
+        let last_known_real_content = last_known_real_marker(sandbox_path)
+            .and_then(|marker| fs::read(marker).ok())
+            // Non-UTF-8 marker bytes cannot be carried through the JSON
+            // request, and a session could not have loaded such a file in the
+            // first place (`crate::commands::list_entries` refuses non-UTF-8
+            // content outright), so this is treated as "no usable record".
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        ExternalChangeGuard {
+            last_known_real_content,
+            allow_external_change,
+        }
+    }
+
+    /// The guard for a write that has no marker to compare against at all:
+    /// case 3 of `crate::commands::save_document_with` (an explicit
+    /// `RUSTAB_TARGET_PATH=/etc/fstab`), which deliberately keeps no
+    /// last-known-content marker.
+    ///
+    /// Carries no record, so [`Self::detect`] reports nothing and that path
+    /// behaves exactly as it did before T36. `allow_external_change` is
+    /// `false` because nothing was confirmed - the check is skipped for want
+    /// of an expectation, not for want of a warning.
+    pub fn unchecked() -> Self {
+        ExternalChangeGuard {
+            last_known_real_content: None,
+            allow_external_change: false,
+        }
+    }
+
+    /// Compares what Rustab last knew against what `real_fstab` holds right
+    /// now, returning both sides when they differ.
+    ///
+    /// `None` - "no external change to report" - for each of:
+    ///
+    /// - the user already confirmed the overwrite
+    ///   ([`Self::allow_external_change`]);
+    /// - there is no usable record to compare against
+    ///   ([`Self::last_known_real_content`]);
+    /// - `real_fstab` cannot be read at all (missing, or no permission).
+    ///   Nothing can be established in that case, and a file that is *gone*
+    ///   is not an edit to warn about: the write recreates it, the same
+    ///   first-ever-save state [`refresh_sandbox_if_real_changed`] already
+    ///   treats as "nothing to compare";
+    /// - the bytes match.
+    ///
+    /// The comparison itself is byte-exact against the recorded bytes. Only
+    /// the *reported* current content is lossy
+    /// ([`String::from_utf8_lossy`]) - it exists to be rendered as a diff, and
+    /// a real file whose bytes are not UTF-8 necessarily differs from a
+    /// recorded expectation that is, so the verdict never depends on that
+    /// conversion.
+    pub fn detect(&self, real_fstab: &Path) -> Option<ExternalChange> {
+        if self.allow_external_change {
+            return None;
+        }
+        let last_known = self.last_known_real_content.as_deref()?;
+        let current = fs::read(real_fstab).ok()?;
+        if current == last_known.as_bytes() {
+            return None;
+        }
+        Some(ExternalChange {
+            last_known: last_known.to_string(),
+            current: String::from_utf8_lossy(&current).into_owned(),
+        })
+    }
 }
 
 /// Writes `bytes` onto `path` as a sibling temp file plus a `rename`,
@@ -1533,6 +1685,124 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let decoy = dir.join("decoy");
         fs::write(&decoy, "# not fstab\n").expect("write");
         assert!(!is_real_fstab(&decoy));
+    }
+
+    // -- T36: external-change detection -------------------------------------
+    //
+    // Unit-level coverage of the one comparison both sides of a write perform
+    // (the unprivileged courtesy check in `crate::commands` and the
+    // authoritative one in `crate::privileged`), against a stand-in for
+    // `/etc/fstab` - never the machine's own file.
+
+    /// The headline: the comparison is the **marker's** recorded content
+    /// against the real file's *current* content, and a difference is reported
+    /// with both sides, in the right order (old = what Rustab knew, new = what
+    /// is there now).
+    #[test]
+    fn a_real_file_that_no_longer_matches_the_marker_is_an_external_change() {
+        let dir = TempDir::new("guard-drift");
+        let draft = dir.join("fstab.sandbox");
+        let real = dir.join("etc-fstab-stand-in");
+        fs::write(marker_of(&draft), "# what rustab knew\n").expect("seed the marker");
+        fs::write(&real, "# what someone else wrote\n").expect("seed the real stand-in");
+
+        let change = ExternalChangeGuard::from_marker(&draft, false)
+            .detect(&real)
+            .expect("a differing real file is an external change");
+
+        assert_eq!(change.last_known, "# what rustab knew\n");
+        assert_eq!(change.current, "# what someone else wrote\n");
+    }
+
+    /// The ordinary case, and the one that must never produce a warning: the
+    /// real file still holds exactly what the marker recorded. The draft is
+    /// deliberately *different* from both - that is what unsaved edits look
+    /// like, and it says nothing about anything outside Rustab.
+    #[test]
+    fn an_unchanged_real_file_is_no_external_change_even_with_a_drifted_draft() {
+        let dir = TempDir::new("guard-no-drift");
+        let draft = dir.join("fstab.sandbox");
+        let real = dir.join("etc-fstab-stand-in");
+        fs::write(&draft, "# the user's unsaved edits\n").expect("seed the draft");
+        fs::write(marker_of(&draft), "# agreed reality\n").expect("seed the marker");
+        fs::write(&real, "# agreed reality\n").expect("seed the real stand-in");
+
+        assert_eq!(
+            ExternalChangeGuard::from_marker(&draft, false).detect(&real),
+            None,
+            "a draft differing from the marker is unsaved work, not external drift"
+        );
+    }
+
+    /// The three ways the check is skipped rather than failed, each of which
+    /// leaves the pre-T36 behaviour in place: the user said "write anyway",
+    /// there is no marker to compare against, and the real file cannot be read
+    /// at all.
+    #[test]
+    fn a_check_with_nothing_to_compare_reports_no_external_change() {
+        let dir = TempDir::new("guard-skips");
+        let draft = dir.join("fstab.sandbox");
+        let real = dir.join("etc-fstab-stand-in");
+        fs::write(&real, "# someone else's content\n").expect("seed the real stand-in");
+
+        // No marker at all: nothing is known, so nothing can be claimed.
+        assert_eq!(
+            ExternalChangeGuard::from_marker(&draft, false).detect(&real),
+            None
+        );
+        assert_eq!(
+            ExternalChangeGuard::unchecked().detect(&real),
+            None,
+            "the no-marker target kinds behave exactly as they did before T36"
+        );
+
+        // A marker that differs, but the user has already seen the diff.
+        fs::write(marker_of(&draft), "# what rustab knew\n").expect("seed the marker");
+        assert!(ExternalChangeGuard::from_marker(&draft, false)
+            .detect(&real)
+            .is_some());
+        assert_eq!(
+            ExternalChangeGuard::from_marker(&draft, true).detect(&real),
+            None,
+            "an explicit write-anyway must silence the check for this one call"
+        );
+
+        // An unreadable (here: missing) real file establishes nothing.
+        assert_eq!(
+            ExternalChangeGuard::from_marker(&draft, false).detect(&no_real_fstab(&dir)),
+            None
+        );
+    }
+
+    /// The comparison is on bytes, and only the *reported* current content is
+    /// lossy: a real file whose bytes are not UTF-8 cannot match a recorded
+    /// expectation that is, so it is reported as a change rather than silently
+    /// passing a round trip through `from_utf8_lossy`.
+    #[test]
+    fn a_non_utf8_real_file_is_reported_as_a_change_with_lossy_text() {
+        let dir = TempDir::new("guard-non-utf8");
+        let draft = dir.join("fstab.sandbox");
+        let real = dir.join("etc-fstab-stand-in");
+        fs::write(marker_of(&draft), "# plain text\n").expect("seed the marker");
+        fs::write(&real, [b'#', 0xff, b'\n']).expect("seed non-UTF-8 bytes");
+
+        let change = ExternalChangeGuard::from_marker(&draft, false)
+            .detect(&real)
+            .expect("non-UTF-8 bytes cannot match a UTF-8 expectation");
+        assert_eq!(change.last_known, "# plain text\n");
+        assert!(
+            change.current.contains('\u{fffd}'),
+            "the reported content is lossy by design: {:?}",
+            change.current
+        );
+
+        // And the marker itself being non-UTF-8 means "no usable record",
+        // rather than a comparison nothing could satisfy.
+        fs::write(marker_of(&draft), [0xff, 0xfe]).expect("seed a non-UTF-8 marker");
+        assert_eq!(
+            ExternalChangeGuard::from_marker(&draft, false).last_known_real_content,
+            None
+        );
     }
 
     #[test]

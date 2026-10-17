@@ -120,6 +120,21 @@
 //! root-owned path" - not `/etc/shadow`, not a different target's backup, not
 //! the target itself.
 //!
+//! ## The external-change check lives in the child too (T36)
+//!
+//! For the same structural reason, and it is worth stating plainly: a write
+//! request carries what the unprivileged side believed `/etc/fstab` held (its
+//! last-known-real marker's content - see [`target::ExternalChangeGuard`]),
+//! and the elevated side re-reads the file and compares, immediately before
+//! [`writer::write_document`]. The reason it cannot be checked only on the
+//! unprivileged side is this module's own mechanism: `pkexec` blocks on a
+//! human typing a password, so the interval between "the parent looked" and
+//! "the write happens" contains an arbitrarily long, human-paced wait during
+//! which anything else can write the file. The parent's check (in
+//! `crate::commands::save_document_with`) is a courtesy that saves a pointless
+//! password prompt; the child's is the one that decides, exactly as it is for
+//! validation.
+//!
 //! The create-backup operation carries only a `target`, and that single
 //! identity check is the whole of its authority: the path it writes is chosen
 //! by [`writer::create_backup`] from the verified target's own name, never by
@@ -198,6 +213,27 @@ pub enum PrivilegedRequest {
         target: String,
         /// The document to write, in the same shape the frontend sent it.
         candidate: DocumentDto,
+        /// What the unprivileged side believes `target` currently holds - the
+        /// content its last-known-real marker records (T36). The elevated side
+        /// re-reads `target` itself and refuses the write if the two differ,
+        /// *immediately* before [`writer::write_document`] runs; see
+        /// [`handle_write`].
+        ///
+        /// `None` means the unprivileged side has no usable record and no
+        /// comparison is possible, which is the pre-T36 behaviour (see
+        /// [`target::ExternalChangeGuard`]).
+        ///
+        /// Deliberately **not** `#[serde(default)]`, unlike the additive
+        /// fields on the DTOs that cross the Tauri boundary: this protocol is
+        /// internal to one build speaking to itself, and a missing field
+        /// defaulting to "no record" would be a silently fail-*open* default
+        /// on the one check that exists to fail closed. A request that does
+        /// not carry the field is a protocol error, as it should be.
+        last_known_real_content: Option<String>,
+        /// `true` only when the user has already been shown what changed
+        /// externally and asked for the write anyway, which makes the elevated
+        /// side skip the comparison for this one request (T36).
+        allow_external_change: bool,
     },
     /// Unlink one of `target`'s own backups. Never `target` itself.
     DeleteBackup {
@@ -352,9 +388,21 @@ pub fn handle_privileged_request<R: Read, W: Write>(
     };
 
     match request {
-        PrivilegedRequest::Write { target, candidate } => {
-            handle_write(output, allowed_target, &target, candidate)
-        }
+        PrivilegedRequest::Write {
+            target,
+            candidate,
+            last_known_real_content,
+            allow_external_change,
+        } => handle_write(
+            output,
+            allowed_target,
+            &target,
+            candidate,
+            &target::ExternalChangeGuard {
+                last_known_real_content,
+                allow_external_change,
+            },
+        ),
         PrivilegedRequest::DeleteBackup {
             target,
             backup_path,
@@ -365,14 +413,35 @@ pub fn handle_privileged_request<R: Read, W: Write>(
     }
 }
 
-/// The elevated write: refuse any target but `allowed_target`, then perform
-/// the complete [`writer::write_document`] operation in this one process under
-/// this one authorization.
+/// The elevated write: refuse any target but `allowed_target`, refuse a target
+/// that changed outside Rustab since the unprivileged side last looked, then
+/// perform the complete [`writer::write_document`] operation in this one
+/// process under this one authorization.
+///
+/// ## Why the external-change check is *here* (T36)
+///
+/// This is the authoritative one, and it is placed as the last thing before
+/// `write_document` on purpose. [`save_elevated`] spawns `pkexec`, which
+/// blocks on a human reading a dialog and typing a password - an arbitrarily
+/// long wait, during which another tool, another Rustab instance or a text
+/// editor can write `/etc/fstab`. A check made only in the unprivileged parent
+/// before that prompt would therefore leave the largest part of the window
+/// uncovered. So the request carries what the parent believed the file held
+/// ([`target::ExternalChangeGuard`]), this process re-reads the file itself and
+/// compares, and only then writes.
+///
+/// It is exactly the relationship this module already has for *validation*:
+/// [`save_elevated`] validates before prompting as a courtesy (so nobody types
+/// a password for a save that cannot succeed), and `write_document` validates
+/// again in here, where the answer is binding. Both unprivileged pre-checks
+/// could be deleted without weakening any guarantee this function makes;
+/// neither of the checks in here can.
 fn handle_write<W: Write>(
     output: &mut W,
     allowed_target: &Path,
     target: &str,
     candidate: DocumentDto,
+    guard: &target::ExternalChangeGuard,
 ) -> i32 {
     let target_path = PathBuf::from(target);
     if !target::is_same_file(&target_path, allowed_target) {
@@ -389,6 +458,25 @@ fn handle_write<W: Write>(
                     ),
                 )
                 .with_path(&target_path),
+            },
+            EXIT_OPERATION_ERROR,
+        );
+    }
+
+    // The authoritative external-change check: re-read the verified target
+    // *in this process*, now that the authentication wait is over, and refuse
+    // rather than overwrite content that appeared while it was on screen.
+    // Nothing has touched the disk at this point, which is why the error can
+    // promise `target_unchanged`.
+    if let Some(change) = guard.detect(&target_path) {
+        return respond(
+            output,
+            PrivilegedResponse::Error {
+                error: WriteErrorDto::external_change(
+                    &target_path,
+                    &change.last_known,
+                    &change.current,
+                ),
             },
             EXIT_OPERATION_ERROR,
         );
@@ -719,16 +807,25 @@ impl NoResponseReason {
 /// that touches disk happens inside the elevated
 /// [`writer::write_document`] call (see the module docs).
 ///
+/// `guard` is what the caller believes `target` currently holds, plus the
+/// user's "write anyway" answer (T36). It is pure transport here - this
+/// function neither reads `target` nor decides anything from it; the elevated
+/// side re-reads the file and makes the call ([`handle_write`]), which is why
+/// the password wait cannot hide a change from the check.
+///
 /// # Errors
 ///
 /// Returns a [`WriteErrorDto`] whose `kind` is
 /// [`WriteErrorKindDto::PrivilegeEscalation`] if the helper could not be
 /// launched, the authorization was refused or dismissed, or the helper
 /// produced no usable response; otherwise the error the helper itself
-/// reported, forwarded unchanged.
+/// reported, forwarded unchanged - including
+/// [`WriteErrorKindDto::ExternalChange`], which is how the elevated side
+/// reports a target that changed under it.
 pub fn save_elevated(
     target: &Path,
     candidate: &Document,
+    guard: &target::ExternalChangeGuard,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
     // Validate before prompting. This is a courtesy, not the safety net: a
     // document with blocking findings is rejected without making the user
@@ -743,6 +840,8 @@ pub fn save_elevated(
     let request = PrivilegedRequest::Write {
         target: target.to_string_lossy().into_owned(),
         candidate: DocumentDto::from(candidate),
+        last_known_real_content: guard.last_known_real_content.clone(),
+        allow_external_change: guard.allow_external_change,
     };
     let output = run_elevated(&request).map_err(|failure| write_launch_error(target, &failure))?;
 
@@ -1199,9 +1298,32 @@ mod tests {
         allowed_target: &Path,
         candidate: &Document,
     ) -> (i32, PrivilegedResponse) {
+        // No record of the file's previous content, which is the one guard
+        // that disables T36's check entirely - so these tests exercise exactly
+        // the pre-T36 behaviour of the helper. The guarded variants have their
+        // own helper below.
+        run_helper_guarded(
+            target,
+            allowed_target,
+            candidate,
+            &target::ExternalChangeGuard::unchecked(),
+        )
+    }
+
+    /// [`run_helper`] with an explicit [`target::ExternalChangeGuard`], for the
+    /// T36 tests: the request carries what the unprivileged side claims the
+    /// target held, and the helper re-reads the file itself.
+    fn run_helper_guarded(
+        target: &Path,
+        allowed_target: &Path,
+        candidate: &Document,
+        guard: &target::ExternalChangeGuard,
+    ) -> (i32, PrivilegedResponse) {
         let request = PrivilegedRequest::Write {
             target: target.to_string_lossy().into_owned(),
             candidate: DocumentDto::from(candidate),
+            last_known_real_content: guard.last_known_real_content.clone(),
+            allow_external_change: guard.allow_external_change,
         };
         let payload = serde_json::to_vec(&request).expect("the request must serialize");
         let mut stdin = payload.as_slice();
@@ -1355,9 +1477,182 @@ mod tests {
         );
     }
 
+    // -- T36: the authoritative external-change check ------------------------
+    //
+    // These exercise the real `handle_privileged_request` against a temp file
+    // standing in for `/etc/fstab`, which is the point of its `allowed_target`
+    // parameter: the check under test genuinely *reads* the target, and
+    // `cargo test` must never read the machine's own file.
+
+    /// The check that actually protects the file: the request says what the
+    /// unprivileged side last knew, the helper re-reads the target *itself*,
+    /// finds something else, and refuses - leaving the file byte-for-byte as
+    /// it was, with no backup and no temp file beside it.
+    ///
+    /// This is the case a check in the unprivileged parent alone cannot cover:
+    /// the content below appeared while `pkexec` was waiting for a password.
+    #[test]
+    fn helper_refuses_a_write_when_the_target_changed_since_the_request_was_built() {
+        let dir = TempDir::new("helper-external-change");
+        let target = dir.join("fstab");
+        fs::write(&target, "# written by someone else, during the prompt\n")
+            .expect("seed the target");
+
+        let (code, response) = run_helper_guarded(
+            &target,
+            &target,
+            &valid_candidate("/mnt/blocked"),
+            &target::ExternalChangeGuard {
+                last_known_real_content: Some(ORIGINAL.to_string()),
+                allow_external_change: false,
+            },
+        );
+
+        assert_eq!(code, EXIT_OPERATION_ERROR);
+        let PrivilegedResponse::Error { error } = response else {
+            panic!("the write should have been refused: {response:?}");
+        };
+        assert_eq!(error.kind, WriteErrorKindDto::ExternalChange);
+        assert!(
+            error.target_unchanged,
+            "nothing was opened for writing, so this is a guarantee"
+        );
+        let change = error
+            .external_change
+            .as_deref()
+            .expect("the diff payload must be attached");
+        assert_eq!(change.last_known_content, ORIGINAL);
+        assert_eq!(
+            change.current_content, "# written by someone else, during the prompt\n",
+            "the frontend builds its diff out of these two"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("read the target"),
+            "# written by someone else, during the prompt\n",
+            "the external content must survive untouched"
+        );
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the temp dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["fstab".to_string()],
+            "not even a backup or a temp file may be created by a refused write"
+        );
+    }
+
+    /// The same request against a target that still holds what it claimed:
+    /// the write goes through, exactly as it did before T36.
+    #[test]
+    fn helper_writes_when_the_target_still_holds_what_the_request_expected() {
+        let dir = TempDir::new("helper-no-external-change");
+        let target = dir.join("fstab");
+        fs::write(&target, ORIGINAL).expect("seed the target");
+
+        let candidate = valid_candidate("/mnt/allowed");
+        let (code, response) = run_helper_guarded(
+            &target,
+            &target,
+            &candidate,
+            &target::ExternalChangeGuard {
+                last_known_real_content: Some(ORIGINAL.to_string()),
+                allow_external_change: false,
+            },
+        );
+
+        assert_eq!(code, EXIT_OK);
+        assert!(
+            matches!(response, PrivilegedResponse::Ok { .. }),
+            "{response:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("read the target"),
+            candidate.to_string()
+        );
+    }
+
+    /// "Write anyway": the user has seen the diff and asked for it, so the
+    /// helper performs the full ordinary write over the changed content -
+    /// whose previous bytes `write_document` backs up on the way, as it does
+    /// for any other save.
+    #[test]
+    fn helper_writes_over_an_external_change_when_the_user_allowed_it() {
+        let dir = TempDir::new("helper-write-anyway");
+        let target = dir.join("fstab");
+        fs::write(&target, "# someone else's content\n").expect("seed the target");
+
+        let candidate = valid_candidate("/mnt/anyway");
+        let (code, response) = run_helper_guarded(
+            &target,
+            &target,
+            &candidate,
+            &target::ExternalChangeGuard {
+                last_known_real_content: Some(ORIGINAL.to_string()),
+                allow_external_change: true,
+            },
+        );
+
+        assert_eq!(code, EXIT_OK);
+        let PrivilegedResponse::Ok { outcome } = response else {
+            panic!("an allowed write must succeed: {response:?}");
+        };
+        assert_eq!(
+            fs::read_to_string(&target).expect("read the target"),
+            candidate.to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(outcome.backup.expect("a backup must still be taken"))
+                .expect("read the backup"),
+            "# someone else's content\n",
+            "the overwritten external content stays recoverable, as for any save"
+        );
+    }
+
+    /// Ordering: the identity check comes first and is unconditional. A
+    /// request for the wrong target is refused as such even when it also
+    /// carries a stale expectation, so a drifted guard can never be used to
+    /// get a different error (or a read) for a file this process may not
+    /// touch.
+    #[test]
+    fn the_identity_check_still_comes_first_for_a_drifted_request() {
+        let dir = TempDir::new("helper-wrong-target-drifted");
+        let decoy = dir.join("somewhere-else");
+        fs::write(&decoy, "# must not be touched\n").expect("seed the decoy");
+        let allowed = dir.join("fstab");
+
+        let (code, response) = run_helper_guarded(
+            &decoy,
+            &allowed,
+            &valid_candidate("/mnt/nope"),
+            &target::ExternalChangeGuard {
+                last_known_real_content: Some(ORIGINAL.to_string()),
+                allow_external_change: false,
+            },
+        );
+
+        assert_eq!(code, EXIT_OPERATION_ERROR);
+        let PrivilegedResponse::Error { error } = response else {
+            panic!("the write should have been refused: {response:?}");
+        };
+        assert_eq!(error.kind, WriteErrorKindDto::InvalidTarget);
+        assert_eq!(
+            fs::read_to_string(&decoy).expect("read the decoy"),
+            "# must not be touched\n"
+        );
+    }
+
     /// The request shape is the DTO shape, so a candidate survives the trip
     /// through JSON exactly - including malformed lines and trailing
     /// comments, which a text-based protocol could silently reinterpret.
+    /// Since T36 it also carries what the parent last knew the target to
+    /// hold, which the elevated side needs in order to re-check it.
     #[test]
     fn request_round_trips_the_candidate_exactly() {
         let candidate = parser::parse(
@@ -1369,16 +1664,27 @@ mod tests {
         let request = PrivilegedRequest::Write {
             target: "/etc/fstab".to_string(),
             candidate: DocumentDto::from(&candidate),
+            last_known_real_content: Some("# what the parent last knew\n".to_string()),
+            allow_external_change: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: PrivilegedRequest = serde_json::from_str(&json).expect("deserialize");
         let PrivilegedRequest::Write {
-            candidate: back, ..
+            candidate: back,
+            last_known_real_content,
+            allow_external_change,
+            ..
         } = back
         else {
             panic!("a write request must deserialize as a write request: {back:?}");
         };
         assert_eq!(Document::from(back), candidate);
+        assert_eq!(
+            last_known_real_content.as_deref(),
+            Some("# what the parent last knew\n"),
+            "the expectation the elevated side re-checks must survive the trip verbatim"
+        );
+        assert!(!allow_external_change);
     }
 
     /// The tagged union: each operation is discriminated by `op`, so the one
@@ -1388,6 +1694,8 @@ mod tests {
         let write = PrivilegedRequest::Write {
             target: "/etc/fstab".to_string(),
             candidate: DocumentDto::from(&valid_candidate("/mnt/d")),
+            last_known_real_content: None,
+            allow_external_change: false,
         };
         let delete = PrivilegedRequest::DeleteBackup {
             target: "/etc/fstab".to_string(),
@@ -1506,10 +1814,19 @@ mod tests {
 
     /// `save_elevated` must not prompt for a password to perform a save that
     /// validation already rejects.
+    ///
+    /// Safe to call with the real path because the rejection happens before
+    /// anything is read, spawned or written - `save_elevated` never touches
+    /// the target itself (the T36 guard is pure transport here; it is the
+    /// elevated side that re-reads the file).
     #[test]
     fn save_elevated_rejects_an_invalid_candidate_before_escalating() {
-        let error = save_elevated(Path::new("/etc/fstab"), &invalid_candidate())
-            .expect_err("an invalid candidate must be rejected");
+        let error = save_elevated(
+            Path::new("/etc/fstab"),
+            &invalid_candidate(),
+            &target::ExternalChangeGuard::unchecked(),
+        )
+        .expect_err("an invalid candidate must be rejected");
         assert_eq!(error.kind, WriteErrorKindDto::Validation);
         assert!(error.target_unchanged);
         assert!(error.report.is_some());

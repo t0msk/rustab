@@ -20,7 +20,10 @@
 //! content into the working draft, while an explicit `RUSTAB_TARGET_PATH`
 //! target is written outright and alone. Read that function's docs before
 //! changing anything here; it is where `docs/SPEC.md` §7's "every save writes
-//! `/etc/fstab`" is actually implemented.
+//! `/etc/fstab`" is actually implemented - and, since T36, where a save first
+//! asks whether the real `/etc/fstab` changed outside Rustab since the session
+//! last synced with it, refusing to overwrite such a change until the user has
+//! seen it and said so ([`save_document_with`], [`target::ExternalChangeGuard`]).
 //!
 //! The second interesting decision - "whose backups am I looking at" - is
 //! [`backup_target_path`], added by T35 to close the gap T34 left open. Every
@@ -187,14 +190,32 @@ pub fn render_candidate(candidate: DocumentDto) -> String {
 /// Every case runs the same [`writer::write_document`]. See
 /// [`save_document_with`] for the full reasoning.
 ///
+/// `allow_external_change` is the T36 "write anyway" signal, and the frontend
+/// always passes it explicitly: `false` on the normal path, `true` only after
+/// the user has been shown the diff of an external change to the real
+/// `/etc/fstab` and asked for the write regardless. It is layered *on top of*
+/// the existing real-target confirmation, never a replacement for it - see
+/// [`save_document_with`].
+///
 /// # Errors
 ///
 /// A [`WriteErrorDto`]; check its `target_unchanged` field, which is `true`
 /// only when the target is guaranteed to still hold its previous bytes.
+/// [`WriteErrorKindDto::ExternalChange`] is the one kind that asks a question
+/// rather than reporting a fault: nothing was written, and the error carries
+/// both sides of the diff.
 #[tauri::command(async, rename_all = "snake_case")]
-pub fn save(candidate: DocumentDto) -> Result<WriteOutcomeDto, WriteErrorDto> {
+pub fn save(
+    candidate: DocumentDto,
+    allow_external_change: bool,
+) -> Result<WriteOutcomeDto, WriteErrorDto> {
     let target = resolve_target_for_write()?;
-    save_document(&target, &Document::from(candidate))
+    save_document(
+        &target,
+        real_fstab(),
+        &Document::from(candidate),
+        allow_external_change,
+    )
 }
 
 /// Lists the backups of the file this session's saves write, newest first -
@@ -245,16 +266,30 @@ pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
 ///
 /// # Errors
 ///
+/// T36 is inherited the same way the dual write is: a restore is a save, so
+/// an external change to the real `/etc/fstab` blocks it exactly as it blocks
+/// [`save`], and `allow_external_change` means the same thing here - `false`
+/// on the normal path, `true` only after the user has seen the diff and asked
+/// for the restore anyway (asserted in this module's tests for *both*
+/// commands, not just for `save`).
+///
+/// # Errors
+///
 /// [`WriteErrorKindDto::InvalidBackup`] if `backup_path` is not one of this
 /// target's backups, [`WriteErrorKindDto::ReadBackup`] if it cannot be read
-/// or is not UTF-8, otherwise whatever the save itself reported.
+/// or is not UTF-8, otherwise whatever the save itself reported - including
+/// [`WriteErrorKindDto::ExternalChange`].
 #[tauri::command(async, rename_all = "snake_case")]
-pub fn restore_backup(backup_path: String) -> Result<WriteOutcomeDto, WriteErrorDto> {
+pub fn restore_backup(
+    backup_path: String,
+    allow_external_change: bool,
+) -> Result<WriteOutcomeDto, WriteErrorDto> {
     let target = resolve_target_for_write()?;
     restore_backup_with(
         &target,
         real_fstab(),
         &backup_path,
+        allow_external_change,
         privileged::save_elevated,
     )
 }
@@ -555,12 +590,19 @@ fn list_backups_for(
 ///    only list [`list_backups`] offers in that case.
 /// 2. Hand the backup's parsed text to [`save_document_with`], unchanged. That
 ///    is where the dual write lives, so a restore still inherits it with no
-///    write code of its own.
+///    write code of its own - and, since T36, inherits the external-change
+///    check in the same way, from the same place, for free. `real_fstab` and
+///    `allow_external_change` are passed straight through for that reason.
 fn restore_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
     backup_path: &str,
-    elevate: impl Fn(&Path, &Document) -> Result<WriteOutcomeDto, WriteErrorDto>,
+    allow_external_change: bool,
+    elevate: impl Fn(
+        &Path,
+        &Document,
+        &target::ExternalChangeGuard,
+    ) -> Result<WriteOutcomeDto, WriteErrorDto>,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
     let owner = backup_target_path(target, real_fstab);
 
@@ -589,7 +631,13 @@ fn restore_backup_with(
         .with_path(&backup)
     })?;
 
-    save_document_with(target, &parser::parse(&text), elevate)
+    save_document_with(
+        target,
+        real_fstab,
+        &parser::parse(&text),
+        allow_external_change,
+        elevate,
+    )
 }
 
 /// The one dispatch point between the save paths.
@@ -602,12 +650,21 @@ fn restore_backup_with(
 /// Takes the already-resolved [`ActiveTarget`] rather than resolving it
 /// itself so the tests can point a save at a temp file without mutating
 /// process-wide environment variables (which would race with every other
-/// test in the binary).
+/// test in the binary). `real_fstab` is a parameter for the same reason it is
+/// one on [`backup_target_path`] - see [`save_document_with`].
 fn save_document(
     target: &ActiveTarget,
+    real_fstab: &Path,
     candidate: &Document,
+    allow_external_change: bool,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
-    save_document_with(target, candidate, privileged::save_elevated)
+    save_document_with(
+        target,
+        real_fstab,
+        candidate,
+        allow_external_change,
+        privileged::save_elevated,
+    )
 }
 
 /// [`save_document`], with the elevated half injectable - and, since T34, the
@@ -665,18 +722,77 @@ fn save_document(
 /// session's point of view the file *did* change under it, by a run that was
 /// not keeping its draft in sync - and it is the same answer Rustab gives for
 /// an edit made with any other tool.
+///
+/// ## The external-change check (T36), and why only case 1 has one
+///
+/// Case 1 compares what Rustab last knew the real `/etc/fstab` to hold (its
+/// marker) against what that file holds *now*, right before elevating, and
+/// refuses the write if they differ
+/// ([`target::ExternalChangeGuard`], [`WriteErrorKindDto::ExternalChange`]).
+/// `allow_external_change` is the user's explicit "I have seen the diff, write
+/// anyway" answer, which skips the comparison for this one call; a
+/// "write anyway" that succeeds is in every other respect an ordinary save,
+/// mirror and marker included, because it goes through the same code below.
+///
+/// **The check here is a courtesy, not the safety net.** It exists to avoid
+/// asking for a password for a write that the elevated side is going to
+/// refuse. The binding check is the identical comparison performed *inside*
+/// the elevated process immediately before `write_document`
+/// (`crate::privileged::handle_write`), because `pkexec` blocks on a human
+/// typing a password and the file can change during exactly that wait. This is
+/// deliberately the same relationship `privileged::save_elevated` already has
+/// between its pre-prompt `validate::validate` call and the authoritative
+/// validation inside `write_document`: delete either pre-check and no
+/// guarantee is weakened, only a pointless password prompt is reintroduced.
+///
+/// Case 2 needs no check (nothing else is writing a scratch file, and it keeps
+/// no marker), and case 3 deliberately keeps none either - it has no marker to
+/// compare against, so it passes [`target::ExternalChangeGuard::unchecked`]
+/// and behaves exactly as it did before T36. That leaves an explicit
+/// `RUSTAB_TARGET_PATH=/etc/fstab` with the same theoretical race, which is a
+/// known, recorded gap rather than an oversight (`PROJECT_PLAN.md` §T36).
+///
+/// ## Why `real_fstab` is a parameter
+///
+/// Before T36 this branch could hardcode [`target::REAL_FSTAB_PATH`], because
+/// the path was only ever *handed* to `elevate` - which the tests replace with
+/// a recording stand-in that touches nothing. The external-change check
+/// genuinely **reads** that file, so it needs the same injectable seam
+/// [`backup_target_path`] already has, for the identical reason: `cargo test`
+/// must never read the machine's own `/etc/fstab`. Production passes
+/// [`real_fstab`] at both call sites ([`save`] and [`restore_backup`], via
+/// [`save_document`] and [`restore_backup_with`]); the tests pass a temp file.
 fn save_document_with(
     target: &ActiveTarget,
+    real_fstab: &Path,
     candidate: &Document,
-    elevate: impl Fn(&Path, &Document) -> Result<WriteOutcomeDto, WriteErrorDto>,
+    allow_external_change: bool,
+    elevate: impl Fn(
+        &Path,
+        &Document,
+        &target::ExternalChangeGuard,
+    ) -> Result<WriteOutcomeDto, WriteErrorDto>,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
     match target.source {
         TargetSource::SandboxDefault => {
-            let real_fstab = Path::new(target::REAL_FSTAB_PATH);
+            let guard =
+                target::ExternalChangeGuard::from_marker(&target.path, allow_external_change);
+            // The courtesy half of T36 (see this function's docs): refuse
+            // before the password prompt, not instead of the elevated side's
+            // own check. Nothing has been opened for writing here, which is
+            // why the error can promise `target_unchanged`.
+            if let Some(change) = guard.detect(real_fstab) {
+                return Err(WriteErrorDto::external_change(
+                    real_fstab,
+                    &change.last_known,
+                    &change.current,
+                ));
+            }
+
             // Authoritative: if this fails, the save failed, and nothing is
             // mirrored anywhere - the draft must not start showing content
             // that is not in the real file.
-            let mut outcome = elevate(real_fstab, candidate)?;
+            let mut outcome = elevate(real_fstab, candidate, &guard)?;
 
             // The exact bytes the elevated writer just put into the real file
             // (`writer::write_document` writes `candidate.to_string()`), so
@@ -693,7 +809,13 @@ fn save_document_with(
             }
             Ok(outcome)
         }
-        TargetSource::Environment if target.is_real => elevate(&target.path, candidate),
+        // No marker exists for an explicit override, so there is nothing to
+        // compare and no check happens here - see this function's docs.
+        TargetSource::Environment if target.is_real => elevate(
+            &target.path,
+            candidate,
+            &target::ExternalChangeGuard::unchecked(),
+        ),
         TargetSource::Environment => writer::write_document(&target.path, candidate)
             .map(|outcome| WriteOutcomeDto::from_outcome(&outcome, false))
             .map_err(|err| WriteErrorDto::from(&err)),
@@ -1087,17 +1209,25 @@ mod tests {
         Path::new("/nonexistent/rustab-tests-must-never-touch-this/fstab")
     }
 
-    /// An elevate stand-in that records what it was asked to write and
-    /// reports the success the real helper would report - **without writing
-    /// anything at all**, which is what keeps these tests away from
-    /// `pkexec` and from the machine's own `/etc/fstab`.
+    /// An elevate stand-in that records what it was asked to write - path,
+    /// document and, since T36, the [`target::ExternalChangeGuard`] it was
+    /// handed to pass on to the elevated side - and reports the success the
+    /// real helper would report, **without writing anything at all**, which is
+    /// what keeps these tests away from `pkexec` and from the machine's own
+    /// `/etc/fstab`.
+    #[allow(clippy::type_complexity)]
     fn recording_elevate(
-        calls: &std::cell::RefCell<Vec<(PathBuf, Document)>>,
-    ) -> impl Fn(&Path, &Document) -> Result<WriteOutcomeDto, WriteErrorDto> + '_ {
-        move |path, document| {
+        calls: &std::cell::RefCell<Vec<(PathBuf, Document, target::ExternalChangeGuard)>>,
+    ) -> impl Fn(
+        &Path,
+        &Document,
+        &target::ExternalChangeGuard,
+    ) -> Result<WriteOutcomeDto, WriteErrorDto>
+           + '_ {
+        move |path, document, guard| {
             calls
                 .borrow_mut()
-                .push((path.to_path_buf(), document.clone()));
+                .push((path.to_path_buf(), document.clone(), guard.clone()));
             Ok(WriteOutcomeDto {
                 target: path.to_string_lossy().into_owned(),
                 backup: None,
@@ -1149,7 +1279,8 @@ mod tests {
         let target = override_target(path.clone());
 
         let candidate = valid_candidate("/mnt/saved");
-        let outcome = save_document(&target, &candidate).expect("the save should succeed");
+        let outcome = save_document(&target, unused_real_fstab(), &candidate, false)
+            .expect("the save should succeed");
 
         assert_eq!(
             fs::read_to_string(&path).expect("read the target"),
@@ -1194,7 +1325,8 @@ mod tests {
         );
         assert_eq!(round_tripped, candidate, "the DTO must round-trip exactly");
 
-        save_document(&target, &round_tripped).expect("the save should succeed");
+        save_document(&target, unused_real_fstab(), &round_tripped, false)
+            .expect("the save should succeed");
         assert_eq!(
             fs::read_to_string(&path).expect("read the target"),
             candidate.to_string()
@@ -1208,8 +1340,13 @@ mod tests {
         let path = dir.join("fstab.sandbox");
         let target = override_target(path.clone());
 
-        let outcome = save_document(&target, &valid_candidate("/mnt/first"))
-            .expect("the save should succeed");
+        let outcome = save_document(
+            &target,
+            unused_real_fstab(),
+            &valid_candidate("/mnt/first"),
+            false,
+        )
+        .expect("the save should succeed");
 
         assert!(outcome.backup.is_none());
         assert!(path.exists());
@@ -1224,7 +1361,7 @@ mod tests {
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let error = save_document(&target, &invalid_candidate())
+        let error = save_document(&target, unused_real_fstab(), &invalid_candidate(), false)
             .expect_err("an invalid candidate must be refused");
 
         assert_eq!(error.kind, WriteErrorKindDto::Validation);
@@ -1252,8 +1389,13 @@ mod tests {
         let dir = TempDir::new("save-nodir");
         let target = override_target(dir.join("missing-dir/fstab"));
 
-        let error = save_document(&target, &valid_candidate("/mnt/nope"))
-            .expect_err("a missing directory must fail");
+        let error = save_document(
+            &target,
+            unused_real_fstab(),
+            &valid_candidate("/mnt/nope"),
+            false,
+        )
+        .expect_err("a missing directory must fail");
 
         assert!(error.target_unchanged);
         assert!(
@@ -1277,14 +1419,21 @@ mod tests {
         let target = override_target(path.clone());
 
         // First save: creates a backup holding ORIGINAL.
-        save_document(&target, &valid_candidate("/mnt/second")).expect("first save");
+        save_document(
+            &target,
+            unused_real_fstab(),
+            &valid_candidate("/mnt/second"),
+            false,
+        )
+        .expect("first save");
         let first_backup = backups::list(&path).expect("listing")[0].path.clone();
 
         // Restore it the way the command does.
         let resolved =
             backups::resolve_requested(&path, &first_backup).expect("it is a real backup");
         let text = backups::read_text(&resolved).expect("readable");
-        let outcome = save_document(&target, &parser::parse(&text)).expect("the restore succeeds");
+        let outcome = save_document(&target, unused_real_fstab(), &parser::parse(&text), false)
+            .expect("the restore succeeds");
 
         assert_eq!(
             fs::read_to_string(&path).expect("read the target"),
@@ -1833,8 +1982,13 @@ mod tests {
 
         let manual = create_backup_of(&target, unused_real_fstab()).expect("a manual backup");
         for i in 0..(writer::MAX_BACKUPS + 3) {
-            save_document(&target, &valid_candidate(&format!("/mnt/n{i}")))
-                .unwrap_or_else(|err| panic!("save {i} failed: {err:?}"));
+            save_document(
+                &target,
+                unused_real_fstab(),
+                &valid_candidate(&format!("/mnt/n{i}")),
+                false,
+            )
+            .unwrap_or_else(|err| panic!("save {i} failed: {err:?}"));
         }
 
         let listed = backups::list(&path).expect("listing");
@@ -2296,8 +2450,14 @@ mod tests {
         let candidate = valid_candidate("/mnt/elevated");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome = save_document_with(&target, &candidate, recording_elevate(&calls))
-            .expect("the elevated stand-in succeeds");
+        let outcome = save_document_with(
+            &target,
+            unused_real_fstab(),
+            &candidate,
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("the elevated stand-in succeeds");
 
         assert!(outcome.elevated);
         assert_eq!(
@@ -2334,9 +2494,13 @@ mod tests {
         let path = dir.join("fstab.custom");
         let target = override_target(path.clone());
 
-        let outcome = save_document_with(&target, &valid_candidate("/mnt/custom"), |_, _| {
-            panic!("an explicit non-real override must never escalate");
-        })
+        let outcome = save_document_with(
+            &target,
+            unused_real_fstab(),
+            &valid_candidate("/mnt/custom"),
+            false,
+            |_, _, _| panic!("an explicit non-real override must never escalate"),
+        )
         .expect("the save should succeed");
 
         assert!(!outcome.elevated);
@@ -2354,25 +2518,33 @@ mod tests {
     /// Case 1, the T34 headline: a **default** launch's save always writes
     /// the real `/etc/fstab` through the elevated path, even though the
     /// resolved target is the draft and `is_real` is `false`. The elevated
-    /// call must be aimed at the hardcoded real path, never at the draft.
+    /// call must be aimed at the real file, never at the draft.
+    ///
+    /// Since T36 the real file's path is the injected `real_fstab` argument
+    /// rather than the inlined constant, because the drift check genuinely
+    /// reads it (see [`save_document_with`]); this test therefore passes a
+    /// stand-in and asserts the call went to *that*, exactly as the T35
+    /// backup tests above do. That production passes
+    /// [`target::REAL_FSTAB_PATH`] is a one-line delegation in [`save`] and
+    /// [`restore_backup`], the same arrangement [`backup_target_path`]
+    /// documents.
     #[test]
     fn a_default_launch_save_always_elevates_the_real_fstab() {
         let dir = TempDir::new("default-save-elevates");
-        let draft = dir.join("fstab.sandbox");
-        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let (draft, real) = draft_and_real_stand_in(&dir);
         let target = default_draft_target(draft.clone());
         let candidate = valid_candidate("/mnt/for-real");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome = save_document_with(&target, &candidate, recording_elevate(&calls))
-            .expect("the elevated stand-in succeeds");
+        let outcome =
+            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
+                .expect("the elevated stand-in succeeds");
 
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
         assert_eq!(
-            calls[0].0,
-            Path::new(target::REAL_FSTAB_PATH),
-            "the elevated call must be aimed at the real /etc/fstab, not at the draft"
+            calls[0].0, real,
+            "the elevated call must be aimed at the real file, not at the draft"
         );
         assert_eq!(
             calls[0].1, candidate,
@@ -2381,7 +2553,7 @@ mod tests {
         assert!(outcome.elevated);
         assert_eq!(
             outcome.target,
-            target::REAL_FSTAB_PATH,
+            real.to_string_lossy(),
             "the reported outcome is the real write's, which is the authoritative one"
         );
     }
@@ -2393,14 +2565,14 @@ mod tests {
     #[test]
     fn a_default_launch_save_mirrors_into_the_draft_and_moves_the_marker() {
         let dir = TempDir::new("default-save-mirrors");
-        let draft = dir.join("fstab.sandbox");
-        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let (draft, real) = draft_and_real_stand_in(&dir);
         let target = default_draft_target(draft.clone());
         let candidate = valid_candidate("/mnt/mirrored");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome = save_document_with(&target, &candidate, recording_elevate(&calls))
-            .expect("the elevated stand-in succeeds");
+        let outcome =
+            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
+                .expect("the elevated stand-in succeeds");
 
         assert_eq!(outcome.draft_sync_warning, None, "{outcome:?}");
         assert_eq!(
@@ -2425,18 +2597,17 @@ mod tests {
     #[test]
     fn the_draft_mirror_does_not_create_its_own_backups() {
         let dir = TempDir::new("default-save-no-draft-backups");
-        let draft = dir.join("fstab.sandbox");
-        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let (draft, real) = draft_and_real_stand_in(&dir);
         let target = default_draft_target(draft.clone());
 
         let calls = std::cell::RefCell::new(Vec::new());
         for i in 0..3 {
-            save_document_with(
-                &target,
-                &valid_candidate(&format!("/mnt/n{i}")),
-                recording_elevate(&calls),
-            )
-            .expect("the elevated stand-in succeeds");
+            // Every save after the first moves the marker, so the stand-in is
+            // kept in step with it - these are ordinary saves, not drift.
+            let candidate = valid_candidate(&format!("/mnt/n{i}"));
+            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
+                .expect("the elevated stand-in succeeds");
+            fs::write(&real, candidate.to_string()).expect("the elevated write, re-enacted");
         }
 
         assert!(
@@ -2451,17 +2622,22 @@ mod tests {
     #[test]
     fn a_failed_elevated_write_fails_the_save_and_mirrors_nothing() {
         let dir = TempDir::new("default-save-elevate-fails");
-        let draft = dir.join("fstab.sandbox");
-        fs::write(&draft, ORIGINAL).expect("seed the draft");
+        let (draft, real) = draft_and_real_stand_in(&dir);
         let target = default_draft_target(draft.clone());
 
-        let error = save_document_with(&target, &valid_candidate("/mnt/nope"), |_, _| {
-            Err(WriteErrorDto::new(
-                WriteErrorKindDto::PrivilegeEscalation,
-                true,
-                "the user dismissed the password prompt; nothing was written",
-            ))
-        })
+        let error = save_document_with(
+            &target,
+            &real,
+            &valid_candidate("/mnt/nope"),
+            false,
+            |_, _, _| {
+                Err(WriteErrorDto::new(
+                    WriteErrorKindDto::PrivilegeEscalation,
+                    true,
+                    "the user dismissed the password prompt; nothing was written",
+                ))
+            },
+        )
         .expect_err("a refused escalation must fail the save");
 
         assert_eq!(error.kind, WriteErrorKindDto::PrivilegeEscalation);
@@ -2493,12 +2669,16 @@ mod tests {
         let dir = TempDir::new("default-save-mirror-fails");
         let draft = dir.join("fstab.sandbox");
         fs::create_dir_all(&draft).expect("mkdir in the draft's place");
+        let real = dir.join("etc-fstab-stand-in");
+        fs::write(&real, ORIGINAL).expect("seed the real stand-in");
         let target = default_draft_target(draft.clone());
 
         let calls = std::cell::RefCell::new(Vec::new());
         let outcome = save_document_with(
             &target,
+            &real,
             &valid_candidate("/mnt/warned"),
+            false,
             recording_elevate(&calls),
         )
         .expect("a draft-sync failure must not fail the save");
@@ -2508,7 +2688,7 @@ mod tests {
             .draft_sync_warning
             .expect("the draft failure must be surfaced, not swallowed");
         assert!(
-            warning.contains(target::REAL_FSTAB_PATH)
+            warning.contains(&real.display().to_string())
                 && warning.contains(&draft.display().to_string()),
             "the warning must name both files so the user knows which one is fine: {warning}"
         );
@@ -2536,10 +2716,11 @@ mod tests {
     ///   match, marker included.
     ///
     /// The elevate seam is injected, so this neither launches `pkexec` nor
-    /// touches the machine's own `/etc/fstab`; note that the elevated call is
-    /// aimed at the hardcoded [`target::REAL_FSTAB_PATH`] (that is
-    /// `save_document_with`'s own business, and it only *records* the path
-    /// here), while the *backup* was resolved against the stand-in.
+    /// touches the machine's own `/etc/fstab`; since T36 the real file's path
+    /// is the injected `real_fstab` argument on both halves (the backup
+    /// resolution *and* the write), so the elevated call is aimed at the
+    /// stand-in here - production's own call site passes
+    /// [`target::REAL_FSTAB_PATH`] (see [`restore_backup`]).
     #[test]
     fn restoring_a_backup_resolves_against_the_real_fstab_and_inherits_the_dual_write() {
         let dir = TempDir::new("restore-dual-write");
@@ -2556,14 +2737,19 @@ mod tests {
         let target = default_draft_target(draft.clone());
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome = restore_backup_with(&target, &real, &real_backup, recording_elevate(&calls))
-            .expect("the restore must succeed");
+        let outcome = restore_backup_with(
+            &target,
+            &real,
+            &real_backup,
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("the restore must succeed");
 
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1, "a restore must elevate exactly once");
         assert_eq!(
-            calls[0].0,
-            Path::new(target::REAL_FSTAB_PATH),
+            calls[0].0, real,
             "a restore must write the real file, like any other save"
         );
         assert_eq!(
@@ -2589,12 +2775,290 @@ mod tests {
         // The other half of T35's resolution change: a backup of the *draft*
         // is not one of this session's backups any more, and is refused
         // before anything is written.
-        let error = restore_backup_with(&target, &real, &draft_backup, |_, _| {
+        let error = restore_backup_with(&target, &real, &draft_backup, false, |_, _, _| {
             panic!("a path that is not one of the real file's backups must not be written");
         })
         .expect_err("the draft's backups are not this session's restore points");
         assert_eq!(error.kind, WriteErrorKindDto::InvalidBackup);
         assert!(error.target_unchanged);
+    }
+
+    // -- T36: an external change to the real file, before a write -----------
+    //
+    // Every test here uses a `SandboxDefault` target plus a stand-in for the
+    // real `/etc/fstab`, because the check reads that file (see
+    // `save_document_with`'s docs on why `real_fstab` became a parameter).
+    // The elevate seam stays injected, so a "proceeds" case still writes
+    // nothing outside the temp directory and a "blocked" case can assert the
+    // elevated half was never even reached.
+
+    /// Records `content` as what Rustab last knew the real file to hold -
+    /// written straight into the marker `target::last_known_real_marker`
+    /// names, which is what a refresh or a previous save would have left
+    /// there.
+    fn seed_marker(draft: &Path, content: &str) {
+        fs::write(
+            target::last_known_real_marker(draft).expect("a draft has a marker sibling"),
+            content,
+        )
+        .expect("seed the marker");
+    }
+
+    /// The regression half: nothing changed externally, so the save behaves
+    /// exactly as it did before T36 - one elevated call, mirror and marker
+    /// moved - and the expectation the elevated side will re-check is threaded
+    /// through to it (that re-check, not this one, is the authoritative one;
+    /// see `privileged::handle_write`).
+    #[test]
+    fn a_save_proceeds_untouched_when_the_real_fstab_has_not_changed() {
+        let dir = TempDir::new("t36-no-drift");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        seed_marker(&draft, ORIGINAL);
+        let target = default_draft_target(draft.clone());
+        let candidate = valid_candidate("/mnt/undisturbed");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome =
+            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
+                .expect("an unchanged real file must not block a save");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
+        assert_eq!(
+            calls[0].2.last_known_real_content.as_deref(),
+            Some(ORIGINAL),
+            "the elevated side must be told what to re-check against"
+        );
+        assert!(
+            !calls[0].2.allow_external_change,
+            "a normal save must not carry a write-anyway override"
+        );
+        assert_eq!(outcome.draft_sync_warning, None, "{outcome:?}");
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            candidate.to_string()
+        );
+    }
+
+    /// Unsaved edits are not drift: the draft differs from both the marker and
+    /// the real file, which is the normal state of a session with pending
+    /// changes, and must not be mistaken for someone else having written
+    /// `/etc/fstab`.
+    #[test]
+    fn an_unsaved_draft_edit_is_not_mistaken_for_an_external_change() {
+        let dir = TempDir::new("t36-draft-edits");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        seed_marker(&draft, ORIGINAL);
+        fs::write(&draft, "# the user has been typing\n").expect("edit the draft");
+        let target = default_draft_target(draft.clone());
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        save_document_with(
+            &target,
+            &real,
+            &valid_candidate("/mnt/pending"),
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("a drifted draft must not block its own save");
+
+        assert_eq!(calls.into_inner().len(), 1);
+    }
+
+    /// The headline: the real file no longer holds what Rustab last knew, so
+    /// the save is refused before anything is written - the elevated half is
+    /// never reached (no password prompt), the real file keeps the external
+    /// content, and the draft and marker are left exactly as they were. The
+    /// error carries both sides of the diff.
+    #[test]
+    fn a_save_is_blocked_when_the_real_fstab_changed_externally() {
+        let dir = TempDir::new("t36-save-blocked");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        seed_marker(&draft, ORIGINAL);
+        let external = "# someone else edited /etc/fstab while Rustab was open\n";
+        fs::write(&real, external).expect("let the real file drift");
+        let target = default_draft_target(draft.clone());
+
+        let error = save_document_with(
+            &target,
+            &real,
+            &valid_candidate("/mnt/blocked"),
+            false,
+            |_, _, _| panic!("a detected external change must not reach the elevated writer"),
+        )
+        .expect_err("an external change must block the save");
+
+        assert_eq!(error.kind, WriteErrorKindDto::ExternalChange);
+        assert!(
+            error.target_unchanged,
+            "nothing was written, so this is a guarantee"
+        );
+        assert_eq!(error.path.as_deref(), Some(real.to_string_lossy().as_ref()));
+        let change = error
+            .external_change
+            .as_deref()
+            .expect("the diff payload must be attached");
+        assert_eq!(
+            change.last_known_content, ORIGINAL,
+            "the old side of the diff is the marker's content"
+        );
+        assert_eq!(
+            change.current_content, external,
+            "the new side is what the file holds right now"
+        );
+        assert_eq!(
+            fs::read(&real).expect("read the real stand-in"),
+            external.as_bytes(),
+            "the external content must still be on disk, byte for byte"
+        );
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            ORIGINAL,
+            "a blocked save must not touch the draft either"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                target::last_known_real_marker(&draft).expect("a marker sibling exists")
+            )
+            .expect("read the marker"),
+            ORIGINAL,
+            "and must not move the sync point it just refused to act on"
+        );
+    }
+
+    /// The same drift blocks a **restore**, not just a save - the point of
+    /// landing the check in `save_document_with`, which both commands go
+    /// through. Asserted through the production [`restore_backup_with`], and
+    /// then its write-anyway half, so neither is left to inference.
+    #[test]
+    fn a_restore_is_blocked_by_an_external_change_exactly_like_a_save() {
+        let dir = TempDir::new("t36-restore-blocked");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        // A real backup of the real stand-in, the way a previous save made it.
+        writer::write_document(&real, &valid_candidate("/mnt/newer")).expect("seed a real backup");
+        let backup = backups::list(&real).expect("listing")[0].path.clone();
+        // What Rustab last knew, and what the file holds now: different.
+        seed_marker(&draft, ORIGINAL);
+        let external = "# changed between opening the Backups panel and clicking Restore\n";
+        fs::write(&real, external).expect("let the real file drift");
+        let target = default_draft_target(draft.clone());
+
+        let error = restore_backup_with(&target, &real, &backup, false, |_, _, _| {
+            panic!("a detected external change must not reach the elevated writer")
+        })
+        .expect_err("an external change must block the restore");
+
+        assert_eq!(error.kind, WriteErrorKindDto::ExternalChange);
+        assert!(error.target_unchanged);
+        let change = error
+            .external_change
+            .as_deref()
+            .expect("the diff payload must be attached");
+        assert_eq!(change.last_known_content, ORIGINAL);
+        assert_eq!(change.current_content, external);
+        assert_eq!(
+            fs::read(&real).expect("read the real stand-in"),
+            external.as_bytes(),
+            "nothing may reach the real file"
+        );
+
+        // And the user's second way forward works for a restore too.
+        let calls = std::cell::RefCell::new(Vec::new());
+        restore_backup_with(&target, &real, &backup, true, recording_elevate(&calls))
+            .expect("an explicit write-anyway must let the restore through");
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].2.allow_external_change);
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            ORIGINAL,
+            "a restore that went through is an ordinary save: the draft follows it"
+        );
+    }
+
+    /// "Write anyway": the user has seen the diff and asked for the write, so
+    /// the save proceeds and its outcome is indistinguishable from any other
+    /// successful T34 save - same single elevated call, same mirror, same
+    /// marker move. The override is also *passed on* to the elevated side,
+    /// which would otherwise refuse the write on its own re-check.
+    #[test]
+    fn writing_anyway_proceeds_despite_an_external_change_and_resyncs_the_draft() {
+        let dir = TempDir::new("t36-write-anyway");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        seed_marker(&draft, ORIGINAL);
+        fs::write(&real, "# someone else's content\n").expect("let the real file drift");
+        let target = default_draft_target(draft.clone());
+        let candidate = valid_candidate("/mnt/anyway");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome =
+            save_document_with(&target, &real, &candidate, true, recording_elevate(&calls))
+                .expect("an explicit write-anyway must let the save through");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "exactly one elevated call, as always");
+        assert_eq!(calls[0].0, real);
+        assert_eq!(calls[0].1, candidate);
+        assert!(
+            calls[0].2.allow_external_change,
+            "the elevated side must be told the user already confirmed, or it refuses too"
+        );
+        assert_eq!(
+            calls[0].2.last_known_real_content.as_deref(),
+            Some(ORIGINAL),
+            "the expectation still travels, so a report of what happened stays honest"
+        );
+        assert_eq!(outcome.draft_sync_warning, None, "{outcome:?}");
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            candidate.to_string(),
+            "the draft must be mirrored exactly like any other successful save"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                target::last_known_real_marker(&draft).expect("a marker sibling exists")
+            )
+            .expect("read the marker"),
+            candidate.to_string(),
+            "and the marker must move with it, so the next save starts from the truth"
+        );
+    }
+
+    /// The recorded scope boundary (`PROJECT_PLAN.md` §T36): an explicit
+    /// `RUSTAB_TARGET_PATH=/etc/fstab` keeps no marker, so there is nothing to
+    /// compare and this case is deliberately left exactly as T34 left it -
+    /// even when a marker-shaped sibling happens to exist beside the named
+    /// path. Pinned so the gap stays a decision rather than becoming a
+    /// surprise.
+    #[test]
+    fn an_explicit_real_override_is_outside_the_external_change_check() {
+        let dir = TempDir::new("t36-override-unchecked");
+        let path = dir.join("fstab");
+        fs::write(&path, "# content nobody recorded\n").expect("seed the target");
+        seed_marker(&path, ORIGINAL);
+        let target = ActiveTarget {
+            path: path.clone(),
+            is_real: true,
+            source: TargetSource::Environment,
+        };
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        save_document_with(
+            &target,
+            unused_real_fstab(),
+            &valid_candidate("/mnt/override"),
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("case 3 must be unaffected by T36");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].2,
+            target::ExternalChangeGuard::unchecked(),
+            "case 3 must send no expectation and no override of its own"
+        );
     }
 
     #[test]

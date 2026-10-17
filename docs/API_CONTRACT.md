@@ -250,10 +250,18 @@ frontend - would be a byte-for-byte fidelity risk for no benefit.)
 ### 3.5 `save`
 
 ```
-save(candidate: DocumentDto) -> WriteOutcomeDto     (rejects with WriteErrorDto)
+save(candidate: DocumentDto, allow_external_change: bool)
+    -> WriteOutcomeDto                              (rejects with WriteErrorDto)
 ```
 
 Atomically writes `candidate`. **The only write path in the application.**
+
+`allow_external_change` is **T36's "write anyway" signal** and must always be
+sent explicitly: `false` on the normal path, `true` only to repeat a call that
+has just rejected with `kind: "external_change"`, after the user has been shown
+the diff and asked for the write regardless. It is layered on top of the
+existing real-target confirmation (`docs/UI_DESIGN.md` §2), never a replacement
+for it, and it has no effect in any case but case 1 below.
 
 **Revised 2026-10-17 (T34): dispatch is on `source`, not on `is_real`.**
 Three cases, implemented in one place (`commands.rs::save_document_with`):
@@ -301,6 +309,39 @@ the marker is then stale and `/etc/fstab` wins. The draft is published before
 the marker, deliberately: a stale marker costs one redundant copy on the next
 launch, whereas a marker ahead of the draft would make the next launch skip a
 refresh the draft actually needed.
+
+**Added 2026-10-17 (T36): a case-1 save refuses to overwrite an external
+change.** Before the write commits, Rustab compares what it last knew
+`/etc/fstab` to hold - the last-known-real marker of §2 - against what that
+file holds *now*. If they differ, someone else wrote the file since this
+session synced with it, and the call rejects with
+`kind: "external_change"` (§8): nothing was written, `target_unchanged` is
+`true`, and the error carries both file bodies so the UI can show *what*
+changed. The two ways forward are the only two: cancel (nothing happens), or
+repeat the call with `allow_external_change: true`, which skips the comparison
+for that one call and then behaves like any other successful save (same single
+elevated write, same draft mirror, same marker move, `draft_sync_warning`
+included). There is deliberately no "reload and re-sync mid-session" option.
+
+Precisely what is compared: the **marker** against the **real file**, never the
+draft against the real file. A draft that differs from the marker is the
+ordinary state of having unsaved edits and never triggers this. Three
+situations also pass the check rather than blocking, because nothing can be
+established from them: there is no marker yet, the marker is unreadable, or
+`/etc/fstab` itself cannot be read (missing - the write recreates it).
+
+The comparison is made **twice**, and the second one is the one that protects
+the file: once on the unprivileged side before the `pkexec` prompt (a courtesy,
+so nobody types a password for a write that will be refused), and once *inside
+the elevated process* immediately before the write - because the prompt blocks
+on a human and the file can change during exactly that wait. See §4.3. The
+frontend cannot tell which of the two refused: the error is identical.
+
+Cases 2 and 3 have no such check. Case 2 writes a scratch file nothing else is
+touching, and case 3 (an explicit `RUSTAB_TARGET_PATH=/etc/fstab`) keeps no
+marker, so there is nothing to compare against; `allow_external_change` is
+ignored in both. Case 3 therefore still has this race in theory - a known,
+recorded gap (`PROJECT_PLAN.md` §T36), not an oversight.
 
 On failure, **always read `target_unchanged`** before writing UI copy:
 `true` means the file on disk is guaranteed to still hold its previous bytes
@@ -362,11 +403,19 @@ Error kinds: `target_resolution`, `list_backups`.
 ### 3.7 `restore_backup`
 
 ```
-restore_backup(backup_path: string) -> WriteOutcomeDto   (rejects with WriteErrorDto)
+restore_backup(backup_path: string, allow_external_change: bool)
+    -> WriteOutcomeDto                                   (rejects with WriteErrorDto)
 ```
 
 Restores a backup onto the active target. `backup_path` must be a `path`
 value from a `list_backups` result for the **current** target.
+
+`allow_external_change` means exactly what it means for `save` (§3.5) and is
+sent explicitly for the same reason: a `/etc/fstab` that changed between
+opening the Backups panel and clicking Restore is the identical hazard through
+the identical code path, so a restore rejects with `kind: "external_change"`
+in exactly the same situations a save does, and is repeated with `true` after
+the user has seen the diff and confirmed.
 
 A restore is not a copy and not a shortcut. The backup's text is parsed and
 then goes through *the same* save path as `save`: it is validated, the content
@@ -374,7 +423,10 @@ it replaces is itself backed up first, and it is written through the same
 atomic temp-file/`fsync`/`rename`/verify sequence - elevated exactly once
 wherever a save would be. It therefore **inherits §3.5's dispatch in full**:
 on a default launch, restoring a backup writes the real `/etc/fstab` and then
-mirrors it into the working draft, `draft_sync_warning` included.
+mirrors it into the working draft, `draft_sync_warning` included - and, since
+T36, it inherits the external-change refusal from the same place, with no
+check of its own (both commands go through one dispatch function; asserted per
+command in `commands.rs`'s tests).
 Consequences the UI should state plainly
 (the copy in `docs/UI_DESIGN.md` §7 already does):
 
@@ -399,7 +451,7 @@ already requires the access needed to edit `/etc/fstab` directly - and the
 restore still validates, backs up and writes atomically.)
 
 Error kinds: `target_resolution`, `invalid_backup`, `read_backup`, plus any
-`save` error kind.
+`save` error kind - `external_change` included.
 
 ### 3.8 `discover_devices`
 
@@ -662,7 +714,7 @@ file escalates nothing.
 
 | Operation | Used by | What the elevated process does |
 | --- | --- | --- |
-| `write` | `save` (§3.5), `restore_backup` (§3.7) | One `fstab_core::writer::write_document` call: the whole `docs/SPEC.md` §6 sequence. |
+| `write` | `save` (§3.5), `restore_backup` (§3.7) | Re-check that the target still holds what the request says Rustab last knew (T36), then one `fstab_core::writer::write_document` call: the whole `docs/SPEC.md` §6 sequence. |
 | `delete_backup` | `delete_backup` (§3.10) | Resolve the requested path against the target's real backup list, then one `remove_file`. |
 | `create_backup` | `create_backup` (§3.11) | One `fstab_core::writer::create_backup` call: copy the target to a new `.manual` backup beside it and `fsync` the copy. The target is only read. |
 
@@ -679,12 +731,14 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
 `/etc/fstab`'s per §4.2's predicate (a default launch, or an explicit
 `RUSTAB_TARGET_PATH=/etc/fstab`):
 
-1. The unprivileged side does its cheap pre-check first - purely to avoid
+1. The unprivileged side does its cheap pre-checks first - purely to avoid
    asking for a password for an operation that cannot succeed. For a write
-   that is validating the candidate; for a delete it is resolving
+   those are validating the candidate and (T36) comparing `/etc/fstab`'s
+   current bytes against the marker's; for a delete it is resolving
    `backup_path` against the backup list; a `create_backup` has nothing to
    pre-check, since its request carries no path but the target. None of these
-   write anything and none is **the safety net** (see §4.6).
+   write anything and none is **the safety net** (see §4.6) - each has a
+   counterpart inside the elevated process, which is the one that decides.
 2. It re-executes **its own binary** (`std::env::current_exe()`) as
    `pkexec <rustab> --internal-privileged-write`, with stdin, stdout and
    stderr piped. (The flag's name is historical - it predates the two backup
@@ -693,16 +747,28 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
 3. It writes one JSON request to the child's stdin and closes the pipe. The
    request is a union tagged by `op`:
    ```json
-   {"op": "write",         "target": "/etc/fstab", "candidate": { /* DocumentDto */ }}
+   {"op": "write",         "target": "/etc/fstab", "candidate": { /* DocumentDto */ }, "last_known_real_content": "# ...\n", "allow_external_change": false}
    {"op": "delete_backup", "target": "/etc/fstab", "backup_path": "/etc/fstab.rustab-backup.0000000001.000000002"}
    {"op": "create_backup", "target": "/etc/fstab"}
    ```
+   A `write`'s `last_known_real_content` is what the unprivileged side
+   believes `/etc/fstab` currently holds (its marker's content, §2), or `null`
+   when it has no usable record; `allow_external_change` is the user's
+   explicit "write anyway" answer from §3.5. Both are required fields of the
+   request - unlike the *additive, optional* fields of the DTOs in §5-§9, this
+   protocol is one build talking to itself, and a missing field defaulting to
+   "no record" would be a fail-open default on the one check that exists to
+   fail closed.
 4. The elevated process, in `main()`, sees `--internal-privileged-write` as
    `argv[1]` **before anything else starts** - no Tauri runtime, no webview,
    no plugins, no logger are ever initialized in a root process. It reads
    stdin to EOF exactly once, refuses any `target` other than `/etc/fstab`
    (for either operation), and then:
-   - `write`: reconstructs the document and calls
+   - `write`: unless `allow_external_change` is `true`, re-reads the verified
+     target **in this process** and compares it with
+     `last_known_real_content`; if they differ it answers
+     `{"status": "error"}` with `kind: "external_change"` and writes nothing
+     (T36). Otherwise it reconstructs the document and calls
      `fstab_core::writer::write_document` **once**.
    - `delete_backup`: resolves `backup_path` against the *already-validated*
      target's real backup list - in this process, trusting nothing the
@@ -727,6 +793,12 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    that point the helper does not yet know which operation it was asked for;
    the delete and create paths read that variant too and report it as
    "nothing was deleted" / "no backup was created".
+
+   T36 needed **no new response variant**: a refused-because-changed write is
+   a `write` that did not complete, which is exactly what
+   `{"status": "error"}` means, and `WriteErrorDto` already carries the kind
+   and the payload (§8). The unprivileged side's existing rule - a reported
+   error is forwarded to the frontend unchanged - delivers it as-is.
 
    `CreateBackupOutcomeDto` is internal to this protocol - it never reaches
    the frontend. The `create_backup` command turns it into the
@@ -842,6 +914,20 @@ unprivileged side's own resolution is not consulted.
 path: the target check is the whole of its authority, and the file it writes
 is named by `fstab_core::writer::create_backup` from the verified target's own
 name, in that target's own directory.
+
+**T36's external-change check is in the child for the same structural reason,
+plus one specific to this mechanism.** The expectation
+(`last_known_real_content`) arrives as data and is re-verified against the file
+itself, in the elevated process, immediately before the write - so a bug or a
+lie on the unprivileged side cannot turn the write into a blind overwrite. The
+mechanism-specific reason is `pkexec` itself: it blocks on a human reading a
+dialog and typing a password, an arbitrarily long wait that sits *between* any
+check the parent could make and the write. A check made only before the prompt
+would leave the largest part of the window uncovered, which is most of the
+point of having one. The parent's copy of the comparison is therefore exactly
+what its `validate()` call already is - a courtesy that saves a pointless
+password prompt, deletable without weakening any guarantee - and the child's
+is binding.
 
 **Known limitation:** escalation is therefore only available for the real
 `/etc/fstab`. Pointing `RUSTAB_TARGET_PATH` at some *other* root-owned file
@@ -1089,7 +1175,8 @@ degraded mode because `findmnt` is unavailable.
   "target_unchanged": true,
   "report": null,
   "path": null,
-  "backup": null
+  "backup": null,
+  "external_change": null
 }
 ```
 
@@ -1103,6 +1190,22 @@ degraded mode because `findmnt` is unavailable.
   content, i.e. the user's way out.
 - For `kind: "verify"` the two file bodies are deliberately **not** sent: the
   recovery path is "restore the backup", not "diff two blobs in a toast".
+- `external_change` (T36) is non-null only for `kind: "external_change"`, and
+  then carries the two bodies the UI *does* diff:
+
+  ```json
+  { "last_known_content": "# what Rustab last knew\n",
+    "current_content":    "# what the file holds now\n" }
+  ```
+
+  `last_known_content` is the old side (the marker's content, §2) and
+  `current_content` the new side (what is on disk right now, i.e. what the
+  refused write would have replaced). Both are complete file bodies, always
+  sent together - that is why they are one nested object rather than two
+  sibling fields - and `path` names the file they describe. Non-UTF-8 bytes in
+  the file on disk are rendered lossily here, since the payload exists to be
+  displayed; the comparison that produced it was byte-exact.
+  Optional on the wire: a response without the field deserializes as `null`.
 
 **`target_unchanged` is the field to branch on.** `true` is a guarantee:
 the target still holds its previous bytes. `false` is *not* a claim that the
@@ -1125,10 +1228,18 @@ to `true` on a maybe.
 | `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read | `true` |
 | `read_backup` | The backup could not be read, or is not valid UTF-8 | `true` |
 | `internal` | A bug or protocol violation between the two halves of the elevated write | `true` |
+| `external_change` | The real `/etc/fstab` changed outside Rustab since this session synced with it, so the write was refused before it began (§3.5) | `true`, always |
 
 Suggested UI treatment: `target_unchanged: true` → show the message, keep the
 user's pending changes, offer retry. `target_unchanged: false` → show the
 message, reload the target with `list_entries`, and point at the backup panel.
+
+`external_change` is the one kind that is not a fault report but a question,
+and the only one with a retry that is *not* the same call again: show the diff
+from its `external_change` payload, then either cancel (nothing happened; the
+file still holds the other content) or repeat the call with
+`allow_external_change: true`. Do not retry it silently, and do not treat it
+as a failed save - nothing was attempted.
 
 ### `CommandErrorDto` (read-side commands)
 
@@ -1248,15 +1359,16 @@ does not have it.
 These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 
 ```json
-{"lines":[{"kind":"comment","text":" hi"},{"kind":"blank"},{"kind":"entry","entry":{"source":{"kind":"uuid","value":"1111"},"mount_point":"/mnt/d","fs_type":"ext4","options":[{"key":"noauto","value":null},{"key":"fmask","value":"0022"}],"dump":0,"pass":2,"trailing_comment":" note"}},{"kind":"malformed","raw":"/dev/sdb1"}]}
+{"lines":[{"kind":"comment","text":" hi"},{"kind":"blank"},{"kind":"entry","entry":{"source":{"kind":"uuid","value":"1111"},"mount_point":"/mnt/d","fs_type":"ext4","options":[{"key":"noauto","value":null},{"key":"fmask","value":"0022"}],"dump":0,"pass":2,"trailing_comment":" note","description":null}},{"kind":"malformed","raw":"/dev/sdb1"}]}
 ```
 
 ```json
 {"target":{"path":"/p","is_real":false,"source":"sandbox_default"},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}
 {"findings":[{"severity":"warning","message":"m","field":null,"line_index":null}],"has_errors":false}
 {"findings":[{"severity":"warning","message":"m","field":"mount_point","line_index":2}],"has_errors":false}
-{"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true}
-{"kind":"privilege_escalation","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null}
+{"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true,"draft_sync_warning":null}
+{"kind":"privilege_escalation","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null,"external_change":null}
+{"kind":"external_change","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null,"external_change":{"last_known_content":"# old\n","current_content":"# new\n"}}
 {"kind":"not_utf8","message":"m"}
 {"kind":"invalid_backup","message":"m"}
 {"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true}
@@ -1265,19 +1377,28 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 {"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}
 ```
 
-The second and third lines above are both `ValidationReportDto`, showing an
-untagged (`field`/`line_index` both `null`) and a field/line-tagged finding
-respectively - see §7 for what the two extra fields mean. The sixth line is
-`CommandErrorDto` and the seventh is `DeleteBackupErrorDto` - they are the
-same two-field shape, distinguished only by which command produced them and
-by which `kind` strings are possible. The same goes for the tenth,
-`CreateBackupErrorDto`. The ninth is `CreateBackupOutcomeDto`, which only
-ever travels inside the elevated protocol (§4.3), never to the frontend.
+Line by line after the `DocumentViewDto`: the next two are both
+`ValidationReportDto`, showing an untagged (`field`/`line_index` both `null`)
+and a field/line-tagged finding respectively - see §7 for what the two extra
+fields mean. Then `WriteOutcomeDto`, then **two** `WriteErrorDto`s: an ordinary
+one (every kind-specific field `null`) and a `kind: "external_change"` one
+carrying its `external_change` payload (§8), which is the only shape in which
+those two file bodies are ever sent. Then `CommandErrorDto` and
+`DeleteBackupErrorDto` - the same two-field shape, distinguished only by which
+command produced them and by which `kind` strings are possible - then
+`BackupInfoDto`, then `CreateBackupOutcomeDto`, which only ever travels inside
+the elevated protocol (§4.3) and never reaches the frontend, then
+`CreateBackupErrorDto` (that same two-field shape again) and
+`DeviceDiscoveryDto`.
 
-Every `kind` spelling of all three error-kind enums is pinned individually by
+Every `kind` spelling of all four error-kind enums is pinned individually by
 `dto::tests::every_error_kind_spelling_is_exactly_as_documented`, because the
 frontend matches these strings exhaustively:
 
+- `WriteErrorKindDto`: `target_resolution`, `validation`, `invalid_target`,
+  `backup`, `write`, `metadata`, `fsync`, `rename`, `read_back`, `verify`,
+  `privilege_escalation`, `invalid_backup`, `read_backup`, `internal`,
+  `external_change`.
 - `CommandErrorKindDto`: `target_resolution`, `read_target`, `not_utf8`,
   `list_backups`, `invalid_backup`, `read_backup`, `open_location`,
   `open_external_link`, `open_path`.
@@ -1288,7 +1409,7 @@ frontend matches these strings exhaustively:
 
 Likewise, every `field` spelling of `ValidationFieldDto` (§7) is pinned
 individually by `dto::tests::every_validation_field_spelling_is_exactly_as_documented`:
-`mount_point`, `source`, `fs_type`.
+`mount_point`, `source`, `fs_type`, `description`.
 
 ---
 

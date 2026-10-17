@@ -590,10 +590,12 @@ impl WriteOutcomeDto {
 
 /// Which stage of a save failed.
 ///
-/// The first ten variants map one-to-one onto [`WriteError`]'s variants; the
-/// rest describe failures *around* the write - resolving the target,
-/// escalating privileges, choosing or reading a backup to restore, and an
-/// internal protocol failure - which `fstab-core` knows nothing about.
+/// The ten variants from [`Self::Validation`] to [`Self::Verify`] map
+/// one-to-one onto [`WriteError`]'s variants; the rest describe failures
+/// *around* the write - resolving the target, escalating privileges, choosing
+/// or reading a backup to restore, an external change to the real file that
+/// stopped the write before it began, and an internal protocol failure -
+/// which `fstab-core` knows nothing about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteErrorKindDto {
@@ -635,6 +637,16 @@ pub enum WriteErrorKindDto {
     /// A bug or a protocol violation between the two halves of the elevated
     /// write.
     Internal,
+    /// The real `/etc/fstab` changed outside Rustab since this session last
+    /// synced with it, so the write was **refused before it started** (T36).
+    ///
+    /// Not a failure of the write and not an I/O problem: nothing was
+    /// attempted, `target_unchanged` is always `true`, and the two file bodies
+    /// needed to show the user *what* changed are attached as
+    /// an `external_change` object. The user's two ways forward
+    /// are to cancel, or to repeat the call with `allow_external_change: true`
+    /// after seeing the diff.
+    ExternalChange,
 }
 
 /// A failed save or restore.
@@ -658,6 +670,44 @@ pub struct WriteErrorDto {
     /// For [`WriteErrorKindDto::Verify`], the backup holding the pre-save
     /// content, if one was made.
     pub backup: Option<String>,
+    /// For [`WriteErrorKindDto::ExternalChange`], the two file bodies the UI
+    /// diffs. `null` for every other kind - exactly like `report`, which is
+    /// the same shape of kind-specific optional payload.
+    ///
+    /// Optional on the wire for the same reason
+    /// [`WriteOutcomeDto::draft_sync_warning`] is: it is an additive field,
+    /// and a response produced without it still deserializes.
+    ///
+    /// ## Why it is boxed
+    ///
+    /// `Box` is invisible on the wire (serde serializes straight through it);
+    /// it is here because [`WriteErrorDto`] is the error half of *every*
+    /// write-side `Result` in the crate, and two inline `String`s would push
+    /// that type past `clippy::result_large_err`'s threshold - i.e. would make
+    /// every `save`/`restore_backup` return move 160 bytes of mostly-`None`
+    /// instead of 120. One pointer keeps the common (non-`ExternalChange`)
+    /// path cheap while the uncommon one pays for the content it carries.
+    #[serde(default)]
+    pub external_change: Option<Box<ExternalChangeDto>>,
+}
+
+/// The two file bodies a [`WriteErrorKindDto::ExternalChange`] carries, so the
+/// frontend can show *what* changed outside Rustab before the user decides
+/// (T36).
+///
+/// One nested object rather than two sibling fields on [`WriteErrorDto`] so
+/// the pair cannot be half-present: there is no meaningful state in which the
+/// UI has one side of a diff and not the other, and this makes that
+/// unrepresentable rather than merely documented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalChangeDto {
+    /// What Rustab last knew the real `/etc/fstab` to hold - the **old** side
+    /// of the diff (the content of the last-known-real marker, see
+    /// `crate::target`).
+    pub last_known_content: String,
+    /// What the real `/etc/fstab` holds **right now** - the new side, i.e. the
+    /// content the refused write would have replaced.
+    pub current_content: String,
 }
 
 impl WriteErrorDto {
@@ -675,6 +725,7 @@ impl WriteErrorDto {
             report: None,
             path: None,
             backup: None,
+            external_change: None,
         }
     }
 
@@ -683,6 +734,40 @@ impl WriteErrorDto {
     pub fn with_path(mut self, path: &Path) -> Self {
         self.path = Some(path_to_wire(path));
         self
+    }
+
+    /// The one T36 outcome: `target` changed outside Rustab, so the write was
+    /// refused before it began.
+    ///
+    /// Built here, in one place, rather than at each detection site, because
+    /// the check happens **twice** - once as a courtesy before the `pkexec`
+    /// prompt (`crate::commands::save_document_with`) and once
+    /// authoritatively inside the elevated process
+    /// (`crate::privileged::handle_write`) - and the frontend must not be able
+    /// to tell which of the two refused the write: it is the same situation,
+    /// with the same two ways forward.
+    ///
+    /// `target_unchanged` is unconditionally `true`: nothing was opened for
+    /// writing, no backup was taken, no temp file was created.
+    pub fn external_change(target: &Path, last_known: &str, current: &str) -> Self {
+        WriteErrorDto {
+            external_change: Some(Box::new(ExternalChangeDto {
+                last_known_content: last_known.to_string(),
+                current_content: current.to_string(),
+            })),
+            ..WriteErrorDto::new(
+                WriteErrorKindDto::ExternalChange,
+                true,
+                format!(
+                    "{} has changed outside Rustab since this session last synced with it, so \
+                     nothing was written and the file still holds that newer content. Review what \
+                     changed before deciding: cancel and keep it, or write your version over it \
+                     anyway.",
+                    target.display()
+                ),
+            )
+            .with_path(target)
+        }
     }
 }
 
@@ -1221,8 +1306,28 @@ mod tests {
         let error = WriteErrorDto::new(WriteErrorKindDto::PrivilegeEscalation, true, "m");
         assert_eq!(
             serde_json::to_string(&error).expect("serialize"),
-            r#"{"kind":"privilege_escalation","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null}"#
+            r#"{"kind":"privilege_escalation","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null,"external_change":null}"#
         );
+
+        // The T36 addition, on the wire: the one error kind that carries two
+        // file bodies, because the frontend builds a diff out of them
+        // (`crate::target::ExternalChangeGuard`).
+        let external = WriteErrorDto {
+            message: "m".to_string(),
+            path: None,
+            ..WriteErrorDto::external_change(Path::new("/etc/fstab"), "# old\n", "# new\n")
+        };
+        assert_eq!(
+            serde_json::to_string(&external).expect("serialize"),
+            r##"{"kind":"external_change","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null,"external_change":{"last_known_content":"# old\n","current_content":"# new\n"}}"##
+        );
+        // It is additive and optional on the way in, so a response produced
+        // by a build that predates it still deserializes.
+        let without: WriteErrorDto = serde_json::from_str(
+            r#"{"kind":"write","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(without.external_change, None);
 
         let command_error = CommandErrorDto::new(CommandErrorKindDto::NotUtf8, "m");
         assert_eq!(
@@ -1283,7 +1388,7 @@ mod tests {
         );
     }
 
-    /// Every `kind` spelling of the three error enums the frontend matches on
+    /// Every `kind` spelling of the four error enums the frontend matches on
     /// by string, pinned individually.
     ///
     /// `remaining_wire_formats_are_exactly_as_documented` pins one instance of
@@ -1293,6 +1398,33 @@ mod tests {
     /// be noticed.
     #[test]
     fn every_error_kind_spelling_is_exactly_as_documented() {
+        let write_kinds = [
+            (WriteErrorKindDto::TargetResolution, "target_resolution"),
+            (WriteErrorKindDto::Validation, "validation"),
+            (WriteErrorKindDto::InvalidTarget, "invalid_target"),
+            (WriteErrorKindDto::Backup, "backup"),
+            (WriteErrorKindDto::Write, "write"),
+            (WriteErrorKindDto::Metadata, "metadata"),
+            (WriteErrorKindDto::Fsync, "fsync"),
+            (WriteErrorKindDto::Rename, "rename"),
+            (WriteErrorKindDto::ReadBack, "read_back"),
+            (WriteErrorKindDto::Verify, "verify"),
+            (
+                WriteErrorKindDto::PrivilegeEscalation,
+                "privilege_escalation",
+            ),
+            (WriteErrorKindDto::InvalidBackup, "invalid_backup"),
+            (WriteErrorKindDto::ReadBackup, "read_backup"),
+            (WriteErrorKindDto::Internal, "internal"),
+            (WriteErrorKindDto::ExternalChange, "external_change"),
+        ];
+        for (kind, spelling) in write_kinds {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{spelling}\"")
+            );
+        }
+
         let command_kinds = [
             (CommandErrorKindDto::TargetResolution, "target_resolution"),
             (CommandErrorKindDto::ReadTarget, "read_target"),
