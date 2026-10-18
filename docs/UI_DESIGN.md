@@ -185,7 +185,7 @@ and blanks are never dropped, just not given their own row in this list view).
 | Options | first ~3 options as small chips + `+N more` overflow; the full ordered list is visible on hover tooltip, in the expanded detail panel below, and always fully editable in the drawer |
 | Dump | single digit |
 | Pass | single digit |
-| Actions | Edit (`EditIcon` button) · Delete (`DeleteIcon` button, `text-red-600` on hover) |
+| Actions | Move up / Move down (`ChevronUpIcon`/`ChevronDownIcon` buttons, T40 - full spec in §13) · Edit (`EditIcon` button) · Delete (`DeleteIcon` button, `text-red-600` on hover) |
 
 Row styling: `bg-white dark:bg-slate-800`, alternating/zebra optional (`odd:bg-slate-50
 dark:odd:bg-slate-800/60`), hover `hover:bg-sky-50 dark:hover:bg-slate-700/60`, row
@@ -238,6 +238,12 @@ inline mount-point warning and flat warning stack (§5) - both read from the sam
 `validate_candidate` response, just scoped differently (the table scopes by row, the
 drawer by "about this draft specifically").
 
+**Reordering (T40)**: entries can be moved up/down within this table, staged into the
+same in-memory candidate document as any other edit and feeding the exact same
+document-wide validation described above. Full spec, including the Move up/down button
+design, the freestanding-comment/blank-line landing rule, and a required correctness fix
+to the diff/pending-count logic this introduces, is in §13 - not duplicated here.
+
 **UnparsedEntryRow (malformed line):**
 
 - Full-width single row (spans all columns), background `bg-amber-50 dark:bg-amber-900/20`,
@@ -246,12 +252,12 @@ drawer by "about this draft specifically").
   shown as raw text"` + the raw original line text verbatim in `font-mono text-sm`
   inside a `bg-slate-900/5 dark:bg-slate-950/40` inset block so it visually reads as
   "quoted raw text," not as a normal structured row.
-- Still has Edit and Delete actions. Edit opens the EntryDetailDrawer in a "raw text"
-  sub-mode (a single multi-line text field containing the raw line, since structured
-  fields cannot be offered for a line the parser couldn't decompose) rather than the
-  normal structured form. Delete removes the line like any other row. The line is never
-  silently hidden or auto-corrected - this satisfies SPEC's explicit "never dropped or
-  hidden" requirement.
+- Still has Move up/Move down, Edit and Delete actions (§13). Edit opens the
+  EntryDetailDrawer in a "raw text" sub-mode (a single multi-line text field containing
+  the raw line, since structured fields cannot be offered for a line the parser couldn't
+  decompose) rather than the normal structured form. Delete removes the line like any
+  other row. The line is never silently hidden or auto-corrected - this satisfies
+  SPEC's explicit "never dropped or hidden" requirement.
 - `EmptyState` variant: if the table has zero entries (e.g. a truly empty fstab), show
   a centered placeholder: icon + `"No entries yet"` + a primary `Add Entry` button.
 
@@ -462,14 +468,26 @@ reason of not silently discarding unsaved work on a stray click.
    both halves of the brief ("structured per-field change list" and "exact textual
    diff"):
    - **DiffSummaryList** (Summary tab): entries grouped under `Added (N)` / `Modified
-     (N)` / `Removed (N)` headings.
+     (N)` / `Reordered (N)` / `Removed (N)` headings. The `Reordered` group is new in
+     T40 (§13.7) - see that section for why it exists and exactly when an entry lands
+     there instead of `Modified`.
      - Added entries: whole-row summary on a `bg-emerald-50 dark:bg-emerald-900/20`
        tinted card.
      - Removed entries: whole-row summary on `bg-red-50 dark:bg-red-900/20`, text
        `line-through text-slate-500`.
      - Modified entries: one card per entry, listing only the fields that actually
        changed as `label: ~~old value~~ → **new value**` rows - old value muted
-       strikethrough, new value bold, unchanged fields not repeated here at all.
+       strikethrough, new value bold, unchanged fields not repeated here at all. If
+       the same entry also changed position, that is appended as one extra note line
+       rather than also being listed under `Reordered` (§13.7's precedence rule) - no
+       entry is ever listed twice.
+     - Reordered entries (T40, §13.7): whole-row summary on a `bg-sky-50
+       dark:bg-sky-900/20` tinted card (sky, not emerald/red/amber - this is neither
+       additive, destructive, nor itself a warning), with one extra line stating
+       `"Moved from position {old} to position {new}"` (1-based rank among entries
+       still present in both versions - see §13.7 for exactly how that rank is
+       computed). No field-level diff rows, since content is byte-identical to the
+       original - position is the only thing that changed.
    - **DiffRawText** (Raw diff tab): classic unified-diff rendering of the full
      candidate file text against the current target file text, `font-mono text-sm`,
      line-numbered gutter, `-` (removed) lines `bg-red-50 text-red-700 dark:bg-red-950/40
@@ -478,6 +496,9 @@ reason of not silently discarding unsaved work on a stray click.
      `text-slate-600 dark:text-slate-400`. This is the exact textual before/after of
      the real file content, including comments/blank-line positions, so a careful user
      can verify byte-level correctness, not just Rustab's interpretation of the change.
+     A pure reorder already renders correctly here with no changes needed (§13.7) -
+     the two now-swapped lines simply show as a `-`/`+` pair at their respective
+     positions, same as any other line-level change.
 3. Footer action bar:
    - `Cancel` (secondary) - closes the modal, pending changes remain staged (nothing is
      lost, nothing is written).
@@ -734,10 +755,11 @@ visual weight stays a reliable signal (§2).
   reuse `emerald-600`-on-white for small body text).
 - Every interactive element has a visible `:focus-visible` ring using `focus-ring`
   (§ above) - never remove the outline without replacing it.
-- All icon-only buttons (Edit/Delete/Browse/remove-chip) carry an accessible label
-  (`aria-label` equivalent in Yew) in addition to the icon.
-- Disabled buttons (e.g. Save while validation errors exist) are real `disabled`
-  elements, not just visually dimmed clickable ones.
+- All icon-only buttons (Edit/Delete/Browse/remove-chip/Move up/Move down) carry an
+  accessible label (`aria-label` equivalent in Yew) in addition to the icon.
+- Disabled buttons (e.g. Save while validation errors exist, or a boundary row's Move
+  up/down - §13.2) are real `disabled` elements, not just visually dimmed clickable
+  ones.
 
 ### Responsive breakpoints
 
@@ -782,8 +804,10 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 6. `EntryRow` - one parsed entry's row (§3); click-to-expand reveals every field,
    untruncated, including the description, in an inline detail panel (no separate
    inline description indicator in the collapsed row itself). Does get a left-border
-   accent + title tooltip when a document-wide warning is tagged to this row
-7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3)
+   accent + title tooltip when a document-wide warning is tagged to this row, plus
+   Move up/Move down buttons in its Actions cell (T40, §13)
+7. `UnparsedEntryRow` - malformed-line row, raw text + warning (§3) - also gets
+   Move up/Move down (T40, §13)
 8. `EmptyState` - generic empty-list placeholder (entries or backups)
 9. `EntryDetailDrawer` - add/edit form container (§4)
 10. `SourceTypeSelect` - source-type dropdown
@@ -799,7 +823,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 19. `FormActionBar` - Cancel/Verify/Save buttons inside the drawer
 20. `DeleteConfirmDialog` - single-entry delete confirmation (§4)
 21. `DiffView` - the pending-changes/diff confirmation modal (§6)
-22. `DiffSummaryList` - structured per-field Added/Modified/Removed list (§6)
+22. `DiffSummaryList` - structured per-field Added/Modified/Reordered/Removed list (§6,
+    §13.7)
 23. `DiffRawText` - unified-diff monospace rendering (§6)
 24. `RealTargetConfirmCheckbox` - the extra "I understand..." gate for any write that
     reaches the real `/etc/fstab` (§2's `writes_real_file`, not raw `is_real`), reused
@@ -822,6 +847,10 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
     expand-chevron and the expanded Mount point row's copy/open-in-file-manager
     buttons (§3). `stroke="currentColor"` so hover/dark-mode color changes already
     applied to the button apply to the icon too, same as `AboutDialog`'s own icons.
+    T40 (§13) adds two more to this module: `ChevronUpIcon`/`ChevronDownIcon`, for the
+    Move up/Move down buttons - dedicated Lucide glyphs, not a CSS-rotated reuse of
+    `ChevronRightIcon`, consistent with every other icon in this module getting its
+    own path rather than a transform.
 34. `RawViewDialog` - read-only overlay showing the active target's exact current
     raw text, no diff (§11)
 35. `ExternalChangeDialog` - external-change/drift warning modal shown after a
@@ -952,6 +981,347 @@ so nothing was written.
   rather than any new state of its own; no toast, since nothing was written and the
   dialog's own transition is feedback enough. On failure: shown inline in this dialog's
   error slot, same treatment as any other retry failure here.
+
+---
+
+## 13. Entry reordering (T40)
+
+**The problem**: `findmnt --verify` (the validation backend already calls this, see
+`PROJECT_PLAN.md`'s T39 section) requires a parent mount point's line to appear before
+any nested/child mount point beneath it. Before this task, Rustab had no in-app way to
+change an entry's position at all - the only way to fix a genuine "wrong order" finding
+was delete-and-re-add, or editing the raw file outside the app entirely.
+
+**Decision: Move up / Move down buttons added to `EntryRow`/`UnparsedEntryRow`'s
+existing Actions cell** - candidate #1 of the five the repo owner named, not
+drag-and-drop, not an order-number field, and not a separate reorder view. This is not
+a close call the repo owner needs to break a tie on: §13.1 below gives the specific
+reasoning for this app. Two refinements beyond the plain button idea as literally
+named turned out to be necessary, not optional nice-to-haves, and are specified in full
+here: a persistent indicator for where freestanding comments/blank lines sit relative
+to the rows around them (§13.4-§13.5), and a correctness fix to the diff/pending-count
+logic so a pure reorder is never silently invisible at the one screen (DiffView) this
+app treats as a hard safety gate (§13.7).
+
+### 13.1 Why Move up/down, and why not the other four
+
+**Against drag-and-drop (#2)**: this app's entire UI today is zero drag interactions -
+confirmed by reading `docs/UI_DESIGN.md` itself (this document) end to end before this
+section existed. Adding one here would be a genuinely new interaction paradigm, not an
+extension of an existing pattern, and the cost is not just implementation effort:
+
+- A fully keyboard-operable drag reorder (WAI-ARIA's own grid/listbox reorder pattern)
+  ends up needing something functionally equivalent to Move up/down buttons *underneath*
+  the drag anyway, to satisfy the accessibility baseline this document already commits
+  to (§8: "every interactive element has a visible focus state", disabled real buttons,
+  not just visual dimming). Shipping drag-and-drop would mean shipping both, with drag
+  as pure added surface area for the mouse-only case, not a replacement for anything.
+- This app's whole visual language is deliberately calm and explicit everywhere else:
+  named icon buttons with `aria-label`s, native `disabled` states, no hover-reveal
+  "mystery meat" controls. A drag handle, a ghost row, and a drop-target indicator would
+  be the first fluid, physics-feeling interaction in an otherwise entirely static,
+  click-and-see-the-result UI - a style mismatch on top of the engineering cost, not
+  independent of it.
+- Precision matters more here than in, say, a kanban board: this app's own audience
+  (people editing a system file, described in this task's own brief as skewing toward
+  caution and precision) benefits more from "I clicked this exact button and the row
+  visibly swapped by exactly one slot" than from "I dropped it somewhere that was
+  probably where I meant."
+
+**Against an order-number field (#3)**: it raises exactly the sub-questions the brief
+itself names - what happens on a duplicate number while typing, whether gaps are
+allowed, when renumbering of the other rows actually commits - none of which has an
+established, discoverable answer in this app today, so choosing this option would mean
+*first* resolving a second, harder design problem for the same underlying capability
+Move up/down solves with zero new sub-questions. It is also a worse fit for the common
+case: nudging one entry by one or two positions needs no arithmetic with Move up/down,
+but typing a correct destination number requires the user to already know (or count)
+the exact target rank. It does not resolve the freestanding-comment ambiguity (§13.4)
+any more cleanly either - that ambiguity exists regardless of how "move" is expressed -
+so nothing is gained for the extra complexity.
+
+**Against a dedicated reorder view (#4)**: the existing table already shows exactly
+what a user needs to decide how to reorder - source, mount point, fstype, and (critically)
+the amber warning border this document already specifies in §3 for an ordering problem.
+A separate view would have to either duplicate that context or strip it down to
+something less informative. It also splits "see the current order" from "see whether
+reordering fixed the validation problem" into two screens the user has to switch
+between, which actively works against this task's own live-validation-feedback
+requirement (§13.6) rather than helping it. Nothing about this task's actual complexity
+- which turned out to be data-model correctness (§13.7), not UI surface - is made
+easier by a second screen.
+
+**For Move up/down (#1)**, honestly weighed: its own named downside - "tedious over
+long distances" - is real but minor for this app's actual data. A real `/etc/fstab`
+file realistically holds on the order of single digits to a couple of dozen entries,
+not hundreds, so even a worst-case top-to-bottom move is a small, bounded number of
+clicks. And because every click re-runs validation immediately and visibly (§13.6), the
+one-step-at-a-time nature of this interaction is arguably the right fit for this app's
+existing character, not just an accepted cost: nothing else in Rustab lets one click
+cascade an effect the user can't immediately see and verify (the same "a toast, not a
+silent swallow" standard `PROJECT_PLAN.md`'s T34 section holds the rest of this app to).
+
+### 13.2 Row layout and new icons
+
+Two new icon-only buttons, **Move up** and **Move down**, are added to the Actions
+cell of both `EntryRow` and `UnparsedEntryRow`, to the *left* of the existing Edit
+button, in this order: Move up, Move down, Edit, Delete. A small visual gap (`ml-2` on
+the Edit button, or an explicit `border-l border-slate-200 dark:border-slate-700 pl-2`
+divider before it) separates the Move pair from Edit/Delete, so the cell reads as two
+groups - "change this entry's position" and "change this entry's content/existence" -
+without inventing any new chrome (same spacing-only grouping technique already used
+elsewhere in this document, e.g. the drawer's option-chip groups in §4).
+
+- Icons: two new dedicated Lucide-derived SVGs added to the `icons` module (§9 item 33)
+  - `ChevronUpIcon` (path `m18 15-6-6-6 6`) and `ChevronDownIcon` (path `m6 9 6 6 6-6`) -
+  not a CSS-rotated reuse of `ChevronRightIcon`. `ChevronRightIcon`'s own rotation is
+  appropriate because it represents one glyph's two states (collapsed/expanded, §3); Up
+  and Down are two distinct, permanently-meaningful actions, so - matching how
+  `EditIcon`/`DeleteIcon` are each their own dedicated path rather than a shared shape
+  transformed - they get their own paths too.
+- Styling: identical treatment to the existing Edit button - `p-2 rounded-md
+  hover:bg-slate-100 dark:hover:bg-slate-700 focus-visible:ring-2
+  focus-visible:ring-sky-500`, neutral slate on hover, **not** the accent/sky color
+  (reserved for primary CTAs) and **not** red (reserved for Delete/real-target writes):
+  moving an entry is reversible by clicking the opposite button and is neither the
+  app's primary action nor destructive.
+- `aria-label`: `"Move entry up"` / `"Move entry down"` (or the raw-row equivalent
+  wording for `UnparsedEntryRow`).
+- **Disabled state, not hidden**: the top row's Move up and the bottom row's Move down
+  are real `disabled` buttons (same rule as the Save button in §5 - "an actual disabled
+  state, not just a styling warning the user could click through"), `opacity-40
+  cursor-not-allowed`, no hover background, with a `title` tooltip explaining why
+  (`"Already the first entry"` / `"Already the last entry"`). A 1-row table disables
+  both. Buttons are never removed from the DOM - their position in the Actions cell
+  stays constant across every row, so nothing shifts around as a row becomes/stops
+  being a boundary row.
+- The `<th>` header label for this column stays `"Actions"` (unchanged) - it already
+  covers "any icon button that acts on this specific row," which Move up/down are.
+
+### 13.3 Keyboard accessibility and focus behavior
+
+Move up/down are plain `<button type="button">` elements, so they are reachable by Tab
+and operable with Enter/Space with zero extra code, consistent with every other
+icon-only button in this table.
+
+**Deliberately not adding a "sticky focus" mechanism** to let a keyboard user blast
+through several positions by holding Enter without looking: `EntriesTable`'s rows are
+keyed by `candidate_index`, which is a *position* in the candidate document (the same
+index `on_edit`/`on_delete` already use as the row's identity - see
+`frontend/src/candidate.rs`), not a stable per-entry id. After a swap, Yew's keyed diff
+correctly re-renders the row at a given key with its new content, but that means a DOM
+node that had keyboard focus keeps the focus while the *entry* under it changes - so a
+second blind "press Enter again" would act on whichever entry now occupies that slot,
+not the one the user originally meant to keep moving. Building a stable, moveable
+per-entry focus target would require giving every row a position-independent identity
+throughout the table (edit/delete included), which is a materially larger change than
+this task's own scope boundary allows ("reordering ... must not require touching"
+anything beyond producing a new candidate document order). The practical answer is
+simpler and, for this app's audience, arguably more appropriate anyway: each click
+immediately re-renders the table with the new order and the focus ring (§8) stays
+visibly on a real `<button>`, so a user who wants to move an entry several steps just
+looks at the row before each subsequent click - exactly the "look before you act on a
+system file" posture this app already expects of its users everywhere else (e.g. the
+non-dismissible-by-backdrop drawer/modals in §4/§6, there for the identical reason).
+
+### 13.4 The freestanding-comment/blank-line landing rule
+
+**Established fact** (not re-derived here, see `PROJECT_PLAN.md`'s T40 section and
+`frontend/src/candidate.rs`'s own module doc comment): a `# // <text>` description
+comment and a same-line trailing comment are both already baked into their entry's own
+`description`/`trailing_comment` fields at parse time, so they always travel with their
+entry automatically - no design decision needed there. Any *other* full-line comment
+(a section header, a standalone note) or blank line is genuinely freestanding: it has
+no attachment to any entry and sits at its own fixed position in
+`CandidateDocument.lines`, which `rows()` simply filters out of the table's view.
+
+**The rule**: moving an entry up/down is a plain **positional swap of exactly the two
+row-kind (`Entry`/`Malformed`) lines involved** - the one being moved, and its nearest
+row-kind neighbor in that direction. Nothing else's position changes. Concretely,
+`CandidateDocument` gains:
+
+> `stage_move(&mut self, from: usize, to: usize)` - swaps `self.lines[from]` and
+> `self.lines[to]` in place (bounds-checked, a no-op if either index is out of range,
+> same defensive contract shape as the existing `stage_delete`). It does not re-derive
+> "nearest neighbor" itself - the caller (`EntriesTable`, see §13.8) already knows both
+> indices from its own `rows()`-derived render order, so there is exactly one place in
+> the codebase that decides adjacency, not two that could disagree.
+
+Any freestanding comment/blank line that physically sat between the two swapped lines
+stays at the same absolute position it already had - it ends up between the same two
+*slots*, just now bordered by the opposite pair of entries. For example: if the file
+reads `[Local disk entry] [## Network mounts] [NFS entry]` and the NFS entry is moved
+above the local disk entry, the result is `[NFS entry] [## Network mounts] [Local disk
+entry]` - the header comment, which was presumably introducing the entry below it,
+no longer precedes that entry.
+
+This is a deliberate, simplest-available choice, not an oversight: no rule can
+correctly guess a freestanding comment's intended "owner," because the data model has
+never recorded one (that is exactly what makes it freestanding, per the facts
+established before this task). A heuristic that tries to guess - "comments travel with
+whichever entry was below them," or some other rule - would be right in some files and
+wrong in others, which is strictly *less* predictable than a rule that is always
+mechanically the same: **freestanding content is anchored to its position in the
+document, never to either entry**, exactly matching how the parser already treats it
+(zero new coupling invented, consistent with the existing model rather than layering a
+guess on top of it). A user who cares about a specific comment tracking a specific
+entry already has the tool for that: the description field (§4 item 7), which is
+entry-attached by design and always moves with its entry.
+
+### 13.5 The between-rows gap indicator
+
+Because comments/blanks are invisible in this table (§3: "not rendered as table rows"),
+the rule in §13.4 would otherwise be silent and surprising - discoverable only by
+opening the Raw diff tab after the fact. To communicate it proactively, `EntriesTable`
+renders a thin, non-interactive divider row between two adjacent table rows whenever
+there is a gap between their `candidate_index` values greater than 1 (i.e. ≥1
+non-row-kind line sits between them in `CandidateDocument.lines` - this is derivable
+directly from the two already-known indices, `rows[k+1].0 - rows[k].0 - 1`, with no new
+prop or backend data needed, since `rows()` already filters comments/blanks out and
+`EntriesTable` already has both neighboring indices to compute Move up/down's
+disabled state).
+
+- Renders only when that count is ≥1 - the common case (no freestanding comments
+  between two entries) shows nothing extra, matching this table's existing restraint
+  (§3's border-only warning treatment, no background tint, is the same instinct).
+- Markup: a single `<tr>` with one `colspan="8"` `<td>`, `py-1`, containing a centered
+  row: a `flex-1 border-t border-dashed border-slate-200 dark:border-slate-700` rule on
+  each side of a short `text-xs text-slate-400 dark:text-slate-500` label - dashed, not
+  solid, and muted, so it visually reads as "a gap marker," never as a real row or a
+  warning (it is informational, not advisory).
+- Visible label: `"{N} line(s) stay here"` (pluralize `N` normally).
+- `title` tooltip, same mechanism as the row-warning tooltip in §3: `"{N} comment or
+  blank line(s) sit between these two entries in the file. They aren't shown as rows
+  and aren't attached to either entry - moving an entry across this gap does not move
+  them; they keep their exact position. Check the Raw diff tab in Review & Save to see
+  them."`
+- Not `aria-hidden` - the visible text is plain content a screen reader already reads
+  normally, so no extra ARIA is needed to make this accessible; it also takes no part
+  in row click-to-expand (no `onclick`, no hover state) and is excluded from Tab order
+  (nothing inside it is focusable).
+- This divider is always present under these conditions (not just immediately after a
+  move) - it describes the document's actual current structure, so a user can predict
+  the outcome of a move *before* clicking, not just get notified after.
+
+### 13.6 Live validation feedback
+
+No new plumbing is needed here - `stage_move` is staged into the exact same
+`candidate` state every other mutation already goes through
+(`frontend/src/components/app_shell.rs`'s `on_delete_confirm`/`on_drawer_save` are the
+precedent: `let mut next = (*candidate).clone(); next.stage_move(from, to);
+candidate.set(next);`), and that state already drives the `use_effect_with(candidate.
+clone(), ...)` effect documented in §3 ("Document-wide warning indicator") that
+re-runs `validate_candidate` against the whole document on every staged change. A move
+is staged exactly like an add/edit/delete, so it participates in that same, already-
+specified revalidation automatically. The result is shown exactly the same way §3
+already specifies: the amber left-border + tooltip on whichever row(s) `line_index` the
+finding is tagged to. If a move actually resolves a `findmnt`-ordering warning, that
+row's amber border simply disappears on the next render once the async
+`validate_candidate` call resolves - no new success state, modal, or toast is
+introduced for this, matching this app's existing minimal, non-celebratory feedback
+style for a warning going away anywhere else in the table.
+
+The drawer's own `Verify` button and inline validation (§4, §5) are untouched - per
+this task's own scope boundary, reordering is a table-level operation kept cleanly
+separate from the drawer, which only ever concerns one entry's content.
+
+### 13.7 Diff and pending-count correctness - the Reordered category (required)
+
+**This is the one genuinely load-bearing correctness requirement this task
+introduces, not an optional polish item** - it directly affects the diff-before-save
+step this document's own priority reminder (top of this file) calls a hard gate that
+"nothing in this document may obscure, shortcut, or let the user bypass."
+
+`frontend/src/diff.rs::compute_summary_diff` and
+`frontend/src/candidate.rs::CandidateDocument::pending_count` both currently classify a
+line purely by comparing its *content* at its own `original_index` - they have no
+notion of position at all. A plain `stage_move` swap exchanges two `CandidateLine`
+values (content **and** `original_index` together), so each entry's content-at-its-
+own-original-index comparison is unchanged by a swap: **a pure reorder with no content
+edit currently produces zero Added/Modified/Removed entries and does not increment
+`pending_count`**, verified directly against both functions' existing logic (confirmed
+by reading `frontend/src/diff.rs` and `frontend/src/candidate.rs` while designing this
+section). Concretely, this means `PendingChangesBar` could read "0 entries changed"
+and `DiffView`'s Summary tab could show nothing at all for a session where the user did
+nothing but reorder entries - exactly the kind of silent gap this app's whole diff-gate
+philosophy exists to prevent. (The Raw diff tab is **not** affected - it is a textual
+diff of full rendered file content, so a reorder already shows there correctly as a
+line-level change with no fix needed.)
+
+**Required fix - a fourth category, `Reordered`,** added to `SummaryDiff` (alongside
+`added`/`modified`/`removed`) and to `pending_count`'s total. Detection, in prose (this
+document's own convention - no Rust/Yew code is written here):
+
+1. Take every row-kind line still present in the candidate document (i.e. its
+   `original_index` is `Some` and that original index wasn't dropped by a delete - the
+   same `still_present` set `compute_summary_diff`/`pending_count` already build today).
+2. Rank those still-present lines twice: once by their order in the *original* document
+   (ignoring any lines that were since removed, so ranks are comparable like-for-like),
+   and once by their order in the *current* candidate document (ignoring any added
+   lines, which have no original rank to compare against). Both ranks are plain
+   0-based positions among only the lines in that comparison set.
+3. Any still-present line whose original rank differs from its current rank has
+   changed position - that is the `Reordered` set, keyed by `original_index`.
+4. **Precedence**: a line whose *content* also changed is reported once, under
+   `Modified`, never under both - `Reordered` only ever covers a line whose content is
+   byte-identical to its original and whose rank alone differs. If a `Modified` entry's
+   rank also changed, append one extra note to its existing card (§6: "If the same
+   entry also changed position...") rather than listing it a second time.
+
+This algorithm is correct for any combination of moves, edits, additions and deletions
+made in any order before Review & Save is opened, not just a single isolated swap -
+it compares final state to original state directly, the same way every other category
+already does, so it can't drift out of sync with however many individual moves the
+user actually made. `DiffSummaryList`'s new `Reordered (N)` group and its card styling
+(`bg-sky-50 dark:bg-sky-900/20`, "Moved from position {old} to position {new}", both
+1-based) are specified in §6. Where exactly the shared rank-comparison logic lives
+(a method on `CandidateDocument` that both `pending_count` and `diff.rs` call, vs. two
+independent call sites) is left to the implementer's judgment, with one hard
+requirement carried over from T39's own closing lesson in `PROJECT_PLAN.md` - both
+call sites must use the *same* logic, not two independently-written versions that can
+quietly disagree.
+
+### 13.8 Data model and component-contract summary
+
+For the frontend-developer implementing this (prose, matching this document's
+no-code convention):
+
+- `CandidateDocument` gains `stage_move(&mut self, from: usize, to: usize)` (§13.4) and
+  the rank-comparison helper behind the `Reordered` category (§13.7). Both are pure,
+  synchronous, in-memory mutations/queries, exactly like the existing `stage_add`/
+  `stage_edit_entry`/`stage_edit_raw`/`stage_delete` - no backend, writer, or IPC
+  surface is touched by this task, matching the scope boundary.
+- `EntriesTableProps` gains an `on_move: Callback<(usize, usize)>` ("from" candidate
+  index, "to" candidate index), fired by a row's Move up/down button. `EntriesTable`
+  resolves "to" itself, directly from the adjacent element in its own already-iterated
+  `rows` list (`rows[k-1].0` for Move up, `rows[k+1].0` for Move down) - it needs no
+  knowledge of comments/blanks to do this, since `rows()` has already filtered them
+  out; this is also exactly the information it already needs to compute each button's
+  disabled state (§13.2). `AppShell`'s handler is a direct structural match for
+  `on_delete_confirm` (§13.6): clone `candidate`, call `stage_move`, `candidate.set`.
+- **Required alongside the callback**: `EntriesTable`'s own `expanded: HashSet<usize>`
+  state (§3, "any number of rows can be expanded at once") is keyed by the same
+  position-based `candidate_index` as everything else in this table. Swapping two
+  lines' positions without also updating this set would leave the *wrong* row visually
+  expanded after a move (whichever entry now occupies the slot that used to be
+  expanded) - a direct, demonstrable bug, not a hypothetical, stemming from the same
+  positional-identity fact already discussed in §13.3. `EntriesTable`'s own move
+  handler must mirror the swap onto `expanded` at the same time it emits `on_move`: if
+  `from` and/or `to` were present in the set, swap their membership so expansion state
+  follows the entries, not the slots.
+
+### 13.9 Visual tokens used
+
+Nothing new was invented for this task - every value above is a direct reuse:
+`text-slate-400`/`dark:text-slate-500` and `border-slate-200`/`dark:border-slate-700`
+(existing `border-default`/`text-muted` tokens, §8) for the gap divider; the existing
+icon-button hover/focus/disabled treatment (§8's spacing/accessibility conventions,
+and §5's "real `disabled` element" rule) for Move up/down; `bg-sky-50
+dark:bg-sky-900/20` (the existing `accent` family, already used at this same tint
+elsewhere, e.g. the row-expand panel's accent border in §3) for the new `Reordered`
+diff card, chosen specifically because sky is this app's only "notable, non-alarming"
+color - every other tinted card in DiffView is emerald (added/safe) or red
+(removed/destructive), and a reorder is neither.
 
 ---
 

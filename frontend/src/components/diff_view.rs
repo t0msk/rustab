@@ -1,8 +1,8 @@
 //! `DiffView` - the pending-changes/diff confirmation modal (§6), plus its
 //! `DiffSummaryList` and `DiffRawText` sub-views.
 //!
-//! Purely presentational: `AppShell` computes the Added/Modified/Removed
-//! grouping (`crate::diff::compute_summary_diff`) and the raw unified diff
+//! Purely presentational: `AppShell` computes the Added/Modified/
+//! Reordered/Removed grouping (`crate::diff::compute_summary_diff`) and the raw unified diff
 //! (`crate::diff::compute_raw_diff`, fed by the real `render_candidate`
 //! call) and hands both down as props, along with the save-in-flight/error
 //! state for the confirm button (T12) and the two target flags below
@@ -15,7 +15,7 @@ use crate::components::loading_spinner::LoadingSpinner;
 use crate::components::real_target_confirm_checkbox::{
     confirm_disabled, RealTargetConfirmCheckbox,
 };
-use crate::diff::{RawDiffLine, SummaryDiff};
+use crate::diff::{position_sentence, RawDiffLine, SummaryDiff};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiffTab {
@@ -221,8 +221,10 @@ pub fn diff_view(props: &DiffViewProps) -> Html {
     }
 }
 
-/// `DiffSummaryList` - structured per-field Added/Modified/Removed list
-/// (§6), rendered from the real diff `AppShell` computes.
+/// `DiffSummaryList` - structured per-field Added/Modified/Reordered/
+/// Removed list (§6), rendered from the real diff `AppShell` computes. The
+/// `Reordered` group is T40's (§13.7); an entry that was both edited and
+/// moved appears only under `Modified`, with its move as one note line.
 #[derive(Properties, PartialEq)]
 pub struct DiffSummaryListProps {
     pub summary: SummaryDiff,
@@ -231,7 +233,11 @@ pub struct DiffSummaryListProps {
 #[function_component(DiffSummaryList)]
 pub fn diff_summary_list(props: &DiffSummaryListProps) -> Html {
     let summary = &props.summary;
-    if summary.added.is_empty() && summary.modified.is_empty() && summary.removed.is_empty() {
+    if summary.added.is_empty()
+        && summary.modified.is_empty()
+        && summary.reordered.is_empty()
+        && summary.removed.is_empty()
+    {
         return html! {
             <p class="text-sm text-slate-500 dark:text-slate-400">{ "No changes." }</p>
         };
@@ -270,6 +276,26 @@ pub fn diff_summary_list(props: &DiffSummaryListProps) -> Html {
                                         <span class="font-bold text-slate-800 dark:text-slate-100">{ field.new.clone() }</span>
                                     </p>
                                 }) }
+                                if let Some(note) = modified.position_note.clone() {
+                                    <p class="text-slate-500 dark:text-slate-400 italic">{ note }</p>
+                                }
+                            </div>
+                        }) }
+                    </div>
+                </section>
+            }
+            if !summary.reordered.is_empty() {
+                <section>
+                    <h3 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                        { format!("Reordered ({})", summary.reordered.len()) }
+                    </h3>
+                    <div class="space-y-2">
+                        { for summary.reordered.iter().map(|line| html! {
+                            <div class="rounded-md bg-sky-50 dark:bg-sky-900/20 px-3 py-2 text-sm space-y-1">
+                                <p class="font-mono text-sky-800 dark:text-sky-300">{ line.summary.clone() }</p>
+                                <p class="text-slate-500 dark:text-slate-400">
+                                    { position_sentence(line.old_position, line.new_position) }
+                                </p>
                             </div>
                         }) }
                     </div>

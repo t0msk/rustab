@@ -17,7 +17,8 @@
 //! added for the entries-table row-expand panel (T32): the expand/collapse
 //! disclosure chevron, and the Mount point value's copy-to-clipboard /
 //! open-in-file-manager buttons (the latter swaps to `CheckIcon` briefly
-//! after a successful copy).
+//! after a successful copy). `ChevronUpIcon`/`ChevronDownIcon` were added
+//! for the entries-table Move up/Move down buttons (T40).
 
 use yew::prelude::*;
 
@@ -75,6 +76,26 @@ pub fn delete_icon() -> Html {
 pub fn chevron_right_icon() -> Html {
     icon_svg!(html! {
         <path d="m9 18 6-6-6-6" />
+    })
+}
+
+/// Entry-reordering "Move up" glyph (T40, `docs/UI_DESIGN.md` §13.2).
+/// Deliberately its own path rather than a CSS-rotated `ChevronRightIcon`:
+/// that icon's rotation represents one glyph's two states (collapsed/
+/// expanded), while Up and Down are two distinct, permanently-meaningful
+/// actions - so, like `EditIcon`/`DeleteIcon`, each gets its own path.
+#[function_component(ChevronUpIcon)]
+pub fn chevron_up_icon() -> Html {
+    icon_svg!(html! {
+        <path d="m18 15-6-6-6 6" />
+    })
+}
+
+/// Entry-reordering "Move down" glyph - see [`ChevronUpIcon`].
+#[function_component(ChevronDownIcon)]
+pub fn chevron_down_icon() -> Html {
+    icon_svg!(html! {
+        <path d="m6 9 6 6 6-6" />
     })
 }
 

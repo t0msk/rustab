@@ -527,6 +527,23 @@ pub fn app_shell() -> Html {
         })
     };
 
+    // Stages a reorder, structurally the same as `on_delete_confirm`
+    // above: a plain in-memory candidate mutation, no dialog and no write.
+    // Both indices come from `EntriesTable`, which resolved the "to" slot
+    // from its own row order (`docs/UI_DESIGN.md` §13.8). Staging into
+    // `candidate` is also all that live revalidation needs - the
+    // `use_effect_with(candidate.clone(), ...)` effect above re-runs
+    // `validate_candidate` against the whole document on every staged
+    // change, so an ordering warning appears/disappears on its own (§13.6).
+    let on_move_entry = {
+        let candidate = candidate.clone();
+        Callback::from(move |(from, to): (usize, usize)| {
+            let mut next = (*candidate).clone();
+            next.stage_move(from, to);
+            candidate.set(next);
+        })
+    };
+
     let on_review = {
         let diff_view_open = diff_view_open.clone();
         let diff_error = diff_error.clone();
@@ -1379,6 +1396,7 @@ pub fn app_shell() -> Html {
                             row_warnings={row_warnings}
                             on_edit={on_edit_entry}
                             on_delete={on_delete_entry}
+                            on_move={on_move_entry}
                             on_add_entry={on_add_entry}
                             show_toast={show_toast.clone()}
                         />
