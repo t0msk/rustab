@@ -485,7 +485,7 @@ mod tests {
             ],
         };
         let mut candidate = CandidateDocument::from_document(&original);
-        candidate.stage_move(0, 1);
+        let _ = candidate.stage_move(0, 1);
 
         let diff = compute_summary_diff(&original, &candidate);
         assert!(diff.added.is_empty());
@@ -513,7 +513,7 @@ mod tests {
             ],
         };
         let mut candidate = CandidateDocument::from_document(&original);
-        candidate.stage_move(0, 1);
+        let _ = candidate.stage_move(0, 1);
         candidate.stage_edit_entry(
             1,
             match entry_line("/data", &["defaults", "noatime"]) {
@@ -574,7 +574,7 @@ mod tests {
             LineDto::Entry { entry } => entry,
             _ => unreachable!(),
         });
-        candidate.stage_move(0, 1); // swap the two survivors
+        let _ = candidate.stage_move(0, 1); // swap the two survivors
 
         let diff = compute_summary_diff(&original, &candidate);
         assert_eq!(diff.added.len(), 1);
@@ -615,7 +615,7 @@ mod tests {
             ],
         };
         let mut candidate = CandidateDocument::from_document(&original);
-        candidate.stage_move(2, 0);
+        let _ = candidate.stage_move(2, 0);
 
         let diff = compute_summary_diff(&original, &candidate);
         assert_eq!(diff.reordered.len(), 2);

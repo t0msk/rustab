@@ -41,6 +41,56 @@ fn is_row(line: &LineDto) -> bool {
     matches!(line, LineDto::Entry { .. } | LineDto::Malformed { .. })
 }
 
+/// Where the two lines involved in a [`CandidateDocument::stage_move`]
+/// actually ended up (`docs/UI_DESIGN.md` §13.4 step 3).
+///
+/// T40's `stage_move` was a bare `Vec::swap`, so a caller could assume the
+/// line at `from` landed at `to` and vice versa. Once each entry can carry
+/// an attached comment block of its own length (§13.4), that assumption is
+/// wrong whenever the two blocks differ in length - so the computation that
+/// already has to rearrange the lines reports its own answer rather than
+/// leaving a caller to re-derive it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveOutcome {
+    /// New index of the line that was at `from`.
+    pub from_new_index: usize,
+    /// New index of the line that was at `to`.
+    pub to_new_index: usize,
+}
+
+/// Where the two row-kind lines of a move land, given each one's attached
+/// comment block length (`docs/UI_DESIGN.md` §13.4 step 3).
+///
+/// `upper`/`lower` are the two lines' current indices by *document
+/// position* (not by which button was clicked), `upper_len`/`lower_len`
+/// their [`CandidateDocument::attached_block_len`] values. Returns
+/// `(new_upper, new_lower)`.
+///
+/// The affected range runs from `upper - upper_len` through `lower`
+/// inclusive and is rewritten in place as `lower`'s span, the unchanged
+/// freestanding middle, then `upper`'s span - so:
+///
+/// - `upper`'s own line is the last line of the last span placed, and the
+///   range still ends at `lower`, so it always lands exactly at `lower`,
+///   whatever either block's length.
+/// - `lower`'s own line is the last line of the *first* span placed, which
+///   starts at `upper - upper_len`, so it lands at
+///   `upper - upper_len + lower_len` - *not* simply `upper`, whenever the
+///   two blocks differ in length.
+///
+/// This is the single place either fact is computed: `stage_move` uses it
+/// to report its [`MoveOutcome`], and `EntriesTable` uses the same function
+/// to keep its position-keyed `expanded` set in sync (§13.8), so the two
+/// cannot quietly disagree.
+pub fn resolve_moved_indices(
+    upper: usize,
+    upper_len: usize,
+    lower: usize,
+    lower_len: usize,
+) -> (usize, usize) {
+    (lower, upper.saturating_sub(upper_len) + lower_len)
+}
+
 /// One still-present line whose *position* changed relative to the
 /// originally loaded document - the raw material behind both
 /// `pending_count`'s reorder contribution and `DiffView`'s `Reordered`
@@ -144,20 +194,122 @@ impl CandidateDocument {
         }
     }
 
-    /// Stages a positional swap of the lines at `from` and `to`
-    /// (`docs/UI_DESIGN.md` §13.4). A no-op if either index is out of
-    /// range, the same defensive contract shape as `stage_delete`.
+    /// Length of the attached comment block sitting directly above the
+    /// row-kind line at `row_index` - the lines that move *with* it
+    /// (`docs/UI_DESIGN.md` §13.4). `0` means it has none.
     ///
-    /// This is deliberately a plain two-line swap and nothing more: it does
-    /// **not** re-derive "the nearest row-kind neighbor" itself, because the
-    /// caller (`EntriesTable`) already knows both indices from its own
-    /// `rows()`-derived render order, so exactly one place in the codebase
-    /// decides adjacency. Any freestanding comment/blank line that sat
-    /// between the two swapped lines keeps its exact position (§13.4).
-    pub fn stage_move(&mut self, from: usize, to: usize) {
-        if from < self.lines.len() && to < self.lines.len() {
-            self.lines.swap(from, to);
+    /// An ordinary `#` comment written above an entry is the common fstab
+    /// convention for describing that entry, so it must travel with the
+    /// entry when it moves; T40 wrongly left every comment behind. (A
+    /// `# //` description comment and a same-line trailing comment are
+    /// absorbed into their entry's own fields at parse time and are never
+    /// standalone `LineDto::Comment` values, so they are not involved here
+    /// at all.)
+    ///
+    /// The backward walk, exactly as §13.4 specifies it:
+    ///
+    /// 1. Skip any number of consecutive `Blank` lines immediately above
+    ///    `row_index`. Blank lines alone never break attachment.
+    /// 2. If the first non-blank line reached is not a `Comment` (a
+    ///    row-kind line, or the start of the document), there is no
+    ///    attached block - return `0`.
+    /// 3. Otherwise keep walking back *without* skipping blanks, while the
+    ///    lines stay strictly contiguous `Comment`s; a `Blank`, a row-kind
+    ///    line or the start of the document ends the run. The attached
+    ///    block is everything from there down to (but excluding)
+    ///    `row_index` itself - i.e. the comment run *and* any blank lines
+    ///    step 1 skipped, so that the block plus its row is one contiguous
+    ///    span that can be relocated as a unit.
+    ///
+    /// A second, separate comment block further back is never reached (the
+    /// walk stops at the nearer one), and a comment block at true
+    /// end-of-file is never visited by any walk at all - both stay
+    /// freestanding and pinned in place, exactly as T40 had them.
+    pub fn attached_block_len(&self, row_index: usize) -> usize {
+        if row_index >= self.lines.len() {
+            return 0;
         }
+
+        // Step 1: skip blanks immediately above.
+        let mut cursor = row_index;
+        while cursor > 0 && matches!(self.lines[cursor - 1].line, LineDto::Blank) {
+            cursor -= 1;
+        }
+
+        // Step 2: the first non-blank line above must be a comment.
+        if cursor == 0 || !matches!(self.lines[cursor - 1].line, LineDto::Comment { .. }) {
+            return 0;
+        }
+
+        // Step 3: the contiguous comment run this block is made of.
+        let mut block_start = cursor;
+        while block_start > 0 && matches!(self.lines[block_start - 1].line, LineDto::Comment { .. })
+        {
+            block_start -= 1;
+        }
+
+        row_index - block_start
+    }
+
+    /// Stages a reorder of the row-kind lines at `from` and `to`, each
+    /// moving together with its own attached comment block
+    /// (`docs/UI_DESIGN.md` §13.4).
+    ///
+    /// A no-op (`None`, document untouched) if either index is out of range
+    /// or `from == to` - the same defensive contract shape as
+    /// `stage_delete`. Otherwise the whole range from the upper line's
+    /// block start through the lower line inclusive is rewritten as the
+    /// lower line's full span, the unchanged freestanding middle, then the
+    /// upper line's full span. That range's length is unchanged, so nothing
+    /// outside it shifts by even one index.
+    ///
+    /// This does **not** re-derive "the nearest row-kind neighbor" itself:
+    /// the caller (`EntriesTable`) already knows both indices from its own
+    /// `rows()`-derived render order, so exactly one place in the codebase
+    /// decides adjacency. Freestanding comment/blank lines - ones no
+    /// entry's attachment walk claims - never travel with either entry:
+    /// they stay in the middle, in their original order, and keep their
+    /// exact index whenever the two spans are the same length (the common
+    /// case). When the spans differ in length the middle necessarily
+    /// shifts by that difference, since the whole range is rewritten in
+    /// place and the middle still sits between the two spans.
+    ///
+    /// Returns the *actual* new indices of the two lines, via
+    /// [`resolve_moved_indices`]; they are not simply `to`/`from` once the
+    /// two attached blocks differ in length.
+    pub fn stage_move(&mut self, from: usize, to: usize) -> Option<MoveOutcome> {
+        if from >= self.lines.len() || to >= self.lines.len() || from == to {
+            return None;
+        }
+
+        let upper = from.min(to);
+        let lower = from.max(to);
+        let upper_len = self.attached_block_len(upper);
+        // The lower line's block can never reach across the upper line when
+        // both are row-kind lines (the walk stops at a row-kind line), but
+        // clamp anyway so a non-row index from a future caller can't make
+        // the two spans overlap.
+        let lower_len = self.attached_block_len(lower).min(lower - upper - 1);
+
+        let range_start = upper - upper_len;
+        let mut rearranged: Vec<CandidateLine> = Vec::with_capacity(lower - range_start + 1);
+        // Lower's full span, then the untouched freestanding middle, then
+        // upper's full span (§13.4 steps 1-2).
+        rearranged.extend_from_slice(&self.lines[lower - lower_len..=lower]);
+        rearranged.extend_from_slice(&self.lines[upper + 1..lower - lower_len]);
+        rearranged.extend_from_slice(&self.lines[range_start..=upper]);
+        self.lines.splice(range_start..=lower, rearranged);
+
+        let (new_upper, new_lower) = resolve_moved_indices(upper, upper_len, lower, lower_len);
+        let (from_new_index, to_new_index) = if from == upper {
+            (new_upper, new_lower)
+        } else {
+            (new_lower, new_upper)
+        };
+        Some(MoveOutcome {
+            from_new_index,
+            to_new_index,
+        })
     }
 
     /// Every still-present row-kind line whose position changed relative to
@@ -330,7 +482,7 @@ mod tests {
         let original = document(vec![entry_line("/a"), entry_line("/b"), entry_line("/c")]);
         let mut candidate = CandidateDocument::from_document(&original);
 
-        candidate.stage_move(0, 2);
+        let _ = candidate.stage_move(0, 2);
 
         assert_eq!(mount_points(&candidate), vec!["/c", "/b", "/a"]);
         assert_eq!(candidate.lines[0].original_index, Some(2));
@@ -342,30 +494,24 @@ mod tests {
         let original = document(vec![entry_line("/a"), entry_line("/b"), entry_line("/c")]);
         let mut candidate = CandidateDocument::from_document(&original);
 
-        candidate.stage_move(1, 2);
+        let _ = candidate.stage_move(1, 2);
 
         assert_eq!(mount_points(&candidate), vec!["/a", "/c", "/b"]);
     }
 
     #[test]
-    fn stage_move_leaves_a_freestanding_comment_between_the_two_slots_in_place() {
-        // §13.4's landing rule: only the two row-kind lines swap; anything
-        // between them keeps its exact position.
-        let original = document(vec![
-            entry_line("/a"),
-            LineDto::Comment {
-                text: " Network mounts".to_string(),
-            },
-            entry_line("/b"),
-        ]);
+    fn stage_move_leaves_a_freestanding_blank_line_between_the_two_slots_in_place() {
+        // §13.4's landing rule for genuinely freestanding content: a blank
+        // line is never itself an attached block, so it keeps its exact
+        // position while the two spans around it swap. (T40 asserted the
+        // same for an ordinary comment here, which §13.4 now corrects -
+        // see `a_single_comment_directly_above_an_entry_is_attached`.)
+        let original = document(vec![entry_line("/a"), LineDto::Blank, entry_line("/b")]);
         let mut candidate = CandidateDocument::from_document(&original);
 
-        candidate.stage_move(2, 0);
+        let _ = candidate.stage_move(2, 0);
 
-        assert_eq!(
-            mount_points(&candidate),
-            vec!["/b", "# Network mounts", "/a"]
-        );
+        assert_eq!(mount_points(&candidate), vec!["/b", "", "/a"]);
     }
 
     #[test]
@@ -374,11 +520,11 @@ mod tests {
         let before = CandidateDocument::from_document(&original);
 
         let mut from_out_of_range = before.clone();
-        from_out_of_range.stage_move(5, 1);
+        assert_eq!(from_out_of_range.stage_move(5, 1), None);
         assert_eq!(from_out_of_range, before);
 
         let mut to_out_of_range = before.clone();
-        to_out_of_range.stage_move(0, 5);
+        assert_eq!(to_out_of_range.stage_move(0, 5), None);
         assert_eq!(to_out_of_range, before);
     }
 
@@ -388,7 +534,7 @@ mod tests {
         let before = CandidateDocument::from_document(&original);
 
         let mut candidate = before.clone();
-        candidate.stage_move(1, 1);
+        assert_eq!(candidate.stage_move(1, 1), None);
 
         assert_eq!(candidate, before);
     }
@@ -400,7 +546,7 @@ mod tests {
         // was reported at all.
         let original = document(vec![entry_line("/a"), entry_line("/b")]);
         let mut candidate = CandidateDocument::from_document(&original);
-        candidate.stage_move(0, 1);
+        let _ = candidate.stage_move(0, 1);
 
         let changes = candidate.position_changes(&original);
         assert_eq!(changes.len(), 2);
@@ -417,7 +563,7 @@ mod tests {
     fn an_entry_that_did_not_move_is_never_reported_as_reordered() {
         let original = document(vec![entry_line("/a"), entry_line("/b"), entry_line("/c")]);
         let mut candidate = CandidateDocument::from_document(&original);
-        candidate.stage_move(0, 1);
+        let _ = candidate.stage_move(0, 1);
 
         let moved: Vec<usize> = candidate
             .position_changes(&original)
@@ -450,7 +596,7 @@ mod tests {
         // count such a line once (as modified), not twice.
         let original = document(vec![entry_line("/a"), entry_line("/b")]);
         let mut candidate = CandidateDocument::from_document(&original);
-        candidate.stage_move(0, 1);
+        let _ = candidate.stage_move(0, 1);
         // `/a` now sits at index 1; edit it there.
         candidate.stage_edit_entry(1, entry("/a-renamed"));
 
@@ -489,11 +635,278 @@ mod tests {
         assert_eq!(candidate.pending_count(&original), 2);
 
         // Now actually swap the two survivors: they rank among themselves.
-        candidate.stage_move(0, 1);
+        let _ = candidate.stage_move(0, 1);
         let changes = candidate.position_changes(&original);
         assert_eq!(changes.len(), 2);
         assert_eq!((changes[0].original_index, changes[0].new_rank), (2, 0));
         assert_eq!((changes[1].original_index, changes[1].new_rank), (1, 1));
         assert_eq!(candidate.pending_count(&original), 4);
+    }
+
+    // --- T41: attached comment blocks (`docs/UI_DESIGN.md` §13.4/§13.10) ---
+
+    fn comment(text: &str) -> LineDto {
+        LineDto::Comment {
+            text: format!(" {text}"),
+        }
+    }
+
+    #[test]
+    fn a_single_comment_directly_above_an_entry_is_attached_and_moves_with_it() {
+        // §13.10 case 1 - the core bug T40 shipped: an ordinary `#` comment
+        // describing an entry was left behind when the entry moved.
+        let original = document(vec![
+            entry_line("/a"),
+            comment("the /b mount"),
+            entry_line("/b"),
+        ]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(2), 1);
+        assert_eq!(candidate.attached_block_len(0), 0);
+
+        let outcome = candidate.stage_move(2, 0).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec!["# the /b mount", "/b", "/a"],
+            "the comment must travel with its entry, not stay behind"
+        );
+        assert_eq!(outcome.from_new_index, 1);
+        assert_eq!(outcome.to_new_index, 2);
+    }
+
+    #[test]
+    fn a_multi_line_comment_block_moves_as_one_intact_unit() {
+        // §13.10 case 2 - never split, never partially left behind.
+        let original = document(vec![
+            entry_line("/a"),
+            comment("block line 1"),
+            comment("block line 2"),
+            comment("block line 3"),
+            entry_line("/b"),
+        ]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(4), 3);
+
+        let outcome = candidate.stage_move(0, 4).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec![
+                "# block line 1",
+                "# block line 2",
+                "# block line 3",
+                "/b",
+                "/a",
+            ]
+        );
+        assert_eq!(outcome.from_new_index, 4); // `/a`
+        assert_eq!(outcome.to_new_index, 3); // `/b`
+    }
+
+    #[test]
+    fn multiple_blank_lines_do_not_break_attachment() {
+        // §13.10 case 3 - blank lines alone never break attachment, so the
+        // attached span reaches past them to the comment (and carries them
+        // along, since a span is contiguous).
+        let original = document(vec![
+            entry_line("/a"),
+            comment("the /b mount"),
+            LineDto::Blank,
+            LineDto::Blank,
+            entry_line("/b"),
+        ]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(4), 3);
+
+        let _ = candidate.stage_move(4, 0).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec!["# the /b mount", "", "", "/b", "/a"]
+        );
+    }
+
+    #[test]
+    fn a_second_comment_block_further_back_stays_freestanding() {
+        // §13.10 case 4 - the walk stops at the nearest block, so the one
+        // above it belongs to nobody and keeps its exact position. Both
+        // spans are one comment + one entry here, so "keeps its position"
+        // is literal, index for index.
+        let original = document(vec![
+            comment("the /a mount"),
+            entry_line("/a"),
+            comment("Section: network mounts"),
+            LineDto::Blank,
+            comment("the /b mount"),
+            entry_line("/b"),
+        ]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(1), 1);
+        assert_eq!(
+            candidate.attached_block_len(5),
+            1,
+            "only the nearest block attaches - the section header does not"
+        );
+
+        let _ = candidate.stage_move(5, 1).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec![
+                "# the /b mount",
+                "/b",
+                "# Section: network mounts",
+                "",
+                "# the /a mount",
+                "/a",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comment_block_at_end_of_file_belongs_to_nobody_and_never_moves() {
+        // §13.10 case 5 - the walk only ever runs backward from a row, so a
+        // block with no row below it is never visited by any walk.
+        let original = document(vec![
+            entry_line("/a"),
+            entry_line("/b"),
+            comment("end of file note"),
+            comment("second line of it"),
+        ]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(0), 0);
+        assert_eq!(candidate.attached_block_len(1), 0);
+
+        let _ = candidate.stage_move(0, 1).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec!["/b", "/a", "# end of file note", "# second line of it"]
+        );
+    }
+
+    #[test]
+    fn a_description_marker_comment_is_never_part_of_an_attached_block() {
+        // §13.10 case 6 - a `# // <text>` line is absorbed into its entry's
+        // `description` by the backend parser
+        // (`fstab-core::parser::absorb_description_comments`) and never
+        // reaches the frontend as a `LineDto::Comment`, so it cannot enter
+        // the attachment walk at all. It travels with its entry via the
+        // `description` field, exactly as it did before T40.
+        let mut described = entry("/a");
+        described.description = Some("Root filesystem".to_string());
+        let original = document(vec![LineDto::Entry { entry: described }, entry_line("/b")]);
+        let candidate_before = CandidateDocument::from_document(&original);
+
+        assert!(
+            !candidate_before
+                .lines
+                .iter()
+                .any(|cl| matches!(cl.line, LineDto::Comment { .. })),
+            "a `# //` line is not a standalone comment line in the frontend"
+        );
+        assert_eq!(candidate_before.attached_block_len(0), 0);
+        assert_eq!(candidate_before.attached_block_len(1), 0);
+
+        let mut candidate = candidate_before;
+        let _ = candidate.stage_move(0, 1).expect("a real move");
+
+        assert_eq!(mount_points(&candidate), vec!["/b", "/a"]);
+        let LineDto::Entry { entry: moved } = &candidate.lines[1].line else {
+            panic!("the described entry is still an entry");
+        };
+        assert_eq!(moved.description.as_deref(), Some("Root filesystem"));
+    }
+
+    /// The §13.10 case 7/8 scenario, built once so both tests provably use
+    /// the same asymmetric-block document.
+    fn asymmetric_block_document() -> DocumentDto {
+        document(vec![
+            comment("block line 1"),
+            comment("block line 2"),
+            comment("block line 3"),
+            entry_line("/a"),
+            LineDto::Blank,
+            entry_line("/b"),
+        ])
+    }
+
+    #[test]
+    fn asymmetric_attached_blocks_relocate_correctly_and_report_real_indices() {
+        // §13.10 case 7: `/a` carries a 3-line block, `/b` carries none, so
+        // neither one lands where a plain `to`/`from` swap would assume.
+        let original = asymmetric_block_document();
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(3), 3);
+        assert_eq!(candidate.attached_block_len(5), 0);
+
+        let outcome = candidate.stage_move(3, 5).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec![
+                "/b",
+                "",
+                "# block line 1",
+                "# block line 2",
+                "# block line 3",
+                "/a"
+            ]
+        );
+        assert_eq!(outcome.from_new_index, 5, "`/a` really ended up at 5");
+        assert_eq!(
+            outcome.to_new_index, 0,
+            "`/b` ended up at 0, not at the naive `from` of 3"
+        );
+
+        // The same move requested in the other direction is the same
+        // rearrangement, with the two reported indices simply swapped.
+        let mut other_direction = CandidateDocument::from_document(&original);
+        let reverse = other_direction.stage_move(5, 3).expect("a real move");
+        assert_eq!(other_direction, candidate);
+        assert_eq!(reverse.from_new_index, 0);
+        assert_eq!(reverse.to_new_index, 5);
+    }
+
+    #[test]
+    fn resolve_moved_indices_agrees_with_what_stage_move_actually_does() {
+        // §13.10 case 8: one shared function, not two computations that can
+        // drift - checked against the real rearrangement, not restated.
+        let original = asymmetric_block_document();
+        let mut candidate = CandidateDocument::from_document(&original);
+        let upper_len = candidate.attached_block_len(3);
+        let lower_len = candidate.attached_block_len(5);
+
+        let (new_upper, new_lower) = resolve_moved_indices(3, upper_len, 5, lower_len);
+        assert_eq!((new_upper, new_lower), (5, 0));
+
+        let outcome = candidate.stage_move(3, 5).expect("a real move");
+        assert_eq!(outcome.from_new_index, new_upper);
+        assert_eq!(outcome.to_new_index, new_lower);
+
+        // And the indices it predicts really are where those lines are now.
+        assert_eq!(candidate.lines[new_upper].original_index, Some(3));
+        assert_eq!(candidate.lines[new_lower].original_index, Some(5));
+    }
+
+    #[test]
+    fn equal_length_blocks_reduce_to_a_plain_swap_of_the_two_indices() {
+        // The common case (including zero/zero) must behave exactly as T40
+        // did, so this fix only changes behavior where T40 was wrong.
+        let original = document(vec![entry_line("/a"), entry_line("/b")]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        let outcome = candidate.stage_move(0, 1).expect("a real move");
+
+        assert_eq!(outcome.from_new_index, 1);
+        assert_eq!(outcome.to_new_index, 0);
+        assert_eq!(resolve_moved_indices(0, 0, 1, 0), (1, 0));
     }
 }

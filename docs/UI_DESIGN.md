@@ -1003,6 +1003,19 @@ to the rows around them (§13.4-§13.5), and a correctness fix to the diff/pendi
 logic so a pure reorder is never silently invisible at the one screen (DiffView) this
 app treats as a hard safety gate (§13.7).
 
+**Correction (T41).** The repo owner reviewed T40 after it shipped (`4be7d2a`, not
+amended - see `PROJECT_PLAN.md`'s T41 section for the full history) and found §13.4's
+original rule - stated unconditionally - wrong in a specific, common case: an ordinary
+`#` comment written directly above an entry (the everyday fstab convention of
+describing the entry below it, distinct from this app's own `# //` description marker)
+was left behind by a move, ending up describing the wrong entry afterward. §13.4, §13.5
+and §13.8 below are rewritten to fix this - a comment block that is actually *attached*
+to a moving entry, by the precise rule §13.4 now defines, now moves with it; truly
+freestanding content still never moves, exactly as T40 originally specified. §13.7 is
+confirmed unaffected (not just left alone - see its own closing paragraph) since it only
+ever ranks row-kind lines. This note documents the correction in place, the same way §2
+narrates T34 → T35.
+
 ### 13.1 Why Move up/down, and why not the other four
 
 **Against drag-and-drop (#2)**: this app's entire UI today is zero drag interactions -
@@ -1124,84 +1137,174 @@ looks at the row before each subsequent click - exactly the "look before you act
 system file" posture this app already expects of its users everywhere else (e.g. the
 non-dismissible-by-backdrop drawer/modals in §4/§6, there for the identical reason).
 
-### 13.4 The freestanding-comment/blank-line landing rule
+### 13.4 Attached comment blocks and the move-span algorithm (revised, T41)
 
-**Established fact** (not re-derived here, see `PROJECT_PLAN.md`'s T40 section and
-`frontend/src/candidate.rs`'s own module doc comment): a `# // <text>` description
-comment and a same-line trailing comment are both already baked into their entry's own
-`description`/`trailing_comment` fields at parse time, so they always travel with their
-entry automatically - no design decision needed there. Any *other* full-line comment
-(a section header, a standalone note) or blank line is genuinely freestanding: it has
-no attachment to any entry and sits at its own fixed position in
-`CandidateDocument.lines`, which `rows()` simply filters out of the table's view.
+**This subsection corrects and replaces T40's original §13.4.** T40 said: "moving an
+entry up/down is a plain positional swap of exactly the two row-kind lines involved...
+[freestanding content] is anchored to its position in the document, never to either
+entry." The repo owner found this wrong for a case that rule did not distinguish: an
+ordinary `#` comment (or a contiguous block of them) written directly above an entry is
+a common, real-world fstab convention for describing that entry - a genuinely different
+thing from a truly freestanding comment (a section header, a standalone note) that
+describes nothing in particular. T40 left both kinds behind a moved entry equally; this
+subsection draws the distinction T40 was missing and fixes the first kind, without
+touching T40's correct handling of the second.
 
-**The rule**: moving an entry up/down is a plain **positional swap of exactly the two
-row-kind (`Entry`/`Malformed`) lines involved** - the one being moved, and its nearest
-row-kind neighbor in that direction. Nothing else's position changes. Concretely,
-`CandidateDocument` gains:
+**Unchanged from T40 - established fact, not re-derived**: a `# // <text>` description
+comment and a same-line trailing comment are both baked into their entry's own
+`description`/`trailing_comment` fields at parse time (`parser.rs`'s
+`absorb_description_comments`/`split_trailing_comment`) - never standalone
+`LineDto::Comment` values, so they always travel with their entry automatically.
+Nothing below concerns them. Everything below is about *other* full-line `Comment`
+lines - the ones the parser leaves as their own standalone `LineDto::Comment` values in
+`CandidateDocument.lines` - and `Blank` lines.
 
-> `stage_move(&mut self, from: usize, to: usize)` - swaps `self.lines[from]` and
-> `self.lines[to]` in place (bounds-checked, a no-op if either index is out of range,
-> same defensive contract shape as the existing `stage_delete`). It does not re-derive
-> "nearest neighbor" itself - the caller (`EntriesTable`, see §13.8) already knows both
-> indices from its own `rows()`-derived render order, so there is exactly one place in
-> the codebase that decides adjacency, not two that could disagree.
+**The attached-comment-block walk.** For any row-kind (`Entry`/`Malformed`) candidate
+line `E`, its **attached comment block** is the (possibly empty) run of comment lines
+that moves with `E` whenever `E` moves. It is found by walking backward from `E`
+through `CandidateDocument.lines`:
 
-Any freestanding comment/blank line that physically sat between the two swapped lines
-stays at the same absolute position it already had - it ends up between the same two
-*slots*, just now bordered by the opposite pair of entries. For example: if the file
-reads `[Local disk entry] [## Network mounts] [NFS entry]` and the NFS entry is moved
-above the local disk entry, the result is `[NFS entry] [## Network mounts] [Local disk
-entry]` - the header comment, which was presumably introducing the entry below it,
-no longer precedes that entry.
+1. Skip zero or more consecutive `Blank` lines immediately above `E` - any number, not
+   just zero or one. A comment separated from its entry by several blank lines is still
+   reached by this step; blank lines alone never break attachment.
+2. Look at the next line up (the first non-blank line reached, after step 1's skip, if
+   any).
+   - If it is **not** a `Comment` - another row-kind line, or nothing further (start of
+     document) - `E` has **no** attached comment block. Stop.
+   - If it **is** a `Comment`, this is the nearest comment block below, and it attaches
+     to `E` in full. Find that block's own upper boundary by continuing backward from
+     here *without* skipping any more blanks: as long as the immediately preceding line
+     is also a `Comment` (strictly contiguous - a blank line inside the run would end
+     it), it belongs to the same block. The walk stops at the first line that is a
+     `Blank`, a row-kind line, or the start of the document. Everything from that
+     stopping point (exclusive) down to `E` (exclusive of `E` itself) is `E`'s attached
+     comment block - a single indivisible unit, however many lines long. It moves with
+     `E` in full whenever `E` moves: never split, never partially left behind.
+3. This walk cannot double-claim a comment block. A second, separate comment block
+   sitting further back (above the one step 2 just found) is never reached by `E`'s
+   walk, because step 2 stops at the very first comment block it meets going downward -
+   attachment requires that no other comment block sit between the candidate block and
+   `E`. That further-back block is evaluated independently, by running this same walk
+   from its own position: the nearest thing below it, once blanks are skipped, is the
+   block step 2 already found (not a row-kind line), so it has no owning entry and is
+   **freestanding**.
+4. A comment block at true end-of-file, with no row-kind line below it anywhere, is
+   freestanding by construction: this walk only ever runs backward *from* a row-kind
+   line, so a block with nothing below it is never visited by any walk, and keeps T40's
+   original pinned-in-place behavior automatically.
 
-This is a deliberate, simplest-available choice, not an oversight: no rule can
-correctly guess a freestanding comment's intended "owner," because the data model has
-never recorded one (that is exactly what makes it freestanding, per the facts
-established before this task). A heuristic that tries to guess - "comments travel with
-whichever entry was below them," or some other rule - would be right in some files and
-wrong in others, which is strictly *less* predictable than a rule that is always
-mechanically the same: **freestanding content is anchored to its position in the
-document, never to either entry**, exactly matching how the parser already treats it
-(zero new coupling invented, consistent with the existing model rather than layering a
-guess on top of it). A user who cares about a specific comment tracking a specific
-entry already has the tool for that: the description field (§4 item 7), which is
-entry-attached by design and always moves with its entry.
+**Attached vs. freestanding - what actually supersedes T40.** A comment block is
+**attached** (and moves with its entry) exactly when some entry's walk above reaches
+it; every other comment block is **freestanding** (cases 3 and 4 above), and a `Blank`
+line not consumed by step 1 of some entry's walk is also freestanding (step 2 only ever
+matches a `Comment` going backward, never a `Blank`, so a blank line is never itself
+part of an attached block). T40's "freestanding content never moves, anchored to its
+position" still holds, unchanged, for every genuinely freestanding line - it was only
+wrong to call *every* comment freestanding.
 
-### 13.5 The between-rows gap indicator
+**The move itself: swapping full spans.** Define an entry's (or malformed line's)
+**move span** as its attached comment block (if any) immediately followed by its own
+row-kind line - the whole unit that relocates together. Given the two row-kind indices
+`EntriesTable` resolves for a Move click (§13.8, unchanged from T40 - the clicked entry
+and its adjacent row-kind neighbor), call whichever one sits earlier in the document
+`upper` and the other `lower` (by document position, not by which button was clicked -
+a Move-up and a Move-down between the same two entries name `upper`/`lower`
+identically). Let `upper_len`/`lower_len` be the length (possibly 0) of each one's own
+attached comment block.
 
-Because comments/blanks are invisible in this table (§3: "not rendered as table rows"),
-the rule in §13.4 would otherwise be silent and surprising - discoverable only by
-opening the Raw diff tab after the fact. To communicate it proactively, `EntriesTable`
-renders a thin, non-interactive divider row between two adjacent table rows whenever
-there is a gap between their `candidate_index` values greater than 1 (i.e. ≥1
-non-row-kind line sits between them in `CandidateDocument.lines` - this is derivable
-directly from the two already-known indices, `rows[k+1].0 - rows[k].0 - 1`, with no new
-prop or backend data needed, since `rows()` already filters comments/blanks out and
-`EntriesTable` already has both neighboring indices to compute Move up/down's
-disabled state).
+1. The lines strictly between `upper` (exclusive) and `lower`'s attached block's start,
+   `lower - lower_len` (exclusive), are the **freestanding middle** - whatever already
+   sat between the upper entry's own line and the lower entry's attached block,
+   belonging to neither span. It never moves, by the same "freestanding content keeps
+   its position" principle T40 established, now applied between the two full spans
+   rather than the two single lines.
+2. The whole affected range - from `upper`'s own block start, `upper - upper_len`,
+   through `lower` inclusive - is rearranged in place to: `lower`'s full span, then the
+   unchanged freestanding middle, then `upper`'s full span. Its total length is
+   unchanged (lines are reordered within it, not added or removed), so **nothing
+   outside this range shifts by even one index** - the same guarantee T40's plain
+   two-element swap gave, now stated for a range instead of two slots.
+3. Two facts fall out of step 2 and matter to the caller: `upper`'s own row-kind line
+   always lands at index `lower`, regardless of either block's length (it is the last
+   line of the last span placed in the range, and the range still ends at `lower`).
+   `lower`'s own row-kind line lands at `upper - upper_len + lower_len` - *not* simply
+   `upper`'s old index, whenever the two attached blocks differ in length. This pair of
+   formulas is named `resolve_moved_indices(upper, upper_len, lower, lower_len) ->
+   (new_upper, new_lower)` below, since both `stage_move` and `EntriesTable`'s own
+   `expanded`-tracking need it and must use the exact same one (the same "one place
+   decides" standard §13.7 already holds the diff/pending-count logic to).
 
-- Renders only when that count is ≥1 - the common case (no freestanding comments
-  between two entries) shows nothing extra, matching this table's existing restraint
-  (§3's border-only warning treatment, no background tint, is the same instinct).
-- Markup: a single `<tr>` with one `colspan="8"` `<td>`, `py-1`, containing a centered
-  row: a `flex-1 border-t border-dashed border-slate-200 dark:border-slate-700` rule on
-  each side of a short `text-xs text-slate-400 dark:text-slate-500` label - dashed, not
-  solid, and muted, so it visually reads as "a gap marker," never as a real row or a
-  warning (it is informational, not advisory).
-- Visible label: `"{N} line(s) stay here"` (pluralize `N` normally).
-- `title` tooltip, same mechanism as the row-warning tooltip in §3: `"{N} comment or
-  blank line(s) sit between these two entries in the file. They aren't shown as rows
-  and aren't attached to either entry - moving an entry across this gap does not move
-  them; they keep their exact position. Check the Raw diff tab in Review & Save to see
-  them."`
-- Not `aria-hidden` - the visible text is plain content a screen reader already reads
-  normally, so no extra ARIA is needed to make this accessible; it also takes no part
-  in row click-to-expand (no `onclick`, no hover state) and is excluded from Tab order
-  (nothing inside it is focusable).
-- This divider is always present under these conditions (not just immediately after a
-  move) - it describes the document's actual current structure, so a user can predict
-  the outcome of a move *before* clicking, not just get notified after.
+**Contract.** `CandidateDocument` gains `attached_block_len(&self, row_index: usize) ->
+usize` (the pure query behind the walk above - the length of `row_index`'s own attached
+comment block, 0 if none; §13.5 reuses it for the gap divider, §13.8 for `expanded`) and
+a free function `resolve_moved_indices(upper: usize, upper_len: usize, lower: usize,
+lower_len: usize) -> (usize, usize)` implementing step 3's two formulas - the single
+place either index fact is ever computed. `stage_move(&mut self, from: usize, to:
+usize) -> Option<MoveOutcome>` replaces T40's plain `Vec::swap`:
+
+> No-op (`None`, document untouched) under the same conditions as T40 - either index
+> out of range, or `from == to`. Otherwise: computes `upper`/`lower` and their lengths
+> via `attached_block_len`, performs the rearrangement in steps 1-2 above, calls
+> `resolve_moved_indices` for the two new indices, and returns `Some(MoveOutcome {
+> from_new_index, to_new_index })` - the *actual* new indices of the lines that were at
+> `from`/`to` (mapped from whichever of `upper`/`lower` each one was), not assumed to be
+> `to`/`from` the way T40's bare swap let the caller assume.
+
+This is the index-shift subtlety's resolution: once the two entries' attached blocks
+can differ in length, their final indices are no longer simply "swap `from` and `to`,"
+so the computation that already has to happen to build the new line order also reports
+its own answer, rather than leaving a caller to assume or re-derive it with a second,
+possibly-drifting implementation. §13.8 covers exactly how `EntriesTable` uses this (via
+`resolve_moved_indices` directly, not a round trip through `stage_move`'s return value -
+see there for why).
+
+### 13.5 The between-rows gap indicator (revised, T41)
+
+**Still earns its place, now more precisely targeted.** Before this fix, T40's gap
+divider fired for *any* non-row-kind content between two adjacent rows, including an
+ordinary descriptive comment that - per §13.4's corrected rule - usually turns out to be
+attached and therefore now moves correctly on its own. Now that attached blocks are
+handled, the only thing left for a gap to mean is content this app genuinely cannot
+reattach to anyone: a blank-line separator, or a comment block with no owning entry
+(§13.4 cases 3-4). That is a narrower set of triggers than before, but not a smaller
+need - it is exactly the case T40's original rationale (communicating proactively,
+before a move, that *this specific content* will not follow either neighboring entry)
+was written for. Removing the divider now would silently regress that disclosure for a
+rarer but still-real trigger. **Decision: keep it**, with its gap-count computation
+corrected to stop over-counting lines that are now correctly attached.
+
+**The corrected gap count.** T40's original formula, `rows[k+1].0 - rows[k].0 - 1`
+("every non-row-kind line between the two row indices"), now **over-counts**: it would
+include `rows[k+1]`'s own attached comment block, which no longer sits in this gap once
+a move actually happens - it travels with `rows[k+1]`. Using §13.4's
+`attached_block_len`, the corrected count between row `k` and row `k+1` is:
+
+> `rows[k+1].0 - attached_block_len(rows[k+1].0) - rows[k].0 - 1`
+
+i.e. the number of lines strictly between row `k`'s own line and row `k+1`'s attached
+block's start - exactly the freestanding-middle count §13.4 step 1 defines for a move
+between these same two rows. Row `k`'s own attached block never enters this count,
+because it sits *above* row `k`, not between row `k` and row `k+1`.
+
+**Contract.** `EntriesTableProps` gains one new prop, `attached_block_len:
+HashMap<usize, usize>` (keyed by every row's own `candidate_index` → its own attached
+block's length, computed by `AppShell` once per render from
+`CandidateDocument::attached_block_len`, the same whole-document cadence as the
+existing `row_warnings` map). `EntriesTable`'s existing local `gap_between` function is
+corrected in place to use the formula above (it already has both row indices from
+`rows`; it now also looks up `rows[k+1]`'s length in this new map) rather than removed -
+unlike T40's version, it no longer needs any *other* new plumbing, since the one extra
+number it's missing is exactly what this prop supplies.
+
+Everything else about the divider is unchanged from T40: renders only when the
+corrected count is ≥1, same dashed/muted markup, same non-interactive/excluded-from-
+Tab-order treatment. **Copy update**: the visible label stays `"{N} line(s) stay
+here"`; the `title` tooltip is reworded to match the narrower, now-accurate meaning
+(T40's "they aren't shown as rows and aren't attached to either entry" read as if *no*
+comment ever attaches, which is now false for the common case): `"{N} comment or blank
+line(s) here aren't attached to either neighboring entry - moving one across this gap
+does not move them; they keep their exact position. Check the Raw diff tab in Review &
+Save to see them."`
 
 ### 13.6 Live validation feedback
 
@@ -1281,34 +1384,67 @@ requirement carried over from T39's own closing lesson in `PROJECT_PLAN.md` - bo
 call sites must use the *same* logic, not two independently-written versions that can
 quietly disagree.
 
-### 13.8 Data model and component-contract summary
+**Confirmed unaffected by T41.** This category ranks only row-kind (`Entry`/
+`Malformed`) lines (`is_row`, step 1's filter) - comment lines were never part of the
+comparable set, before or after §13.4's fix. An attached comment block now physically
+relocating with its entry changes no row-kind line's rank relative to any other
+row-kind line beyond what the move itself already changed under T40 - confirmed by
+re-reading this algorithm against §13.4's move semantics, not assumed.
+`position_changes`, `pending_count`, and `compute_summary_diff` need no code change for
+this fix.
+
+### 13.8 Data model and component-contract summary (revised, T41)
 
 For the frontend-developer implementing this (prose, matching this document's
 no-code convention):
 
-- `CandidateDocument` gains `stage_move(&mut self, from: usize, to: usize)` (§13.4) and
-  the rank-comparison helper behind the `Reordered` category (§13.7). Both are pure,
-  synchronous, in-memory mutations/queries, exactly like the existing `stage_add`/
-  `stage_edit_entry`/`stage_edit_raw`/`stage_delete` - no backend, writer, or IPC
-  surface is touched by this task, matching the scope boundary.
-- `EntriesTableProps` gains an `on_move: Callback<(usize, usize)>` ("from" candidate
-  index, "to" candidate index), fired by a row's Move up/down button. `EntriesTable`
-  resolves "to" itself, directly from the adjacent element in its own already-iterated
-  `rows` list (`rows[k-1].0` for Move up, `rows[k+1].0` for Move down) - it needs no
-  knowledge of comments/blanks to do this, since `rows()` has already filtered them
-  out; this is also exactly the information it already needs to compute each button's
-  disabled state (§13.2). `AppShell`'s handler is a direct structural match for
-  `on_delete_confirm` (§13.6): clone `candidate`, call `stage_move`, `candidate.set`.
-- **Required alongside the callback**: `EntriesTable`'s own `expanded: HashSet<usize>`
-  state (§3, "any number of rows can be expanded at once") is keyed by the same
-  position-based `candidate_index` as everything else in this table. Swapping two
-  lines' positions without also updating this set would leave the *wrong* row visually
-  expanded after a move (whichever entry now occupies the slot that used to be
-  expanded) - a direct, demonstrable bug, not a hypothetical, stemming from the same
-  positional-identity fact already discussed in §13.3. `EntriesTable`'s own move
-  handler must mirror the swap onto `expanded` at the same time it emits `on_move`: if
-  `from` and/or `to` were present in the set, swap their membership so expansion state
-  follows the entries, not the slots.
+- `CandidateDocument` gains `attached_block_len(&self, row_index: usize) -> usize` and
+  a revised `stage_move(&mut self, from: usize, to: usize) -> Option<MoveOutcome>`
+  (both §13.4), plus the shared `resolve_moved_indices` free function. The
+  rank-comparison helper behind the `Reordered` category (§13.7) is unchanged -
+  confirmed, not just left alone (§13.7's closing paragraph). All of these stay pure,
+  synchronous, in-memory operations on `CandidateDocument`, exactly like the existing
+  `stage_add`/`stage_edit_entry`/`stage_edit_raw`/`stage_delete` - no backend, writer,
+  or IPC surface is touched by this fix, matching the scope boundary.
+- `EntriesTableProps`'s `on_move: Callback<(usize, usize)>` is unchanged in shape and
+  meaning - `EntriesTable` still resolves `to` itself from the adjacent element in its
+  own `rows` list, exactly as T40 specified, with no knowledge of comment blocks needed
+  to do that. `AppShell`'s handler barely changes: clone `candidate`, call
+  `stage_move(from, to)`, `candidate.set(next)` - the same structural match to
+  `on_delete_confirm` T40 specified; the `Option<MoveOutcome>` return value can be
+  ignored here (a no-op move leaves `next` equal to the clone, so setting it is
+  harmless either way, same as T40's version already tolerated for a self-move).
+- **`expanded` tracking, revised.** T40's `expanded: HashSet<usize>` mirroring assumed
+  a plain swap, moving membership directly between `from` and `to`. That assumption
+  breaks once the two entries' attached blocks can differ in length (§13.4 step 3) -
+  the entry that was at `from` does not, in general, end up at `to`. The fix does
+  **not** route anything back through `on_move`'s one-way callback (`AppShell` never
+  reports back to `EntriesTable` - there is no such channel today, and inventing one
+  would be a bigger structural change than this fix needs). Instead, `EntriesTable`
+  computes the real outcome itself, synchronously, in the same click handler that
+  already updates `expanded` and emits `on_move` (T40's existing structure) - using the
+  **same** `resolve_moved_indices` function `stage_move` uses internally, fed by the
+  new `attached_block_len` prop (§13.5) it already receives for the gap divider:
+  `upper = min(from, to)`, `lower = max(from, to)`, `upper_len`/`lower_len` read from
+  the prop map, then `resolve_moved_indices(upper, upper_len, lower, lower_len)` gives
+  the real new indices, mapped back to whichever of `from`/`to` was `upper`/`lower`.
+  `expanded`'s membership is then moved from `from`/`to` to these real new indices (if
+  `from` was in the set, it moves to its real new index; same for `to`) instead of to
+  the old, possibly-wrong `to`/`from`. Because `attached_block_len` is recomputed every
+  render from the same `CandidateDocument` `EntriesTable` is currently showing, and the
+  click handler reads it synchronously at click time, this prediction is always
+  consistent with what `stage_move` is about to do - calling the *same* function both
+  places is what makes that a guarantee, not a coincidence (the same "one place
+  decides" standard §13.7 already holds the diff/pending-count logic to, now also
+  covering this calculation). In the common case where both attached blocks are the
+  same length (including the usual zero/zero case), this reduces exactly to T40's
+  original swap - the fix only changes behavior where T40 would otherwise have been
+  wrong.
+- `EntriesTableProps` gains the one new prop named above, `attached_block_len:
+  HashMap<usize, usize>` (§13.4/§13.5), computed by `AppShell` once per render from
+  `CandidateDocument::attached_block_len`, the same whole-document cadence as the
+  existing `row_warnings` map. No other new prop is needed - this single map is enough
+  for both the gap-divider fix (§13.5) and the `expanded`-tracking fix above.
 
 ### 13.9 Visual tokens used
 
@@ -1322,6 +1458,70 @@ elsewhere, e.g. the row-expand panel's accent border in §3) for the new `Reorde
 diff card, chosen specifically because sky is this app's only "notable, non-alarming"
 color - every other tinted card in DiffView is emerald (added/safe) or red
 (removed/destructive), and a reorder is neither.
+
+**T41 confirms this list is still complete.** The comment-attachment fix is
+logic-only (§13.4/§13.5/§13.8) - no new color, spacing, or icon token was needed; the
+gap divider's tooltip wording changed (§13.5) but reuses the exact same
+`text-slate-400`/`dark:text-slate-500` token it already used.
+
+### 13.10 Required test coverage (T41)
+
+Combining the repo owner's original list and both of their corrections
+(`PROJECT_PLAN.md`'s T41 section), plus the index-shift fix's own needs (§13.4/§13.8).
+Prose descriptions only - implementation writes the actual Rust, matching this
+document's convention.
+
+**Attachment walk (§13.4), exercised through `attached_block_len`/`stage_move`:**
+
+1. A plain single `#` comment line directly (no blank) above an entry has an attached
+   block of length 1, and moves attached to that entry when it is moved.
+2. A multi-line (3+) contiguous comment block directly above an entry has an attached
+   block of that exact length, and moves as one intact, unsplit unit attached to that
+   entry - never split, never partially left behind.
+3. A comment separated from its owning entry by **multiple** (2+) blank lines still has
+   an attached block reaching that comment, and still moves attached to that entry when
+   it is moved - this must not regress to "a blank line breaks attachment" (the
+   orchestrator's own first, corrected-away draft of this rule).
+4. A comment block that has **another, separate** comment block between it and the
+   nearest entry below is **not** attached to that entry - and does not move when that
+   nearby entry is reordered; it remains freestanding and pinned in place.
+5. A comment block at true end-of-file, with no entry below it at all, has no owning
+   entry (freestanding) and stays pinned in place regardless of any move elsewhere in
+   the document.
+6. The existing `# //` description-marker behavior (parse-time absorption into
+   `EntryDto.description`, pre-T40, pre-this-fix) is unchanged - a `# //` line never
+   becomes a standalone `LineDto::Comment` at all, so it never enters this new logic's
+   attached-block computation in the first place; a regression test confirms a document
+   containing one round-trips and moves (via its entry's `description` field, not a
+   `LineDto::Comment`) exactly as before.
+
+**Move-span and index-shift (§13.4 steps 1-3, §13.8):**
+
+7. Moving two entries whose attached comment blocks differ in length (e.g. one has a
+   3-line block, the other none) relocates each one's own full span correctly, leaves
+   the freestanding middle (if any) exactly in place, and `stage_move`'s returned
+   `MoveOutcome` reports each entry's real new index - not the naive `to`/`from` a plain
+   swap would assume.
+8. `resolve_moved_indices`, tested directly with asymmetric block lengths, agrees with
+   the indices `stage_move` actually produces for the equivalent scenario in test 7 -
+   confirming the one shared function, not two independently-written computations that
+   could disagree.
+9. `EntriesTable`'s `expanded`-remap logic (consuming `attached_block_len` and calling
+   `resolve_moved_indices` itself, per §13.8), given the same asymmetric-block scenario,
+   moves an expanded row's membership to the entry's real new index, not to the old
+   `to`/`from` T40's version assumed - the direct regression test for the bug this
+   subtlety exists to prevent.
+
+**Gap divider (§13.5):**
+
+10. A comment block that **is** attached to the lower neighbor is excluded from the gap
+    count entirely (the corrected formula reports 0, or a smaller count than T40's
+    original formula would have, when the only content in the raw index gap was that
+    now-attached block).
+11. A genuinely freestanding block or blank line sitting in the same kind of gap still
+    counts, unchanged from T40.
+12. Two directly adjacent rows (no lines of any kind between them) still produce no
+    divider - unchanged from T40.
 
 ---
 

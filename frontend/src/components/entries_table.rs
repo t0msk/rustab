@@ -11,21 +11,28 @@
 //! rows can be open at once (not an accordion). `UnparsedEntryRow` is not
 //! affected - it already shows its full raw text untruncated.
 //!
-//! **Reordering (T40, `docs/UI_DESIGN.md` §13):** every row carries Move
-//! up/Move down buttons that emit `on_move((from, to))` with two
-//! *candidate-document* indices. This component resolves `to` itself from
-//! the adjacent entry in its own `rows` list, so exactly one place decides
-//! adjacency (§13.4), and it mirrors the swap onto its own `expanded` set
-//! at the same time, because that set is keyed by position, not by entry
-//! identity (§13.8). Freestanding comments/blank lines never move with an
-//! entry; where one sits between two rows, a gap divider says so up front
+//! **Reordering (T40, revised by T41 - `docs/UI_DESIGN.md` §13):** every
+//! row carries Move up/Move down buttons that emit `on_move((from, to))`
+//! with two *candidate-document* indices. This component resolves `to`
+//! itself from the adjacent entry in its own `rows` list, so exactly one
+//! place decides adjacency (§13.4), and it mirrors the move onto its own
+//! `expanded` set at the same time, because that set is keyed by position,
+//! not by entry identity (§13.8).
+//!
+//! An entry moves together with its attached comment block (§13.4), so the
+//! two entries do not simply trade indices once their blocks differ in
+//! length - this component predicts where each one really lands with the
+//! same `resolve_moved_indices` `stage_move` uses, fed by the
+//! `attached_block_len` prop. Only *freestanding* comments/blank lines stay
+//! behind; where one sits between two rows, a gap divider says so up front
 //! (§13.5).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use yew::prelude::*;
 
 use crate::api;
+use crate::candidate::resolve_moved_indices;
 use crate::components::empty_state::EmptyState;
 use crate::components::icons::{
     CheckIcon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CopyIcon, DeleteIcon, EditIcon,
@@ -56,7 +63,15 @@ pub struct EntriesTableProps {
     /// inline, to avoid repeating the mistake the mount-point note-glyph
     /// made (taking up row space) - this is a border accent only.
     #[prop_or_default]
-    pub row_warnings: std::collections::HashMap<usize, Vec<AttrValue>>,
+    pub row_warnings: HashMap<usize, Vec<AttrValue>>,
+    /// Each row's own attached comment block length, keyed by
+    /// `candidate_index` - computed by `AppShell` once per render from
+    /// `CandidateDocument::attached_block_len`, the same whole-document
+    /// cadence as `row_warnings` (`docs/UI_DESIGN.md` §13.4/§13.5). A row
+    /// missing from the map has no attached block. Used for both the gap
+    /// divider's count (§13.5) and the `expanded`-set remap (§13.8).
+    #[prop_or_default]
+    pub attached_block_len: HashMap<usize, usize>,
     pub on_edit: Callback<usize>,
     pub on_delete: Callback<usize>,
     /// `(from, to)` candidate indices for a Move up/Move down click (T40,
@@ -108,13 +123,23 @@ fn can_move_down(row_position: usize, row_count: usize) -> bool {
     row_position + 1 < row_count
 }
 
-/// How many non-row-kind lines (freestanding comments/blank lines) sit
-/// between two adjacent table rows in the candidate document, from their
-/// candidate indices alone: `rows[k+1].0 - rows[k].0 - 1`
-/// (`docs/UI_DESIGN.md` §13.5). `0` means the two entries are physically
-/// adjacent and no divider is rendered.
-fn gap_between(upper_candidate_index: usize, lower_candidate_index: usize) -> usize {
+/// How many *freestanding* lines (ones no entry's attachment walk claims)
+/// sit between two adjacent table rows in the candidate document:
+/// `rows[k+1].0 - attached_block_len(rows[k+1].0) - rows[k].0 - 1`
+/// (`docs/UI_DESIGN.md` §13.5). `0` means no divider is rendered.
+///
+/// T40's version was `rows[k+1].0 - rows[k].0 - 1`, which over-counts: the
+/// lower row's own attached comment block sits in that raw index gap but
+/// travels with the lower row when it moves, so it is not content that
+/// "stays here". The upper row's own block never enters this count - it
+/// sits above the upper row, not between the two.
+fn gap_between(
+    upper_candidate_index: usize,
+    lower_candidate_index: usize,
+    lower_attached_block_len: usize,
+) -> usize {
     lower_candidate_index
+        .saturating_sub(lower_attached_block_len)
         .saturating_sub(upper_candidate_index)
         .saturating_sub(1)
 }
@@ -130,16 +155,21 @@ fn gap_label(count: usize) -> String {
 
 /// The gap divider's `title` tooltip - the full explanation of §13.4's
 /// landing rule, shown on hover rather than inline.
+///
+/// Reworded for T41 (§13.5): T40's "they aren't shown as rows and aren't
+/// attached to either entry" read as if *no* comment ever attaches, which
+/// is now false for the common case of a comment describing the entry
+/// below it. This gap is specifically the content that attaches to nobody.
 fn gap_tooltip(count: usize) -> String {
     let subject = if count == 1 {
-        "1 comment or blank line sits".to_string()
+        "1 comment or blank line here isn't".to_string()
     } else {
-        format!("{count} comments or blank lines sit")
+        format!("{count} comments or blank lines here aren't")
     };
     format!(
-        "{subject} between these two entries in the file. They aren't shown as rows and aren't \
-         attached to either entry - moving an entry across this gap does not move them; they keep \
-         their exact position. Check the Raw diff tab in Review & Save to see them."
+        "{subject} attached to either neighboring entry - moving one across this gap does not \
+         move them; they keep their exact position. Check the Raw diff tab in Review & Save to \
+         see them."
     )
 }
 
@@ -181,24 +211,57 @@ fn move_button(
     }
 }
 
-/// Mirrors a `from`/`to` positional swap onto the set of expanded
-/// candidate indices (`docs/UI_DESIGN.md` §13.8).
+/// Mirrors a `from`/`to` move onto the set of expanded candidate indices
+/// (`docs/UI_DESIGN.md` §13.8).
 ///
 /// `expanded` is keyed by *position*, not by entry identity, so without
 /// this an expanded row would stay open over whichever entry moved into
 /// its slot instead of following the entry the user actually expanded.
-fn swap_expanded(expanded: &HashSet<usize>, from: usize, to: usize) -> HashSet<usize> {
-    let mut next = expanded.clone();
+///
+/// T40 did this as a plain membership swap between `from` and `to`, which
+/// is wrong once each entry moves together with an attached comment block
+/// of its own length (§13.4): the entry at `from` does not, in general,
+/// end up at `to`. Rather than route the real answer back from `AppShell`
+/// (there is no such channel, and inventing one would be a far bigger
+/// change than this needs), this predicts it synchronously at click time
+/// with the very same [`resolve_moved_indices`] `stage_move` runs
+/// internally, fed by the `attached_block_len` prop computed from the same
+/// document this table is currently showing - so the prediction agreeing
+/// with the staged result is a guarantee, not a coincidence.
+///
+/// Only `from`/`to` need remapping: `to` is always the *adjacent row* in
+/// the render order, so no other row-kind line sits between them, and
+/// comment/blank lines are never in `expanded` to begin with.
+///
+/// With two equal-length blocks (including the usual none/none case) this
+/// reduces exactly to T40's swap.
+fn remap_expanded(
+    expanded: &HashSet<usize>,
+    from: usize,
+    to: usize,
+    attached_block_len: &HashMap<usize, usize>,
+) -> HashSet<usize> {
+    let upper = from.min(to);
+    let lower = from.max(to);
+    let block_len = |index: usize| attached_block_len.get(&index).copied().unwrap_or(0);
+    let (new_upper, new_lower) =
+        resolve_moved_indices(upper, block_len(upper), lower, block_len(lower));
+    let (from_new, to_new) = if from == upper {
+        (new_upper, new_lower)
+    } else {
+        (new_lower, new_upper)
+    };
+
     let from_was_expanded = expanded.contains(&from);
     let to_was_expanded = expanded.contains(&to);
-    if from_was_expanded != to_was_expanded {
-        next.remove(&from);
-        next.remove(&to);
-        if from_was_expanded {
-            next.insert(to);
-        } else {
-            next.insert(from);
-        }
+    let mut next = expanded.clone();
+    next.remove(&from);
+    next.remove(&to);
+    if from_was_expanded {
+        next.insert(from_new);
+    }
+    if to_was_expanded {
+        next.insert(to_new);
     }
     next
 }
@@ -259,16 +322,22 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                             .then(|| props.rows[row_position - 1].0);
                         let down_target = can_move_down(row_position, row_count)
                             .then(|| props.rows[row_position + 1].0);
-                        // Both Move buttons stage the swap *and* mirror it
+                        // Both Move buttons stage the move *and* mirror it
                         // onto `expanded` (§13.8) - the set is keyed by
                         // position, so expansion would otherwise stay with
                         // the slot rather than with the entry.
                         let make_move = |target: Option<usize>| {
                             let cb = props.on_move.clone();
                             let expanded = expanded.clone();
+                            let attached_block_len = props.attached_block_len.clone();
                             target.map(|to| Callback::from(move |e: MouseEvent| {
                                 e.stop_propagation();
-                                expanded.set(swap_expanded(&expanded, candidate_index, to));
+                                expanded.set(remap_expanded(
+                                    &expanded,
+                                    candidate_index,
+                                    to,
+                                    &attached_block_len,
+                                ));
                                 cb.emit((candidate_index, to));
                             }))
                         };
@@ -276,11 +345,17 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                         let on_move_down = make_move(down_target);
                         // The divider that follows this row, if any
                         // freestanding comment/blank line sits between it
-                        // and the next one (§13.5).
+                        // and the next one - the next row's own attached
+                        // block does not count, it travels with that row
+                        // (§13.5).
                         let gap = props
                             .rows
                             .get(row_position + 1)
-                            .map(|(next_index, _)| gap_between(candidate_index, *next_index))
+                            .map(|(next_index, _)| gap_between(
+                                candidate_index,
+                                *next_index,
+                                props.attached_block_len.get(next_index).copied().unwrap_or(0),
+                            ))
                             .unwrap_or(0);
                         let gap_divider = (gap > 0).then(|| html! {
                             <tr key={format!("gap-{candidate_index}")} title={gap_tooltip(gap)}>
@@ -790,24 +865,45 @@ mod tests {
         assert!(!can_move_down(0, 1));
     }
 
+    /// No row has an attached comment block - the T40 baseline, and still
+    /// the common case.
+    fn no_blocks() -> HashMap<usize, usize> {
+        HashMap::new()
+    }
+
     #[test]
     fn adjacent_entries_have_no_gap_between_them() {
-        assert_eq!(gap_between(0, 1), 0);
-        assert_eq!(gap_between(7, 8), 0);
+        // §13.10 case 12 - unchanged from T40.
+        assert_eq!(gap_between(0, 1, 0), 0);
+        assert_eq!(gap_between(7, 8, 0), 0);
     }
 
     #[test]
     fn one_freestanding_line_between_two_entries_is_one_gap_line() {
-        assert_eq!(gap_between(0, 2), 1);
+        // §13.10 case 11 - a genuinely freestanding line still counts.
+        assert_eq!(gap_between(0, 2, 0), 1);
         assert_eq!(gap_label(1), "1 line stays here");
-        assert!(gap_tooltip(1).starts_with("1 comment or blank line sits between"));
+        assert!(gap_tooltip(1).starts_with("1 comment or blank line here isn't attached"));
     }
 
     #[test]
     fn several_freestanding_lines_between_two_entries_are_counted_and_pluralized() {
-        assert_eq!(gap_between(3, 7), 3);
+        assert_eq!(gap_between(3, 7, 0), 3);
         assert_eq!(gap_label(3), "3 lines stay here");
-        assert!(gap_tooltip(3).starts_with("3 comments or blank lines sit between"));
+        assert!(gap_tooltip(3).starts_with("3 comments or blank lines here aren't attached"));
+    }
+
+    #[test]
+    fn a_comment_block_attached_to_the_lower_row_is_excluded_from_the_gap_count() {
+        // §13.10 case 10 - T40's formula would have reported 1 and 3 here,
+        // claiming content "stays here" that actually travels with the
+        // lower entry.
+        assert_eq!(gap_between(0, 2, 1), 0);
+        assert_eq!(gap_between(3, 7, 3), 0);
+
+        // A mix: 3 raw lines in the gap, 2 of which are the lower row's
+        // attached block - only the remaining one stays.
+        assert_eq!(gap_between(3, 7, 2), 1);
     }
 
     #[test]
@@ -817,12 +913,12 @@ mod tests {
         let expanded: HashSet<usize> = [2].into_iter().collect();
 
         // The expanded row itself moves down into slot 4.
-        let after_moving_it = swap_expanded(&expanded, 2, 4);
+        let after_moving_it = remap_expanded(&expanded, 2, 4, &no_blocks());
         assert_eq!(after_moving_it, [4].into_iter().collect::<HashSet<usize>>());
 
         // A collapsed row moves into the expanded row's slot: the
         // expansion goes with the entry that left, not with the slot.
-        let after_moving_the_other = swap_expanded(&expanded, 4, 2);
+        let after_moving_the_other = remap_expanded(&expanded, 4, 2, &no_blocks());
         assert_eq!(
             after_moving_the_other,
             [4].into_iter().collect::<HashSet<usize>>()
@@ -832,15 +928,53 @@ mod tests {
     #[test]
     fn swapping_two_rows_that_are_both_or_neither_expanded_leaves_the_set_alone() {
         let both: HashSet<usize> = [1, 2, 9].into_iter().collect();
-        assert_eq!(swap_expanded(&both, 1, 2), both);
+        assert_eq!(remap_expanded(&both, 1, 2, &no_blocks()), both);
 
         let neither: HashSet<usize> = [9].into_iter().collect();
-        assert_eq!(swap_expanded(&neither, 1, 2), neither);
+        assert_eq!(remap_expanded(&neither, 1, 2, &no_blocks()), neither);
     }
 
     #[test]
     fn swapping_an_expanded_row_with_itself_keeps_it_expanded() {
         let expanded: HashSet<usize> = [3].into_iter().collect();
-        assert_eq!(swap_expanded(&expanded, 3, 3), expanded);
+        assert_eq!(remap_expanded(&expanded, 3, 3, &no_blocks()), expanded);
+    }
+
+    #[test]
+    fn expansion_follows_the_entry_to_its_real_index_when_blocks_differ_in_length() {
+        // §13.10 case 9, the direct regression test for the index-shift
+        // bug. Same document as `candidate.rs`'s asymmetric-block tests:
+        // row 3 (`/a`) carries a 3-line block, row 5 (`/b`) carries none,
+        // so `/a` really lands at 5 and `/b` at 0 - T40's naive swap would
+        // have moved `/b`'s expansion to 3, over a comment line.
+        let attached: HashMap<usize, usize> = [(3, 3), (5, 0)].into_iter().collect();
+
+        let a_expanded: HashSet<usize> = [3].into_iter().collect();
+        assert_eq!(
+            remap_expanded(&a_expanded, 3, 5, &attached),
+            [5].into_iter().collect::<HashSet<usize>>()
+        );
+
+        let b_expanded: HashSet<usize> = [5].into_iter().collect();
+        assert_eq!(
+            remap_expanded(&b_expanded, 3, 5, &attached),
+            [0].into_iter().collect::<HashSet<usize>>(),
+            "`/b` lands at 0, not at the naive `from` of 3"
+        );
+
+        // Clicking Move up on `/b` instead of Move down on `/a` is the
+        // same move, so it must produce the same mapping.
+        assert_eq!(
+            remap_expanded(&b_expanded, 5, 3, &attached),
+            [0].into_iter().collect::<HashSet<usize>>()
+        );
+
+        // Both expanded: both follow their own entry, and an unrelated
+        // expanded row outside the affected range is untouched.
+        let both: HashSet<usize> = [3, 5, 9].into_iter().collect();
+        assert_eq!(
+            remap_expanded(&both, 3, 5, &attached),
+            [0, 5, 9].into_iter().collect::<HashSet<usize>>()
+        );
     }
 }

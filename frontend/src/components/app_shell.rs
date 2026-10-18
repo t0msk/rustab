@@ -539,7 +539,12 @@ pub fn app_shell() -> Html {
         let candidate = candidate.clone();
         Callback::from(move |(from, to): (usize, usize)| {
             let mut next = (*candidate).clone();
-            next.stage_move(from, to);
+            // The returned `MoveOutcome` is deliberately unused here: this
+            // handler only stages the result, and `EntriesTable` predicts
+            // the same indices itself for its own `expanded` set (§13.8).
+            // A no-op move leaves `next` equal to the clone, so setting it
+            // is harmless either way.
+            let _ = next.stage_move(from, to);
             candidate.set(next);
         })
     };
@@ -1249,6 +1254,17 @@ pub fn app_shell() -> Html {
         })
         .collect();
 
+    // Each row's attached comment block length (`docs/UI_DESIGN.md`
+    // §13.4), computed once per render over the whole document - the same
+    // cadence as `row_warnings` above. `EntriesTable` needs it both to
+    // exclude attached content from the gap divider's count (§13.5) and to
+    // predict where a moved entry really lands, for its position-keyed
+    // `expanded` set (§13.8).
+    let attached_block_len: std::collections::HashMap<usize, usize> = rows
+        .iter()
+        .map(|(index, _)| (*index, candidate.attached_block_len(*index)))
+        .collect();
+
     let other_lines = candidate.lines_excluding(*editing_index);
 
     let pending_count = original_document
@@ -1394,6 +1410,7 @@ pub fn app_shell() -> Html {
                         <EntriesTable
                             rows={rows}
                             row_warnings={row_warnings}
+                            attached_block_len={attached_block_len}
                             on_edit={on_edit_entry}
                             on_delete={on_delete_entry}
                             on_move={on_move_entry}
