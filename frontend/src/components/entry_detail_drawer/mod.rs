@@ -90,6 +90,45 @@ pub struct EntryDetailDrawerProps {
     /// toast; owned/rendered by `AppShell`, same callback it already
     /// threads to other actions.
     pub show_toast: Callback<(ToastKind, String)>,
+    /// This entry's position in the full candidate document (`AppShell`'s
+    /// `editing_index`) - `None` for `DrawerMode::Add` (a brand new entry
+    /// has no original position to restore). Used to reinsert the drafted
+    /// entry at its real position when building a document for
+    /// `validate_candidate`, instead of always appending it - appending
+    /// unconditionally is exactly the bug this field exists to fix (a
+    /// parent entry opened/edited while a later line is its own nested
+    /// child mount point gets moved after that child, producing a false
+    /// `findmnt` "wrong order" finding).
+    pub editing_index: Option<usize>,
+}
+
+/// Where the drafted entry actually lands in a document built by
+/// `document_with_draft` - i.e. `editing_index` if this is an edit of an
+/// existing line, or the very end if this is a new entry (`editing_index
+/// == None`) or the edited line happened to already be last. Shared by
+/// `document_with_draft` itself and `draft_line_index` below so the two
+/// can never independently drift out of sync on what "the draft's
+/// position" means.
+fn draft_insertion_index(other_lines_len: usize, editing_index: Option<usize>) -> usize {
+    editing_index
+        .unwrap_or(other_lines_len)
+        .min(other_lines_len)
+}
+
+/// The document sent to `validate_candidate`: every other line, plus
+/// this drawer's current draft, reinserted at the position it actually
+/// occupies in the real candidate document - not appended at the end.
+/// `editing_index: None` (an `Add`, with no original position) naturally
+/// reduces to "append", which remains correct for that case.
+fn document_with_draft(
+    other_lines: &[LineDto],
+    editing_index: Option<usize>,
+    draft: EntryDto,
+) -> DocumentDto {
+    let mut lines = other_lines.to_vec();
+    let insert_at = draft_insertion_index(lines.len(), editing_index);
+    lines.insert(insert_at, LineDto::Entry { entry: draft });
+    DocumentDto { lines }
 }
 
 fn chips_to_options(chips: &[String]) -> Vec<OptionDto> {
@@ -208,6 +247,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
         let validation = validation.clone();
         let validation_request = validation_request.clone();
         let other_lines = props.other_lines.clone();
+        let editing_index = props.editing_index;
         let draft = build_entry(
             &source_type,
             &source_value,
@@ -239,13 +279,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                         *counter += 1;
                         *counter
                     };
-                    let document = DocumentDto {
-                        lines: other_lines
-                            .iter()
-                            .cloned()
-                            .chain(std::iter::once(LineDto::Entry { entry: draft }))
-                            .collect(),
-                    };
+                    let document = document_with_draft(&other_lines, editing_index, draft);
                     wasm_bindgen_futures::spawn_local(async move {
                         gloo_timers::future::TimeoutFuture::new(400).await;
                         if *validation_request.borrow() != request_id {
@@ -276,6 +310,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
     let on_save_click = {
         let on_save = props.on_save.clone();
         let other_lines = props.other_lines.clone();
+        let editing_index = props.editing_index;
         let source_type = source_type.clone();
         let source_value = source_value.clone();
         let mount_point = mount_point.clone();
@@ -306,15 +341,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 &trailing_comment,
                 &description,
             );
-            let document = DocumentDto {
-                lines: other_lines
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(LineDto::Entry {
-                        entry: draft.clone(),
-                    }))
-                    .collect(),
-            };
+            let document = document_with_draft(&other_lines, editing_index, draft.clone());
 
             let on_save = on_save.clone();
             let validation = validation.clone();
@@ -366,6 +393,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
 
     let on_verify_click = {
         let other_lines = props.other_lines.clone();
+        let editing_index = props.editing_index;
         let source_type = source_type.clone();
         let source_value = source_value.clone();
         let mount_point = mount_point.clone();
@@ -391,13 +419,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 &trailing_comment,
                 &description,
             );
-            let document = DocumentDto {
-                lines: other_lines
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(LineDto::Entry { entry: draft }))
-                    .collect(),
-            };
+            let document = document_with_draft(&other_lines, editing_index, draft);
 
             let validation = validation.clone();
             let validation_request = validation_request.clone();
@@ -478,10 +500,12 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 .collect()
         })
         .unwrap_or_default();
-    // The draft entry being edited is always appended last to the document
-    // sent to `validate_candidate` (see the `use_effect_with` above), so its
-    // own findings are unambiguously those tagged with this index.
-    let draft_line_index = props.other_lines.len();
+    // The draft is reinserted at its real original position by
+    // `document_with_draft` (see the `use_effect_with` above), not always
+    // appended last - mirror that exact placement here via the shared
+    // `draft_insertion_index` helper so this index always matches the one
+    // the document sent to `validate_candidate` actually used.
+    let draft_line_index = draft_insertion_index(props.other_lines.len(), props.editing_index);
     let is_own_mount_point_warning = |f: &crate::dto::FindingDto| {
         f.severity == FindingSeverity::Warning
             && f.field == Some(ValidationField::MountPoint)
@@ -782,5 +806,131 @@ fn render_source_value_field(
                 on_pick={on_pick}
             />
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft_entry(mount_point: &str) -> EntryDto {
+        EntryDto {
+            source: SourceDto {
+                kind: crate::dto::SourceKind::Path,
+                value: "/dev/sda1".to_string(),
+            },
+            mount_point: mount_point.to_string(),
+            fs_type: "ext4".to_string(),
+            options: vec![],
+            dump: 0,
+            pass: 0,
+            trailing_comment: None,
+            description: None,
+        }
+    }
+
+    fn line(mount_point: &str) -> LineDto {
+        LineDto::Entry {
+            entry: draft_entry(mount_point),
+        }
+    }
+
+    /// The regression shape itself: excluding a parent entry originally at
+    /// index 0 leaves its nested child (and whatever came after it) as
+    /// `other_lines`. Reinserting the parent's draft at `editing_index =
+    /// Some(0)` must put it back *before* the child, not after it.
+    #[test]
+    fn reinserts_the_draft_before_a_later_child_line_instead_of_appending() {
+        let other_lines = vec![line("/opt/child"), line("/something/else")];
+        let draft = draft_entry("/opt");
+
+        let document = document_with_draft(&other_lines, Some(0), draft.clone());
+
+        assert_eq!(
+            document.lines,
+            vec![
+                LineDto::Entry { entry: draft },
+                line("/opt/child"),
+                line("/something/else"),
+            ]
+        );
+    }
+
+    /// `Add` mode has no original position - still appends at the end.
+    #[test]
+    fn none_editing_index_still_appends_at_the_end() {
+        let other_lines = vec![line("/a"), line("/b")];
+        let draft = draft_entry("/c");
+
+        let document = document_with_draft(&other_lines, None, draft.clone());
+
+        assert_eq!(
+            document.lines,
+            vec![line("/a"), line("/b"), LineDto::Entry { entry: draft }]
+        );
+    }
+
+    /// The entry being edited was originally the very last line - inserting
+    /// at `other_lines.len()` must land at the end, not panic or off-by-one.
+    #[test]
+    fn editing_index_at_the_end_inserts_at_the_end() {
+        let other_lines = vec![line("/a"), line("/b")];
+        let draft = draft_entry("/c");
+
+        let document = document_with_draft(&other_lines, Some(other_lines.len()), draft.clone());
+
+        assert_eq!(
+            document.lines,
+            vec![line("/a"), line("/b"), LineDto::Entry { entry: draft }]
+        );
+    }
+
+    /// Defensive-only: an out-of-range `editing_index` clamps to the end
+    /// rather than panicking.
+    #[test]
+    fn an_out_of_range_editing_index_clamps_instead_of_panicking() {
+        let other_lines = vec![line("/a"), line("/b")];
+        let draft = draft_entry("/c");
+
+        let document = document_with_draft(&other_lines, Some(999), draft.clone());
+
+        assert_eq!(
+            document.lines,
+            vec![line("/a"), line("/b"), LineDto::Entry { entry: draft }]
+        );
+    }
+
+    /// Regression coverage for `draft_line_index`: it must match the exact
+    /// position `document_with_draft` actually inserts the draft at, for
+    /// every one of the same cases covered above - otherwise the drawer's
+    /// own-findings filters (`is_own_mount_point_warning`,
+    /// `warning_messages`) silently stop matching the edited entry's real
+    /// findings for any edit that isn't of the last line.
+    #[test]
+    fn draft_insertion_index_matches_editing_index_not_the_end() {
+        let other_lines_len = 3;
+
+        assert_eq!(draft_insertion_index(other_lines_len, Some(0)), 0);
+        assert_eq!(draft_insertion_index(other_lines_len, Some(1)), 1);
+    }
+
+    #[test]
+    fn draft_insertion_index_appends_at_the_end_when_adding_a_new_entry() {
+        assert_eq!(draft_insertion_index(3, None), 3);
+    }
+
+    #[test]
+    fn draft_insertion_index_at_the_last_line_is_still_the_end() {
+        let other_lines_len = 3;
+
+        assert_eq!(
+            draft_insertion_index(other_lines_len, Some(other_lines_len)),
+            other_lines_len
+        );
+    }
+
+    #[test]
+    fn draft_insertion_index_clamps_an_out_of_range_editing_index() {
+        assert_eq!(draft_insertion_index(3, Some(999)), 3);
     }
 }
