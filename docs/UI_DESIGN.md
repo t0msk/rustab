@@ -922,19 +922,36 @@ so nothing was written.
   a save/restore that would write the real `/etc/fstab`), so the "requires confirmation"
   flag is always true.
 
-- **Action buttons**: `Cancel` (secondary, `bg-slate-100 dark:bg-slate-700`) closes
-  the whole flow back to the state before DiffView/BackupRestoreConfirmDialog opened -
-  nothing is written, pending changes remain staged (save) or nothing happens (restore).
-  Disabled while saving. `"Write anyway"` (destructive, `bg-red-600 hover:bg-red-700
-  text-white`) retries the original call with `allow_external_change: true`, disabled
-  until the checkbox is checked and while saving. Loading state: `"Writing changes…"` +
-  spinner, identical to DiffView/BackupRestoreConfirmDialog.
+- **Action buttons**: three, in order `Cancel` / `"Reload and re-sync"` / `"Write
+  anyway"`. `Cancel` (secondary, `bg-slate-100 dark:bg-slate-700`) closes the whole
+  flow back to the state before DiffView/BackupRestoreConfirmDialog opened - nothing
+  is written, pending changes remain staged (save) or nothing happens (restore).
+  `"Write anyway"` (destructive, `bg-red-600 hover:bg-red-700 text-white`) retries the
+  original call with `allow_external_change: true`, disabled until the checkbox is
+  checked. Loading state: `"Writing changes…"` + spinner, identical to DiffView/
+  BackupRestoreConfirmDialog. **(T37) `"Reload and re-sync"`** (non-destructive,
+  `bg-sky-600 hover:bg-sky-700 text-white`, the same "safe/additive" treatment
+  BackupPanel's "Create backup" button already uses, §7) calls `resync_external_change`
+  (`docs/API_CONTRACT.md` §3.15), which adopts the real file's *current* content as the
+  new baseline - and re-syncs the last-known-real marker to match - without writing to
+  the real file at all. It needs no `RealTargetConfirmCheckbox` gate: nothing it does
+  can ever touch the real target. Loading state: `"Reloading…"` + the same spinner, via
+  its own `resyncing` flag, kept deliberately separate from `saving` so neither button's
+  label is misrepresented by the other call being in flight. All three buttons are
+  disabled while *either* `saving` or `resyncing` is `true`, so the user can never fire
+  two of these calls at once.
 
 - **Outcomes**: On success, same success/`draft_sync_warning` handling as DiffView/
   BackupRestoreConfirmDialog (§6 points 4-5). On re-drift (file changed again mid-retry):
   the dialog stays open with a refreshed diff and the checkbox re-required, recursively
   if external changes keep drifting. On any other failure: shown inline in the still-open
-  dialog's error slot, with `Cancel`/retry remaining available.
+  dialog's error slot, with `Cancel`/retry remaining available. **(T37)** On "Reload and
+  re-sync" success: the dialog closes and the flow returns to its own normal confirm step
+  with a freshly computed diff - DiffView reopened (save flow, pending edits untouched) or
+  BackupRestoreConfirmDialog revealed again with its checkbox re-armed (restore flow) -
+  rather than any new state of its own; no toast, since nothing was written and the
+  dialog's own transition is feedback enough. On failure: shown inline in this dialog's
+  error slot, same treatment as any other retry failure here.
 
 ---
 

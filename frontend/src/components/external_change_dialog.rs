@@ -17,6 +17,14 @@
 //! "write anyway" is a separate, explicit gate layered on top of whichever
 //! `RealTargetConfirmCheckbox` the user already passed to reach this point,
 //! not a replacement for it.
+//!
+//! **T37** adds a third action, "Reload and re-sync", between `Cancel` and
+//! `Write anyway`: it calls `resync_external_change`, which never writes to
+//! the real file, so it needs no confirmation checkbox - only its own
+//! `resyncing` loading flag, kept separate from `saving` so neither button's
+//! label is misrepresented by the other call's state. All three buttons are
+//! disabled while *either* flag is `true`, so the user can't fire two of
+//! these calls at once.
 
 use yew::prelude::*;
 
@@ -55,6 +63,16 @@ pub struct ExternalChangeDialogProps {
     /// `BackupRestoreConfirmDialog`.
     #[prop_or_default]
     pub error: Option<AttrValue>,
+    /// T37: calls `resync_external_change`, adopting the real file's current
+    /// content as the new baseline without touching the user's pending
+    /// edits (save flow) or writing anything (restore flow).
+    pub on_reload: Callback<()>,
+    /// Set by `AppShell` while the `resync_external_change` call is in
+    /// flight - its own flag, deliberately kept separate from `saving` so
+    /// neither button's loading state is misrepresented by the other one
+    /// being in flight.
+    #[prop_or(false)]
+    pub resyncing: bool,
 }
 
 #[function_component(ExternalChangeDialog)]
@@ -67,14 +85,26 @@ pub fn external_change_dialog(props: &ExternalChangeDialogProps) -> Html {
         let cb = props.on_write_anyway.clone();
         Callback::from(move |_: MouseEvent| cb.emit(()))
     };
+    let on_reload_click = {
+        let cb = props.on_reload.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
     let stop_propagation = Callback::from(|e: MouseEvent| e.stop_propagation());
+
+    // Mutual exclusion: none of the three buttons may be clicked while
+    // *either* retried call is in flight, so a user can never fire two of
+    // them at once.
+    let any_in_flight = props.saving || props.resyncing;
 
     // "Write anyway" is gated exactly like the save/restore confirm button
     // it sits behind: always `requires_confirmation: true` here, since this
     // dialog only ever appears on a path that already writes the real
     // `/etc/fstab` (the external-change check only runs for the
     // `SandboxDefault` dispatch - API_CONTRACT.md §3.5).
-    let write_anyway_disabled = confirm_disabled(true, props.confirm_checked, props.saving);
+    let write_anyway_disabled = confirm_disabled(true, props.confirm_checked, any_in_flight);
+    // "Reload and re-sync" writes nothing to the real file, so it needs no
+    // confirmation checkbox - only the same in-flight gate as the other two.
+    let reload_disabled = any_in_flight;
 
     html! {
         // Intentionally no `onclick` here, same as `DiffView`/
@@ -121,11 +151,24 @@ pub fn external_change_dialog(props: &ExternalChangeDialogProps) -> Html {
                     <div class="flex justify-end gap-2">
                         <button
                             type="button"
-                            disabled={props.saving}
+                            disabled={any_in_flight}
                             class="px-4 py-2 rounded-md bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-sm font-medium focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60 disabled:cursor-not-allowed"
                             onclick={on_cancel_click}
                         >
                             { "Cancel" }
+                        </button>
+                        <button
+                            type="button"
+                            disabled={reload_disabled}
+                            class="px-4 py-2 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-sm font-medium inline-flex items-center gap-2 focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                            onclick={on_reload_click}
+                        >
+                            if props.resyncing {
+                                <LoadingSpinner />
+                                { "Reloading…" }
+                            } else {
+                                { "Reload and re-sync" }
+                            }
                         </button>
                         <button
                             type="button"

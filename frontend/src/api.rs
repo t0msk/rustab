@@ -4,8 +4,9 @@
 //! `list_backups` and `restore_backup` (T12), plus `read_backup` and
 //! `delete_backup` (T20), plus `create_backup` (T21.1), plus
 //! `open_backup_location` (T25), plus `open_external_link` (T26), plus
-//! `pick_directory`, plus `open_path_in_file_manager` (T32). See
-//! `docs/API_CONTRACT.md` for the exact contract.
+//! `pick_directory`, plus `open_path_in_file_manager` (T32), plus
+//! `resync_external_change` (T37). See `docs/API_CONTRACT.md` for the exact
+//! contract.
 //!
 //! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
 //! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
@@ -75,6 +76,15 @@ pub async fn get_target_info() -> Result<TargetInfoDto, String> {
 /// `list_entries() -> DocumentViewDto` (API_CONTRACT.md §3.2).
 pub async fn list_entries() -> Result<DocumentViewDto, String> {
     invoke("list_entries", &EmptyArgs {}).await
+}
+
+/// `resync_external_change() -> DocumentViewDto` (API_CONTRACT.md §3.15).
+/// Re-syncs the active target's working draft (and its last-known-real
+/// marker) from the real `/etc/fstab`'s current content, without writing to
+/// `/etc/fstab` itself - the "Reload and re-sync" action `ExternalChangeDialog`
+/// offers (T37). Never escalates privilege, never prompts.
+pub async fn resync_external_change() -> Result<DocumentViewDto, String> {
+    invoke("resync_external_change", &EmptyArgs {}).await
 }
 
 #[derive(Serialize)]

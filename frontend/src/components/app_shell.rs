@@ -341,6 +341,13 @@ pub fn app_shell() -> Html {
     let restore_external_change: UseStateHandle<Option<ExternalChangeInfo>> = use_state(|| None);
     let restore_external_change_confirm_checked = use_state(|| false);
 
+    // T37: "Reload and re-sync" in-flight flags, one per flow - kept
+    // separate from `diff_saving`/`restore_saving` so neither button's
+    // loading label is misrepresented by the other call being in flight
+    // (see `ExternalChangeDialog`'s own `saving`/`resyncing` props).
+    let diff_resyncing = use_state(|| false);
+    let restore_resyncing = use_state(|| false);
+
     // Transient success notification (§6 point 4 / §7's "same ... success
     // ... pattern"); auto-dismissed a few seconds after it's shown. A
     // monotonically increasing request id guards against an older timeout
@@ -723,6 +730,58 @@ pub fn app_shell() -> Html {
         })
     };
 
+    // T37: "Reload and re-sync" for the save flow - adopts the real file's
+    // current content as the new baseline and reopens `DiffView` so the
+    // user can re-review their still-pending `candidate` against it.
+    // Deliberately does not call `reload_entries`: that helper also resets
+    // `candidate` (correct for its own callers, wrong here - the whole
+    // point of this action is to keep the user's pending edits intact).
+    let on_diff_reload = {
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
+        let diff_resyncing = diff_resyncing.clone();
+        let diff_error = diff_error.clone();
+        let diff_external_change = diff_external_change.clone();
+        let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
+        let diff_view_open = diff_view_open.clone();
+        let diff_confirm_checked = diff_confirm_checked.clone();
+        Callback::from(move |()| {
+            if *diff_resyncing {
+                return;
+            }
+            let original_document = original_document.clone();
+            let original_text = original_text.clone();
+            let diff_resyncing = diff_resyncing.clone();
+            let diff_error = diff_error.clone();
+            let diff_external_change = diff_external_change.clone();
+            let diff_external_change_confirm_checked = diff_external_change_confirm_checked.clone();
+            let diff_view_open = diff_view_open.clone();
+            let diff_confirm_checked = diff_confirm_checked.clone();
+            diff_resyncing.set(true);
+            diff_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::resync_external_change().await {
+                    Ok(view) => {
+                        original_text.set(view.text);
+                        original_document.set(Some(view.document));
+                        diff_resyncing.set(false);
+                        diff_external_change.set(None);
+                        diff_external_change_confirm_checked.set(false);
+                        diff_view_open.set(true);
+                        diff_confirm_checked.set(false);
+                    }
+                    Err(message) => {
+                        // Shown inline in `ExternalChangeDialog`'s existing
+                        // error slot; the dialog stays open with
+                        // Cancel/Write-anyway/Reload all still available.
+                        diff_error.set(Some(message));
+                        diff_resyncing.set(false);
+                    }
+                }
+            });
+        })
+    };
+
     let on_restore = {
         let restore_target = restore_target.clone();
         let restore_error = restore_error.clone();
@@ -932,6 +991,57 @@ pub fn app_shell() -> Html {
                                 .await;
                         }
                         restore_saving.set(false);
+                    }
+                }
+            });
+        })
+    };
+
+    // T37: "Reload and re-sync" for the restore flow - identical semantics
+    // to `on_diff_reload` (never touches `candidate`, which doesn't even
+    // apply to this flow's own confirm dialog, but keeping the behavior
+    // symmetric is still correct for the live `EntriesTable` behind it).
+    // Clearing `restore_external_change` reveals `BackupRestoreConfirmDialog`
+    // again (hidden-not-closed while `restore_target` stays `Some`, per the
+    // existing T36 pattern) rather than needing any new "reopen" step.
+    let on_restore_reload = {
+        let original_document = original_document.clone();
+        let original_text = original_text.clone();
+        let restore_resyncing = restore_resyncing.clone();
+        let restore_error = restore_error.clone();
+        let restore_external_change = restore_external_change.clone();
+        let restore_external_change_confirm_checked =
+            restore_external_change_confirm_checked.clone();
+        let restore_confirm_checked = restore_confirm_checked.clone();
+        Callback::from(move |()| {
+            if *restore_resyncing {
+                return;
+            }
+            let original_document = original_document.clone();
+            let original_text = original_text.clone();
+            let restore_resyncing = restore_resyncing.clone();
+            let restore_error = restore_error.clone();
+            let restore_external_change = restore_external_change.clone();
+            let restore_external_change_confirm_checked =
+                restore_external_change_confirm_checked.clone();
+            let restore_confirm_checked = restore_confirm_checked.clone();
+            restore_resyncing.set(true);
+            restore_error.set(None);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::resync_external_change().await {
+                    Ok(view) => {
+                        original_text.set(view.text);
+                        original_document.set(Some(view.document));
+                        restore_resyncing.set(false);
+                        restore_external_change.set(None);
+                        restore_external_change_confirm_checked.set(false);
+                        restore_confirm_checked.set(false);
+                    }
+                    Err(message) => {
+                        // Shown inline in `ExternalChangeDialog`'s existing
+                        // error slot; the dialog stays open.
+                        restore_error.set(Some(message));
+                        restore_resyncing.set(false);
                     }
                 }
             });
@@ -1339,6 +1449,8 @@ pub fn app_shell() -> Html {
                     on_write_anyway={on_diff_write_anyway}
                     saving={*diff_saving}
                     error={(*diff_error).clone().map(AttrValue::from)}
+                    on_reload={on_diff_reload}
+                    resyncing={*diff_resyncing}
                 />
             }
 
@@ -1384,6 +1496,8 @@ pub fn app_shell() -> Html {
                     on_write_anyway={on_restore_write_anyway}
                     saving={*restore_saving}
                     error={(*restore_error).clone().map(AttrValue::from)}
+                    on_reload={on_restore_reload}
+                    resyncing={*restore_resyncing}
                 />
             }
 
