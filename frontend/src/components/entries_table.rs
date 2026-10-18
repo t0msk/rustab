@@ -23,9 +23,7 @@
 //! two entries do not simply trade indices once their blocks differ in
 //! length - this component predicts where each one really lands with the
 //! same `resolve_moved_indices` `stage_move` uses, fed by the
-//! `attached_block_len` prop. Only *freestanding* comments/blank lines stay
-//! behind; where one sits between two rows, a gap divider says so up front
-//! (§13.5).
+//! `attached_block_len` prop.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,9 +65,9 @@ pub struct EntriesTableProps {
     /// Each row's own attached comment block length, keyed by
     /// `candidate_index` - computed by `AppShell` once per render from
     /// `CandidateDocument::attached_block_len`, the same whole-document
-    /// cadence as `row_warnings` (`docs/UI_DESIGN.md` §13.4/§13.5). A row
-    /// missing from the map has no attached block. Used for both the gap
-    /// divider's count (§13.5) and the `expanded`-set remap (§13.8).
+    /// cadence as `row_warnings` (`docs/UI_DESIGN.md` §13.4). A row missing
+    /// from the map has no attached block. Used for the `expanded`-set
+    /// remap (§13.8).
     #[prop_or_default]
     pub attached_block_len: HashMap<usize, usize>,
     pub on_edit: Callback<usize>,
@@ -121,56 +119,6 @@ fn can_move_up(row_position: usize) -> bool {
 /// directions (§13.2).
 fn can_move_down(row_position: usize, row_count: usize) -> bool {
     row_position + 1 < row_count
-}
-
-/// How many *freestanding* lines (ones no entry's attachment walk claims)
-/// sit between two adjacent table rows in the candidate document:
-/// `rows[k+1].0 - attached_block_len(rows[k+1].0) - rows[k].0 - 1`
-/// (`docs/UI_DESIGN.md` §13.5). `0` means no divider is rendered.
-///
-/// T40's version was `rows[k+1].0 - rows[k].0 - 1`, which over-counts: the
-/// lower row's own attached comment block sits in that raw index gap but
-/// travels with the lower row when it moves, so it is not content that
-/// "stays here". The upper row's own block never enters this count - it
-/// sits above the upper row, not between the two.
-fn gap_between(
-    upper_candidate_index: usize,
-    lower_candidate_index: usize,
-    lower_attached_block_len: usize,
-) -> usize {
-    lower_candidate_index
-        .saturating_sub(lower_attached_block_len)
-        .saturating_sub(upper_candidate_index)
-        .saturating_sub(1)
-}
-
-/// The gap divider's short visible label (§13.5).
-fn gap_label(count: usize) -> String {
-    if count == 1 {
-        "1 line stays here".to_string()
-    } else {
-        format!("{count} lines stay here")
-    }
-}
-
-/// The gap divider's `title` tooltip - the full explanation of §13.4's
-/// landing rule, shown on hover rather than inline.
-///
-/// Reworded for T41 (§13.5): T40's "they aren't shown as rows and aren't
-/// attached to either entry" read as if *no* comment ever attaches, which
-/// is now false for the common case of a comment describing the entry
-/// below it. This gap is specifically the content that attaches to nobody.
-fn gap_tooltip(count: usize) -> String {
-    let subject = if count == 1 {
-        "1 comment or blank line here isn't".to_string()
-    } else {
-        format!("{count} comments or blank lines here aren't")
-    };
-    format!(
-        "{subject} attached to either neighboring entry - moving one across this gap does not \
-         move them; they keep their exact position. Check the Raw diff tab in Review & Save to \
-         see them."
-    )
 }
 
 /// One Move up/Move down button (`docs/UI_DESIGN.md` §13.2).
@@ -315,7 +263,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                     </tr>
                 </thead>
                 <tbody>
-                    { for props.rows.iter().enumerate().flat_map(|(row_position, (candidate_index, row))| {
+                    { for props.rows.iter().enumerate().map(|(row_position, (candidate_index, row))| {
                         let candidate_index = *candidate_index;
                         let row_count = props.rows.len();
                         let up_target = can_move_up(row_position)
@@ -343,31 +291,6 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                         };
                         let on_move_up = make_move(up_target);
                         let on_move_down = make_move(down_target);
-                        // The divider that follows this row, if any
-                        // freestanding comment/blank line sits between it
-                        // and the next one - the next row's own attached
-                        // block does not count, it travels with that row
-                        // (§13.5).
-                        let gap = props
-                            .rows
-                            .get(row_position + 1)
-                            .map(|(next_index, _)| gap_between(
-                                candidate_index,
-                                *next_index,
-                                props.attached_block_len.get(next_index).copied().unwrap_or(0),
-                            ))
-                            .unwrap_or(0);
-                        let gap_divider = (gap > 0).then(|| html! {
-                            <tr key={format!("gap-{candidate_index}")} title={gap_tooltip(gap)}>
-                                <td colspan="8" class="py-1">
-                                    <div class="flex items-center gap-2">
-                                        <span class="flex-1 border-t border-dashed border-slate-200 dark:border-slate-700"></span>
-                                        <span class="text-xs text-slate-400 dark:text-slate-500">{ gap_label(gap) }</span>
-                                        <span class="flex-1 border-t border-dashed border-slate-200 dark:border-slate-700"></span>
-                                    </div>
-                                </td>
-                            </tr>
-                        });
                         let on_edit = {
                             let cb = props.on_edit.clone();
                             Callback::from(move |e: MouseEvent| {
@@ -426,9 +349,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                                 />
                             },
                         };
-                        // Flattened rather than wrapped in a fragment so
-                        // every row keeps its own key in one flat list.
-                        [Some(row_html), gap_divider].into_iter().flatten()
+                        row_html
                     }) }
                 </tbody>
             </table>
@@ -869,41 +790,6 @@ mod tests {
     /// the common case.
     fn no_blocks() -> HashMap<usize, usize> {
         HashMap::new()
-    }
-
-    #[test]
-    fn adjacent_entries_have_no_gap_between_them() {
-        // §13.10 case 12 - unchanged from T40.
-        assert_eq!(gap_between(0, 1, 0), 0);
-        assert_eq!(gap_between(7, 8, 0), 0);
-    }
-
-    #[test]
-    fn one_freestanding_line_between_two_entries_is_one_gap_line() {
-        // §13.10 case 11 - a genuinely freestanding line still counts.
-        assert_eq!(gap_between(0, 2, 0), 1);
-        assert_eq!(gap_label(1), "1 line stays here");
-        assert!(gap_tooltip(1).starts_with("1 comment or blank line here isn't attached"));
-    }
-
-    #[test]
-    fn several_freestanding_lines_between_two_entries_are_counted_and_pluralized() {
-        assert_eq!(gap_between(3, 7, 0), 3);
-        assert_eq!(gap_label(3), "3 lines stay here");
-        assert!(gap_tooltip(3).starts_with("3 comments or blank lines here aren't attached"));
-    }
-
-    #[test]
-    fn a_comment_block_attached_to_the_lower_row_is_excluded_from_the_gap_count() {
-        // §13.10 case 10 - T40's formula would have reported 1 and 3 here,
-        // claiming content "stays here" that actually travels with the
-        // lower entry.
-        assert_eq!(gap_between(0, 2, 1), 0);
-        assert_eq!(gap_between(3, 7, 3), 0);
-
-        // A mix: 3 raw lines in the gap, 2 of which are the lower row's
-        // attached block - only the remaining one stays.
-        assert_eq!(gap_between(3, 7, 2), 1);
     }
 
     #[test]

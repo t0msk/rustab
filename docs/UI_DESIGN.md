@@ -998,10 +998,10 @@ drag-and-drop, not an order-number field, and not a separate reorder view. This 
 a close call the repo owner needs to break a tie on: §13.1 below gives the specific
 reasoning for this app. Two refinements beyond the plain button idea as literally
 named turned out to be necessary, not optional nice-to-haves, and are specified in full
-here: a persistent indicator for where freestanding comments/blank lines sit relative
-to the rows around them (§13.4-§13.5), and a correctness fix to the diff/pending-count
-logic so a pure reorder is never silently invisible at the one screen (DiffView) this
-app treats as a hard safety gate (§13.7).
+here: an entry moving together with its own attached comment block (§13.4, revised by
+T41, see below), and a correctness fix to the diff/pending-count logic so a pure
+reorder is never silently invisible at the one screen (DiffView) this app treats as a
+hard safety gate (§13.7).
 
 **Correction (T41).** The repo owner reviewed T40 after it shipped (`4be7d2a`, not
 amended - see `PROJECT_PLAN.md`'s T41 section for the full history) and found §13.4's
@@ -1236,8 +1236,8 @@ attached comment block.
 
 **Contract.** `CandidateDocument` gains `attached_block_len(&self, row_index: usize) ->
 usize` (the pure query behind the walk above - the length of `row_index`'s own attached
-comment block, 0 if none; §13.5 reuses it for the gap divider, §13.8 for `expanded`) and
-a free function `resolve_moved_indices(upper: usize, upper_len: usize, lower: usize,
+comment block, 0 if none; §13.8 reuses it for `expanded`) and a free function
+`resolve_moved_indices(upper: usize, upper_len: usize, lower: usize,
 lower_len: usize) -> (usize, usize)` implementing step 3's two formulas - the single
 place either index fact is ever computed. `stage_move(&mut self, from: usize, to:
 usize) -> Option<MoveOutcome>` replaces T40's plain `Vec::swap`:
@@ -1258,53 +1258,17 @@ possibly-drifting implementation. §13.8 covers exactly how `EntriesTable` uses 
 `resolve_moved_indices` directly, not a round trip through `stage_move`'s return value -
 see there for why).
 
-### 13.5 The between-rows gap indicator (revised, T41)
+### 13.5 (removed in T42)
 
-**Still earns its place, now more precisely targeted.** Before this fix, T40's gap
-divider fired for *any* non-row-kind content between two adjacent rows, including an
-ordinary descriptive comment that - per §13.4's corrected rule - usually turns out to be
-attached and therefore now moves correctly on its own. Now that attached blocks are
-handled, the only thing left for a gap to mean is content this app genuinely cannot
-reattach to anyone: a blank-line separator, or a comment block with no owning entry
-(§13.4 cases 3-4). That is a narrower set of triggers than before, but not a smaller
-need - it is exactly the case T40's original rationale (communicating proactively,
-before a move, that *this specific content* will not follow either neighboring entry)
-was written for. Removing the divider now would silently regress that disclosure for a
-rarer but still-real trigger. **Decision: keep it**, with its gap-count computation
-corrected to stop over-counting lines that are now correctly attached.
-
-**The corrected gap count.** T40's original formula, `rows[k+1].0 - rows[k].0 - 1`
-("every non-row-kind line between the two row indices"), now **over-counts**: it would
-include `rows[k+1]`'s own attached comment block, which no longer sits in this gap once
-a move actually happens - it travels with `rows[k+1]`. Using §13.4's
-`attached_block_len`, the corrected count between row `k` and row `k+1` is:
-
-> `rows[k+1].0 - attached_block_len(rows[k+1].0) - rows[k].0 - 1`
-
-i.e. the number of lines strictly between row `k`'s own line and row `k+1`'s attached
-block's start - exactly the freestanding-middle count §13.4 step 1 defines for a move
-between these same two rows. Row `k`'s own attached block never enters this count,
-because it sits *above* row `k`, not between row `k` and row `k+1`.
-
-**Contract.** `EntriesTableProps` gains one new prop, `attached_block_len:
-HashMap<usize, usize>` (keyed by every row's own `candidate_index` → its own attached
-block's length, computed by `AppShell` once per render from
-`CandidateDocument::attached_block_len`, the same whole-document cadence as the
-existing `row_warnings` map). `EntriesTable`'s existing local `gap_between` function is
-corrected in place to use the formula above (it already has both row indices from
-`rows`; it now also looks up `rows[k+1]`'s length in this new map) rather than removed -
-unlike T40's version, it no longer needs any *other* new plumbing, since the one extra
-number it's missing is exactly what this prop supplies.
-
-Everything else about the divider is unchanged from T40: renders only when the
-corrected count is ≥1, same dashed/muted markup, same non-interactive/excluded-from-
-Tab-order treatment. **Copy update**: the visible label stays `"{N} line(s) stay
-here"`; the `title` tooltip is reworded to match the narrower, now-accurate meaning
-(T40's "they aren't shown as rows and aren't attached to either entry" read as if *no*
-comment ever attaches, which is now false for the common case): `"{N} comment or blank
-line(s) here aren't attached to either neighboring entry - moving one across this gap
-does not move them; they keep their exact position. Check the Raw diff tab in Review &
-Save to see them."`
+The between-rows gap indicator previously specified here - a dashed-border row shown
+between two table rows whenever a freestanding comment/blank line sat between them -
+was removed entirely in T42, a repo owner's own decision, not a design question left
+open: no reworded tooltip, no conditional suppression for any particular case, full
+removal uniformly across every case it covered. The underlying attached-comment-block
+move logic (§13.4) it sat on top of is unaffected and still ships; see
+`PROJECT_PLAN.md`'s T42 section for the full rationale. This subsection number is left
+unused rather than renumbering §13.6 onward, since other parts of this file and of
+`PROJECT_PLAN.md` cite those by number.
 
 ### 13.6 Live validation feedback
 
@@ -1424,7 +1388,7 @@ no-code convention):
   computes the real outcome itself, synchronously, in the same click handler that
   already updates `expanded` and emits `on_move` (T40's existing structure) - using the
   **same** `resolve_moved_indices` function `stage_move` uses internally, fed by the
-  new `attached_block_len` prop (§13.5) it already receives for the gap divider:
+  new `attached_block_len` prop it already receives:
   `upper = min(from, to)`, `lower = max(from, to)`, `upper_len`/`lower_len` read from
   the prop map, then `resolve_moved_indices(upper, upper_len, lower, lower_len)` gives
   the real new indices, mapped back to whichever of `from`/`to` was `upper`/`lower`.
@@ -1441,18 +1405,18 @@ no-code convention):
   original swap - the fix only changes behavior where T40 would otherwise have been
   wrong.
 - `EntriesTableProps` gains the one new prop named above, `attached_block_len:
-  HashMap<usize, usize>` (§13.4/§13.5), computed by `AppShell` once per render from
+  HashMap<usize, usize>` (§13.4), computed by `AppShell` once per render from
   `CandidateDocument::attached_block_len`, the same whole-document cadence as the
   existing `row_warnings` map. No other new prop is needed - this single map is enough
-  for both the gap-divider fix (§13.5) and the `expanded`-tracking fix above.
+  for the `expanded`-tracking fix above. (T42 removed the gap-divider UI that also
+  once consumed this prop; the prop itself stays, since `remap_expanded` above still
+  needs it.)
 
 ### 13.9 Visual tokens used
 
-Nothing new was invented for this task - every value above is a direct reuse:
-`text-slate-400`/`dark:text-slate-500` and `border-slate-200`/`dark:border-slate-700`
-(existing `border-default`/`text-muted` tokens, §8) for the gap divider; the existing
-icon-button hover/focus/disabled treatment (§8's spacing/accessibility conventions,
-and §5's "real `disabled` element" rule) for Move up/down; `bg-sky-50
+Nothing new was invented for this task - every value above is a direct reuse: the
+existing icon-button hover/focus/disabled treatment (§8's spacing/accessibility
+conventions, and §5's "real `disabled` element" rule) for Move up/down; `bg-sky-50
 dark:bg-sky-900/20` (the existing `accent` family, already used at this same tint
 elsewhere, e.g. the row-expand panel's accent border in §3) for the new `Reordered`
 diff card, chosen specifically because sky is this app's only "notable, non-alarming"
@@ -1460,9 +1424,12 @@ color - every other tinted card in DiffView is emerald (added/safe) or red
 (removed/destructive), and a reorder is neither.
 
 **T41 confirms this list is still complete.** The comment-attachment fix is
-logic-only (§13.4/§13.5/§13.8) - no new color, spacing, or icon token was needed; the
-gap divider's tooltip wording changed (§13.5) but reuses the exact same
-`text-slate-400`/`dark:text-slate-500` token it already used.
+logic-only (§13.4/§13.8) - no new color, spacing, or icon token was needed.
+
+**T42 note.** The gap divider that previously used
+`text-slate-400`/`dark:text-slate-500` and `border-slate-200`/`dark:border-slate-700`
+here was removed (§13.5); no replacement token is needed since nothing renders in its
+place.
 
 ### 13.10 Required test coverage (T41)
 
@@ -1512,16 +1479,12 @@ document's convention.
    `to`/`from` T40's version assumed - the direct regression test for the bug this
    subtlety exists to prevent.
 
-**Gap divider (§13.5):**
-
-10. A comment block that **is** attached to the lower neighbor is excluded from the gap
-    count entirely (the corrected formula reports 0, or a smaller count than T40's
-    original formula would have, when the only content in the raw index gap was that
-    now-attached block).
-11. A genuinely freestanding block or blank line sitting in the same kind of gap still
-    counts, unchanged from T40.
-12. Two directly adjacent rows (no lines of any kind between them) still produce no
-    divider - unchanged from T40.
+**Gap divider (§13.5): removed in T42**, along with its four dedicated tests
+(`adjacent_entries_have_no_gap_between_them`,
+`one_freestanding_line_between_two_entries_is_one_gap_line`,
+`several_freestanding_lines_between_two_entries_are_counted_and_pluralized`,
+`a_comment_block_attached_to_the_lower_row_is_excluded_from_the_gap_count`) - no
+replacement coverage is needed since the UI surface they tested no longer exists.
 
 ---
 
