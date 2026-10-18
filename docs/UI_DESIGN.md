@@ -86,7 +86,7 @@ the app and is designed to be *impossible to miss*, not a subtle label.
   app, drawers/modals render below it or the banner re-renders on top).
 - **Content**: an icon + bold lead clause + the literal resolved file path, e.g.
   `⚠ REAL SYSTEM FILE - /etc/fstab` or
-  `⚠ SAVING WRITES THE REAL /ETC/FSTAB - editing working draft /home/user/.local/share/rustab/fstab.sandbox`.
+  `⚠ SAVING WRITES THE REAL /ETC/FSTAB - editing working draft /home/user/.local/share/rustab/fstab.draft`.
   The full path is always shown in full (truncated with an ellipsis + tooltip only if
   genuinely too long for the window), never abbreviated to just a filename - ambiguity
   between two similarly-named files is exactly what this banner exists to prevent.
@@ -142,7 +142,7 @@ the app and is designed to be *impossible to miss*, not a subtle label.
   `/etc/fstab` is never written", because it is the only state where that is true
   (`README.md`'s Safety Notes, `CONTRIBUTING.md`'s "Safety-first contribution notes").
   The middle column's copy must not say or imply that, and must not use the word
-  "sandbox": that word now names a *file* (`fstab.sandbox`, the persistent working
+  "sandbox": that word now names a *file* (`fstab.draft`, the persistent working
   draft), not a safe *mode*, and reusing it as reassurance here is what made the
   pre-T34 copy wrong in the first place - "Working draft" names the file being edited
   without claiming anything about where a save ends up.
@@ -566,7 +566,7 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   badge: `"Automatic"` in the same neutral slate styling, `"Manual"` in the sky tones
   used elsewhere for non-destructive emphasis - distinct but not alarming), file size,
   which target path it was backed up from (prefixed with a literal `"Target: "` label,
-  e.g. `"Target: /home/tomsk/.local/share/rustab/fstab.sandbox · 1.2 KB"`), and three
+  e.g. `"Target: /home/tomsk/.local/share/rustab/fstab.draft · 1.2 KB"`), and three
   row-level actions: `Restore`
   (secondary styling, not primary - restoring is not the app's main action), `View diff`
   (secondary styling, identical treatment to `Restore`), and `Delete` (destructive but

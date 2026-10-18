@@ -1454,7 +1454,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn saving_an_override_target_from_the_dto_shape_is_lossless() {
         let dir = TempDir::new("save-dto");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
         let candidate = parser::parse(
@@ -1482,7 +1482,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn saving_a_missing_override_target_creates_it_without_a_backup() {
         let dir = TempDir::new("save-create");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
         let outcome = save_document(
@@ -1502,7 +1502,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn saving_an_invalid_candidate_fails_and_leaves_the_target_untouched() {
         let dir = TempDir::new("save-invalid");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -1559,7 +1559,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn restoring_a_backup_goes_through_the_same_save_path() {
         let dir = TempDir::new("restore");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -1599,7 +1599,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn restoring_a_path_that_is_not_a_backup_is_refused() {
         let dir = TempDir::new("restore-refuse");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
 
         let error = backups::resolve_requested(&path, "/etc/shadow")
@@ -1626,7 +1626,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn read_backup_returns_the_backup_text_verbatim() {
         let dir = TempDir::new("read-backup");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         seed_backups(&path, 2);
         let target = override_target(path.clone());
 
@@ -1660,7 +1660,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn read_backup_refuses_anything_that_is_not_a_backup_of_this_target() {
         let dir = TempDir::new("read-backup-refuse");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         seed_backups(&path, 1);
         let target = override_target(path.clone());
 
@@ -1669,10 +1669,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let other_backup = backups::list(&other).expect("listing")[0].path.clone();
 
         let near_misses = [
-            "fstab.sandbox.rustab-backup.1.2",
-            "fstab.sandbox.rustab-backup.0000000001.000000002.old",
-            "fstab.sandbox.rustab-backup.aaaaaaaaaa.bbbbbbbbb",
-            "fstab.sandbox.bak",
+            "fstab.draft.rustab-backup.1.2",
+            "fstab.draft.rustab-backup.0000000001.000000002.old",
+            "fstab.draft.rustab-backup.aaaaaaaaaa.bbbbbbbbb",
+            "fstab.draft.bak",
         ];
         for name in near_misses {
             fs::write(dir.join(name), "# not a Rustab backup\n").expect("write the near miss");
@@ -1709,12 +1709,12 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn read_backup_refuses_non_utf8_content() {
         let dir = TempDir::new("read-backup-utf8");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
         // A hand-made but exactly-named backup, which `backups` deliberately
         // accepts as a backup of this target (see its module docs).
-        let backup = dir.join("fstab.sandbox.rustab-backup.0000000001.000000002");
+        let backup = dir.join("fstab.draft.rustab-backup.0000000001.000000002");
         fs::write(&backup, [0xff, 0xfe, 0x00]).expect("write invalid UTF-8");
 
         let error = read_backup_of(&target, unused_real_fstab(), &backup.to_string_lossy())
@@ -1732,7 +1732,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn open_backup_location_opens_the_target_s_containing_directory() {
         let dir = TempDir::new("open-backup-location");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -1753,7 +1753,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn open_backup_location_reports_a_launch_failure() {
         let dir = TempDir::new("open-backup-location-fail");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
         let error = open_backup_location_with(&target, unused_real_fstab(), |_| {
@@ -1861,7 +1861,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn deleting_a_sandbox_backup_removes_exactly_that_file() {
         let dir = TempDir::new("delete-backup");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         seed_backups(&path, 3);
         let target = override_target(path.clone());
         let before = backups::list(&path).expect("listing");
@@ -1889,7 +1889,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn deleting_a_path_that_is_not_a_backup_is_refused() {
         let dir = TempDir::new("delete-backup-refuse");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         seed_backups(&path, 1);
         let target = override_target(path.clone());
         let real_backup = backups::list(&path).expect("listing")[0].path.clone();
@@ -1899,8 +1899,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             "../../etc/fstab",
             "",
             &path.to_string_lossy(),
-            &dir.join("fstab.sandbox.rustab-backup.1.2")
-                .to_string_lossy(),
+            &dir.join("fstab.draft.rustab-backup.1.2").to_string_lossy(),
         ] {
             let error = delete_backup_from(&target, unused_real_fstab(), requested)
                 .expect_err("only this target's own backups may be deleted");
@@ -1925,7 +1924,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn deleting_an_already_deleted_backup_is_reported_as_invalid() {
         let dir = TempDir::new("delete-backup-twice");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         seed_backups(&path, 1);
         let target = override_target(path.clone());
         let backup = backups::list(&path).expect("listing")[0].path.clone();
@@ -2000,7 +1999,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn an_explicit_non_real_override_delete_never_reaches_the_elevated_deleter() {
         let dir = TempDir::new("override-delete-dispatch");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         seed_backups(&path, 1);
         let target = override_target(path.clone());
         let backup = backups::list(&path).expect("listing")[0].path.clone();
@@ -2043,7 +2042,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn creating_a_sandbox_backup_copies_the_target_without_changing_it() {
         let dir = TempDir::new("create-backup");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -2077,7 +2076,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn creating_two_backups_yields_two_distinct_restore_points() {
         let dir = TempDir::new("create-backup-twice");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -2104,7 +2103,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn creating_a_backup_of_a_missing_target_is_reported_as_target_missing() {
         let dir = TempDir::new("create-backup-missing");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
         let error = create_backup_of(&target, unused_real_fstab())
@@ -2121,7 +2120,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn a_manual_backup_survives_saves_that_prune_automatic_ones() {
         let dir = TempDir::new("create-backup-retention");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -2212,7 +2211,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn an_explicit_non_real_override_backup_never_reaches_the_elevated_helper() {
         let dir = TempDir::new("override-create-dispatch");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -2230,7 +2229,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn a_manual_backup_can_be_deleted_like_any_other() {
         let dir = TempDir::new("create-then-delete");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
@@ -2266,7 +2265,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::create_dir_all(&draft_dir).expect("mkdir the draft's directory");
         fs::create_dir_all(&etc_dir).expect("mkdir the real file's directory");
 
-        let draft = draft_dir.join("fstab.sandbox");
+        let draft = draft_dir.join("fstab.draft");
         let real = etc_dir.join("fstab");
         fs::write(&draft, ORIGINAL).expect("seed the draft");
         fs::write(&real, ORIGINAL).expect("seed the real stand-in");
@@ -2353,7 +2352,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let dir = TempDir::new("resync-sandbox-default");
         let real = dir.join("real-fstab");
         fs::write(&real, REAL_FSTAB_FOR_RESYNC).expect("seed the real stand-in");
-        let draft = dir.join("fstab.sandbox");
+        let draft = dir.join("fstab.draft");
         fs::write(&draft, "# stale draft content from before the drift\n").expect("seed draft");
         fs::write(marker_of(&draft), "# stale marker content\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
@@ -2456,7 +2455,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     fn a_missing_real_fstab_resyncs_to_empty_rather_than_erroring() {
         let dir = TempDir::new("resync-missing-real");
         let real = dir.join("this-file-does-not-exist");
-        let draft = dir.join("fstab.sandbox");
+        let draft = dir.join("fstab.draft");
         fs::write(&draft, "# stale content that must be cleared\n").expect("seed draft");
         fs::write(marker_of(&draft), "# a stale marker\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
@@ -2487,7 +2486,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let dir = TempDir::new("resync-not-utf8");
         let real = dir.join("real-fstab");
         fs::write(&real, [0xff, 0xfe, 0x00, 0x01]).expect("seed invalid-UTF-8 bytes");
-        let draft = dir.join("fstab.sandbox");
+        let draft = dir.join("fstab.draft");
         fs::write(&draft, "# valid content that must survive\n").expect("seed draft");
         fs::write(marker_of(&draft), "# a marker that must survive\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
@@ -2518,7 +2517,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let dir = TempDir::new("resync-closes-the-loop");
         let real = dir.join("real-fstab");
         fs::write(&real, REAL_FSTAB_FOR_RESYNC).expect("seed the real stand-in");
-        let draft = dir.join("fstab.sandbox");
+        let draft = dir.join("fstab.draft");
         fs::write(&draft, "# a draft that disagrees with the real file\n").expect("seed draft");
         let target = default_draft_target(draft.clone());
 
@@ -2748,7 +2747,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn validate_candidate_reports_blocking_findings_without_writing() {
         let dir = TempDir::new("validate");
-        let path = dir.join("fstab.sandbox");
+        let path = dir.join("fstab.draft");
         fs::write(&path, ORIGINAL).expect("seed the target");
 
         let report = validate_candidate(DocumentDto::from(&invalid_candidate()));
@@ -2764,9 +2763,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     #[test]
     fn target_info_dto_mirrors_the_resolved_target() {
-        let info =
-            TargetInfoDto::from(&override_target(PathBuf::from("/tmp/rustab/fstab.sandbox")));
-        assert_eq!(info.path, "/tmp/rustab/fstab.sandbox");
+        let info = TargetInfoDto::from(&override_target(PathBuf::from("/tmp/rustab/fstab.draft")));
+        assert_eq!(info.path, "/tmp/rustab/fstab.draft");
         assert!(!info.is_real);
         assert_eq!(info.source, TargetSourceDto::Environment);
 
@@ -3016,7 +3014,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn a_draft_mirror_failure_is_a_warning_not_a_failed_save() {
         let dir = TempDir::new("default-save-mirror-fails");
-        let draft = dir.join("fstab.sandbox");
+        let draft = dir.join("fstab.draft");
         fs::create_dir_all(&draft).expect("mkdir in the draft's place");
         let real = dir.join("etc-fstab-stand-in");
         fs::write(&real, ORIGINAL).expect("seed the real stand-in");

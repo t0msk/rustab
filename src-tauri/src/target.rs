@@ -19,8 +19,8 @@
 //!    `crate::commands::save_document_with`. This is the one way to run
 //!    Rustab without it writing the real `/etc/fstab`.
 //! 2. Otherwise the target is the per-user **working draft**,
-//!    `$XDG_DATA_HOME/rustab/fstab.sandbox` (falling back to
-//!    `$HOME/.local/share/rustab/fstab.sandbox`, and to a temp-dir path if
+//!    `$XDG_DATA_HOME/rustab/fstab.draft` (falling back to
+//!    `$HOME/.local/share/rustab/fstab.draft`, and to a temp-dir path if
 //!    neither variable is set). This is the file the GUI reads and edits, but
 //!    since T34 it is *not* where a save ends up: a save writes the real
 //!    `/etc/fstab` and the draft is then updated to match it. The draft's
@@ -131,7 +131,13 @@ pub const REAL_FSTAB_PATH: &str = "/etc/fstab";
 const SANDBOX_DIR_NAME: &str = "rustab";
 
 /// File name of the default sandbox target - the working draft.
-const SANDBOX_FILE_NAME: &str = "fstab.sandbox";
+const SANDBOX_FILE_NAME: &str = "fstab.draft";
+
+/// The pre-T38 name of the working draft file. Used **only** by
+/// [`migrate_legacy_sandbox_file_name`] to recognize a pre-existing
+/// installation's draft, marker and backups and rename them onto the current
+/// [`SANDBOX_FILE_NAME`] - nothing is ever newly written under this name.
+const LEGACY_SANDBOX_FILE_NAME: &str = "fstab.sandbox";
 
 /// Suffix of the marker file that records the real `/etc/fstab`'s content as
 /// of the last time Rustab synced with it (see [`last_known_real_marker`]).
@@ -482,6 +488,7 @@ fn ensure_sandbox_file(
     }
     refresh_state
         .ensure_once(|| {
+            migrate_legacy_sandbox_file_name(path);
             if refresh_sandbox_if_real_changed(path, real_fstab_path) {
                 Ok(())
             } else {
@@ -492,6 +499,101 @@ fn ensure_sandbox_file(
             path: path.to_path_buf(),
             source: failure.as_io_error(),
         })
+}
+
+// ---------------------------------------------------------------------------
+// Legacy file name migration (T38)
+// ---------------------------------------------------------------------------
+
+/// One-time migration from the pre-T38 draft file name
+/// ([`LEGACY_SANDBOX_FILE_NAME`], `fstab.sandbox`) to the current one
+/// ([`SANDBOX_FILE_NAME`], `fstab.draft`), run as the very first step inside
+/// [`ensure_sandbox_file`]'s refresh barrier - before anything else looks the
+/// new path up.
+///
+/// ## One-time guarantee
+///
+/// The `new_path.exists()` check below *is* the "runs once per installation"
+/// gate: the first successful rename makes it true for every later call, this
+/// process or a future one. No separate flag or marker file is needed.
+///
+/// ## Why every rename here is safe, not just convenient
+///
+/// `fs::rename` never removes its source unless the destination actually
+/// lands - there is no copy-then-remove anywhere in this function - so a
+/// failed rename leaves the old file exactly where it was, under its old
+/// name, byte-intact. The worst realistic outcome of a migration bug or a
+/// failed rename is: the old file sits there unmigrated and
+/// [`seed_sandbox_file_if_missing`] creates a fresh file at the new path,
+/// exactly as it does today for a genuine first-ever launch - annoying (the
+/// old content is not picked up automatically) but never silent on-disk data
+/// loss, and the old file remains readable/recoverable by hand.
+///
+/// Every rename - the draft, the marker, each backup - is independent and
+/// best-effort: an `io::Error` from one does not stop the others from being
+/// attempted, and this function never returns an error to its caller
+/// (swallows every `io::Error`, the same pattern [`refresh_sandbox_if_real_changed`]
+/// already uses for [`record_last_known_real`]'s failure).
+fn migrate_legacy_sandbox_file_name(new_path: &Path) {
+    if new_path.exists() {
+        return; // already migrated, or a fresh install with its own file
+    }
+    let legacy_path = new_path.with_file_name(LEGACY_SANDBOX_FILE_NAME);
+    // The main draft rename is independent of the marker/backup migrations
+    // below: a legacy marker or backup can exist without the legacy draft
+    // itself (or vice versa), and each piece that is actually present is
+    // migrated on its own rather than all-or-nothing.
+    if legacy_path.exists() {
+        let _ = fs::rename(&legacy_path, new_path);
+    }
+    migrate_legacy_marker(&legacy_path, new_path);
+    migrate_legacy_backups(&legacy_path, new_path);
+}
+
+/// Migrates the legacy last-known-real marker (if any) onto the new draft's
+/// marker path, independently of whether the main draft rename succeeded.
+///
+/// Uses the existing [`last_known_real_marker`] for both paths rather than
+/// hand-constructing the [`LAST_KNOWN_REAL_SUFFIX`] again, so the two can
+/// never drift apart.
+fn migrate_legacy_marker(legacy_path: &Path, new_path: &Path) {
+    let (Some(legacy_marker), Some(new_marker)) = (
+        last_known_real_marker(legacy_path),
+        last_known_real_marker(new_path),
+    ) else {
+        return;
+    };
+    if legacy_marker.exists() && !new_marker.exists() {
+        let _ = fs::rename(&legacy_marker, &new_marker);
+    }
+}
+
+/// Migrates every automatic and manual backup of the legacy draft name onto
+/// the equivalent name under [`SANDBOX_FILE_NAME`], preserving the rest of
+/// each backup's file name - the timestamp, and the `.manual` suffix when
+/// present - verbatim.
+///
+/// Enumerates via the existing [`fstab_core::writer::list_backups`] rather
+/// than reimplementing the backup-naming grammar: this is the one new,
+/// load-bearing use of `fstab_core::writer` from this module. Each rename is
+/// independent and best-effort, and skips (never overwrites) a destination
+/// that already exists.
+fn migrate_legacy_backups(legacy_path: &Path, new_path: &Path) {
+    let Ok(backups) = fstab_core::writer::list_backups(legacy_path) else {
+        return;
+    };
+    for backup in backups {
+        let Some(file_name) = backup.path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let Some(suffix) = file_name.strip_prefix(LEGACY_SANDBOX_FILE_NAME) else {
+            continue;
+        };
+        let new_backup_path = new_path.with_file_name(format!("{SANDBOX_FILE_NAME}{suffix}"));
+        if !new_backup_path.exists() {
+            let _ = fs::rename(&backup.path, &new_backup_path);
+        }
+    }
 }
 
 /// The once-per-launch draft sync: copies `real_fstab_path` over the draft
@@ -1802,6 +1904,196 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         assert_eq!(
             ExternalChangeGuard::from_marker(&draft, false).last_known_real_content,
             None
+        );
+    }
+
+    // -- T38: legacy `fstab.sandbox` -> `fstab.draft` file name migration ---
+
+    /// A full legacy installation - draft, marker, an automatic backup and a
+    /// manual backup, all still under the pre-T38 name - migrates onto the
+    /// new name byte-exact, with the automatic backup's timestamp and the
+    /// manual backup's `.manual` suffix both surviving verbatim. The renamed
+    /// backups are also re-verified through [`fstab_core::writer::list_backups`]
+    /// itself, so the proof is not just "a file with the right name exists"
+    /// but "the backup grammar recognizes it under its new name".
+    #[test]
+    fn migration_renames_draft_marker_and_both_backup_kinds_byte_exact() {
+        let dir = TempDir::new("target-migrate-full");
+        let new_path = dir.join(SANDBOX_FILE_NAME);
+        let legacy_path = dir.join(LEGACY_SANDBOX_FILE_NAME);
+        fs::write(&legacy_path, "# legacy draft\n").expect("write legacy draft");
+        let legacy_marker = marker_of(&legacy_path);
+        fs::write(&legacy_marker, "# legacy marker\n").expect("write legacy marker");
+        let legacy_auto_backup = dir.join(&format!(
+            "{LEGACY_SANDBOX_FILE_NAME}.rustab-backup.0000000001.000000002"
+        ));
+        fs::write(&legacy_auto_backup, "# automatic backup\n").expect("write automatic backup");
+        let legacy_manual_backup = dir.join(&format!(
+            "{LEGACY_SANDBOX_FILE_NAME}.rustab-backup.0000000003.000000004.manual"
+        ));
+        fs::write(&legacy_manual_backup, "# manual backup\n").expect("write manual backup");
+
+        migrate_legacy_sandbox_file_name(&new_path);
+
+        assert!(
+            !legacy_path.exists(),
+            "the legacy draft must have been renamed away"
+        );
+        assert_eq!(
+            fs::read_to_string(&new_path).expect("read"),
+            "# legacy draft\n"
+        );
+
+        assert!(!legacy_marker.exists());
+        assert_eq!(
+            fs::read_to_string(marker_of(&new_path)).expect("read"),
+            "# legacy marker\n"
+        );
+
+        let new_auto_backup = dir.join(&format!(
+            "{SANDBOX_FILE_NAME}.rustab-backup.0000000001.000000002"
+        ));
+        assert!(!legacy_auto_backup.exists());
+        assert_eq!(
+            fs::read_to_string(&new_auto_backup).expect("read"),
+            "# automatic backup\n"
+        );
+
+        let new_manual_backup = dir.join(&format!(
+            "{SANDBOX_FILE_NAME}.rustab-backup.0000000003.000000004.manual"
+        ));
+        assert!(!legacy_manual_backup.exists());
+        assert_eq!(
+            fs::read_to_string(&new_manual_backup).expect("read"),
+            "# manual backup\n"
+        );
+
+        let listed = fstab_core::writer::list_backups(&new_path).expect("listing");
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .any(|backup| backup.path == new_auto_backup && !backup.manual));
+        assert!(listed
+            .iter()
+            .any(|backup| backup.path == new_manual_backup && backup.manual));
+    }
+
+    /// Running the migration a second time - simulating a second launch - is
+    /// a true no-op: the one-time gate is `new_path.exists()`, and once that
+    /// is true nothing further is ever touched, even a legacy file that
+    /// reappears afterwards (e.g. restored by hand).
+    #[test]
+    fn a_second_migration_call_is_a_true_no_op() {
+        let dir = TempDir::new("target-migrate-twice");
+        let new_path = dir.join(SANDBOX_FILE_NAME);
+        let legacy_path = dir.join(LEGACY_SANDBOX_FILE_NAME);
+        fs::write(&legacy_path, "# legacy draft\n").expect("write");
+
+        migrate_legacy_sandbox_file_name(&new_path);
+        assert!(new_path.exists(), "the first call must have migrated it");
+
+        // A legacy file reappearing after migration (e.g. a manual restore)
+        // must still be left alone, because `new_path` already exists.
+        fs::write(&legacy_path, "# a legacy file that reappeared somehow\n").expect("write");
+        migrate_legacy_sandbox_file_name(&new_path);
+
+        assert_eq!(
+            fs::read_to_string(&new_path).expect("read"),
+            "# legacy draft\n",
+            "the new path must not be touched again"
+        );
+        assert_eq!(
+            fs::read_to_string(&legacy_path).expect("read"),
+            "# a legacy file that reappeared somehow\n",
+            "a legacy file present once new_path exists must be left exactly alone"
+        );
+    }
+
+    /// A fresh install - neither the legacy nor the new file exists - is
+    /// completely unaffected: no panic, and no file created by the migration
+    /// step itself (the ordinary `seed_sandbox_file_if_missing` path is what
+    /// creates the seeded file, untouched by this change).
+    #[test]
+    fn a_fresh_install_with_neither_file_is_unaffected_by_migration() {
+        let dir = TempDir::new("target-migrate-fresh");
+        let new_path = dir.join(SANDBOX_FILE_NAME);
+
+        migrate_legacy_sandbox_file_name(&new_path);
+
+        assert!(
+            !new_path.exists(),
+            "migration itself must not create anything"
+        );
+        assert!(!dir.join(LEGACY_SANDBOX_FILE_NAME).exists());
+    }
+
+    /// An unlikely but possible manual-intervention state: `new_path` already
+    /// exists *and* a legacy file also happens to exist. Migration must not
+    /// overwrite or touch either - the legacy file (and its marker) are left
+    /// exactly alone.
+    #[test]
+    fn an_existing_new_path_leaves_a_coexisting_legacy_file_untouched() {
+        let dir = TempDir::new("target-migrate-coexist");
+        let new_path = dir.join(SANDBOX_FILE_NAME);
+        let legacy_path = dir.join(LEGACY_SANDBOX_FILE_NAME);
+        fs::write(&new_path, "# the current draft\n").expect("write");
+        fs::write(&legacy_path, "# an old file that happens to coexist\n").expect("write");
+        let legacy_marker = marker_of(&legacy_path);
+        fs::write(&legacy_marker, "# an old marker\n").expect("write");
+
+        migrate_legacy_sandbox_file_name(&new_path);
+
+        assert_eq!(
+            fs::read_to_string(&new_path).expect("read"),
+            "# the current draft\n",
+            "the new path must not be overwritten"
+        );
+        assert_eq!(
+            fs::read_to_string(&legacy_path).expect("read"),
+            "# an old file that happens to coexist\n",
+            "the legacy file must be left exactly alone"
+        );
+        assert_eq!(
+            fs::read_to_string(&legacy_marker).expect("read"),
+            "# an old marker\n"
+        );
+    }
+
+    /// A legacy marker and a legacy backup existing *without* a legacy draft
+    /// file does not panic, and both still migrate independently - the main
+    /// draft rename is skipped (there is nothing to rename), but that must
+    /// not short-circuit the marker/backup migrations.
+    #[test]
+    fn markers_and_backups_migrate_independently_of_a_missing_legacy_draft() {
+        let dir = TempDir::new("target-migrate-partial");
+        let new_path = dir.join(SANDBOX_FILE_NAME);
+        let legacy_path = dir.join(LEGACY_SANDBOX_FILE_NAME);
+        // No legacy draft file at all - only a marker and a backup survive.
+        let legacy_marker = marker_of(&legacy_path);
+        fs::write(&legacy_marker, "# an orphaned legacy marker\n").expect("write");
+        let legacy_backup = dir.join(&format!(
+            "{LEGACY_SANDBOX_FILE_NAME}.rustab-backup.0000000005.000000006"
+        ));
+        fs::write(&legacy_backup, "# an orphaned legacy backup\n").expect("write");
+
+        migrate_legacy_sandbox_file_name(&new_path);
+
+        assert!(
+            !new_path.exists(),
+            "no draft existed to migrate, so none is created"
+        );
+        assert!(!legacy_marker.exists());
+        assert_eq!(
+            fs::read_to_string(marker_of(&new_path)).expect("read"),
+            "# an orphaned legacy marker\n"
+        );
+        let new_backup = dir.join(&format!(
+            "{SANDBOX_FILE_NAME}.rustab-backup.0000000005.000000006"
+        ));
+        assert!(!legacy_backup.exists());
+        assert_eq!(
+            fs::read_to_string(&new_backup).expect("read"),
+            "# an orphaned legacy backup\n"
         );
     }
 

@@ -75,8 +75,8 @@ it is spelled out there.
    path happens to be `/etc/fstab` itself (§3.5, case 2/3). This is the only
    way to run Rustab without it writing the real `/etc/fstab`.
 2. Otherwise the target is the per-user **working draft**,
-   `$XDG_DATA_HOME/rustab/fstab.sandbox` (falling back to
-   `$HOME/.local/share/rustab/fstab.sandbox`, then to a temp-dir path).
+   `$XDG_DATA_HOME/rustab/fstab.draft` (falling back to
+   `$HOME/.local/share/rustab/fstab.draft`, then to a temp-dir path).
    `source` is `"sandbox_default"`. This is the file `list_entries` reads and
    the file the user edits between saves; a save of it writes `/etc/fstab`
    and then mirrors the saved content back into it (§3.5, case 1).
@@ -104,7 +104,7 @@ Every later resolution in the same run skips the whole check, so the user's
 own edits and saves survive the session that made them.
 
 "What Rustab last knew `/etc/fstab` to hold" is persisted in a **marker file
-beside the draft**, `fstab.sandbox.rustab-lastknown`, holding a verbatim copy
+beside the draft**, `fstab.draft.rustab-lastknown`, holding a verbatim copy
 of those bytes (a copy, not a hash: the workspace has no hashing dependency,
 and an exact copy cannot produce a false "unchanged" verdict - see
 `target.rs`'s `last_known_real_marker` for the full reasoning). The marker
@@ -1123,7 +1123,7 @@ trip byte-faithful.
 ### `TargetInfoDto`
 
 ```json
-{ "path": "/home/u/.local/share/rustab/fstab.sandbox",
+{ "path": "/home/u/.local/share/rustab/fstab.draft",
   "is_real": false,
   "source": "sandbox_default" }
 ```

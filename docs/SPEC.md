@@ -177,7 +177,7 @@ selected in place of the real file; it is no longer that.
   confirmation checkbox the real target has always required (§9) - every
   save is now the consequential kind, so that gate is no longer conditional
   on "is this the real target."
-- **The local draft file** (`$XDG_DATA_HOME/rustab/fstab.sandbox`, falling
+- **The local draft file** (`$XDG_DATA_HOME/rustab/fstab.draft`, falling
   back as before) is what the GUI actually reads and edits day to day. Its
   purpose is purely to protect in-progress, not-yet-saved work across an app
   restart or crash - it is a *session*, not an isolated test target. A

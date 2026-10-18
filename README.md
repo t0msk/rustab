@@ -88,10 +88,10 @@ Rustab's purpose is editing the real `/etc/fstab`, and by default that is exactl
 Alongside the real file, Rustab keeps a local working draft at:
 
 ```
-$XDG_DATA_HOME/rustab/fstab.sandbox
+$XDG_DATA_HOME/rustab/fstab.draft
 ```
 
-(falling back to `$HOME/.local/share/rustab/fstab.sandbox` if `$XDG_DATA_HOME` is not set).
+(falling back to `$HOME/.local/share/rustab/fstab.draft` if `$XDG_DATA_HOME` is not set).
 
 This draft is what you're actually editing day to day - its job is to protect your in-progress edits across an app restart or crash, not to isolate you from the real file. On launch, Rustab checks whether `/etc/fstab` has changed since it last knew about it; if so, the draft is refreshed from the real file (your unsaved draft edits are only ever discarded when the real file has genuinely moved out from under you - e.g. you or another tool edited it outside Rustab). If nothing changed, your draft - including anything not yet saved - is left exactly as you left it. Every successful save writes `/etc/fstab` first, then updates this draft to match, so the two never drift apart under normal use.
 

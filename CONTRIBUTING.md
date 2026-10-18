@@ -66,7 +66,7 @@ Rustab edits `/etc/fstab`, a critical system file. Preventing data corruption is
 
 Rustab's whole purpose is editing the real `/etc/fstab`, and as of T34 that
 is what it does by default: the local sandbox file
-(`$XDG_DATA_HOME/rustab/fstab.sandbox`) is now a **persistent working
+(`$XDG_DATA_HOME/rustab/fstab.draft`) is now a **persistent working
 draft/session** - something that survives a restart so you don't lose
 in-progress edits, not an isolated "nothing I do here is real" mode. Every
 save (the "Review Changes" confirm step) writes the real `/etc/fstab`
