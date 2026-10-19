@@ -254,6 +254,14 @@ well-formed XML.
 
 ### 2.2 Vendoring Cargo dependencies for offline builds
 
+**Automated since T51**: `flatpak/generate-sources.sh` runs both
+generator invocations below (plus the node one in §2.3) end-to-end -
+cloning `flatpak-builder-tools` into a local cache, setting up its own
+venv, and writing all three output files into `flatpak/`. Run it, don't
+hand-type the commands below; they're kept here as the documented
+reference for what the script actually does, not as a separate manual
+path.
+
 Flathub's build environment has **no network access** during the build
 (confirmed current, `docs.flathub.org`'s Requirements page, "No network
 access during build" - `--share=network` inside `build-args` explicitly
@@ -290,6 +298,8 @@ examples).
 
 ### 2.3 The Node/Tailwind dependency - also needs offline vendoring
 
+**Also covered by `flatpak/generate-sources.sh` (T51)** - see §2.2.
+
 `frontend/package.json`'s only dependencies are `tailwindcss` and
 `@tailwindcss/cli` (dev-only build dependencies - see its own description
 field: "Nothing here ships at runtime"; Tailwind v4 ships the standalone
@@ -307,11 +317,16 @@ mirrors exactly what both `pl.fuzjajadrowa.pulsar` and
 
 One wrinkle Tailwind v4 adds over v3 here: the v4 CLI is a native binary
 distributed through platform-specific optional dependencies
-(`@tailwindcss/oxide-*`, `lightningcss-*`). The vendored node sources must
-therefore include the packages for the build architecture, not just the
-pure-JS tree - worth checking explicitly in `flatpak-node-generator`'s
-output rather than assuming, since optional dependencies are exactly the
-kind of thing such generators skip by default.
+(`@tailwindcss/oxide-*`, `lightningcss-*`, and transitively
+`@parcel/watcher-*`). The vendored node sources must therefore include the
+packages for the build architecture, not just the pure-JS tree.
+**Verified, not just assumed (2026-10-19)**: a real run of
+`flatpak/generate-sources.sh` against this project's actual
+`frontend/package-lock.json` (66 packages read, 134 sources written)
+confirms the current `flatpak-node-generator` *does* include all of these
+by default, with no extra flag needed - re-check this the same way if a
+future generator version changes that default, rather than trusting this
+note forever.
 
 ### 2.4 The Trunk offline build problem (unresolved - read before relying on this manifest)
 
@@ -606,6 +621,58 @@ manifest itself before any of this, not just filling in placeholders.
    that new repo - not this one - is where manifest updates for Flathub
    releases happen, pointed at this repo's tagged releases via its `url`/
    `tag` source fields, per Flathub's normal maintenance model.
+
+### 5.1 How the two repos relate (no submodule needed - read this before assuming you have to duplicate anything)
+
+A natural question once `github.com/flathub/dev.tomsk.Rustab` exists: do
+you now have to copy everything from this repo's `flatpak/` directory
+into that new repo, and keep the two in sync by hand? **No** - re-reading
+the manifest's own `sources:` block (§2.1) answers this directly:
+
+```yaml
+sources:
+  - type: git
+    url: https://github.com/t0msk/rustab.git
+    tag: vX.Y.Z
+```
+
+combined with the build commands further up, which `install` straight out
+of paths like `flatpak/dev.tomsk.Rustab.desktop`, `src-tauri/icons/
+icon.png`, and `LICENSE-MIT`/`LICENSE-APACHE` - **all relative to that
+freshly-cloned source, not to any file living in the Flathub-org repo**.
+
+What this means in practice:
+
+- **`github.com/flathub/dev.tomsk.Rustab` only ever needs to contain the
+  manifest itself** (`dev.tomsk.Rustab.yml`, renamed to the Flathub-
+  expected filename) plus the three generated vendoring files
+  (`cargo-sources.json`, `frontend-cargo-sources.json`, `node-sources.json`
+  - §2.2-2.3). Nothing else.
+- **The desktop entry, the AppStream metainfo, the icon, and the license
+  files never leave this repo.** Every Flathub build re-clones this
+  repo's tag fresh and installs those files straight from it. There is
+  nothing to copy, and nothing to keep in sync by hand for those files -
+  a change to `flatpak/dev.tomsk.Rustab.desktop` here is automatically
+  what the *next* Flathub build picks up, with zero duplication.
+- **No git submodule, subtree, or CI-sync action is needed** to achieve
+  this - the `sources: type: git` directive already *is* the link between
+  the two repos. A submodule would be solving a problem that doesn't
+  exist here; Flathub's own build infrastructure doesn't know or care
+  about this repo's structure beyond what that one `sources:` entry
+  names.
+- **The one thing that is *not* automatic: the `tag:` field is pinned.**
+  Pushing a change to this repo - even to `flatpak/dev.tomsk.Rustab.desktop`
+  itself - does not retrigger a Flathub build by itself. Flathub only
+  rebuilds when something changes in *its own* repo
+  (`github.com/flathub/dev.tomsk.Rustab`), which for a routine update
+  means: cut a new tagged release here as usual
+  (`release-publish.yml`), then edit exactly one line - the `tag:` value -
+  in that repo's copy of the manifest, commit/PR it there (Flathub's own
+  review process applies to that repo too, though routine version bumps
+  are typically fast), and *that* triggers the rebuild. Regenerating the
+  three vendoring files (§2.2-2.3) is also needed whenever a release
+  changes any dependency, not just a version bump with no `Cargo.lock`/
+  `package-lock.json` changes.
 
 ---
 
