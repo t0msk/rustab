@@ -200,11 +200,16 @@ impl CandidateDocument {
     ///
     /// An ordinary `#` comment written above an entry is the common fstab
     /// convention for describing that entry, so it must travel with the
-    /// entry when it moves; T40 wrongly left every comment behind. (A
-    /// `# //` description comment and a same-line trailing comment are
-    /// absorbed into their entry's own fields at parse time and are never
-    /// standalone `LineDto::Comment` values, so they are not involved here
-    /// at all.)
+    /// entry when it moves; T40 wrongly left every comment behind. (As of
+    /// T43, the backend parser itself absorbs any ordinary comment block
+    /// sitting directly above an `Entry` line into that entry's own
+    /// `description` field - and a same-line trailing comment is absorbed
+    /// into `trailing_comment` the same way - so neither ever reaches the
+    /// frontend as a standalone `LineDto::Comment` to begin with, and
+    /// neither is involved here at all. This walk only ever sees comment
+    /// blocks the backend did *not* absorb: ones above a `Malformed` line
+    /// (the backend's rule is scoped to `Entry` lines only) or a block at
+    /// true end-of-file with nothing below it.)
     ///
     /// The backward walk, exactly as §13.4 specifies it:
     ///
@@ -792,13 +797,13 @@ mod tests {
     }
 
     #[test]
-    fn a_description_marker_comment_is_never_part_of_an_attached_block() {
-        // §13.10 case 6 - a `# // <text>` line is absorbed into its entry's
-        // `description` by the backend parser
-        // (`fstab-core::parser::absorb_description_comments`) and never
-        // reaches the frontend as a `LineDto::Comment`, so it cannot enter
-        // the attachment walk at all. It travels with its entry via the
-        // `description` field, exactly as it did before T40.
+    fn an_absorbed_description_comment_is_never_part_of_an_attached_block() {
+        // §13.10 case 6 - an ordinary `#` comment block directly above an
+        // entry is absorbed into that entry's `description` by the backend
+        // parser (`fstab-core::parser::absorb_description_comments`, T43)
+        // and never reaches the frontend as a `LineDto::Comment`, so it
+        // cannot enter the attachment walk at all. It travels with its
+        // entry via the `description` field, exactly as it did before T40.
         let mut described = entry("/a");
         described.description = Some("Root filesystem".to_string());
         let original = document(vec![LineDto::Entry { entry: described }, entry_line("/b")]);
@@ -809,7 +814,7 @@ mod tests {
                 .lines
                 .iter()
                 .any(|cl| matches!(cl.line, LineDto::Comment { .. })),
-            "a `# //` line is not a standalone comment line in the frontend"
+            "an absorbed description comment is not a standalone comment line in the frontend"
         );
         assert_eq!(candidate_before.attached_block_len(0), 0);
         assert_eq!(candidate_before.attached_block_len(1), 0);
@@ -822,6 +827,33 @@ mod tests {
             panic!("the described entry is still an entry");
         };
         assert_eq!(moved.description.as_deref(), Some("Root filesystem"));
+    }
+
+    #[test]
+    fn a_comment_block_above_a_malformed_row_is_still_attached() {
+        // T43 scoped the backend's comment-absorption rule to `Entry` lines
+        // only, so a comment block sitting directly above a `Malformed` row
+        // is never absorbed and still reaches the frontend as standalone
+        // `LineDto::Comment` values - this walk remains the only mechanism
+        // that attaches it to its row.
+        let original = document(vec![
+            entry_line("/a"),
+            comment("can't parse this one"),
+            LineDto::Malformed {
+                raw: "garbage line".to_string(),
+            },
+        ]);
+        let mut candidate = CandidateDocument::from_document(&original);
+
+        assert_eq!(candidate.attached_block_len(2), 1);
+
+        let _ = candidate.stage_move(2, 0).expect("a real move");
+
+        assert_eq!(
+            mount_points(&candidate),
+            vec!["# can't parse this one", "garbage line", "/a"],
+            "the comment must travel with the malformed row, not stay behind"
+        );
     }
 
     /// The §13.10 case 7/8 scenario, built once so both tests provably use

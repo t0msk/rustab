@@ -334,20 +334,25 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
 6. **Dump** and **Pass** - two small numeric inputs side by side (`w-16` each), default
    `0`, helper text under each: `"0 = don't dump"` / `"0 = skip fsck, 1 = root
    filesystem, 2 = checked after root"`.
-7. **DescriptionField** - a fixed-size two-row `<textarea>` (`rows="2"`, not user-
-   resizable), labeled `"Description (optional)"`, giving more visible room than a
-   single-line input for a longer note while the field is edited. The underlying value
-   is still always a single line with no embedded newline (enforced both client-side,
-   by stripping any `\n`/`\r` on input, and authoritatively by the backend's
-   `description_contains_newline` validation check) - the two visible rows are purely a
-   larger editing target, not multi-line storage. Placed last in the field list, directly
+7. **DescriptionField** - a three-row `<textarea>` (`rows="3"`), labeled `"Description
+   (optional)"`. The value is genuinely multi-line (T43): embedded `\n` is a normal,
+   expected shape, not something this field guards against, so there is no client-side
+   stripping and no backend newline-rejection check (both existed pre-T43 and are gone).
+   The textarea is vertically resizable - a user drags its bottom-right corner to grow
+   it for a longer multi-line note - rather than auto-growing via JS/WASM measurement;
+   this matches the project's existing (if incidental) textarea behavior elsewhere (the
+   drawer's raw-line-edit `<textarea>` for `UnparsedEntryRow`'s Edit action, §3, never
+   opts out of Tailwind Preflight's default `resize: vertical` either), so it introduces
+   no new interaction pattern, just makes an existing one deliberate here too. Placed
+   last in the field list, directly
    above `ValidationSummary`, so it sits apart
    from the six functional fstab fields above it rather than between them (a deliberate
    repositioning - it was originally grouped right below Mount point, moved here per
-   direct user request). The value is round-tripped to/from a `# // <text>` comment line
-   placed immediately above the entry in the real fstab file - see `docs/API_CONTRACT.md`
-   §5 for the full round-trip detail. Helper text below the input: `"Shown as a
-   '# // ...' comment line directly above this entry in the fstab file."`
+   direct user request). The value is round-tripped to/from one or more ordinary `#`
+   comment lines placed immediately above the entry in the real fstab file - see
+   `docs/API_CONTRACT.md` §5 for the full round-trip detail. Helper text below the
+   input: `"Shown as one or more ordinary '#' comment lines directly above this entry in
+   the fstab file. Drag the bottom-right corner to resize."`
 
 **FormActionBar** (bottom of drawer, sticky): `Cancel` (secondary, `bg-slate-100
 dark:bg-slate-700`), `Verify` (secondary/outline, `bg-white dark:bg-slate-800 border
@@ -1007,7 +1012,11 @@ hard safety gate (§13.7).
 amended - see `PROJECT_PLAN.md`'s T41 section for the full history) and found §13.4's
 original rule - stated unconditionally - wrong in a specific, common case: an ordinary
 `#` comment written directly above an entry (the everyday fstab convention of
-describing the entry below it, distinct from this app's own `# //` description marker)
+describing the entry below it - at the time, distinct from this app's own `# //`
+description marker; as of T43 the backend absorbs *any* such comment block directly
+above an `Entry` line into that entry's own `description` field at parse time, so it is
+never a standalone comment line to begin with and this walk never sees it - see §13.10
+case 6 and `candidate.rs`'s `attached_block_len` doc comment)
 was left behind by a move, ending up describing the wrong entry afterward. §13.4, §13.5
 and §13.8 below are rewritten to fix this - a comment block that is actually *attached*
 to a moving entry, by the precise rule §13.4 now defines, now moves with it; truly
@@ -1150,14 +1159,17 @@ describes nothing in particular. T40 left both kinds behind a moved entry equall
 subsection draws the distinction T40 was missing and fixes the first kind, without
 touching T40's correct handling of the second.
 
-**Unchanged from T40 - established fact, not re-derived**: a `# // <text>` description
-comment and a same-line trailing comment are both baked into their entry's own
-`description`/`trailing_comment` fields at parse time (`parser.rs`'s
+**Unchanged from T40, generalized by T43**: any ordinary `#` comment block sitting
+directly above an `Entry` line, and a same-line trailing comment, are both baked into
+that entry's own `description`/`trailing_comment` fields at parse time (`parser.rs`'s
 `absorb_description_comments`/`split_trailing_comment`) - never standalone
-`LineDto::Comment` values, so they always travel with their entry automatically.
-Nothing below concerns them. Everything below is about *other* full-line `Comment`
-lines - the ones the parser leaves as their own standalone `LineDto::Comment` values in
-`CandidateDocument.lines` - and `Blank` lines.
+`LineDto::Comment` values, so they always travel with their entry automatically. (T43
+retired the old `# //`-marker requirement: it is no longer *only* a specially-marked
+comment that gets absorbed this way, it is any ordinary comment block directly above an
+`Entry`.) Nothing below concerns them. Everything below is about comment blocks the
+backend's rule does *not* reach - directly above a `Malformed` line, or at true
+end-of-file - which the parser leaves as their own standalone `LineDto::Comment` values
+in `CandidateDocument.lines` - and `Blank` lines.
 
 **The attached-comment-block walk.** For any row-kind (`Entry`/`Malformed`) candidate
 line `E`, its **attached comment block** is the (possibly empty) run of comment lines
@@ -1455,12 +1467,14 @@ document's convention.
 5. A comment block at true end-of-file, with no entry below it at all, has no owning
    entry (freestanding) and stays pinned in place regardless of any move elsewhere in
    the document.
-6. The existing `# //` description-marker behavior (parse-time absorption into
-   `EntryDto.description`, pre-T40, pre-this-fix) is unchanged - a `# //` line never
-   becomes a standalone `LineDto::Comment` at all, so it never enters this new logic's
-   attached-block computation in the first place; a regression test confirms a document
-   containing one round-trips and moves (via its entry's `description` field, not a
-   `LineDto::Comment`) exactly as before.
+6. The existing description-absorption behavior (parse-time absorption of any ordinary
+   comment block directly above an `Entry` into `EntryDto.description`, pre-T40,
+   generalized by T43 from the original `# //`-marker-only scheme) is unchanged from
+   this walk's point of view - an absorbed description comment never becomes a
+   standalone `LineDto::Comment` at all, so it never enters this logic's attached-block
+   computation in the first place; a regression test confirms a document containing one
+   round-trips and moves (via its entry's `description` field, not a `LineDto::Comment`)
+   exactly as before.
 
 **Move-span and index-shift (§13.4 steps 1-3, §13.8):**
 
