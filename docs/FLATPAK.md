@@ -254,6 +254,14 @@ well-formed XML.
 
 ### 2.2 Vendoring Cargo dependencies for offline builds
 
+**Automated since T51**: `flatpak/generate-sources.sh` runs both
+generator invocations below (plus the node one in §2.3) end-to-end -
+cloning `flatpak-builder-tools` into a local cache, setting up its own
+venv, and writing all three output files into `flatpak/`. Run it, don't
+hand-type the commands below; they're kept here as the documented
+reference for what the script actually does, not as a separate manual
+path.
+
 Flathub's build environment has **no network access** during the build
 (confirmed current, `docs.flathub.org`'s Requirements page, "No network
 access during build" - `--share=network` inside `build-args` explicitly
@@ -290,6 +298,8 @@ examples).
 
 ### 2.3 The Node/Tailwind dependency - also needs offline vendoring
 
+**Also covered by `flatpak/generate-sources.sh` (T51)** - see §2.2.
+
 `frontend/package.json`'s only dependencies are `tailwindcss` and
 `@tailwindcss/cli` (dev-only build dependencies - see its own description
 field: "Nothing here ships at runtime"; Tailwind v4 ships the standalone
@@ -307,11 +317,16 @@ mirrors exactly what both `pl.fuzjajadrowa.pulsar` and
 
 One wrinkle Tailwind v4 adds over v3 here: the v4 CLI is a native binary
 distributed through platform-specific optional dependencies
-(`@tailwindcss/oxide-*`, `lightningcss-*`). The vendored node sources must
-therefore include the packages for the build architecture, not just the
-pure-JS tree - worth checking explicitly in `flatpak-node-generator`'s
-output rather than assuming, since optional dependencies are exactly the
-kind of thing such generators skip by default.
+(`@tailwindcss/oxide-*`, `lightningcss-*`, and transitively
+`@parcel/watcher-*`). The vendored node sources must therefore include the
+packages for the build architecture, not just the pure-JS tree.
+**Verified, not just assumed (2026-10-19)**: a real run of
+`flatpak/generate-sources.sh` against this project's actual
+`frontend/package-lock.json` (66 packages read, 134 sources written)
+confirms the current `flatpak-node-generator` *does* include all of these
+by default, with no extra flag needed - re-check this the same way if a
+future generator version changes that default, rather than trusting this
+note forever.
 
 ### 2.4 The Trunk offline build problem (unresolved - read before relying on this manifest)
 
