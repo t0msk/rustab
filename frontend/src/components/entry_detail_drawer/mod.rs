@@ -30,6 +30,7 @@ mod fs_type_field;
 mod mount_point_field;
 mod options_tag_input;
 mod source_type_select;
+mod trailing_comment_field;
 mod validation_message;
 mod validation_summary;
 
@@ -47,6 +48,7 @@ use fs_type_field::FsTypeField;
 use mount_point_field::MountPointField;
 use options_tag_input::OptionsTagInput;
 use source_type_select::SourceTypeSelect;
+use trailing_comment_field::TrailingCommentField;
 use validation_message::{Severity, ValidationMessage};
 
 use crate::api;
@@ -196,8 +198,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
     });
     let dump = use_state(|| editing_entry.as_ref().map(|e| e.dump).unwrap_or(0));
     let pass = use_state(|| editing_entry.as_ref().map(|e| e.pass).unwrap_or(0));
-    // Preserved losslessly but not user-editable in this form (no field
-    // for it in `docs/UI_DESIGN.md` §4) - carried through unchanged.
+    // Editable via `TrailingCommentField`, below.
     let trailing_comment = use_state(|| {
         editing_entry
             .as_ref()
@@ -271,6 +272,7 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 *pass,
                 other_lines.clone(),
                 (*description).clone(),
+                (*trailing_comment).clone(),
             ),
             move |_| {
                 if !is_raw_mode {
@@ -671,6 +673,16 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                                     Callback::from(move |value: String| description.set(Some(value)))
                                 }}
                             />
+
+                            <TrailingCommentField
+                                value={AttrValue::from(
+                                    trailing_comment.as_deref().unwrap_or_default().to_string()
+                                )}
+                                on_change={{
+                                    let trailing_comment = trailing_comment.clone();
+                                    Callback::from(move |value: String| trailing_comment.set(Some(value)))
+                                }}
+                            />
                         </div>
                     }
 
@@ -714,7 +726,7 @@ fn build_entry(
         options: chips_to_options(chips),
         dump,
         pass,
-        trailing_comment: (**trailing_comment).clone(),
+        trailing_comment: normalize_trailing_comment(trailing_comment.as_deref()),
         // Mirrors the backend's own IPC-boundary normalization exactly, so
         // a save -> reload round trip is WYSIWYG (API_CONTRACT.md §5).
         description: description
@@ -723,6 +735,21 @@ fn build_entry(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     }
+}
+
+/// `trailing_comment`'s one piece of non-pass-through logic in
+/// `build_entry`: normalize a fully-empty string to `None` ("no trailing
+/// comment" at all, removing the `#` from the written line) rather than a
+/// bare trailing `#` with nothing after it. Deliberately **no** other
+/// trimming - unlike `description`, any non-empty value (including one
+/// that is only whitespace) is preserved exactly as typed, since
+/// `trailing_comment`'s whole contract is verbatim preservation
+/// (`docs/API_CONTRACT.md` §5). Factored out of `build_entry` purely so it
+/// is unit-testable without a `UseStateHandle`, same reasoning
+/// `draft_insertion_index` was factored out of `document_with_draft` for
+/// above.
+fn normalize_trailing_comment(value: Option<&str>) -> Option<String> {
+    value.filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 fn render_source_value_field(
@@ -932,5 +959,41 @@ mod tests {
     #[test]
     fn draft_insertion_index_clamps_an_out_of_range_editing_index() {
         assert_eq!(draft_insertion_index(3, Some(999)), 3);
+    }
+
+    /// The round-trip this task exists for: a leading space is part of the
+    /// value, not incidental whitespace to clean up - `trailing_comment`'s
+    /// whole contract (unlike `description`'s) is verbatim preservation
+    /// (`docs/API_CONTRACT.md` §5), so `build_entry`'s logic (exercised
+    /// here via `normalize_trailing_comment`) must not trim it.
+    #[test]
+    fn trailing_comment_with_leading_space_is_preserved_through_build_entry() {
+        assert_eq!(
+            normalize_trailing_comment(Some(" a note")),
+            Some(" a note".to_string())
+        );
+    }
+
+    /// The one place `trailing_comment`'s frontend logic isn't a pure
+    /// pass-through: clearing the input box to nothing means "no trailing
+    /// comment at all" (`None`), not a bare trailing `#`.
+    #[test]
+    fn empty_trailing_comment_normalizes_to_none_through_build_entry() {
+        assert_eq!(normalize_trailing_comment(Some("")), None);
+    }
+
+    #[test]
+    fn absent_trailing_comment_stays_none_through_build_entry() {
+        assert_eq!(normalize_trailing_comment(None), None);
+    }
+
+    /// Whitespace-only is non-empty - it must be preserved exactly, not
+    /// treated the same as a genuinely empty string.
+    #[test]
+    fn whitespace_only_trailing_comment_is_preserved_not_normalized_away() {
+        assert_eq!(
+            normalize_trailing_comment(Some("   ")),
+            Some("   ".to_string())
+        );
     }
 }

@@ -353,6 +353,24 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
    `docs/API_CONTRACT.md` §5 for the full round-trip detail. Helper text below the
    input: `"Shown as one or more ordinary '#' comment lines directly above this entry in
    the fstab file. Drag the bottom-right corner to resize."`
+8. **TrailingCommentField** - a single-line `<input type="text">`, labeled
+   `"Trailing comment (optional)"`. Placed directly below Description (item
+   7 above) - grouped with it, not between the six functional fstab fields,
+   since both are optional per-entry metadata rather than one of those six
+   fields. Unlike Description, the value is appended *inline*, on the same
+   physical line as the entry's own six fields, after a `#` - not as a
+   separate comment line above it. It must stay single line: an embedded
+   newline would split one physical fstab line into two, corrupting the
+   file - the second half would then be misparsed as a `Malformed` line or
+   a bogus new entry of its own - so, unlike Description (T43 made that
+   field genuinely multi-line), this input strips any `\n`/`\r` a paste
+   might carry as a client-side defense-in-depth guard, backed by the
+   authoritative `trailing_comment_contains_newline` server-side check. See
+   `docs/API_CONTRACT.md` §5 for the full DTO-level round-trip detail,
+   including this field's verbatim (non-trimming) preservation contract and
+   its newline validation. Helper text below the input: `"Appended inline
+   after this entry's own fields, on the same line, after a '#'. Must be a
+   single line - newlines are not allowed here."`
 
 **FormActionBar** (bottom of drawer, sticky): `Cancel` (secondary, `bg-slate-100
 dark:bg-slate-700`), `Verify` (secondary/outline, `bg-white dark:bg-slate-800 border
