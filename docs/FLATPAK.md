@@ -124,22 +124,21 @@ substitute for this document), see
   submitting, against the `Cargo.lock`/`package-lock.json` that is actually
   being shipped. Fabricating a stand-in here would be actively misleading.
 
-### 1.3 Rustab's Tauri identifier does not match the Flatpak app ID - flagged, not fixed
+### 1.3 Rustab's Tauri identifier now matches the Flatpak app ID (resolved, T44)
 
-`src-tauri/tauri.conf.json`'s `"identifier"` field is currently
-`com.rustab.app`. The Flatpak app ID used throughout this guide and in
-`flatpak/` is `dev.tomsk.Rustab` (established by the previous version of
-this doc, derived from the project's `opensource@tomsk.dev` contact domain).
-**These two identifiers do not match each other.** A Flatpak app ID does
-not strictly have to equal Tauri's own `identifier` field (they serve
-different ecosystems), but having them diverge is still worth a deliberate
-decision rather than an accident. This revision did not change
-`tauri.conf.json` - that file is outside this task's scope (no
-`src-tauri/` changes) - but the maintainer should decide, before
-submitting, whether to reconcile them (e.g. update `tauri.conf.json`'s
-`identifier` to `dev.tomsk.Rustab` for consistency) or leave them
-deliberately distinct, and should not be surprised to see both IDs in the
-wild if left as-is.
+`src-tauri/tauri.conf.json`'s `"identifier"` field was `com.rustab.app`
+while the Flatpak app ID used throughout this guide and in `flatpak/` was
+(and still is) `dev.tomsk.Rustab`. This was flagged by a previous revision
+of this doc as a deliberate decision the maintainer still needed to make.
+The maintainer decided (directly, in conversation) to unify on
+`dev.tomsk.Rustab` project-wide - the domain-based ID the Flatpak/Flathub
+scaffolding already used - rather than the arbitrary `com.rustab.app`.
+T44 updated `tauri.conf.json`'s `identifier` to `dev.tomsk.Rustab`
+accordingly; the two no longer diverge. (Verified at the time of that
+change that nothing in the Rust backend derives the working-draft/backup
+storage path from this identifier - it's a hardcoded literal `"rustab"`
+under `$XDG_DATA_HOME`, see `src-tauri/src/target.rs` - so this rename
+carries no data-migration risk for existing installs.)
 
 ### 1.4 Flathub's Generative AI policy - read this before submitting anything
 
