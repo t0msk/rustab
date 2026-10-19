@@ -459,13 +459,16 @@ before committing a save")
 **Flow placement**: staging an add/edit/delete (via EntryDetailDrawer or
 DeleteConfirmDialog, §4) only updates an in-memory candidate document and makes the
 **PendingChangesBar** appear - a slim bar pinned just below HeaderBar, `bg-amber-50
-dark:bg-amber-900/20 border-b border-amber-300 dark:border-amber-800`, text `"N entries
-changed"` + two buttons, right-aligned: a secondary **`Discard changes`** (outlined,
-amber-toned, matching the bar's own palette) and the primary `Review & Save…`. This bar
-is the only way to reach the diff/write step; there is no other Save action that skips
-it.
+dark:bg-amber-900/20 border-b border-amber-300 dark:border-amber-800`. Deliberately
+**not** a single right-aligned button cluster: text `"N entries changed"` and a
+secondary **`Discard changes`** (outlined, amber-toned, matching the bar's own
+palette) are grouped together on the **left**, with the primary `Review & Save…`
+alone on the **right** - the two are kept apart on purpose, so a reach for the
+primary action can never land on the destructive one by accident. This bar is the
+only way to reach the diff/write step; there is no other Save action that skips it.
 
-**`Discard changes`** (added after T53, direct repo-owner request) opens
+**`Discard changes`** (added after T53, direct repo-owner request, repositioned on
+the owner's own follow-up UX call) opens
 **DiscardChangesConfirmDialog** - same shape and judgment call as DeleteConfirmDialog
 (§4): dismissible by clicking the backdrop, since like that dialog it only resets
 in-memory state, never touches disk. On confirm, `AppShell` rebuilds `candidate` from
