@@ -9,6 +9,7 @@ pub mod backup_panel;
 pub mod backup_restore_confirm_dialog;
 pub mod delete_confirm_dialog;
 pub mod diff_view;
+pub mod discard_changes_confirm_dialog;
 pub mod empty_state;
 pub mod entries_table;
 pub mod entry_detail_drawer;

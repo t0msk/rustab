@@ -35,6 +35,7 @@ use crate::components::backup_panel::{format_timestamps, BackupPanel};
 use crate::components::backup_restore_confirm_dialog::BackupRestoreConfirmDialog;
 use crate::components::delete_confirm_dialog::DeleteConfirmDialog;
 use crate::components::diff_view::DiffView;
+use crate::components::discard_changes_confirm_dialog::DiscardChangesConfirmDialog;
 use crate::components::entries_table::{source_badge, EntriesTable, RowEntry};
 use crate::components::entry_detail_drawer::{DrawerMode, DrawerSaveResult, EntryDetailDrawer};
 use crate::components::external_change_dialog::ExternalChangeDialog;
@@ -274,6 +275,10 @@ pub fn app_shell() -> Html {
     // the drawer is in Add mode, appending rather than replacing).
     let editing_index: UseStateHandle<Option<usize>> = use_state(|| None);
     let delete_target: UseStateHandle<Option<usize>> = use_state(|| None);
+    // Discard-all-pending-changes flow: a bare confirm/cancel gate, no
+    // per-row target to track - there is only ever one thing to discard,
+    // the whole candidate.
+    let discard_confirm_open = use_state(|| false);
     let restore_target: UseStateHandle<Option<usize>> = use_state(|| None);
     let diff_view_open = use_state(|| false);
     let diff_confirm_checked = use_state(|| false);
@@ -555,6 +560,32 @@ pub fn app_shell() -> Html {
         Callback::from(move |()| {
             diff_error.set(None);
             diff_view_open.set(true);
+        })
+    };
+
+    let on_discard_changes = {
+        let discard_confirm_open = discard_confirm_open.clone();
+        Callback::from(move |()| discard_confirm_open.set(true))
+    };
+    let on_discard_cancel = {
+        let discard_confirm_open = discard_confirm_open.clone();
+        Callback::from(move |()| discard_confirm_open.set(false))
+    };
+    let on_discard_confirm = {
+        let discard_confirm_open = discard_confirm_open.clone();
+        let candidate = candidate.clone();
+        let original_document = original_document.clone();
+        Callback::from(move |()| {
+            // Mirrors `reload_entries`' own construction - a fresh
+            // candidate with zero pending changes against the current
+            // baseline - but synchronously and without a round trip
+            // through `list_entries`, since `original_document` is
+            // already held in frontend state. Nothing on disk is read or
+            // written either way.
+            if let Some(doc) = original_document.as_ref() {
+                candidate.set(CandidateDocument::from_document(doc));
+            }
+            discard_confirm_open.set(false);
         })
     };
     let on_diff_cancel = {
@@ -1398,7 +1429,14 @@ pub fn app_shell() -> Html {
                 on_about_click={on_about_click.clone()}
                 on_raw_view_click={on_raw_view_click.clone()}
             />
-            <PendingChangesBar count={pending_count} on_review={on_review} />
+            <PendingChangesBar count={pending_count} on_review={on_review} on_discard={on_discard_changes} />
+            if *discard_confirm_open {
+                <DiscardChangesConfirmDialog
+                    pending_count={pending_count}
+                    on_cancel={on_discard_cancel}
+                    on_confirm={on_discard_confirm}
+                />
+            }
 
             <main class="flex-1 overflow-y-auto px-6 py-6">
                 if *active_tab == Tab::Entries {

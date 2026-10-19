@@ -460,8 +460,21 @@ before committing a save")
 DeleteConfirmDialog, §4) only updates an in-memory candidate document and makes the
 **PendingChangesBar** appear - a slim bar pinned just below HeaderBar, `bg-amber-50
 dark:bg-amber-900/20 border-b border-amber-300 dark:border-amber-800`, text `"N entries
-changed"` + a primary button `Review & Save…`. This bar is the only way to reach the
-diff/write step; there is no other Save action that skips it.
+changed"` + two buttons, right-aligned: a secondary **`Discard changes`** (outlined,
+amber-toned, matching the bar's own palette) and the primary `Review & Save…`. This bar
+is the only way to reach the diff/write step; there is no other Save action that skips
+it.
+
+**`Discard changes`** (added after T53, direct repo-owner request) opens
+**DiscardChangesConfirmDialog** - same shape and judgment call as DeleteConfirmDialog
+(§4): dismissible by clicking the backdrop, since like that dialog it only resets
+in-memory state, never touches disk. On confirm, `AppShell` rebuilds `candidate` from
+scratch via `CandidateDocument::from_document(&original_document)` - the exact same
+construction `reload_entries` already uses, just synchronous and without the
+`list_entries` round trip, since `original_document` is already held in frontend state.
+Every staged add/edit/delete/reorder is discarded at once; the baseline itself
+(`original_document`/`original_text`) is untouched, so this can never discard something
+already on disk - only unsaved, in-memory work.
 
 Clicking `Review & Save…` opens **DiffView**: a centered modal (`max-w-4xl`, up to
 ~85vh tall with internal scroll), `bg-white dark:bg-slate-800 shadow-lg rounded-lg`,
@@ -822,7 +835,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
 3. `HeaderBar` - app title, `Entries`/`Backups` tab nav, contextual action button
    (`Add Entry` on the `Entries` tab, `Create backup` + `Open backup location` on the
    `Backups` tab, T26), plus an always-visible `About` trigger (both tabs, T26)
-4. `PendingChangesBar` - "N entries changed" + `Review & Save…` trigger (§6)
+4. `PendingChangesBar` - "N entries changed" + `Discard changes`/`Review & Save…`
+   triggers (§6)
 5. `EntriesTable` - main entry list (§3)
 6. `EntryRow` - one parsed entry's row (§3); click-to-expand reveals every field,
    untruncated, including the description, in an inline detail panel (no separate
@@ -880,6 +894,8 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
     raw text, no diff (§11)
 35. `ExternalChangeDialog` - external-change/drift warning modal shown after a
     `save`/`restore_backup` rejection (§12, T36)
+36. `DiscardChangesConfirmDialog` - confirms resetting `candidate` to match the
+    current baseline, discarding every staged change at once (§6)
 
 ---
 
