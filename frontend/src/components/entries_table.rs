@@ -671,8 +671,14 @@ fn set_body_user_select_none(disabled: bool) {
     let style = body.style();
     if disabled {
         let _ = style.set_property("user-select", "none");
+        // This app's only real target, WebKitGTK, did not reliably honour
+        // the unprefixed property alone (confirmed live: text selection
+        // still occurred during a drag with only "user-select" set) - the
+        // vendor-prefixed form is load-bearing here, not legacy padding.
+        let _ = style.set_property("-webkit-user-select", "none");
     } else {
         let _ = style.remove_property("user-select");
+        let _ = style.remove_property("-webkit-user-select");
     }
 }
 
@@ -771,6 +777,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                     let style = body.style();
                     let _ = style.set_property("cursor", "grabbing");
                     let _ = style.set_property("user-select", "none");
+                    let _ = style.set_property("-webkit-user-select", "none");
                 }
             }
             move || {
@@ -778,6 +785,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                     let style = body.style();
                     let _ = style.remove_property("cursor");
                     let _ = style.remove_property("user-select");
+                    let _ = style.remove_property("-webkit-user-select");
                 }
             }
         });
