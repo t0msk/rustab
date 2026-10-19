@@ -74,6 +74,26 @@ mount manager):
 - Finish and submit the Flathub packaging (see `docs/FLATPAK.md` - in progress).
 - Additional UI languages beyond English.
 
+**Bigger undertakings (real scope, not a quick win - flagged so nobody mistakes
+these for an afternoon's work):**
+- **True 3-way merge for "Reload and re-sync."** Today, resyncing during a save
+  only moves the comparison baseline forward and leaves pending edits completely
+  untouched (by design, see `PROJECT_PLAN.md` T37) - so any field you didn't
+  personally edit in that session still gets overwritten by your own save,
+  silently discarding whatever changed in the real file in the meantime. A real
+  fix needs genuine three-way diffing (old baseline vs. the fresh external file,
+  old baseline vs. your pending candidate), a reliable way to match entries
+  across two documents that aren't guaranteed to have the same order or count
+  (fstab entries have no stable ID today - matching would have to fall back to
+  a heuristic like source+mount point, which itself needs a documented
+  tie-breaking rule for duplicates), a new conflict-resolution UI for the case
+  where the same field changed on both sides (something this app has never
+  needed before), and new backend/DTO plumbing to carry per-field conflict
+  state across the IPC boundary. Realistically comparable in size to this
+  project's largest single features to date, not a drop-in change.
+- **Drag-and-drop entry reordering** (replacing/supplementing the Move
+  up/down buttons) with a real, animated drag interaction.
+
 Have an idea not listed here, or want to weigh in on priority? Open an issue - see
 [Contact & Support](#contact--support).
 
