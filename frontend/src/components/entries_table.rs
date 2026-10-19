@@ -257,9 +257,9 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                         <th class="px-4 py-2">{ "Mount point" }</th>
                         <th class="px-4 py-2">{ "FS type" }</th>
                         <th class="px-4 py-2">{ "Options" }</th>
-                        <th class="px-4 py-2">{ "Dump" }</th>
-                        <th class="px-4 py-2">{ "Pass" }</th>
-                        <th class="px-4 py-2 text-right">{ "Actions" }</th>
+                        <th class="px-2 py-2">{ "Dump" }</th>
+                        <th class="px-2 py-2">{ "Pass" }</th>
+                        <th class="px-2 py-2 text-center">{ "Actions" }</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -551,39 +551,41 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                         <span class="text-xs text-slate-500 dark:text-slate-400">{ format!("+{overflow} more") }</span>
                     }
                 </td>
-                <td class="px-4 py-2 text-sm">{ entry.dump.to_string() }</td>
-                <td class="px-4 py-2 text-sm">{ entry.pass.to_string() }</td>
-                <td class="px-4 py-2 text-right whitespace-nowrap">
-                    { move_button(
-                        &props.on_move_up,
-                        "Move entry up",
-                        "Already the first entry",
-                        "hover:bg-slate-100 dark:hover:bg-slate-700",
-                        html! { <ChevronUpIcon /> },
-                    ) }
-                    { move_button(
-                        &props.on_move_down,
-                        "Move entry down",
-                        "Already the last entry",
-                        "hover:bg-slate-100 dark:hover:bg-slate-700",
-                        html! { <ChevronDownIcon /> },
-                    ) }
-                    <button
-                        type="button"
-                        aria-label="Edit entry"
-                        class="ml-2 p-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500"
-                        onclick={props.on_edit.clone()}
-                    >
-                        <EditIcon />
-                    </button>
-                    <button
-                        type="button"
-                        aria-label="Delete entry"
-                        class="p-2 rounded-md text-slate-600 dark:text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 focus-visible:ring-2 focus-visible:ring-sky-500"
-                        onclick={props.on_delete.clone()}
-                    >
-                        <DeleteIcon />
-                    </button>
+                <td class="px-2 py-2 text-sm">{ entry.dump.to_string() }</td>
+                <td class="px-2 py-2 text-sm">{ entry.pass.to_string() }</td>
+                <td class="px-2 py-2 text-center whitespace-nowrap">
+                    <div class="inline-flex items-center gap-1">
+                        { move_button(
+                            &props.on_move_up,
+                            "Move entry up",
+                            "Already the first entry",
+                            "hover:bg-slate-100 dark:hover:bg-slate-700",
+                            html! { <ChevronUpIcon /> },
+                        ) }
+                        { move_button(
+                            &props.on_move_down,
+                            "Move entry down",
+                            "Already the last entry",
+                            "hover:bg-slate-100 dark:hover:bg-slate-700",
+                            html! { <ChevronDownIcon /> },
+                        ) }
+                        <button
+                            type="button"
+                            aria-label="Edit entry"
+                            class="p-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-sky-500"
+                            onclick={props.on_edit.clone()}
+                        >
+                            <EditIcon />
+                        </button>
+                        <button
+                            type="button"
+                            aria-label="Delete entry"
+                            class="p-2 rounded-md text-slate-600 dark:text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 focus-visible:ring-2 focus-visible:ring-sky-500"
+                            onclick={props.on_delete.clone()}
+                        >
+                            <DeleteIcon />
+                        </button>
+                    </div>
                 </td>
             </tr>
             if props.expanded {
@@ -745,7 +747,7 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
                         <button
                             type="button"
                             aria-label="Edit raw entry"
-                            class="ml-2 p-2 rounded-md hover:bg-amber-100 dark:hover:bg-amber-900/40 focus-visible:ring-2 focus-visible:ring-sky-500"
+                            class="p-2 rounded-md hover:bg-amber-100 dark:hover:bg-amber-900/40 focus-visible:ring-2 focus-visible:ring-sky-500"
                             onclick={props.on_edit.clone()}
                         >
                             <EditIcon />

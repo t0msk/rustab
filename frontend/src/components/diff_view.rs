@@ -341,21 +341,23 @@ pub fn diff_raw_text(props: &DiffRawTextProps) -> Html {
     }
 
     html! {
-        <pre class="font-mono text-sm rounded-md bg-slate-100 dark:bg-slate-950/40 overflow-x-auto">
-            { for lines.iter().enumerate().map(|(idx, line)| {
-                let row_classes = match line.marker {
-                    "-" => classes!("bg-red-50", "text-red-700", "dark:bg-red-950/40", "dark:text-red-300"),
-                    "+" => classes!("bg-emerald-50", "text-emerald-700", "dark:bg-emerald-950/40", "dark:text-emerald-300"),
-                    _ => classes!("text-slate-600", "dark:text-slate-400"),
-                };
-                html! {
-                    <div class={classes!("flex", "px-3", row_classes)}>
-                        <span class="w-8 shrink-0 text-right pr-2 text-slate-400 select-none">{ (idx + 1).to_string() }</span>
-                        <span class="w-4 shrink-0 select-none">{ line.marker }</span>
-                        <span class="whitespace-pre">{ line.text.clone() }</span>
-                    </div>
-                }
-            }) }
+        <pre class="font-mono text-sm rounded-md bg-slate-100 dark:bg-slate-950/40 overflow-auto max-h-[55vh]">
+            <div class="min-w-max">
+                { for lines.iter().enumerate().map(|(idx, line)| {
+                    let row_classes = match line.marker {
+                        "-" => classes!("bg-red-50", "text-red-700", "dark:bg-red-950/40", "dark:text-red-300"),
+                        "+" => classes!("bg-emerald-50", "text-emerald-700", "dark:bg-emerald-950/40", "dark:text-emerald-300"),
+                        _ => classes!("text-slate-600", "dark:text-slate-400"),
+                    };
+                    html! {
+                        <div class={classes!("flex", "px-3", row_classes)}>
+                            <span class="w-8 shrink-0 text-right pr-2 text-slate-400 select-none">{ (idx + 1).to_string() }</span>
+                            <span class="w-4 shrink-0 select-none">{ line.marker }</span>
+                            <span class="whitespace-pre">{ line.text.clone() }</span>
+                        </div>
+                    }
+                }) }
+            </div>
         </pre>
     }
 }
