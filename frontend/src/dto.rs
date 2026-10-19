@@ -115,6 +115,7 @@ pub enum ValidationField {
     Source,
     FsType,
     Description,
+    TrailingComment,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

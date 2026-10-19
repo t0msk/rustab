@@ -1087,7 +1087,9 @@ trip byte-faithful.
   form, it must re-encode before sending, or it will rewrite the user's paths.
 - `dump` and `pass` are unsigned integers. fstab imposes no tighter range, so
   neither does this contract; validation flags the odd ones.
-- `trailing_comment` is `null` when there is none.
+- `trailing_comment` is `null` when there is none. Like `description` used
+  to be, it is validated for an embedded newline, which is a blocking error
+  (see §7 for the `field` value this sets).
 - `description` is an optional human-readable note about what the entry is
   *for*, and is `null` when there is none. It is **a different mechanism from
   `trailing_comment`**, carried in a separate field: a trailing comment is
@@ -1167,16 +1169,21 @@ precomputed so the UI's "can I save?" test cannot disagree with the backend's.
 `field` and `line_index` let the UI render a finding next to the specific
 input it is about, instead of only in a flat list:
 
-- `field` is `"mount_point"`, `"source"`, `"fs_type"`, or `"description"` when
-  the finding is about exactly one of those fields on one entry, and `null`
-  otherwise. `mount_point_missing` sets `"mount_point"`; `malformed_uuid` and
-  `malformed_partuuid` set `"source"`; `empty_fs_type` sets `"fs_type"`. No
-  current check sets `"description"` - the only one that did required a
-  description to be a single line, which stopped being true when descriptions
-  became multi-line (§5), so it was removed. The value stays part of this
-  enum and a UI must keep handling it: a description is still an editable
-  per-entry input (not one of the six fstab fields) that a future check can
-  attach a finding to, without a contract change.
+- `field` is `"mount_point"`, `"source"`, `"fs_type"`, `"description"`, or
+  `"trailing_comment"` when the finding is about exactly one of those fields
+  on one entry, and `null` otherwise. `mount_point_missing` sets
+  `"mount_point"`; `malformed_uuid` and `malformed_partuuid` set `"source"`;
+  `empty_fs_type` sets `"fs_type"`. No current check sets `"description"` -
+  the only one that did required a description to be a single line, which
+  stopped being true when descriptions became multi-line (§5), so it was
+  removed. The value stays part of this enum and a UI must keep handling it:
+  a description is still an editable per-entry input (not one of the six
+  fstab fields) that a future check can attach a finding to, without a
+  contract change. `trailing_comment_contains_newline` sets
+  `"trailing_comment"`: a trailing comment is appended inline after the
+  entry's six fields on the same physical line (§5), so unlike a
+  description it must stay a single line, and an embedded newline in it is a
+  blocking error.
 - `line_index` is the 0-based index, into the `DocumentDto.lines` array that
   was sent to `validate_candidate`, of the single line the finding is about -
   the same identity scheme `LineDto` already uses elsewhere in this

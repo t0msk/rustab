@@ -468,6 +468,14 @@ pub enum ValidationFieldDto {
     /// [`FindingField::Description`] for the full reasoning. A UI must still
     /// handle it, since it can reappear without a contract change.
     Description,
+    /// The entry's trailing inline comment ([`EntryDto::trailing_comment`]) -
+    /// the free-form text appended after the entry's six fstab fields on the
+    /// same physical line, following a `#`. Distinct from
+    /// [`Self::Description`], which is a separate comment line (or lines)
+    /// placed above the entry. Produced by the backend's
+    /// `trailing_comment_contains_newline` check (see
+    /// [`FindingField::TrailingComment`]).
+    TrailingComment,
 }
 
 impl From<FindingField> for ValidationFieldDto {
@@ -477,6 +485,7 @@ impl From<FindingField> for ValidationFieldDto {
             FindingField::Source => ValidationFieldDto::Source,
             FindingField::FsType => ValidationFieldDto::FsType,
             FindingField::Description => ValidationFieldDto::Description,
+            FindingField::TrailingComment => ValidationFieldDto::TrailingComment,
         }
     }
 }
@@ -1526,6 +1535,7 @@ mod tests {
             (ValidationFieldDto::Source, "source"),
             (ValidationFieldDto::FsType, "fs_type"),
             (ValidationFieldDto::Description, "description"),
+            (ValidationFieldDto::TrailingComment, "trailing_comment"),
         ];
         for (field, spelling) in field_kinds {
             assert_eq!(
@@ -1810,6 +1820,23 @@ mod tests {
         assert_eq!(
             FindingDto::from(&finding).field,
             Some(ValidationFieldDto::Description)
+        );
+    }
+
+    /// The `"trailing_comment"` field tag crosses the boundary unchanged -
+    /// unlike `Description`, this one is actively produced by the backend's
+    /// `trailing_comment_contains_newline` check.
+    #[test]
+    fn the_trailing_comment_validation_field_tag_maps_across_the_boundary() {
+        let finding = Finding {
+            severity: Severity::Error,
+            message: "something about a trailing comment".to_string(),
+            field: Some(FindingField::TrailingComment),
+            line_index: Some(0),
+        };
+        assert_eq!(
+            FindingDto::from(&finding).field,
+            Some(ValidationFieldDto::TrailingComment)
         );
     }
 

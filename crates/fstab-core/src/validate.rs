@@ -117,6 +117,13 @@ pub enum FindingField {
     /// than re-adding it. `fstab-core` is a library crate, so a `pub` variant
     /// nothing constructs is not a `dead_code` hazard.
     Description,
+    /// The entry's trailing inline comment - the free-form text appended
+    /// after the entry's six fstab fields on the same physical line,
+    /// following a `#` (see [`crate::model::FstabEntry::trailing_comment`]).
+    /// Distinct from [`Self::Description`], which is a separate comment
+    /// line (or lines) placed *above* the entry rather than appended after
+    /// it. Produced by [`trailing_comment_contains_newline_findings`].
+    TrailingComment,
 }
 
 /// A single structural or semantic validation finding, with a severity and a
@@ -271,6 +278,7 @@ fn structural_findings(doc: &Document) -> Vec<Finding> {
     findings.extend(duplicate_mount_point_findings(doc));
     findings.extend(malformed_uuid_findings(doc));
     findings.extend(mount_point_missing_findings(doc));
+    findings.extend(trailing_comment_contains_newline_findings(doc));
 
     findings
 }
@@ -318,6 +326,48 @@ fn empty_fs_type_findings(doc: &Document) -> Vec<Finding> {
                     entry.mount_point
                 ),
                 FindingField::FsType,
+                idx,
+            )
+        })
+        .collect()
+}
+
+/// Flags any [`crate::model::FstabEntry`] whose `trailing_comment` contains
+/// an embedded newline (`\n` or `\r`) as a blocking error.
+///
+/// A trailing comment parsed from a real file can never contain one (the
+/// source text was already split on newlines before any field reached this
+/// code, and `trailing_comment` is only ever the text after the first `#` on
+/// that one physical line) - this exists as a second line of defense against
+/// an `EntryDto` constructed directly via the Tauri IPC boundary, bypassing
+/// the text parser entirely, the same reasoning [`empty_fs_type_findings`]
+/// above documents for its own analogous case. If such a value ever reached
+/// the writer, it would split one physical fstab line into two, corrupting
+/// the file - the second half would be misparsed as a [`Line::Malformed`]
+/// line or a bogus new entry on the next load.
+fn trailing_comment_contains_newline_findings(doc: &Document) -> Vec<Finding> {
+    doc.lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| match line {
+            Line::Entry(entry) => Some((idx, entry)),
+            _ => None,
+        })
+        .filter(|(_, entry)| {
+            entry
+                .trailing_comment
+                .as_deref()
+                .is_some_and(|c| c.contains('\n') || c.contains('\r'))
+        })
+        .map(|(idx, entry)| {
+            Finding::error_at(
+                format!(
+                    "entry for mount point {:?} has a trailing comment containing an embedded \
+                     newline; a trailing comment is appended after the entry's fields on the \
+                     same physical line, so it must be a single line of text",
+                    entry.mount_point
+                ),
+                FindingField::TrailingComment,
                 idx,
             )
         })
@@ -1163,6 +1213,77 @@ mod tests {
             "no structural check may be about a description any more: {:?}",
             structural_findings(&doc)
         );
+    }
+
+    // --- Structural: trailing_comment embedded newline ---
+
+    #[test]
+    fn trailing_comment_containing_a_newline_is_an_error() {
+        let doc = doc_with_entry(
+            FstabEntry::new(
+                SourceId::Path("/dev/sda1".into()),
+                "/mnt/data",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )
+            .with_trailing_comment("first line\nsecond line"),
+        );
+        let findings = trailing_comment_contains_newline_findings(&doc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].field, Some(FindingField::TrailingComment));
+        assert_eq!(findings[0].line_index, Some(0));
+    }
+
+    #[test]
+    fn trailing_comment_containing_a_carriage_return_is_an_error() {
+        let doc = doc_with_entry(
+            FstabEntry::new(
+                SourceId::Path("/dev/sda1".into()),
+                "/mnt/data",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )
+            .with_trailing_comment("first line\rsecond line"),
+        );
+        let findings = trailing_comment_contains_newline_findings(&doc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].field, Some(FindingField::TrailingComment));
+        assert_eq!(findings[0].line_index, Some(0));
+    }
+
+    #[test]
+    fn single_line_trailing_comment_produces_no_finding() {
+        let doc = doc_with_entry(
+            FstabEntry::new(
+                SourceId::Path("/dev/sda1".into()),
+                "/mnt/data",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )
+            .with_trailing_comment("encrypted swap, see notes"),
+        );
+        assert!(trailing_comment_contains_newline_findings(&doc).is_empty());
+    }
+
+    #[test]
+    fn absent_trailing_comment_produces_no_finding() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Path("/dev/sda1".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        assert!(trailing_comment_contains_newline_findings(&doc).is_empty());
     }
 
     // --- Semantic: pure decision logic (findmnt I/O-vs-logic split) ---
