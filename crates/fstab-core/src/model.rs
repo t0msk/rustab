@@ -395,19 +395,23 @@ pub struct FstabEntry {
     /// This is deliberately **not** the same mechanism as
     /// [`Self::trailing_comment`], and the two are stored separately. A
     /// trailing comment lives on the *same physical line*, after the six
-    /// fields. A description instead round-trips to and from a comment
-    /// occupying its **own physical line immediately above** this entry,
-    /// carrying Rustab's app-level marker: `# // <text>`. The leading `#`
-    /// is fstab's required comment syntax; the `//` after it is Rustab's
-    /// own marker, which is what distinguishes "this comment is this
-    /// entry's description" from any ordinary, unrelated `#` comment that
-    /// merely happens to sit directly above an entry (such a comment stays
-    /// a [`Line::Comment`] and is never absorbed). Note that the marker is
-    /// the slashes *plus* the whitespace after them, not the slashes alone:
-    /// `#//server/share ...` is an ordinary comment (a hand-commented-out
-    /// CIFS mount, see [`SourceId::Network`]), never a description. The exact
-    /// marker recognition and serialization rules are documented in
-    /// `parser.rs`.
+    /// fields. A description instead round-trips to and from the **ordinary
+    /// `#` comment line(s) sitting directly above** this entry - no marker of
+    /// any kind. Adjacency alone decides it: a comment line's own text has no
+    /// bearing on whether it is this entry's description, so e.g. a
+    /// hand-commented-out CIFS mount (`#//server/share ...`, see
+    /// [`SourceId::Network`]) directly above an entry is that entry's
+    /// description like any other comment. The exact rule - how far up the
+    /// walk goes, which blank lines it crosses, and how the value is written
+    /// back out - is documented in `parser.rs`'s "Description block
+    /// absorption" and "Serialization contract" sections; it is not restated
+    /// here.
+    ///
+    /// The value **may contain embedded `\n`**: a description is a
+    /// genuinely multi-line note, stored with one `\n` per comment line it
+    /// came from (no trailing newline, and no `\r` - the parser never
+    /// produces one, and the IPC boundary folds any it is handed). It is
+    /// written back out as one comment line per `\n`-separated piece.
     ///
     /// `None` means the entry has no description. An empty or
     /// whitespace-only value is never stored here - it is normalized to
@@ -476,10 +480,12 @@ pub enum Line {
     /// [`FstabEntry::trailing_comment`], which is an inline comment
     /// attached to an entry line rather than a comment occupying its own
     /// line. Also distinct from [`FstabEntry::description`]: a comment line
-    /// carrying the `# //` description marker directly above an entry is
-    /// absorbed into that entry's `description` by the parser and therefore
-    /// never appears as a `Comment` line - every *other* comment line,
-    /// marked or not, does (see `parser.rs` for the exact rule).
+    /// that belongs to the comment block attached to an entry is absorbed
+    /// into that entry's `description` by the parser and therefore never
+    /// appears as a `Comment` line. What is left as a `Comment` is every
+    /// comment line no entry claimed - one above a [`Line::Malformed`] line,
+    /// or one with no entry below it at all (see `parser.rs` for the exact
+    /// rule).
     Comment(String),
     /// A blank (whitespace-only or empty) line, preserved so that visual
     /// spacing between sections of the original file survives a round

@@ -1,0 +1,17 @@
+# Single-line description: one ordinary comment hugging its entry
+UUID=aaaa1111-bbbb-2222-cccc-333344445555 /mnt/archive ext4 noauto,nofail 0 2
+
+# Multi-line description, line one of two
+# Multi-line description, line two of two
+LABEL=example-scratch /mnt/scratch xfs defaults 0 2
+
+PARTLABEL=example-spare /mnt/spare ext4 defaults 0 2
+
+#Freestanding block: the line below is malformed on purpose, and a
+#malformed line stops the description walk, so these three lines stay
+#ordinary comment lines that belong to no entry at all.
+/dev/fake9
+# Description of the entry below; the walk stops at the malformed line
+//files.example.internal/media /mnt/media cifs noauto,credentials=/etc/rustab-fixture-creds,_netdev 0 0
+
+#Trailing freestanding block at end of file, with no entry below it.

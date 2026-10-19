@@ -2715,19 +2715,25 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     /// and the file read).
     #[test]
     fn parsed_lines_keep_every_line_in_order_including_malformed_ones() {
+        // `# header` is the entry's own description, so it is carried *on*
+        // the entry rather than as a `comment` line; the comment above the
+        // malformed line is not claimed by anything and stays a line of its
+        // own (see `fstab-core`'s parser docs).
         let text = "# header\n\
-                    \n\
                     UUID=11111111-2222-3333-4444-555555555555 /mnt/data ext4 noauto 0 2\n\
+                    \n\
+                    # the next line cannot be parsed\n\
                     /dev/sdb1\n";
         let document = parser::parse(text);
         let dto = DocumentDto::from(&document);
 
         assert_eq!(dto.lines.len(), 4);
-        assert!(matches!(dto.lines[0], LineDto::Comment { .. }));
         assert!(matches!(dto.lines[1], LineDto::Blank));
-        let LineDto::Entry { entry } = &dto.lines[2] else {
-            panic!("the third line must be an entry");
+        assert!(matches!(dto.lines[2], LineDto::Comment { .. }));
+        let LineDto::Entry { entry } = &dto.lines[0] else {
+            panic!("the first line must be the entry, with its description");
         };
+        assert_eq!(entry.description.as_deref(), Some("header"));
         assert_eq!(entry.source.kind, SourceKindDto::Uuid);
         assert_eq!(
             entry.source.value, "11111111-2222-3333-4444-555555555555",

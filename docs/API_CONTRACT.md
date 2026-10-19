@@ -1068,7 +1068,7 @@ trip byte-faithful.
   "dump": 0,
   "pass": 2,
   "trailing_comment": " a note after the six fields, without the #",
-  "description": "photo archive, only mounted when backing up"
+  "description": "photo archive\nonly mounted when backing up"
 }
 ```
 
@@ -1092,17 +1092,26 @@ trip byte-faithful.
   *for*, and is `null` when there is none. It is **a different mechanism from
   `trailing_comment`**, carried in a separate field: a trailing comment is
   inline on the entry's own line, after the six fields, whereas a description
-  round-trips to and from a comment line of its own, immediately *above* the
-  entry, carrying rustab's `# // <text>` marker. See
-  `fstab-core`'s `model.rs` and `parser.rs` doc comments for the exact
-  marker-recognition and serialization rules. Two consequences for a caller:
-  a marked comment line absorbed this way does **not** also appear as a
-  `{"kind":"comment"}` line (so `DocumentDto.lines` can be shorter than the
-  file's physical line count), and a value sent *in* is normalized at the
-  boundary - trimmed at both ends, and treated as `null` if empty after
-  trimming, exactly as the text parser treats a marker line with an empty
-  payload. A description must be a single line; one containing a newline is a
-  blocking validation error (§7), not something the backend silently rewrites.
+  round-trips to and from the ordinary `#` comment line(s) directly *above*
+  the entry. **No marker is involved** - adjacency alone decides it, so any
+  ordinary comment sitting above an entry is that entry's description (this
+  replaced an earlier `# // <text>` marker convention). See `fstab-core`'s
+  `model.rs` and `parser.rs` doc comments for the exact walk (how far up it
+  goes, which blank lines it crosses) and the serialization rules. Three
+  consequences for a caller:
+  - A comment line absorbed this way does **not** also appear as a
+    `{"kind":"comment"}` line, so `DocumentDto.lines` can be shorter than the
+    file's physical line count. What is still a `comment` line is every
+    comment no entry claimed - e.g. one above a `malformed` line, or one with
+    no entry below it at all.
+  - The value **may be multi-line**: one `\n` per comment line, no trailing
+    newline, never `\r`. It is written back out as one comment line per
+    `\n`-separated piece, contiguously above the entry. A UI editing this
+    field needs a multi-line input, and must not strip newlines.
+  - A value sent *in* is normalized at the boundary: `\r\n` and lone `\r` are
+    folded to `\n`, the result is trimmed at both ends, and an
+    empty-after-trim value is treated as `null` - exactly as the text parser
+    treats a comment block whose text trims away to nothing.
 
 ### `DocumentViewDto`
 
@@ -1161,11 +1170,13 @@ input it is about, instead of only in a flat list:
 - `field` is `"mount_point"`, `"source"`, `"fs_type"`, or `"description"` when
   the finding is about exactly one of those fields on one entry, and `null`
   otherwise. `mount_point_missing` sets `"mount_point"`; `malformed_uuid` and
-  `malformed_partuuid` set `"source"`; `empty_fs_type` sets `"fs_type"`;
-  `description_contains_newline` sets `"description"`. Note that
-  `"description"` is not one of the six fstab fields but rustab's own
-  per-entry note (§5) - from the UI's point of view it is just another
-  editable input a finding can be attached to.
+  `malformed_partuuid` set `"source"`; `empty_fs_type` sets `"fs_type"`. No
+  current check sets `"description"` - the only one that did required a
+  description to be a single line, which stopped being true when descriptions
+  became multi-line (§5), so it was removed. The value stays part of this
+  enum and a UI must keep handling it: a description is still an editable
+  per-entry input (not one of the six fstab fields) that a future check can
+  attach a finding to, without a contract change.
 - `line_index` is the 0-based index, into the `DocumentDto.lines` array that
   was sent to `validate_candidate`, of the single line the finding is about -
   the same identity scheme `LineDto` already uses elsewhere in this
@@ -1184,8 +1195,8 @@ both missing their mount point) - a caller must key off *both* `field` and
 `field` alone.
 
 Typical findings: duplicate mount point, empty filesystem type, malformed
-`UUID=`/`PARTUUID=` value, a description containing an embedded newline,
-mount point missing on disk (warning), malformed lines present (warning),
+`UUID=`/`PARTUUID=` value, mount point missing on disk (warning),
+malformed lines present (warning),
 `findmnt --verify` output, and a warning that the semantic check ran in
 degraded mode because `findmnt` is unavailable.
 
@@ -1430,7 +1441,7 @@ does not have it.
 These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 
 ```json
-{"lines":[{"kind":"comment","text":" hi"},{"kind":"blank"},{"kind":"entry","entry":{"source":{"kind":"uuid","value":"1111"},"mount_point":"/mnt/d","fs_type":"ext4","options":[{"key":"noauto","value":null},{"key":"fmask","value":"0022"}],"dump":0,"pass":2,"trailing_comment":" note","description":null}},{"kind":"malformed","raw":"/dev/sdb1"}]}
+{"lines":[{"kind":"entry","entry":{"source":{"kind":"uuid","value":"1111"},"mount_point":"/mnt/d","fs_type":"ext4","options":[{"key":"noauto","value":null},{"key":"fmask","value":"0022"}],"dump":0,"pass":2,"trailing_comment":" note","description":"hi"}},{"kind":"blank"},{"kind":"comment","text":" freestanding"},{"kind":"malformed","raw":"/dev/sdb1"}]}
 ```
 
 ```json

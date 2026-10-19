@@ -28,65 +28,109 @@
 //! never decode. So naive `str::split_whitespace` cannot split in the middle
 //! of a `\NNN` sequence.
 //!
-//! ### Description marker (`# // <text>`) absorption
+//! ### Description block absorption
 //!
 //! On top of per-line classification, [`parse`] performs one post-processing
-//! pass that "absorbs" an entry's optional
-//! [`FstabEntry::description`] - a human-readable note stored in the file as a
-//! comment line of its own, immediately above the entry it describes (see that
-//! field's docs for how it differs from
-//! [`FstabEntry::trailing_comment`], which is an inline comment on the
-//! entry's *own* line and is handled by the per-line splitting rule below).
+//! pass that "absorbs" an entry's optional [`FstabEntry::description`] - a
+//! human-readable note stored in the file as the ordinary comment line (or
+//! lines) sitting directly above the entry it describes (see that field's docs
+//! for how it differs from [`FstabEntry::trailing_comment`], which is an
+//! inline comment on the entry's *own* line and is handled by the per-line
+//! splitting rule below).
 //!
-//! A comment line is recognized as a description marker when the text after
-//! its leading `#`, with leading whitespace trimmed, starts with the literal
-//! two characters `//`, **those two slashes are immediately followed by at
-//! least one whitespace character**, and at least one non-whitespace
-//! character remains after that. The stored description is the remainder
-//! after the slashes, trimmed at both ends; internal whitespace is preserved
-//! verbatim. The whitespace between the `#` and the `//` carries no meaning -
-//! the `#` is fstab's required comment syntax and the `//` is Rustab's own
-//! app-level marker - so `# // note` and `#// note` are recognized
-//! identically. A marker line whose payload is empty after trimming (`# //`,
-//! `# //   `) is deliberately **not** recognized: an empty description
-//! carries no information, and absorbing it would make the marker line
-//! silently vanish on the very next save.
+//! **No special marker is involved.** Any ordinary `#` comment adjacent to an
+//! entry in the sense defined below is that entry's description. This
+//! deliberately replaced an earlier `# // <text>` marker convention, and with
+//! it that convention's "an unmarked comment is inert and is never absorbed"
+//! invariant: that guarantee is gone on purpose, so a comment line's own text
+//! no longer has any bearing on whether it is absorbed - only its position
+//! does.
 //!
-//! The whitespace required *directly after the slashes* is what keeps the
-//! marker from colliding with real fstab content. Every CIFS/SMB source field
-//! is spelled `//server/share` (see [`SourceId::Network`]), so a line a user
-//! commented out by hand - `#//nas/media /mnt/media cifs guest,noauto 0 0` -
-//! is an ordinary comment that happens to begin with `//`. Absorbing it as
-//! the description of whatever entry sits below it would both corrupt that
-//! line's text on re-serialization and risk deleting it outright on a later
-//! save. Requiring whitespace after the slashes rules out that entire
-//! collision class rather than just the one CIFS spelling: this parser's own
-//! field splitting is whitespace-delimited, so no single real fstab field can
-//! ever contain an internal whitespace character, and therefore a
-//! commented-out line's first field can never have whitespace directly after
-//! a leading `//` that is genuinely part of the field's own text. The cost is
-//! that `#//note`, with no whitespace anywhere between the slashes and the
-//! text, is no longer a marker - it is treated as an ordinary, unmarked
-//! comment (never an error). Both the canonical marker form `# // <text>` and
-//! every natural way a person types it by hand still work.
+//! Walking upward from a [`Line::Entry`] to find its attached block:
 //!
-//! Absorption additionally requires *direct* adjacency: the very next line
-//! must itself be a [`Line::Entry`], with nothing at all in between (not even
-//! a [`Line::Blank`]). A marked comment that is the last line of the file, or
-//! is separated from the entry below it by any other line, stays an ordinary
-//! [`Line::Comment`] - it is never an error. When two marked comments sit
-//! directly above one entry, only the one immediately adjacent to the entry is
-//! absorbed; the one above it stays an ordinary [`Line::Comment`], unchanged,
-//! even though its own text also starts with `//`. This is decided purely by
-//! looking at each comment's own index and the one after it, never at the one
-//! before it, so the outcome does not depend on evaluation order. An ordinary
-//! comment without the `//` marker is never absorbed, whatever it sits next
-//! to.
+//! 1. Skip **exactly one** immediately-preceding [`Line::Blank`], if present.
+//!    That blank is a pure separator: it belongs to neither neighbor, is never
+//!    part of the description, and is never absorbed - it survives as its own
+//!    literal [`Line::Blank`] at its original relative position. If the line
+//!    directly above the entry is not blank, there is nothing to skip.
+//! 2. From there, keep walking upward across a contiguous run of
+//!    [`Line::Comment`] and [`Line::Blank`] lines, in any mixture, until
+//!    hitting a [`Line::Entry`], a [`Line::Malformed`], or the start of the
+//!    file. That whole run is the entry's attached block. Note that a comment
+//!    line does **not** stop the walk: two comment blocks separated only by
+//!    blanks are one single run, and merge into one description.
+//! 3. If the run contains **zero** comment lines, the entry has no
+//!    description and - importantly - **nothing in that span is touched**.
+//!    Absorption only ever rewrites a span it actually extracts a description
+//!    from; a span that yields nothing is left exactly as it was (so, e.g.,
+//!    two blank lines between two entries stay two blank lines). This keeps
+//!    absorption-with-something-to-show-for-it the one and only way the
+//!    number of [`Line`]s can shrink.
+//! 4. Otherwise the description is the run's **comment-line texts only**, in
+//!    original top-to-bottom order, each trimmed, joined with `\n` - so a
+//!    description may legitimately be multi-line. The run's [`Line::Blank`]
+//!    lines contribute **nothing to the value**: they are pure formatting
+//!    noise inside the block, and the re-rendered description block never
+//!    contains a blank line (see the serialization contract below). They are
+//!    not *deleted from the file*, though - only the run's comment lines stop
+//!    being [`Line`]s of their own. Each blank in the run survives as its own
+//!    literal [`Line::Blank`], keeping its relative order, which - because
+//!    the description block is re-rendered hugging its entry - means the
+//!    run's blanks end up directly above that block.
+//!
+//! One deliberate guard on step 4: if every comment line in the run is empty
+//! or whitespace-only (a run of bare `#` lines), the joined text carries no
+//! information, so step 3's "nothing is touched" outcome applies instead.
+//! Otherwise those lines would be absorbed into a description that
+//! [`crate::model`] documents as never being stored (empty/whitespace-only is
+//! normalized to `None`), and would then vanish from the file on the next
+//! save.
+//!
+//! ### Why the run's blank lines are kept as blank lines
+//!
+//! Step 4 keeping each blank in the run is not a softening of "blanks are not
+//! part of the description" - the value and the rendered block really do
+//! contain no blanks. It is what makes absorption **idempotent**, which
+//! `docs/SPEC.md` §5/§6 and this crate's own fixed-point tests require:
+//! re-parsing this parser's own output must reproduce the same document, and
+//! saving twice must not keep changing the file.
+//!
+//! Deleting the run's blanks outright fails that, and the counterexample is
+//! the plan's own `/boot` case. Given `entry, blank, comment, blank, blank,
+//! entry`, step 1 skips the last blank and the run is `blank, comment,
+//! blank`. If those two blanks were deleted, the first save would emit
+//! `entry, blank, comment, entry` (the one skipped separator, then the block).
+//! Re-parsing *that* finds a comment directly above the entry, so step 1 skips
+//! nothing, the run becomes `blank, comment` - and the surviving separator
+//! blank is deleted by the second save. Blank lines would keep disappearing,
+//! one save at a time, with nothing to show for it; the number of physical
+//! lines would shrink on a save that changed nothing. Keeping the run's
+//! blanks converges immediately instead: the first save is already a fixed
+//! point, and the physical line count never changes just because a document
+//! was parsed and written back.
+//!
+//! Two further consequences worth stating plainly, both of which follow from
+//! the rules above rather than from any extra special-casing:
+//!
+//! - The rule is scoped to [`Line::Entry`] lines. A comment block above a
+//!   [`Line::Malformed`] line, or one at the end of the file with no entry
+//!   below it at all, is never absorbed and stays an ordinary
+//!   [`Line::Comment`] run. A [`Line::Malformed`] line also *stops* an
+//!   upward walk, so it shields everything above it from the entry below it.
+//! - Byte-for-byte round-tripping holds for the shape real fstab files use -
+//!   an entry's comment block directly above it, optionally separated from
+//!   whatever is above by blank lines - because the block is re-rendered in
+//!   place. It does *not* hold when a blank line sits *between* two comment
+//!   lines of one run, or between a run's comments and the entry: such a
+//!   blank is in the run, so it comes back above the block rather than inside
+//!   it. That is a one-time re-flow on the first save, and the result is a
+//!   fixed point.
 //!
 //! Absorption is the one and only reason the number of [`Line`]s in a parsed
 //! [`Document`] can be smaller than the number of physical lines in the input;
-//! the absorbed text is not lost, it is re-emitted as its own comment line by
-//! the serializer (see below).
+//! the absorbed comment text is not lost, it is re-emitted as its own comment
+//! line (or lines) by the serializer (see below), so the number of *physical*
+//! lines is unchanged by a parse-and-write-back.
 //!
 //! ## Serialization contract
 //!
@@ -102,12 +146,15 @@
 //!   field is reconstructed with its `KEY=` prefix re-added (e.g.
 //!   [`SourceId::Uuid`] serializes as `UUID=<value>`); the options field
 //!   reuses [`Options`]'s own `Display` impl (comma-joined). If the entry has
-//!   a [`FstabEntry::description`], it is written first, on its own preceding
-//!   physical line, in the exact canonical marker form `# ` + `// ` + the
-//!   description text trimmed at both ends (one space after the `#`, one
-//!   after the `//`) - the inverse of the absorption rule above, so a
-//!   description read from a file is written back byte-identically if its
-//!   marker line was already canonical. An entry with no description renders
+//!   a [`FstabEntry::description`], it is written first, as its own block of
+//!   physical lines directly above the entry: the description is split on
+//!   `\n` and each piece is trimmed and written as `# <piece>` (or a bare `#`
+//!   for an empty piece, with no trailing space). The block is contiguous -
+//!   no blank line is ever inserted inside it, nor between its last line and
+//!   the entry's own fields line. This is the inverse of the absorption rule
+//!   above, so a description read from a file is written back byte-identically
+//!   as long as its comment lines were already canonical (`# ` then the text,
+//!   with the block hugging the entry). An entry with no description renders
 //!   exactly as it did before descriptions existed.
 //!
 //! This is a deliberately **canonical** rendering: it normalizes whatever
@@ -133,10 +180,10 @@ use std::fmt;
 /// contract" docs. Each input line (split on `\n`, with any trailing `\r`
 /// from CRLF input tolerated by [`str::lines`]) is first classified into
 /// exactly one [`Line`], in original order. The single exception to "one
-/// input line, one output line" is description-marker absorption (see
-/// [`absorb_description_comments`] and the module docs): a `# // <text>`
-/// comment line directly above an entry is folded into that entry's
-/// [`FstabEntry::description`] and so does not occupy a [`Line`] of its own.
+/// input line, one output line" is description-block absorption (see
+/// [`absorb_description_comments`] and the module docs): the ordinary comment
+/// line(s) directly above an entry are folded into that entry's
+/// [`FstabEntry::description`] and so do not occupy [`Line`]s of their own.
 ///
 /// Classification per line:
 /// - Whitespace-only (or empty) → [`Line::Blank`].
@@ -169,77 +216,100 @@ pub fn parse(text: &str) -> Document {
     Document::from_lines(absorb_description_comments(classified))
 }
 
-/// Recognizes the app-level description marker on a full-line comment's text
-/// (already has its leading `#` stripped, per [`Line::Comment`]'s own docs).
-/// Returns `Some(trimmed_text)` iff `text.trim_start()` starts with the
-/// literal two characters `//`, those two slashes are **immediately followed
-/// by at least one whitespace character**, AND there is at least one
-/// non-whitespace character remaining after trimming both ends.
-/// Returns `None` otherwise - including when the `//` prefix is present but
-/// nothing but whitespace follows it (deliberately NOT treated as a marked
-/// description: an empty description carries no information, and absorbing
-/// it would make the marker line vanish on the very next save - see
-/// `model.rs`'s [`FstabEntry::description`] field docs), and when the `//` is
-/// followed directly by a non-whitespace character (`#//text`), which is what
-/// keeps a commented-out fstab line whose own first field starts with `//`
-/// (every CIFS/SMB source, see [`SourceId::Network`]) from being mistaken for
-/// a marker. See the module-level docs for why that whitespace requirement is
-/// a complete fix for that collision class rather than a heuristic.
-fn extract_description_marker(text: &str) -> Option<String> {
-    let after_slashes = text.trim_start().strip_prefix("//")?;
-    if !after_slashes.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let payload = after_slashes.trim();
-    if payload.is_empty() {
-        None
-    } else {
-        Some(payload.to_string())
-    }
-}
-
-/// Post-processes a freshly-classified line list, "absorbing" any
-/// [`Line::Comment`] that is recognized as an app-level description marker
-/// (see [`extract_description_marker`]) AND is immediately followed (no line
-/// of any kind in between - must be literally the next index) by a
-/// [`Line::Entry`], into that entry's [`FstabEntry::description`] field -
-/// removing the comment as a separate line from the output.
+/// Post-processes a freshly-classified line list, folding each
+/// [`Line::Entry`]'s attached comment block into its
+/// [`FstabEntry::description`] and removing that block's *comment* lines from
+/// the output (the block's blank lines stay, per step 4 of the rule).
+/// Implements exactly the four-step upward walk documented in the module's
+/// "Description block absorption" section; that section, not this comment, is
+/// the normative description of the rule.
 ///
-/// Two-phase by design: first decide which original indices are absorbed
-/// (purely by looking at each [`Line::Comment`]'s *own* index `i` and index
-/// `i + 1`, never at `i - 1`), then build the final vector by filtering. This
-/// is what makes two consecutive marked comments directly above one entry
-/// resolve correctly and deterministically: only the one immediately
-/// adjacent to the entry (`i + 1` is the entry) is ever absorbed; anything
-/// further up is untouched, even if it also happens to start with `//`.
+/// Two-phase by design, so that every decision is made against *original*
+/// indices and the outcome cannot depend on evaluation order: phase 1 walks
+/// upward from each entry and records (a) which indices that entry absorbs and
+/// (b) the description text it absorbs them into; phase 2 rebuilds the vector
+/// by filtering out the absorbed indices and attaching each description to its
+/// entry.
+///
+/// Idempotence (required by this crate's fixed-point tests) is a property of
+/// the pair (this function, [`fmt::Display`] for [`Document`]), and is argued
+/// in the module docs' "Why the run's blank lines are kept as blank lines"
+/// section. In short: the serializer re-renders the run's comment lines
+/// canonically, hugging the entry, and leaves the run's blanks above them, so
+/// a second walk over that output finds the same run and the same description.
+///
+/// The recorded spans provably never overlap: an entry's walk stops at the
+/// first [`Line::Entry`]/[`Line::Malformed`] above it, so a span lies strictly
+/// between its own entry and the nearest row-kind line above it, and the one
+/// blank line step 1 may skip is excluded from the span by construction.
 fn absorb_description_comments(lines: Vec<Line>) -> Vec<Line> {
-    // Phase 1: decide, by original index alone, which comment lines are
-    // absorbed and what description text each one contributes.
-    let mut absorbed: Vec<Option<String>> = vec![None; lines.len()];
+    // Phase 1: decide, by original index alone, which lines are absorbed and
+    // what description each entry ends up with.
+    let mut absorbed = vec![false; lines.len()];
+    let mut descriptions: Vec<Option<String>> = vec![None; lines.len()];
+
     for (i, line) in lines.iter().enumerate() {
-        let Line::Comment(text) = line else {
+        if !matches!(line, Line::Entry(_)) {
             continue;
-        };
-        let Some(description) = extract_description_marker(text) else {
-            continue;
-        };
-        if matches!(lines.get(i + 1), Some(Line::Entry(_))) {
-            absorbed[i] = Some(description);
         }
+
+        // Step 1: skip exactly one immediately-preceding blank separator. It
+        // stays outside the absorbed span and so survives untouched.
+        let mut end = i;
+        if end > 0 && matches!(lines[end - 1], Line::Blank) {
+            end -= 1;
+        }
+
+        // Step 2: continue upward across a contiguous comment/blank run,
+        // stopping at an entry, a malformed line, or the start of the file.
+        let mut start = end;
+        while start > 0 && matches!(lines[start - 1], Line::Comment(_) | Line::Blank) {
+            start -= 1;
+        }
+
+        // Step 4: comment texts only, each trimmed, joined with `\n`. Blanks
+        // inside the run contribute nothing to the value.
+        let description = lines[start..end]
+            .iter()
+            .filter_map(|line| match line {
+                Line::Comment(text) => Some(text.trim()),
+                _ => None,
+            })
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        // Step 3 (plus the all-blank-comments guard): a span that yields no
+        // description text is left completely alone - not absorbed, not
+        // rewritten, nothing removed.
+        if description.trim().is_empty() {
+            continue;
+        }
+
+        // Only the run's comment lines stop being lines of their own; its
+        // blanks stay exactly where they are (see the module docs).
+        for (offset, line) in lines[start..end].iter().enumerate() {
+            if matches!(line, Line::Comment(_)) {
+                absorbed[start + offset] = true;
+            }
+        }
+        descriptions[i] = Some(description);
     }
 
     // Phase 2: rebuild the line list, dropping every absorbed comment and
-    // attaching its text to the entry that directly followed it. Taking the
-    // text out of `absorbed` here (rather than cloning) is safe because
-    // index `i - 1` was already passed over by this same in-order loop.
+    // attaching each description to the entry that claimed it. Taking the
+    // text out of `descriptions` (rather than cloning) is safe because each
+    // index is visited exactly once by this in-order loop.
     let mut result = Vec::with_capacity(lines.len());
     for (i, line) in lines.into_iter().enumerate() {
-        if absorbed[i].is_some() {
+        if absorbed[i] {
             continue;
         }
         match line {
-            Line::Entry(mut entry) if i > 0 && absorbed[i - 1].is_some() => {
-                entry.description = absorbed[i - 1].take();
+            Line::Entry(mut entry) => {
+                // `try_parse_entry` always leaves this `None`, so this both
+                // attaches an absorbed description and preserves "no block
+                // above me means no description".
+                entry.description = descriptions[i].take();
                 result.push(Line::Entry(entry));
             }
             other => result.push(other),
@@ -300,8 +370,8 @@ fn try_parse_entry(raw: &str) -> Option<Line> {
         pass,
         trailing_comment,
         // A description never comes from the entry's own line; it is
-        // attached afterwards by `absorb_description_comments` if a marked
-        // comment line directly precedes this entry.
+        // attached afterwards by `absorb_description_comments` if a comment
+        // block is attached to this entry.
         description: None,
     }))
 }
@@ -409,11 +479,22 @@ impl fmt::Display for Document {
                 Line::Comment(text) => writeln!(f, "#{text}")?,
                 Line::Malformed(raw) => writeln!(f, "{raw}")?,
                 Line::Entry(entry) => {
-                    // A description is rendered as its own canonical marker
-                    // line directly above the entry it belongs to - the
-                    // inverse of `absorb_description_comments`.
+                    // A description is rendered as a contiguous block of
+                    // ordinary comment lines directly above the entry it
+                    // belongs to - the inverse of
+                    // `absorb_description_comments`. One comment line per
+                    // `\n`-separated piece, each trimmed; an empty piece
+                    // renders as a bare `#` rather than `"# "`, so a
+                    // re-parse sees the same empty piece back.
                     if let Some(description) = &entry.description {
-                        writeln!(f, "# // {}", description.trim())?;
+                        for piece in description.split('\n') {
+                            let text = piece.trim();
+                            if text.is_empty() {
+                                writeln!(f, "#")?;
+                            } else {
+                                writeln!(f, "# {text}")?;
+                            }
+                        }
                     }
                     write!(
                         f,
@@ -630,9 +711,29 @@ mod tests {
 
     #[test]
     fn display_round_trips_blank_and_comment_lines() {
-        let text = "# header\n\nUUID=aaaa / ext4 defaults 0 1\n";
+        // The canonical shape: a separator blank, then the entry's own
+        // comment block hugging it. Both come back byte-for-byte.
+        let text = "\n# header\nUUID=aaaa / ext4 defaults 0 1\n";
         let doc = parse(text);
         assert_eq!(doc.to_string(), text);
+    }
+
+    /// The one shape that re-flows on the first save: a blank line *between*
+    /// an entry's comment block and the entry is inside the absorbed run, so
+    /// it comes back above the re-rendered block instead of inside it. No
+    /// line is gained or lost, and the result is a fixed point.
+    #[test]
+    fn a_blank_between_a_comment_and_its_entry_reflows_once_then_is_stable() {
+        let text = "# header\n\nUUID=aaaa / ext4 defaults 0 1\n";
+        let once = parse(text);
+        let serialized = once.to_string();
+
+        assert_eq!(serialized, "\n# header\nUUID=aaaa / ext4 defaults 0 1\n");
+        assert_eq!(serialized.lines().count(), text.lines().count());
+
+        let twice = parse(&serialized);
+        assert_eq!(once, twice);
+        assert_eq!(twice.to_string(), serialized);
     }
 
     #[test]
@@ -669,7 +770,7 @@ mod tests {
         assert_eq!(twice.to_string(), serialized_once);
     }
 
-    // --- Description marker (`# // <text>`) ---
+    // --- Description block absorption ---
 
     /// Returns the single entry of a one-entry document, panicking with a
     /// useful message if the document is not shaped that way.
@@ -684,183 +785,236 @@ mod tests {
         entries[0]
     }
 
-    #[test]
-    fn extract_description_marker_recognizes_only_the_marked_nonempty_shapes() {
-        assert_eq!(
-            extract_description_marker(" // a note").as_deref(),
-            Some("a note")
-        );
-        assert_eq!(
-            extract_description_marker("// a note").as_deref(),
-            Some("a note")
-        );
-        // The whitespace directly after the slashes is mandatory: without it
-        // the text could be the first field of a commented-out fstab line
-        // (`//server/share`), so this shape is an ordinary comment, not a
-        // marker.
-        assert_eq!(extract_description_marker("//a note"), None);
-        assert_eq!(
-            extract_description_marker("//nas/media /mnt/media cifs"),
-            None
-        );
-        assert_eq!(extract_description_marker(" a plain note"), None);
-        assert_eq!(extract_description_marker(" /not a marker"), None);
-        assert_eq!(extract_description_marker(" //"), None);
-        assert_eq!(extract_description_marker(" //   "), None);
+    /// Every entry's description, in document order.
+    fn descriptions(doc: &Document) -> Vec<Option<&str>> {
+        doc.entries()
+            .map(|entry| entry.description.as_deref())
+            .collect()
     }
 
     #[test]
-    fn description_marker_is_recognized_with_or_without_a_space_after_the_hash() {
-        // The `#` is fstab syntax and the `//` is rustab's marker, so the
-        // whitespace between them carries no meaning: both spellings must
-        // absorb, and must yield the exact same description text.
-        let with_space = parse("# // project archive\nUUID=aaaa /mnt/a ext4 defaults 0 2");
-        let without_space = parse("#// project archive\nUUID=aaaa /mnt/a ext4 defaults 0 2");
+    fn an_ordinary_comment_directly_above_an_entry_is_its_description() {
+        // The whole point of T43: no marker of any kind is involved, and the
+        // comment line stops being a `Line` of its own.
+        let doc = parse("# a plain note\nUUID=aaaa /mnt/a ext4 defaults 0 2\n");
 
-        assert_eq!(with_space.lines.len(), 1);
-        assert_eq!(without_space.lines.len(), 1);
+        assert_eq!(doc.lines.len(), 1, "lines: {:?}", doc.lines);
         assert_eq!(
-            only_entry(&with_space).description.as_deref(),
-            Some("project archive")
+            only_entry(&doc).description.as_deref(),
+            Some("a plain note")
         );
-        assert_eq!(
-            only_entry(&without_space).description.as_deref(),
-            Some("project archive")
-        );
-        assert_eq!(with_space, without_space);
     }
 
     #[test]
-    fn description_text_is_trimmed_at_the_ends_but_not_internally() {
-        let doc = parse("#   //\t  photo   archive,  2nd  drive   \nUUID=aaaa /mnt/a ext4 d 0 2");
+    fn the_comment_hash_and_its_following_whitespace_are_not_part_of_the_value() {
+        // Each comment line's text is trimmed; internal whitespace is
+        // content and stays verbatim.
+        let doc = parse("#\t  photo   archive,  2nd  drive   \nUUID=aaaa /mnt/a ext4 d 0 2");
         assert_eq!(
             only_entry(&doc).description.as_deref(),
             Some("photo   archive,  2nd  drive")
         );
     }
 
-    /// The ambiguous-candidate rule: when two marked comments sit directly
-    /// above one entry, only the one immediately adjacent to it is absorbed.
-    /// The one above stays an ordinary comment line, byte-unchanged, even
-    /// though its own text also starts with `//`.
     #[test]
-    fn only_the_marked_comment_immediately_adjacent_to_an_entry_is_absorbed() {
-        let text = "# // first marker, not adjacent\n\
-                    # // second marker, adjacent\n\
+    fn a_contiguous_comment_block_becomes_one_multi_line_description() {
+        let text = "# first line of the note\n\
+                    # second line of the note\n\
+                    # third line of the note\n\
                     UUID=aaaa /mnt/a ext4 defaults 0 2\n";
         let doc = parse(text);
 
-        assert_eq!(doc.lines.len(), 2, "lines: {:?}", doc.lines);
+        assert_eq!(doc.lines.len(), 1, "lines: {:?}", doc.lines);
         assert_eq!(
-            doc.lines[0],
-            Line::Comment(" // first marker, not adjacent".to_string())
+            only_entry(&doc).description.as_deref(),
+            Some("first line of the note\nsecond line of the note\nthird line of the note")
         );
-        let Line::Entry(entry) = &doc.lines[1] else {
-            panic!("expected the entry at index 1, got {:?}", doc.lines[1]);
-        };
-        assert_eq!(
-            entry.description.as_deref(),
-            Some("second marker, adjacent")
-        );
-
-        // And the non-absorbed marker survives serialization verbatim, so
-        // the whole document still round-trips byte-for-byte.
+        // Canonical in, canonical out: the block is re-emitted contiguously,
+        // directly above the entry, with no blank line anywhere in it.
         assert_eq!(doc.to_string(), text);
     }
 
+    /// A comment line does not stop the upward walk, so two comment blocks
+    /// separated only by a blank line above one entry are one single run and
+    /// merge into one description, with the internal blank dropped. This is
+    /// lines 15/17 of the plan's worked example in isolation.
     #[test]
-    fn marked_comment_as_the_last_line_of_the_file_stays_an_ordinary_comment() {
-        let doc = parse("UUID=aaaa /mnt/a ext4 defaults 0 2\n# // dangling marker\n");
-        assert_eq!(doc.lines.len(), 2);
-        assert_eq!(only_entry(&doc).description, None);
+    fn two_comment_blocks_separated_by_a_blank_line_merge_into_one_description() {
+        let doc = parse(
+            "# /dev/sda3\n\
+             \n\
+             # /dev/sdb1\n\
+             UUID=aaaa /mnt/a ext4 defaults 0 2\n",
+        );
+
+        assert_eq!(doc.lines.len(), 2, "lines: {:?}", doc.lines);
+        assert_eq!(doc.lines[0], Line::Blank);
         assert_eq!(
-            doc.lines[1],
-            Line::Comment(" // dangling marker".to_string())
+            only_entry(&doc).description.as_deref(),
+            Some("/dev/sda3\n/dev/sdb1")
+        );
+        // The internal blank is formatting noise: not part of the value and
+        // never inside the re-rendered block - it stays a blank line of its
+        // own, above the block.
+        assert_eq!(
+            doc.to_string(),
+            "\n# /dev/sda3\n# /dev/sdb1\nUUID=aaaa /mnt/a ext4 defaults 0 2\n"
         );
     }
 
+    /// Step 1 of the rule: exactly one blank line directly above an entry is
+    /// a pure separator. Here the run above it has no comments at all, so by
+    /// step 3 nothing whatsoever is touched - the blanks stay blanks.
     #[test]
-    fn marked_comment_separated_from_its_entry_by_a_blank_line_is_not_absorbed() {
-        let text = "# // not adjacent\n\nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
+    fn a_run_with_zero_comments_is_left_completely_untouched() {
+        let text = "UUID=aaaa /mnt/a ext4 defaults 0 2\n\
+                    \n\
+                    \n\
+                    UUID=bbbb /mnt/b ext4 defaults 0 2\n";
         let doc = parse(text);
 
-        assert_eq!(doc.lines.len(), 3);
-        assert_eq!(doc.lines[0], Line::Comment(" // not adjacent".to_string()));
+        assert_eq!(doc.lines.len(), 4, "lines: {:?}", doc.lines);
         assert_eq!(doc.lines[1], Line::Blank);
-        assert_eq!(only_entry(&doc).description, None);
+        assert_eq!(doc.lines[2], Line::Blank);
+        assert_eq!(descriptions(&doc), vec![None, None]);
         assert_eq!(doc.to_string(), text);
     }
 
+    /// The other resolved sub-case: when a description *is* found, the one
+    /// blank line step 1 skipped survives as its own `Line::Blank`, at its
+    /// original relative position - which, with the run's comments absorbed,
+    /// means above the re-rendered description block, never between the block
+    /// and the entry. The run's own blanks survive the same way (see the
+    /// module docs on idempotence), so no line is lost.
     #[test]
-    fn marked_comment_with_an_empty_payload_is_not_absorbed() {
-        // `# //` - marker, nothing after it at all.
-        let bare = "# //\nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
-        let doc = parse(bare);
-        assert_eq!(doc.lines.len(), 2, "lines: {:?}", doc.lines);
-        assert_eq!(doc.lines[0], Line::Comment(" //".to_string()));
-        assert_eq!(only_entry(&doc).description, None);
-        assert_eq!(doc.to_string(), bare);
+    fn the_skipped_separator_blank_survives_when_a_description_is_found() {
+        // The plan's `/boot` case: entry, blank, comment, blank, blank, entry.
+        let original = "UUID=aaaa /mnt/a ext4 defaults 0 2\n\
+                        \n\
+                        # /dev/sda2\n\
+                        \n\
+                        \n\
+                        UUID=bbbb /boot vfat defaults 0 2\n";
+        let doc = parse(original);
 
-        // `# //   ` - marker followed by whitespace only, which trims away
-        // to an empty payload and so is equally not a description.
-        let padded = "# //   \nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
-        let doc = parse(padded);
-        assert_eq!(doc.lines.len(), 2, "lines: {:?}", doc.lines);
-        assert_eq!(doc.lines[0], Line::Comment(" //   ".to_string()));
-        assert_eq!(only_entry(&doc).description, None);
-        assert_eq!(doc.to_string(), padded);
+        assert_eq!(doc.lines.len(), 5, "lines: {:?}", doc.lines);
+        assert!(matches!(doc.lines[0], Line::Entry(_)));
+        assert_eq!(doc.lines[1], Line::Blank);
+        assert_eq!(doc.lines[2], Line::Blank);
+        assert_eq!(doc.lines[3], Line::Blank);
+        assert_eq!(descriptions(&doc), vec![None, Some("/dev/sda2")]);
+
+        let serialized = doc.to_string();
+        assert_eq!(
+            serialized,
+            "UUID=aaaa /mnt/a ext4 defaults 0 2\n\
+             \n\
+             \n\
+             \n\
+             # /dev/sda2\n\
+             UUID=bbbb /boot vfat defaults 0 2\n"
+        );
+        // Nothing was gained or lost, and this is already a fixed point - the
+        // separator blank is not eaten by a second save.
+        assert_eq!(serialized.lines().count(), original.lines().count());
+        let twice = parse(&serialized);
+        assert_eq!(twice, doc);
+        assert_eq!(twice.to_string(), serialized);
     }
 
-    /// The safety-critical regression test: an ordinary, unmarked comment
-    /// directly above an entry must never be swallowed into that entry.
+    /// A comment block with no entry below it at all is freestanding: the
+    /// rule only ever walks upward *from an entry*.
     #[test]
-    fn ordinary_unmarked_comment_directly_above_an_entry_is_never_absorbed() {
-        let text = "# a plain note\nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
+    fn a_comment_block_at_end_of_file_stays_a_freestanding_comment() {
+        let text = "UUID=aaaa /mnt/a ext4 defaults 0 2\n\
+                    \n\
+                    #a trailing note\n\
+                    #that belongs to nothing\n";
         let doc = parse(text);
 
-        assert_eq!(doc.lines.len(), 2);
-        assert_eq!(doc.lines[0], Line::Comment(" a plain note".to_string()));
+        assert_eq!(doc.lines.len(), 4, "lines: {:?}", doc.lines);
+        assert_eq!(only_entry(&doc).description, None);
+        assert_eq!(doc.lines[2], Line::Comment("a trailing note".to_string()));
+        assert_eq!(
+            doc.lines[3],
+            Line::Comment("that belongs to nothing".to_string())
+        );
+        assert_eq!(doc.to_string(), text);
+    }
+
+    /// A malformed line stops the upward walk, so it shields the comment
+    /// block above it from the entry below it. That block stays freestanding,
+    /// byte-unchanged.
+    #[test]
+    fn a_malformed_line_shields_the_comment_block_above_it() {
+        let text = "#this note describes the broken line below it\n\
+                    /dev/fake1\n\
+                    # this one describes the entry below it\n\
+                    UUID=aaaa /mnt/a ext4 defaults 0 2\n";
+        let doc = parse(text);
+
+        assert_eq!(doc.lines.len(), 3, "lines: {:?}", doc.lines);
+        assert_eq!(
+            doc.lines[0],
+            Line::Comment("this note describes the broken line below it".to_string())
+        );
+        assert_eq!(doc.lines[1], Line::Malformed("/dev/fake1".to_string()));
+        assert_eq!(
+            only_entry(&doc).description.as_deref(),
+            Some("this one describes the entry below it")
+        );
+        assert_eq!(doc.to_string(), text);
+    }
+
+    /// A run whose comment lines are all empty carries no information, so the
+    /// step-3 "nothing is touched" outcome applies rather than storing an
+    /// empty description (which `model.rs` documents as never stored) and
+    /// losing those lines on the next save.
+    #[test]
+    fn a_run_of_empty_comment_lines_is_not_absorbed() {
+        let text = "#\n#   \nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
+        let doc = parse(text);
+
+        assert_eq!(doc.lines.len(), 3, "lines: {:?}", doc.lines);
         assert_eq!(only_entry(&doc).description, None);
         assert_eq!(doc.to_string(), text);
     }
 
-    /// The CIFS collision regression test: `//server/share` is a real fstab
-    /// source spelling (see `SourceId::Network`), so a hand-commented-out
-    /// network mount sitting directly above another entry must stay an
-    /// ordinary comment. Absorbing it would corrupt its whitespace on
-    /// re-serialization and risk deleting the line on a later save.
+    /// An empty line *inside* an otherwise non-empty block is content: it is
+    /// kept as an empty piece of the value and re-emitted as a bare `#`.
     #[test]
-    fn commented_out_cifs_source_line_is_never_mistaken_for_a_description_marker() {
-        let original = "#//nas/media /mnt/media cifs guest,noauto 0 0\n\
-                        UUID=1111 /mnt/data ext4 defaults 0 2\n";
-        let doc = parse(original);
+    fn an_empty_comment_line_inside_a_block_is_kept_as_an_empty_piece() {
+        let text = "# first\n#\n# third\nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
+        let doc = parse(text);
 
-        assert_eq!(doc.lines.len(), 2, "lines: {:?}", doc.lines);
         assert_eq!(
-            doc.lines[0],
-            Line::Comment("//nas/media /mnt/media cifs guest,noauto 0 0".to_string())
+            only_entry(&doc).description.as_deref(),
+            Some("first\n\nthird")
         );
-        assert_eq!(only_entry(&doc).description, None);
-        assert_eq!(doc.to_string(), original);
+        assert_eq!(doc.to_string(), text);
     }
 
-    /// A marker-shaped comment with no whitespace after the slashes is an
-    /// ordinary comment, not an error and not a description - the deliberate
-    /// narrowing that makes the CIFS case above safe.
     #[test]
-    fn marked_comment_without_whitespace_after_the_slashes_is_an_ordinary_comment() {
-        let original = "#//note\nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
+    fn two_entries_keep_their_own_independent_descriptions() {
+        let original = "# first entry's own note\n\
+                        UUID=aaaa /mnt/a ext4 defaults 0 2\n\
+                        # second entry's own note\n\
+                        UUID=bbbb /mnt/b ext4 defaults 0 2\n";
         let doc = parse(original);
 
-        assert_eq!(doc.lines.len(), 2, "lines: {:?}", doc.lines);
-        assert_eq!(doc.lines[0], Line::Comment("//note".to_string()));
-        assert_eq!(only_entry(&doc).description, None);
+        assert_eq!(
+            descriptions(&doc),
+            vec![
+                Some("first entry's own note"),
+                Some("second entry's own note")
+            ]
+        );
         assert_eq!(doc.to_string(), original);
     }
 
     #[test]
     fn document_with_a_description_round_trips_to_a_stable_fixed_point() {
-        let original = "# header\n\n# // scratch space for builds\nLABEL=scratch /mnt/scratch xfs defaults 0 2\n";
+        let original = "# scratch space for builds\nLABEL=scratch /mnt/scratch xfs defaults 0 2\n";
         let once = parse(original);
         let serialized_once = once.to_string();
         assert_eq!(serialized_once, original);
@@ -870,39 +1024,115 @@ mod tests {
         assert_eq!(twice.to_string(), serialized_once);
     }
 
+    /// A commented-out fstab line directly above an entry *is* now that
+    /// entry's description - there is no text-based carve-out left (the old
+    /// `//server/share`-versus-marker collision class is gone with the marker
+    /// itself). What still matters is that its text survives verbatim through
+    /// a round trip, which the trimmed-and-re-emitted block gives us.
     #[test]
-    fn two_entries_keep_their_own_independent_descriptions() {
-        let original = "# // first entry's own note\n\
-                        UUID=aaaa /mnt/a ext4 defaults 0 2\n\
-                        \n\
-                        # // second entry's own note\n\
-                        UUID=bbbb /mnt/b ext4 defaults 0 2\n";
+    fn a_commented_out_cifs_line_above_an_entry_becomes_its_description_verbatim() {
+        let original = "# //nas/media /mnt/media cifs guest,noauto 0 0\n\
+                        UUID=1111 /mnt/data ext4 defaults 0 2\n";
         let doc = parse(original);
 
-        let entries: Vec<&FstabEntry> = doc.entries().collect();
-        assert_eq!(entries.len(), 2);
         assert_eq!(
-            entries[0].description.as_deref(),
-            Some("first entry's own note")
-        );
-        assert_eq!(
-            entries[1].description.as_deref(),
-            Some("second entry's own note")
+            only_entry(&doc).description.as_deref(),
+            Some("//nas/media /mnt/media cifs guest,noauto 0 0")
         );
         assert_eq!(doc.to_string(), original);
     }
 
+    /// The plan's worked example, verbatim, as the rule's test oracle: every
+    /// entry's expected description is spelled out in `docs`/PROJECT_PLAN.md
+    /// §T43 and reproduced here exactly.
     #[test]
-    fn document_with_no_marked_comments_is_byte_for_byte_unaffected() {
-        // Regression proof that absorption never fires spuriously: a
-        // document mixing ordinary comments, blanks, a malformed line, a
-        // trailing inline comment and several entries must serialize to
-        // exactly its original text, with no entry picking up a description.
-        let original = "#rustab header comment\n\
+    fn the_worked_example_from_the_plan_maps_to_the_expected_descriptions() {
+        let text = "\
+# /dev/sda5
+UUID=2f9d47f2-0000-0000-0000-000000000000 / ext4 rw,relatime 0 1
+
+# /dev/sda2
+
+
+UUID=CAF7-75BB /boot vfat rw,relatime 0 2
+
+# /dev/sda4
+UUID=dd525299-0000-0000-0000-000000000000 /root ext4 rw,relatime 0 2
+
+# /dev/sda1
+UUID=CA9D-4EC5 /efi vfat rw,relatime 0 2
+
+# /dev/sda3
+
+# /dev/sdb1
+UUID=5e94cda0-0000-0000-0000-000000000000 /run/media/tomsk/Data ext4 defaults 0 0
+
+/run/media/tomsk/Data/opt/ /opt none bind 0 0
+";
+        let doc = parse(text);
+
+        assert_eq!(
+            descriptions(&doc),
+            vec![
+                Some("/dev/sda5"),
+                Some("/dev/sda2"),
+                Some("/dev/sda4"),
+                Some("/dev/sda1"),
+                Some("/dev/sda3\n/dev/sdb1"),
+                None,
+            ]
+        );
+
+        // The serialization this implies, hand-traced line by line against
+        // the rule: every comment line comes back directly above its own
+        // entry, and every blank line comes back too - the ones that were
+        // inside an absorbed run simply sit above that entry's block now.
+        // Note the preserved line count: a parse-and-write-back of this file
+        // changes where two blanks sit, and nothing else.
+        let serialized = doc.to_string();
+        assert_eq!(
+            serialized,
+            "\
+# /dev/sda5
+UUID=2f9d47f2-0000-0000-0000-000000000000 / ext4 rw,relatime 0 1
+
+
+
+# /dev/sda2
+UUID=CAF7-75BB /boot vfat rw,relatime 0 2
+
+# /dev/sda4
+UUID=dd525299-0000-0000-0000-000000000000 /root ext4 rw,relatime 0 2
+
+# /dev/sda1
+UUID=CA9D-4EC5 /efi vfat rw,relatime 0 2
+
+
+# /dev/sda3
+# /dev/sdb1
+UUID=5e94cda0-0000-0000-0000-000000000000 /run/media/tomsk/Data ext4 defaults 0 0
+
+/run/media/tomsk/Data/opt/ /opt none bind 0 0
+"
+        );
+        assert_eq!(serialized.lines().count(), text.lines().count());
+
+        // And it is a fixed point from there on.
+        let twice = parse(&serialized);
+        assert_eq!(descriptions(&twice), descriptions(&doc));
+        assert_eq!(twice.to_string(), serialized);
+    }
+
+    #[test]
+    fn a_document_whose_comments_are_all_shielded_is_byte_for_byte_unaffected() {
+        // Absorption must not fire where the rule says it cannot: a comment
+        // block above a malformed line, a trailing block at end of file, and
+        // a lone separator blank above an entry are all left alone.
+        let original = "UUID=aaaa /mnt/a ext4 defaults 0 2 # inline note\n\
                         \n\
-                        #ordinary note above an entry\n\
-                        UUID=aaaa /mnt/a ext4 defaults 0 2 # inline note\n\
+                        #a note about the broken line below\n\
                         /dev/fake1\n\
+                        \n\
                         LABEL=home /home ext4 defaults 0 2\n\
                         #trailing note at end of file\n";
         let doc = parse(original);

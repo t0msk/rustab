@@ -1743,18 +1743,25 @@ mod tests {
     /// A valid candidate document (`noauto` + well-formed UUIDs, so real
     /// `findmnt --verify` has nothing to object to - the same approach
     /// `validate.rs`'s tests use).
+    ///
+    /// The leading note is carried as the entry's `description`, not as a
+    /// standalone `Line::Comment`: it serializes to the exact same bytes
+    /// (`# rewritten ...` directly above the entry), but it is the shape the
+    /// parser itself produces for those bytes, so
+    /// [`saved_file_reparses_to_an_equal_document`] can compare documents
+    /// rather than just text.
     fn valid_candidate(mount_point: &str) -> Document {
-        Document::from_lines(vec![
-            Line::Comment(" rewritten by the atomic writer test".to_string()),
-            Line::Entry(FstabEntry::new(
+        Document::from_lines(vec![Line::Entry(
+            FstabEntry::new(
                 SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
                 mount_point,
                 "ext4",
                 Options::from_vec(vec![FstabOption::Flag("noauto".into())]),
                 0,
                 2,
-            )),
-        ])
+            )
+            .with_description("rewritten by the atomic writer test"),
+        )])
     }
 
     /// A candidate that fails *structural* validation: two entries claiming

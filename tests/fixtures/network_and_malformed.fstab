@@ -1,14 +1,13 @@
-#rustab synthetic fixture: network sources (nfs/cifs) and a malformed line.
-#All hostnames, shares, and paths below are fake placeholders.
-
-#NFS export
+# NFS export
 nfs-server.example.internal:/export/share /mnt/nfs-share nfs4 defaults,_netdev,nofail 0 0
 
-#CIFS/SMB share
+# CIFS/SMB share
 //smb-server.example.internal/shared /mnt/smb-share cifs credentials=/etc/rustab-fixture-creds,uid=1000,_netdev 0 0
 
-#The next line is intentionally malformed: a bare source with no other fields.
+#The next line is intentionally malformed: a bare source with no other
+#fields. It is also a freestanding comment block: a malformed line stops
+#the parser's description walk, so no entry ever claims these lines.
 /dev/fake1
 
-#A well-formed entry after the malformed line, proving parsing continues.
+# A well-formed entry after the malformed line, proving parsing continues.
 /dev/fake2 /mnt/example ext4 defaults 0 2

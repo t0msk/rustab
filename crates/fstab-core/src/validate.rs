@@ -6,9 +6,8 @@
 //! 1. **Structural validation** (`structural_findings`): cheap, in-memory
 //!    checks of a [`Document`]'s [`crate::model::FstabEntry`] lines -
 //!    non-empty `fs_type`, duplicate mount points, malformed-looking
-//!    `UUID=`/`PARTUUID=` values, newline-free entry descriptions, and a
-//!    couple of advisory checks (mount point missing on disk, visible
-//!    [`Line::Malformed`] lines).
+//!    `UUID=`/`PARTUUID=` values, and a couple of advisory checks (mount
+//!    point missing on disk, visible [`Line::Malformed`] lines).
 //! 2. **Semantic validation** (`semantic_findings`): an external check
 //!    equivalent to `findmnt --verify --tab-file <path>`, run against a
 //!    temporary rendering of the candidate document - never against the
@@ -106,8 +105,17 @@ pub enum FindingField {
     /// The entry's filesystem type (third fstab field).
     FsType,
     /// The entry's human-readable description - not one of the six fstab
-    /// fields itself, but rustab's own `# // <text>` comment line attached
-    /// to the entry (see [`crate::model::FstabEntry::description`]).
+    /// fields itself, but the comment line (or lines) rustab attaches to the
+    /// entry (see [`crate::model::FstabEntry::description`]).
+    ///
+    /// No check in this module currently produces this variant: T43 deleted
+    /// the only one that did (a description had to be a single line back when
+    /// it was written as exactly one comment line; it no longer does). The
+    /// variant itself is deliberately kept - it is part of a wire-locked
+    /// enum, spelled `"description"`, documented in `docs/API_CONTRACT.md`
+    /// §7, and a future description-specific check should reuse it rather
+    /// than re-adding it. `fstab-core` is a library crate, so a `pub` variant
+    /// nothing constructs is not a `dead_code` hazard.
     Description,
 }
 
@@ -263,7 +271,6 @@ fn structural_findings(doc: &Document) -> Vec<Finding> {
     findings.extend(duplicate_mount_point_findings(doc));
     findings.extend(malformed_uuid_findings(doc));
     findings.extend(mount_point_missing_findings(doc));
-    findings.extend(description_contains_newline_findings(doc));
 
     findings
 }
@@ -476,46 +483,6 @@ fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
                     entry.mount_point
                 ),
                 FindingField::MountPoint,
-                idx,
-            )
-        })
-        .collect()
-}
-
-/// Flags any [`crate::model::FstabEntry`] whose `description` contains an
-/// embedded newline (`\n` or `\r`) as a blocking error.
-///
-/// A description parsed from a real file can never contain one (the source
-/// text was already split on newlines before any field reached this code) -
-/// this exists as a second line of defense against an `EntryDto` constructed
-/// directly via the Tauri IPC boundary, bypassing the text parser entirely,
-/// the same reasoning [`empty_fs_type_findings`] above documents for its own
-/// analogous case. If such a value ever reached the writer, it would split
-/// into two physical lines and corrupt the single-comment-line structure this
-/// feature depends on.
-fn description_contains_newline_findings(doc: &Document) -> Vec<Finding> {
-    doc.lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| match line {
-            Line::Entry(entry) => Some((idx, entry)),
-            _ => None,
-        })
-        .filter(|(_, entry)| {
-            entry
-                .description
-                .as_deref()
-                .is_some_and(|text| text.contains('\n') || text.contains('\r'))
-        })
-        .map(|(idx, entry)| {
-            Finding::error_at(
-                format!(
-                    "entry for mount point {:?} has a description containing an embedded \
-                     newline; a description is written as a single comment line above the \
-                     entry, so it must be a single line of text",
-                    entry.mount_point
-                ),
-                FindingField::Description,
                 idx,
             )
         })
@@ -1167,66 +1134,35 @@ mod tests {
         assert_ne!(findings[0].line_index, findings[1].line_index);
     }
 
-    // --- Structural: description must stay a single line ---
+    // --- Structural: a description is free-form text, never a finding ---
 
-    /// Builds an entry whose description is exactly `description`.
-    fn entry_with_description(description: &str) -> FstabEntry {
-        FstabEntry::new(
-            SourceId::Path("/dev/sda1".into()),
-            "/mnt/data",
-            "ext4",
-            Options::new(),
-            0,
-            2,
-        )
-        .with_description(description)
-    }
-
+    /// T43 retired the "a description must be a single line" check: a
+    /// description is now parsed from, and written back as, however many
+    /// comment lines it needs, so an embedded `\n` is the expected shape of a
+    /// multi-line note rather than an error. Nothing about a description's
+    /// *text* is structurally invalid any more, which this pins: a
+    /// multi-line description must produce no structural finding at all.
     #[test]
-    fn description_containing_a_line_feed_is_an_error() {
-        // A comment and a blank line precede the entry so a correct
-        // `line_index` of 2 proves the index is really `doc.lines`' index.
-        let doc = Document::from_lines(vec![
-            Line::Comment(" a comment".to_string()),
-            Line::Blank,
-            Line::Entry(entry_with_description("first line\nsecond line")),
-        ]);
-        let findings = description_contains_newline_findings(&doc);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Error);
-        assert_eq!(findings[0].field, Some(FindingField::Description));
-        assert_eq!(findings[0].line_index, Some(2));
-    }
+    fn a_multi_line_description_produces_no_structural_finding() {
+        let doc = Document::from_lines(vec![Line::Entry(
+            FstabEntry::new(
+                SourceId::Path("/dev/sda1".into()),
+                "/mnt/data",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )
+            .with_description("photo archive\nonly mounted for backups"),
+        )]);
 
-    #[test]
-    fn description_containing_a_carriage_return_is_an_error() {
-        let doc = doc_with_entry(entry_with_description("first line\rsecond line"));
-        let findings = description_contains_newline_findings(&doc);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Error);
-        assert_eq!(findings[0].field, Some(FindingField::Description));
-        assert_eq!(findings[0].line_index, Some(0));
-    }
-
-    #[test]
-    fn single_line_description_produces_no_finding() {
-        let doc = doc_with_entry(entry_with_description(
-            "photo archive, only mounted for backups",
-        ));
-        assert!(description_contains_newline_findings(&doc).is_empty());
-    }
-
-    #[test]
-    fn absent_description_produces_no_finding() {
-        let doc = doc_with_entry(FstabEntry::new(
-            SourceId::Path("/dev/sda1".into()),
-            "/mnt/data",
-            "ext4",
-            Options::new(),
-            0,
-            2,
-        ));
-        assert!(description_contains_newline_findings(&doc).is_empty());
+        assert!(
+            structural_findings(&doc)
+                .iter()
+                .all(|finding| finding.field != Some(FindingField::Description)),
+            "no structural check may be about a description any more: {:?}",
+            structural_findings(&doc)
+        );
     }
 
     // --- Semantic: pure decision logic (findmnt I/O-vs-logic split) ---

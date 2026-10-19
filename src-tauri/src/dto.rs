@@ -244,16 +244,21 @@ pub struct EntryDto {
     /// Distinct from [`Self::trailing_comment`] - two different mechanisms,
     /// stored separately. A trailing comment is inline, on the entry's *own*
     /// physical line, after the six fields; a description instead round-trips
-    /// to and from a comment line of its own, immediately *above* the entry,
-    /// carrying rustab's `# // <text>` marker. See
+    /// to and from the ordinary `#` comment line(s) directly *above* the
+    /// entry, with no marker of any kind - adjacency alone decides it. See
     /// [`fstab_core::model::FstabEntry::description`] and `fstab-core`'s
-    /// `parser.rs` for the exact marker-recognition and serialization rules;
-    /// they are not restated here.
+    /// `parser.rs` for the exact absorption and serialization rules; they are
+    /// not restated here.
+    ///
+    /// **May be multi-line.** The value carries one `\n` per comment line,
+    /// with no trailing newline and no `\r`, and is written back out as one
+    /// comment line per `\n`-separated piece. A UI editing this field should
+    /// use a multi-line input.
     ///
     /// Normalized on the way in: see [`From<EntryDto> for FstabEntry`] below,
-    /// which is where a value arriving over IPC is held to the same
-    /// "empty-after-trim is not a description" standard as one arriving via
-    /// the text parser.
+    /// which is where a value arriving over IPC has its line endings folded
+    /// to `\n` and is held to the same "empty-after-trim is not a
+    /// description" standard as one arriving via the text parser.
     pub description: Option<String>,
 }
 
@@ -293,14 +298,22 @@ impl From<EntryDto> for FstabEntry {
             // `None` "by whoever constructs the entry"; for anything arriving
             // from the frontend, this IPC boundary is that place. The parser
             // already enforces the same rule on text read from a file (a
-            // `# //` marker whose payload is empty after trimming is not a
-            // description at all), so a description typed into the UI and one
+            // comment block whose text is empty after trimming is not
+            // absorbed at all), so a description typed into the UI and one
             // read from disk are held to the same standard - otherwise a
             // whitespace-only value from the UI would be stored, then written
-            // out as a bare marker line, and silently vanish on the next
-            // parse.
+            // out as a bare `#` line, and silently vanish on the next parse.
+            //
+            // Line endings are folded to `\n` *first*. A description is now
+            // genuinely multi-line, and `\n` is the only separator the model
+            // and the serializer understand (one comment line per piece); a
+            // stray `\r` would otherwise end up inside a comment line's text
+            // and be written into the file. A browser `<textarea>`'s `.value`
+            // is already LF-only per the HTML spec, but an IPC boundary is
+            // exactly the place not to assume what the other side sent.
             description: dto
                 .description
+                .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"))
                 .map(|text| text.trim().to_string())
                 .filter(|text| !text.is_empty()),
         }
@@ -447,8 +460,13 @@ pub enum ValidationFieldDto {
     FsType,
     /// The entry's human-readable description ([`EntryDto::description`]) -
     /// not one of the six fstab fields, but an editable per-entry value the
-    /// UI can focus just the same. Set by the `description_contains_newline`
-    /// check.
+    /// UI can focus just the same.
+    ///
+    /// No backend check currently produces this value: the only one that did
+    /// (a description had to be a single line) was deleted when descriptions
+    /// became multi-line. The variant is wire-locked and stays - see
+    /// [`FindingField::Description`] for the full reasoning. A UI must still
+    /// handle it, since it can reappear without a contract change.
     Description,
 }
 
@@ -1203,10 +1221,15 @@ mod tests {
     /// the documentation that has to be updated with it.
     #[test]
     fn document_wire_format_is_exactly_as_documented() {
+        // `# hi` is this entry's description (absorbed, so it is not also a
+        // `comment` line); `# freestanding` is above a malformed line, which
+        // is one of the positions where a comment stays a comment - so all
+        // four `kind`s and a non-null `description` appear in one document.
         let document = parser::parse(
             "# hi\n\
-             \n\
              UUID=1111 /mnt/d ext4 noauto,fmask=0022 0 2 # note\n\
+             \n\
+             # freestanding\n\
              /dev/sdb1\n",
         );
 
@@ -1216,13 +1239,13 @@ mod tests {
             json,
             concat!(
                 r#"{"lines":["#,
-                r#"{"kind":"comment","text":" hi"},"#,
-                r#"{"kind":"blank"},"#,
                 r#"{"kind":"entry","entry":{"#,
                 r#""source":{"kind":"uuid","value":"1111"},"#,
                 r#""mount_point":"/mnt/d","fs_type":"ext4","#,
                 r#""options":[{"key":"noauto","value":null},{"key":"fmask","value":"0022"}],"#,
-                r#""dump":0,"pass":2,"trailing_comment":" note","description":null}},"#,
+                r#""dump":0,"pass":2,"trailing_comment":" note","description":"hi"}},"#,
+                r#"{"kind":"blank"},"#,
+                r#"{"kind":"comment","text":" freestanding"},"#,
                 r#"{"kind":"malformed","raw":"/dev/sdb1"}"#,
                 r#"]}"#,
             )
@@ -1616,20 +1639,21 @@ mod tests {
     /// A description is carried across the boundary in both directions, and
     /// serializes under its own key - not merged into `trailing_comment`.
     ///
-    /// The marker line itself is `fstab-core`'s concern (and is pinned by its
-    /// own tests plus `fixtures_round_trip_through_the_dto_layer_byte_for_byte`
-    /// in `commands.rs`, which runs the `description_marker.fstab` fixture
+    /// Which comment lines become a description is `fstab-core`'s concern
+    /// (and is pinned by its own tests plus
+    /// `fixtures_round_trip_through_the_dto_layer_byte_for_byte` in
+    /// `commands.rs`, which runs the `description_blocks.fstab` fixture
     /// through this very layer); what is pinned here is only the wire shape.
     #[test]
     fn a_description_round_trips_separately_from_a_trailing_comment() {
         let document = parser::parse(
-            "# // photo archive, only mounted for backups\n\
+            "# photo archive, only mounted for backups\n\
              /dev/sdc1 /mnt/photos ext4 noauto 0 2 # inline\n",
         );
         let dto = DocumentDto::from(&document);
 
         let LineDto::Entry { entry } = &dto.lines[0] else {
-            panic!("expected the marker line to have been absorbed into the entry");
+            panic!("expected the comment line to have been absorbed into the entry");
         };
         assert_eq!(
             entry.description.as_deref(),
@@ -1655,8 +1679,8 @@ mod tests {
     /// This is the only normalization this module performs, and it exists
     /// because `fstab_core::model` deliberately performs none itself. Without
     /// it, a whitespace-only value typed into the UI would be stored, written
-    /// out as a bare `# //` marker line, and then silently vanish on the next
-    /// parse - the marker form with an empty payload is not recognized.
+    /// out as a bare `#` line, and then silently vanish on the next parse -
+    /// a comment block that trims away to nothing is not absorbed.
     #[test]
     fn a_description_arriving_over_ipc_is_trimmed_and_emptied_to_none() {
         let entry_with = |description: Option<&str>| EntryDto {
@@ -1688,23 +1712,33 @@ mod tests {
         assert_eq!(FstabEntry::from(entry_with(None)).description, None);
 
         // Internal whitespace is content, not padding, and stays verbatim -
-        // the same rule `fstab-core`'s parser documents for a marker line.
+        // the same rule `fstab-core`'s parser documents for a comment line's
+        // own text.
         assert_eq!(
             FstabEntry::from(entry_with(Some("two  inner   spaces"))).description,
             Some("two  inner   spaces".to_string())
         );
+
+        // An interior newline is content too: a description is multi-line
+        // now, so trimming the ends must not touch it.
+        assert_eq!(
+            FstabEntry::from(entry_with(Some("  first line\nsecond line  "))).description,
+            Some("first line\nsecond line".to_string()),
+            "trimming must not strip or collapse an interior newline"
+        );
     }
 
-    /// A description that survives normalization but still carries a newline
-    /// is left for `validate.rs` to reject, not silently mangled here.
+    /// Line endings arriving over IPC are folded to `\n` before anything else.
     ///
-    /// The two layers have different jobs: this boundary normalizes what is
-    /// safely normalizable (padding), while a value that cannot be written as
-    /// a single comment line is a *blocking validation error* the user is told
-    /// about - not something to quietly rewrite behind their back.
+    /// `\n` is the only line separator the model and the serializer know: the
+    /// writer emits one comment line per `\n`-separated piece, so a stray
+    /// `\r` left in the value would be written into the user's fstab inside a
+    /// comment line. A `<textarea>` cannot produce one (the HTML spec says
+    /// its `value` is LF-only), but this is an IPC boundary and the frontend
+    /// is not the only possible caller.
     #[test]
-    fn an_embedded_newline_is_left_for_validation_to_reject() {
-        let entry = FstabEntry::from(EntryDto {
+    fn crlf_and_lone_cr_line_endings_are_folded_before_trimming() {
+        let entry_with = |description: &str| EntryDto {
             source: SourceDto {
                 kind: SourceKindDto::Path,
                 value: "/dev/sdc1".to_string(),
@@ -1715,21 +1749,61 @@ mod tests {
             dump: 0,
             pass: 2,
             trailing_comment: None,
-            description: Some("  first line\nsecond line  ".to_string()),
-        });
+            description: Some(description.to_string()),
+        };
 
+        for sent in ["first\r\nsecond", "first\rsecond", "first\nsecond"] {
+            let folded = FstabEntry::from(entry_with(sent)).description;
+            assert_eq!(
+                folded,
+                Some("first\nsecond".to_string()),
+                "{sent:?} must normalize to the same LF-separated value"
+            );
+        }
+
+        // Folding happens *before* the trim/empty check, so a value that is
+        // nothing but line endings is still `None` rather than a stored
+        // "\n\n".
+        assert_eq!(FstabEntry::from(entry_with("\r\n\r")).description, None);
+    }
+
+    /// A genuinely multi-line description makes the whole trip through this
+    /// layer - DTO out, JSON out, JSON in, DTO in - and comes back as the
+    /// same multi-line value on the same entry, with the file text it
+    /// serializes to being one comment line per piece.
+    #[test]
+    fn a_multi_line_description_round_trips_through_the_dto_layer() {
+        let original = "# first line of the note\n\
+                        # second line of the note\n\
+                        /dev/sdc1 /mnt/photos ext4 noauto 0 2\n";
+        let document = parser::parse(original);
+
+        let json = serde_json::to_string(&DocumentDto::from(&document)).expect("serialize");
+        let back: DocumentDto = serde_json::from_str(&json).expect("deserialize");
+
+        let LineDto::Entry { entry } = &back.lines[0] else {
+            panic!("expected the comment block to have been absorbed into the entry");
+        };
         assert_eq!(
             entry.description.as_deref(),
-            Some("first line\nsecond line"),
-            "trimming must not strip an interior newline"
+            Some("first line of the note\nsecond line of the note"),
+            "the embedded newline must survive JSON in both directions"
         );
 
-        // `fstab-core`'s own tests cover that its `description_contains_newline`
-        // check fires for exactly this entry; what this layer owes the frontend
-        // is that the field tag it produces survives the trip unchanged.
+        let restored = Document::from(back);
+        assert_eq!(restored, document);
+        assert_eq!(restored.to_string(), original);
+    }
+
+    /// The `"description"` field tag still crosses the boundary unchanged,
+    /// even though no backend check currently produces it: the enum variant
+    /// is wire-locked (`docs/API_CONTRACT.md` §7) and the UI must keep
+    /// handling it.
+    #[test]
+    fn the_description_validation_field_tag_still_maps_across_the_boundary() {
         let finding = Finding {
             severity: Severity::Error,
-            message: "has a description containing an embedded newline".to_string(),
+            message: "something about a description".to_string(),
             field: Some(FindingField::Description),
             line_index: Some(0),
         };
