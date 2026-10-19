@@ -52,6 +52,7 @@ pub fn run() {
             commands::validate_candidate,
             commands::render_candidate,
             commands::save,
+            commands::resync_external_change,
             commands::list_backups,
             commands::restore_backup,
             commands::read_backup,
