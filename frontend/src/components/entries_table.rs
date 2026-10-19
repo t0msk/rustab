@@ -25,16 +25,70 @@
 //! same `resolve_moved_indices` `stage_move` uses, fed by the
 //! `attached_block_len` prop.
 //!
-//! **Drag-and-drop (T48, §13.11)** is layered on top of that, additively:
-//! every row grows a drag handle whose `pointerdown`/`pointermove`/
-//! `pointerup` gesture commits *the very same* `on_move((from, to))` calls
-//! a Move-button click makes - one adjacent step per row boundary the
-//! pointer crosses, and **at most one emission per pointer event**. That
-//! last rule is not a style preference: `AppShell`'s handler reads a
-//! `UseStateHandle` snapshot of the candidate document and calls `.set()`,
-//! so a second `emit` in the same JS callback would stage onto the
-//! pre-`.set()` document and the two steps would not compose. A fast drag
-//! that outruns one step per event simply catches up on the next one.
+//! **Drag-and-drop (T48, revised by T52 - §13.11)** is layered on top of
+//! that, additively: a row's own `<tr>` *is* the grab surface, and its
+//! `pointerdown`/`pointermove`/`pointerup` gesture commits *the very same*
+//! `on_move((from, to))` calls a Move-button click makes - one adjacent
+//! step per row boundary the pointer crosses, and **at most one emission
+//! per pointer event**. That last rule is not a style preference:
+//! `AppShell`'s handler reads a `UseStateHandle` snapshot of the candidate
+//! document and calls `.set()`, so a second `emit` in the same JS callback
+//! would stage onto the pre-`.set()` document and the two steps would not
+//! compose. A fast drag that outruns one step per event simply catches up
+//! on the next one.
+//!
+//! **Click vs. drag (T52).** T48 started this gesture from a dedicated
+//! grip handle purely to keep it off the row's own T32 expand click; the
+//! repo owner's own live feedback replaced that with a whole-row grab, so
+//! the two gestures now share one `pointerdown` on one element and are
+//! told apart by pointer *travel* rather than by hit target:
+//!
+//! - A press only starts a *pending* gesture ([`PendingGesture`]: pointer
+//!   id, row position, origin x/y, plus pointer capture). Nothing is
+//!   measured, no state that renders is touched, and no default is
+//!   prevented - so a press that never travels stays, as far as the
+//!   browser is concerned, the same plain click it was before this
+//!   feature existed, and T32's `on_toggle` runs byte-for-byte unchanged.
+//! - Once a `pointermove` clears [`crossed_drag_threshold`]'s
+//!   [`DRAG_THRESHOLD_PX`] of travel (Euclidean, both axes, measured from
+//!   the *original* `pointerdown` position so the geometry below sees the
+//!   gesture's true start, not the point it was reclassified at), the
+//!   pending gesture is promoted: rows are measured, the layout freezes,
+//!   and a real [`DragState`] exists.
+//! - Promotion also raises a "this press became a drag" flag that
+//!   `on_toggle` checks and clears. That flag is deliberately a plain
+//!   shared cell (`use_mut_ref`), **not** a `use_state`: the browser
+//!   synthesises `click` right after `pointerup` for the same
+//!   interaction, with no guarantee that Yew's scheduler has re-rendered
+//!   with a cleared `DragState` in between, so a render-scoped snapshot
+//!   cannot be trusted to answer "was this press a drag?". The flag lives
+//!   outside the render cycle and is read synchronously, which makes the
+//!   suppression structural rather than a timing hope.
+//! - Descendants that own their own pointer behaviour
+//!   ([`NO_DRAG_SELECTOR`] - every `button`, and `UnparsedEntryRow`'s
+//!   raw-line `<pre>`, whose text selection is the only way to copy that
+//!   line) bail out at the top of the handler, before any capture, state
+//!   change or `prevent_default`, so their native behaviour is left
+//!   completely untouched instead of being fought with `stop_propagation`
+//!   after the fact.
+//! - A non-excluded press also blocks text selection document-wide
+//!   ([`set_body_user_select_none`]) right there in the `pointerdown`
+//!   handler, and `on_drag_end` clears it again - both synchronously,
+//!   deliberately *not* through the `use_effect_with` below, which still
+//!   owns `cursor: grabbing` and is now only an idempotent backstop for
+//!   `user-select`. This fixes a race T48 shipped with: an effect keyed on
+//!   `drag.is_some()` cannot apply the style until Yew has processed a
+//!   state update and re-rendered, while the browser's native "press, then
+//!   move, so select text" behaviour waits for nothing - so a drag visibly
+//!   highlighted row text on its way past. The handler, by contrast, runs
+//!   to completion before any later native event of the same input stream
+//!   is dispatched, leaving no window to race against. Note what is *not*
+//!   used here: `prevent_default()` on `pointerdown` would also suppress
+//!   selection, but per the Pointer Events spec it suppresses that
+//!   interaction's compatibility mouse events too - plausibly including
+//!   the very `click` this whole two-phase design exists to preserve - so
+//!   the CSS route is taken instead, being orthogonal to `click`
+//!   synthesis rather than merely assumed to be safe.
 //!
 //! **Why the drag renders rows out of document order.** A move changes
 //! only the *contents* of this table's rows, never their count or their
@@ -58,6 +112,7 @@
 //! `on_move` and `candidate_index` keep their exact position-based
 //! meaning, and the frozen keys live and die with one gesture.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -69,7 +124,7 @@ use crate::candidate::resolve_moved_indices;
 use crate::components::empty_state::EmptyState;
 use crate::components::icons::{
     CheckIcon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CopyIcon, DeleteIcon, EditIcon,
-    FolderOpenIcon, GripVerticalIcon,
+    FolderOpenIcon,
 };
 use crate::components::status_toast::ToastKind;
 use crate::dto::{EntryDto, OptionDto, SourceKind};
@@ -300,6 +355,29 @@ struct DragState {
     keys: Vec<usize>,
 }
 
+/// A press on a row that has not (yet) been reclassified as a drag (T52,
+/// §13.11) - everything the promotion needs, and nothing more.
+///
+/// Deliberately held in a `use_mut_ref` rather than a `use_state`: a
+/// pending gesture has no visual effect at all, so promoting it is the
+/// first moment anything needs to re-render, and keeping it out of the
+/// render cycle means the geometry [`measure_rows`] reads at promotion is
+/// still the same untouched document-order layout the press landed on.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PendingGesture {
+    /// The pointer this press captured; events from any other pointer are
+    /// ignored, exactly as in [`DragState`].
+    pointer_id: i32,
+    /// The pressed row's render position at `pointerdown` - becomes
+    /// [`DragState::start_position`] if this gesture is promoted.
+    start_position: usize,
+    /// The press position, in client coordinates. Both axes, because the
+    /// threshold is a distance, not a vertical delta - and this is also
+    /// the point the promoted gesture's `start_y` is anchored to.
+    start_x: f64,
+    start_y: f64,
+}
+
 /// The candidate index one adjacent step away from `row_position` in this
 /// table's own render order, or `None` at that boundary.
 ///
@@ -524,19 +602,103 @@ fn group_row_metrics(raw: &[(usize, f64, f64)], row_count: usize) -> Option<Vec<
         .collect()
 }
 
-/// Marks the drag handle in the DOM so a pointer event landing on the icon
-/// inside it still resolves to the handle itself.
-const DRAG_HANDLE_SELECTOR: &str = "[data-drag-handle]";
+/// How far the pointer has to travel from its `pointerdown` position
+/// before a press on a row stops being a click and becomes a drag, in CSS
+/// pixels (T52, §13.11).
+///
+/// Comfortably above the hand jitter an ordinary click carries - so
+/// click-to-expand (T32) still fires on presses that were never meant to
+/// move anything - and small enough that a deliberate drag clears it
+/// almost immediately, so the gesture does not feel like it has to be
+/// "unstuck" before it starts.
+const DRAG_THRESHOLD_PX: f64 = 5.0;
 
-/// The handle element a pointer event belongs to, if any.
-fn handle_element(event: &PointerEvent) -> Option<web_sys::Element> {
-    event
-        .target()?
-        .dyn_into::<web_sys::Element>()
-        .ok()?
-        .closest(DRAG_HANDLE_SELECTOR)
-        .ok()
-        .flatten()
+/// Whether a press whose pointer has travelled `(dx, dy)` from where it
+/// went down counts as a drag rather than a click (§13.12 item 1).
+///
+/// Euclidean distance over *both* axes, not a per-axis test: a drag is a
+/// drag however diagonally it starts, and e.g. two 4px components are
+/// ~5.7px of real travel even though neither axis alone clears the
+/// threshold. Pulled out as its own pure function for the same reason
+/// every other geometry decision in this file is ([`plan_step`],
+/// [`clamp_drag_offset`]) - so the rule is testable without a DOM.
+fn crossed_drag_threshold(dx: f64, dy: f64) -> bool {
+    dx.hypot(dy) >= DRAG_THRESHOLD_PX
+}
+
+/// Descendants of a row that must never start a drag gesture (T52,
+/// §13.11): a press landing inside one of these is left entirely to the
+/// browser - no pointer capture, no state, no `prevent_default`.
+///
+/// `button` covers Move up/Move down, Edit and Delete (and, for defence in
+/// depth, the expanded detail panel's copy/open-in-file-manager buttons,
+/// which sit on a `<tr>` that carries no pointer wiring at all). `pre` is
+/// `UnparsedEntryRow`'s raw-line block: that row has no copy button, so
+/// selecting its text with a click-drag is the only way to copy the line,
+/// and a literal "anywhere on the row" grab would turn every such
+/// selection into a reorder the moment it passed [`DRAG_THRESHOLD_PX`].
+const NO_DRAG_SELECTOR: &str = "button, pre";
+
+/// Mirrors the row `<tr>`s [`measure_rows`] reads, so a pointer event can
+/// be resolved back to the row it happened on.
+const ROW_SELECTOR: &str = "tr[data-row-position]";
+
+/// The one place this file resolves `<body>`, so the two mechanisms that
+/// write to its inline style - the synchronous
+/// [`set_body_user_select_none`] calls in the pointer handlers and the
+/// `cursor: grabbing` effect in [`entries_table`] - cannot drift apart on
+/// *which* element they are styling.
+fn document_body() -> Option<web_sys::HtmlElement> {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.body())
+}
+
+/// Turns the document-level text-selection block on/off, as an inline
+/// style on `<body>` (T52, §13.11).
+///
+/// Called *synchronously* from the row's `pointerdown`/`pointerup`
+/// handlers rather than from an effect, which is the whole point: a
+/// render-cycle-delayed `user-select: none` loses a race it cannot win
+/// (see the module docs' text-selection note). Setting an already-set
+/// property, or removing an already-removed one, is a no-op, so this is
+/// safe to call redundantly - which is what lets the `cursor` effect keep
+/// doing the same thing as a backstop.
+fn set_body_user_select_none(disabled: bool) {
+    let Some(body) = document_body() else {
+        return;
+    };
+    let style = body.style();
+    if disabled {
+        let _ = style.set_property("user-select", "none");
+    } else {
+        let _ = style.remove_property("user-select");
+    }
+}
+
+/// The element a pointer event was dispatched at, if it is an element at
+/// all.
+fn event_element(event: &PointerEvent) -> Option<web_sys::Element> {
+    event.target()?.dyn_into::<web_sys::Element>().ok()
+}
+
+/// Whether this pointer event landed inside a [`NO_DRAG_SELECTOR`]
+/// descendant - the bail-out at the top of the row's `pointerdown`
+/// handler.
+fn is_drag_excluded(event: &PointerEvent) -> bool {
+    event_element(event)
+        .is_some_and(|element| element.closest(NO_DRAG_SELECTOR).ok().flatten().is_some())
+}
+
+/// The row `<tr>` a pointer event belongs to, if any.
+///
+/// Resolved from `target` rather than `currentTarget` for the same reason
+/// T48's handle lookup was: a `pointerdown` on a row lands on whichever
+/// cell, span or icon is actually under the pointer, never on the `<tr>`
+/// itself. Once the gesture owns pointer capture the target *is* the
+/// capturing `<tr>`, which this resolves to unchanged.
+fn row_element(event: &PointerEvent) -> Option<web_sys::Element> {
+    event_element(event)?.closest(ROW_SELECTOR).ok().flatten()
 }
 
 /// Reads every row's current geometry out of the live DOM, once, at
@@ -565,6 +727,28 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // panics with "Hooks are called conditionally".
     let expanded: UseStateHandle<HashSet<usize>> = use_state(HashSet::new);
     let drag: UseStateHandle<Option<DragState>> = use_state(|| None);
+    // The two halves of T52's click-vs-drag disambiguation, both held
+    // outside Yew's render cycle on purpose (module docs):
+    //
+    // * `pending_gesture` - a press that may or may not become a drag.
+    //   Nothing about it renders, so it has no business triggering one;
+    //   and because it does not, the layout it is promoted against is
+    //   still exactly the layout it was pressed on.
+    // * `drag_promoted` - "the press that is ending right now became a
+    //   drag, so swallow the `click` the browser is about to synthesise
+    //   from it." `click` is dispatched synchronously after `pointerup`,
+    //   before any re-render is guaranteed, so `on_toggle` cannot answer
+    //   this from a render-scoped snapshot of `drag` and reads this cell
+    //   synchronously instead.
+    //
+    // One of each per table, not per row: only one pointer gesture can be
+    // in flight at a time (the pointer is captured, and non-primary
+    // pointers are ignored), and a per-row-per-render cell would be a
+    // *different* allocation by the time the synthetic `click` arrives -
+    // several renders happen between promotion and `pointerup` - which is
+    // precisely the identity the suppression depends on.
+    let pending_gesture: Rc<RefCell<Option<PendingGesture>>> = use_mut_ref(|| None);
+    let drag_promoted: Rc<RefCell<bool>> = use_mut_ref(|| false);
 
     // The grabbing cursor has to be document-level for the gesture's
     // duration (§13.11), or it flickers back to the default as the pointer
@@ -573,12 +757,15 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // any cascade layer, which outranks every utility class. Running it as
     // an effect (rather than setting/clearing it in the pointer handlers)
     // means the cleanup also covers an unmount mid-gesture.
+    //
+    // `user-select` is still written here too, but is no longer *owned*
+    // here: the pointer handlers apply and clear it synchronously (T52's
+    // text-selection fix - see the module docs), and this effect is only
+    // an idempotent backstop plus the unmount-mid-gesture cleanup path.
     {
         let dragging = drag.is_some();
         use_effect_with(dragging, move |dragging: &bool| {
-            let body = web_sys::window()
-                .and_then(|window| window.document())
-                .and_then(|document| document.body());
+            let body = document_body();
             if *dragging {
                 if let Some(body) = &body {
                     let style = body.style();
@@ -666,8 +853,10 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
             .collect(),
     };
 
-    // `pointermove`: advance the gesture and, if this event crossed the
-    // next boundary, commit exactly one adjacent step - the identical
+    // `pointermove` does double duty (T52): while the press is still
+    // pending it is the *only* thing that can promote it into a drag, and
+    // once promoted it advances the gesture and, if this event crossed the
+    // next boundary, commits exactly one adjacent step - the identical
     // `on_move` call the neighbouring Move button would have made, plus
     // the identical `expanded` remap its click handler does (§13.8). One
     // `if let`, never a loop: see the module docs on the staleness trap.
@@ -677,8 +866,65 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
         let on_move = props.on_move.clone();
         let attached_block_len = props.attached_block_len.clone();
         let candidate_indices = candidate_indices.clone();
+        let pending_gesture = pending_gesture.clone();
+        let drag_promoted = drag_promoted.clone();
         Callback::from(move |event: PointerEvent| {
             let Some(state) = (*drag).clone() else {
+                // No drag yet. If there is a pending press from this same
+                // pointer and it has now travelled far enough, this is the
+                // event that turns it into one.
+                let Some(gesture) = *pending_gesture.borrow() else {
+                    return;
+                };
+                if event.pointer_id() != gesture.pointer_id {
+                    return;
+                }
+                let pointer_x = f64::from(event.client_x());
+                let pointer_y = f64::from(event.client_y());
+                if !crossed_drag_threshold(pointer_x - gesture.start_x, pointer_y - gesture.start_y)
+                {
+                    return;
+                }
+                // Past the threshold the press is a drag whatever happens
+                // next, so it stops being pending even if the measurement
+                // below fails - a half-promoted press must not keep
+                // re-entering this branch on every further move.
+                pending_gesture.replace(None);
+                let Some(tbody) =
+                    row_element(&event).and_then(|row| row.closest("tbody").ok().flatten())
+                else {
+                    return;
+                };
+                let Some(metrics) = measure_rows(&tbody, candidate_indices.len()) else {
+                    return;
+                };
+                if gesture.start_position >= metrics.len() {
+                    return;
+                }
+                // Raised synchronously, read synchronously by `on_toggle`:
+                // this is what keeps the row's own T32 expand click off a
+                // gesture that turned out to be a drag (module docs).
+                drag_promoted.replace(true);
+                // Only now, with the press reclassified, is suppressing
+                // the browser's own default correct - doing it at
+                // `pointerdown`, the way a handle-based gesture could
+                // afford to, would have broken every ordinary click on the
+                // row. Text selection is not this call's job at all - the
+                // document-level `user-select: none` has been in place
+                // since `pointerdown` (module docs).
+                event.prevent_default();
+                drag.set(Some(DragState {
+                    pointer_id: gesture.pointer_id,
+                    start_position: gesture.start_position,
+                    current_position: gesture.start_position,
+                    // Anchored at the press, not at the point the
+                    // threshold happened to be crossed, so `plan_step`/
+                    // `clamp_drag_offset` see the gesture's true start.
+                    start_y: gesture.start_y,
+                    current_y: pointer_y,
+                    metrics,
+                    keys: (*candidate_indices).clone(),
+                }));
                 return;
             };
             if event.pointer_id() != state.pointer_id {
@@ -714,18 +960,40 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // the same way: release the capture and drop every drag-only visual.
     // The committed document order is already live, so there is nothing to
     // apply here and nothing moves on screen.
+    //
+    // A press that never promoted ends here too, and silently: it has
+    // nothing to undo, and it must leave the `click` the browser is about
+    // to synthesise completely alone - that click *is* T32's expand toggle
+    // (T52). `drag_promoted` is deliberately not touched here; only
+    // `on_toggle` (or the next `pointerdown`) clears it.
     let on_drag_end = {
         let drag = drag.clone();
+        let pending_gesture = pending_gesture.clone();
         Callback::from(move |event: PointerEvent| {
-            if drag.is_none() {
+            let pointer_id = event.pointer_id();
+            let gesture_pointer = (*drag)
+                .as_ref()
+                .map(|state| state.pointer_id)
+                .or_else(|| pending_gesture.borrow().as_ref().map(|g| g.pointer_id));
+            if gesture_pointer != Some(pointer_id) {
                 return;
             }
-            if let Some(handle) = handle_element(&event) {
-                if handle.has_pointer_capture(event.pointer_id()) {
-                    let _ = handle.release_pointer_capture(event.pointer_id());
+            // Mirror of the synchronous block `on_drag_start` applied: the
+            // gesture is over, whether or not it ever became a drag, so
+            // normal text selection comes back before the browser gets to
+            // synthesise this interaction's `click`. Inside the pointer-id
+            // gate on purpose - a stray `pointerup` from some other pointer
+            // must not re-enable selection mid-drag.
+            set_body_user_select_none(false);
+            pending_gesture.replace(None);
+            if let Some(row) = row_element(&event) {
+                if row.has_pointer_capture(pointer_id) {
+                    let _ = row.release_pointer_capture(pointer_id);
                 }
             }
-            drag.set(None);
+            if drag.is_some() {
+                drag.set(None);
+            }
         })
     };
 
@@ -785,49 +1053,67 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                                 cb.emit(candidate_index);
                             })
                         };
-                        // `pointerdown` on this row's handle: capture the
-                        // pointer, freeze the table's geometry, and start
-                        // the gesture at this row's *current* render
-                        // position (no drag is in progress yet, so render
-                        // order is still document order and the gesture
-                        // slot equals the render position).
+                        // `pointerdown` anywhere on this row (T52): record
+                        // the press and capture the pointer, and *nothing
+                        // else*. No geometry is measured, no rendering
+                        // state is touched and no default is prevented
+                        // yet, because this may still turn out to be an
+                        // ordinary click-to-expand - only
+                        // `crossed_drag_threshold` travel in `on_drag_move`
+                        // promotes it into a real drag, starting from this
+                        // row's *current* render position (no drag is in
+                        // progress yet, so render order is still document
+                        // order and the gesture slot equals the render
+                        // position).
                         let on_drag_start = {
                             let drag = drag.clone();
-                            let candidate_indices = candidate_indices.clone();
+                            let pending_gesture = pending_gesture.clone();
+                            let drag_promoted = drag_promoted.clone();
                             Callback::from(move |event: PointerEvent| {
                                 // Only the primary button/contact drags: a
-                                // right-click or a second finger on the
-                                // handle is not a reorder gesture.
-                                if event.button() != 0 || !event.is_primary() {
+                                // right-click or a second finger on the row
+                                // is not a reorder gesture - and a press
+                                // arriving while a drag already owns the
+                                // pointer (a touch during a mouse drag) is
+                                // not allowed to overwrite its origin.
+                                if event.button() != 0 || !event.is_primary() || drag.is_some() {
                                     return;
                                 }
-                                // The row's own `<tr>` carries the T32
-                                // expand/collapse click (§13.11's whole
-                                // reason for a dedicated handle) - keep the
-                                // gesture off it, and off the browser's
-                                // text selection.
-                                event.stop_propagation();
-                                event.prevent_default();
-                                let Some(handle) = handle_element(&event) else {
+                                // Descendants with their own pointer
+                                // behaviour are left completely alone -
+                                // see `NO_DRAG_SELECTOR`.
+                                if is_drag_excluded(&event) {
+                                    return;
+                                }
+                                let Some(row) = row_element(&event) else {
                                     return;
                                 };
-                                let Some(tbody) = handle.closest("tbody").ok().flatten() else {
-                                    return;
-                                };
-                                let Some(metrics) = measure_rows(&tbody, candidate_indices.len())
-                                else {
-                                    return;
-                                };
-                                let _ = handle.set_pointer_capture(event.pointer_id());
-                                let pointer_y = f64::from(event.client_y());
-                                drag.set(Some(DragState {
+                                // Block text selection *now*, synchronously,
+                                // for every press this gesture takes over -
+                                // click or drag, because which one this is
+                                // cannot be known yet, and the native
+                                // "press + move = select text" behaviour
+                                // starts without waiting to be told. Cleared
+                                // again in `on_drag_end`, i.e. within this
+                                // same synchronous pointerdown/pointerup
+                                // pair for a press that stayed a click. Done
+                                // after the row lookup above so there is no
+                                // path that sets it without also recording
+                                // the gesture that clears it.
+                                set_body_user_select_none(true);
+                                // Every press that can reach `on_toggle`
+                                // clears the flag on its way in, so a
+                                // promoted gesture whose synthetic `click`
+                                // never arrived (released off the row,
+                                // cancelled) cannot swallow a later,
+                                // unrelated click.
+                                drag_promoted.replace(false);
+                                let _ = row.set_pointer_capture(event.pointer_id());
+                                pending_gesture.replace(Some(PendingGesture {
                                     pointer_id: event.pointer_id(),
                                     start_position: row_position,
-                                    current_position: row_position,
-                                    start_y: pointer_y,
-                                    current_y: pointer_y,
-                                    metrics,
-                                    keys: (*candidate_indices).clone(),
+                                    start_x: f64::from(event.client_x()),
+                                    start_y: f64::from(event.client_y()),
                                 }));
                             })
                         };
@@ -848,7 +1134,19 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                                 let is_expanded = expanded.contains(&candidate_index);
                                 let on_toggle = {
                                     let expanded = expanded.clone();
+                                    let drag_promoted = drag_promoted.clone();
                                     Callback::from(move |_: MouseEvent| {
+                                        // A press that became a drag still
+                                        // ends in a `click` the browser
+                                        // synthesises; swallow exactly
+                                        // that one (T52, module docs).
+                                        // Checked *and cleared* here, and
+                                        // synchronously, because this runs
+                                        // before any re-render is
+                                        // guaranteed to have happened.
+                                        if drag_promoted.replace(false) {
+                                            return;
+                                        }
                                         let mut next = (*expanded).clone();
                                         if !next.remove(&candidate_index) {
                                             next.insert(candidate_index);
@@ -917,12 +1215,16 @@ pub struct EntryRowProps {
     pub expanded: bool,
     /// Toggles `expanded` for this row's own `candidate_index`. Clicking
     /// anywhere on the row's `<tr>` fires this; Edit/Delete call
-    /// `stop_propagation` first so neither of them also toggles the row.
+    /// `stop_propagation` first so neither of them also toggles the row,
+    /// and `EntriesTable`'s own handler swallows the one `click` a
+    /// completed drag gesture synthesises (T52 - the `<tr>` is now the
+    /// grab surface as well as the toggle surface).
     pub on_toggle: Callback<MouseEvent>,
     /// This row's position in the table's render order, mirrored into a
     /// `data-row-position` attribute on both of this row's `<tr>`s so one
-    /// `pointerdown` can measure the whole table's geometry in a single
-    /// DOM query (T48).
+    /// gesture can measure the whole table's geometry in a single DOM
+    /// query - and so a pointer event can be resolved back to the row it
+    /// happened on (T48, T52).
     pub row_position: usize,
     /// Moves this entry one position up/down (T40, §13.2). `None` means
     /// this row is at that boundary of the table, which renders a real
@@ -931,9 +1233,11 @@ pub struct EntryRowProps {
     pub on_move_down: Option<Callback<MouseEvent>>,
     pub on_edit: Callback<MouseEvent>,
     pub on_delete: Callback<MouseEvent>,
-    /// Drag-handle pointer wiring (T48, §13.11) - the gesture's whole
-    /// state machine lives in `EntriesTable`, which owns the document
-    /// order; this row only forwards its handle's pointer events.
+    /// Whole-row pointer wiring (T48, revised by T52 - §13.11) - the
+    /// gesture's whole state machine (pending press, 5px promotion,
+    /// committed drag) lives in `EntriesTable`, which owns the document
+    /// order; this row only hangs the three handlers on its main `<tr>`,
+    /// never on its expanded detail `<tr>`.
     pub on_drag_start: Callback<PointerEvent>,
     pub on_drag_move: Callback<PointerEvent>,
     pub on_drag_end: Callback<PointerEvent>,
@@ -967,55 +1271,6 @@ const ROW_SLIDE_CLASS: &str =
 /// border.
 const INSERTION_TOP_CLASS: &str = "border-t-2 border-t-sky-500 dark:border-t-sky-400";
 const INSERTION_BOTTOM_CLASS: &str = "border-b-2 border-b-sky-500 dark:border-b-sky-400";
-
-/// The drag handle (T48, §13.11).
-///
-/// Deliberately **not** a `<button>`: it is `aria-hidden`, carries no
-/// `tabindex` and never takes focus, because there is no sensible keyboard
-/// activation for "start a continuous pointer drag" and Move up/Move down
-/// already are this table's fully keyboard-operable reorder path. The
-/// `title` keeps it discoverable for a sighted mouse user.
-///
-/// The `onclick` that stops propagation is load-bearing, not defensive
-/// tidiness: `stop_propagation` on `pointerdown` does not stop the `click`
-/// the browser synthesises afterwards, which would otherwise bubble to the
-/// row's own `<tr>` and toggle the T32 expansion panel on every grab.
-fn drag_handle(
-    title: &'static str,
-    hover_class: &'static str,
-    on_drag_start: &Callback<PointerEvent>,
-    on_drag_move: &Callback<PointerEvent>,
-    on_drag_end: &Callback<PointerEvent>,
-) -> Html {
-    html! {
-        <span
-            data-drag-handle="true"
-            class={classes!(
-                "inline-flex",
-                "items-center",
-                "p-2",
-                "rounded-md",
-                "text-slate-400",
-                "dark:text-slate-500",
-                "cursor-grab",
-                "active:cursor-grabbing",
-                "touch-none",
-                "select-none",
-                hover_class,
-            )}
-            title={title}
-            aria-hidden="true"
-            onpointerdown={on_drag_start.clone()}
-            onpointermove={on_drag_move.clone()}
-            onpointerup={on_drag_end.clone()}
-            onpointercancel={on_drag_end.clone()}
-            onlostpointercapture={on_drag_end.clone()}
-            onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}
-        >
-            <GripVerticalIcon />
-        </span>
-    }
-}
 
 /// The inline `transform` a row carries while a drag is in progress.
 /// Always written out explicitly (including `0px`) so every committed step
@@ -1201,6 +1456,11 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                 data-row-position={row_position.clone()}
                 title={row_title}
                 onclick={props.on_toggle.clone()}
+                onpointerdown={props.on_drag_start.clone()}
+                onpointermove={props.on_drag_move.clone()}
+                onpointerup={props.on_drag_end.clone()}
+                onpointercancel={props.on_drag_end.clone()}
+                onlostpointercapture={props.on_drag_end.clone()}
             >
                 <td class="px-2 py-2 text-slate-400 dark:text-slate-500">
                     <span class={chevron_class} aria-hidden="true">
@@ -1241,13 +1501,6 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                 <td class="px-2 py-2 text-sm">{ entry.pass.to_string() }</td>
                 <td class="px-2 py-2 text-center whitespace-nowrap">
                     <div class="inline-flex items-center gap-1">
-                        { drag_handle(
-                            "Drag to reorder",
-                            "hover:bg-slate-100 dark:hover:bg-slate-700",
-                            &props.on_drag_start,
-                            &props.on_drag_move,
-                            &props.on_drag_end,
-                        ) }
                         { move_button(
                             &props.on_move_up,
                             "Move entry up",
@@ -1408,7 +1661,9 @@ pub struct UnparsedEntryRowProps {
     pub on_edit: Callback<MouseEvent>,
     pub on_delete: Callback<MouseEvent>,
     /// Same drag wiring and drag-only visuals as `EntryRowProps` - a raw
-    /// row is reordered exactly like a parsed one (§13.11).
+    /// row is grabbed and reordered exactly like a parsed one (§13.11),
+    /// with its raw-line `<pre>` excluded from the gesture so that text
+    /// stays selectable (`NO_DRAG_SELECTOR`).
     pub on_drag_start: Callback<PointerEvent>,
     pub on_drag_move: Callback<PointerEvent>,
     pub on_drag_end: Callback<PointerEvent>,
@@ -1447,6 +1702,11 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
             class={row_class}
             style={drag_transform_style(props.drag_offset)}
             data-row-position={props.row_position.to_string()}
+            onpointerdown={props.on_drag_start.clone()}
+            onpointermove={props.on_drag_move.clone()}
+            onpointerup={props.on_drag_end.clone()}
+            onpointercancel={props.on_drag_end.clone()}
+            onlostpointercapture={props.on_drag_end.clone()}
         >
             <td colspan="8" class="px-4 py-3">
                 <div class="flex items-start gap-3">
@@ -1460,13 +1720,6 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
                         </pre>
                     </div>
                     <div class="flex gap-1 shrink-0">
-                        { drag_handle(
-                            "Drag to reorder raw entry",
-                            "hover:bg-amber-100 dark:hover:bg-amber-900/40",
-                            &props.on_drag_start,
-                            &props.on_drag_move,
-                            &props.on_drag_end,
-                        ) }
                         { move_button(
                             &props.on_move_up,
                             "Move raw entry up",
@@ -1604,15 +1857,55 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Drag-and-drop (T48, `docs/UI_DESIGN.md` §13.11/§13.12)
+    // Drag-and-drop (T48, revised by T52 - `docs/UI_DESIGN.md`
+    // §13.11/§13.12)
     //
     // Everything §13.12 lists as unit-testable is pure geometry/
     // bookkeeping, deliberately extracted out of the pointer handlers the
     // same way `can_move_up`/`remap_expanded` already are, so it is
     // testable without a DOM. The wiring those functions feed (real
-    // pointer events, the actual CSS transition, focus order) is §13.12's
-    // own manual/code-review list.
+    // pointer events, the actual CSS transition, which descendants bail
+    // out of the gesture) is §13.12's own manual/code-review list.
     // ---------------------------------------------------------------
+
+    #[test]
+    fn a_press_that_does_not_travel_is_still_a_click() {
+        // T52's whole premise: the row is both the expand-click surface
+        // and the grab surface, so a press that never moves must stay a
+        // click (§13.12 item 1b). Zero travel, and the sub-pixel jitter a
+        // real mouse click carries, are both clicks.
+        assert!(!crossed_drag_threshold(0.0, 0.0));
+        assert!(!crossed_drag_threshold(0.5, -0.5));
+    }
+
+    #[test]
+    fn the_drag_threshold_is_a_distance_not_a_per_axis_test() {
+        // Just under, just over - in each direction on each axis, so a
+        // sign error anywhere in the predicate shows up here.
+        assert!(!crossed_drag_threshold(0.0, 4.9));
+        assert!(crossed_drag_threshold(0.0, 5.1));
+        assert!(!crossed_drag_threshold(0.0, -4.9));
+        assert!(crossed_drag_threshold(0.0, -5.1));
+
+        // Purely horizontal travel counts too: a drag is a drag however
+        // the user starts moving, and the vertical reordering geometry
+        // takes over from there (`plan_step`).
+        assert!(!crossed_drag_threshold(4.9, 0.0));
+        assert!(crossed_drag_threshold(5.1, 0.0));
+        assert!(crossed_drag_threshold(-5.1, 0.0));
+
+        // The case a per-axis test would get wrong: neither component
+        // clears 5px on its own, but the real travel is ~5.66px.
+        assert!(crossed_drag_threshold(4.0, 4.0));
+        assert!(crossed_drag_threshold(-4.0, 4.0));
+        // ...and the mirror image of it, still a click at ~4.24px.
+        assert!(!crossed_drag_threshold(3.0, 3.0));
+
+        // Exactly on the threshold counts as travel, so the predicate has
+        // no gap between "click" and "drag".
+        assert!(crossed_drag_threshold(0.0, DRAG_THRESHOLD_PX));
+        assert!(crossed_drag_threshold(DRAG_THRESHOLD_PX, 0.0));
+    }
 
     /// `count` rows of equal `height`, stacked from y=0 - the common case
     /// (every `EntryRow` is `h-11`, i.e. 44px, when collapsed).

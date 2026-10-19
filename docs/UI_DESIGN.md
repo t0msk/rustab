@@ -873,9 +873,9 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
     T40 (§13) adds two more to this module: `ChevronUpIcon`/`ChevronDownIcon`, for the
     Move up/Move down buttons - dedicated Lucide glyphs, not a CSS-rotated reuse of
     `ChevronRightIcon`, consistent with every other icon in this module getting its
-    own path rather than a transform. T48 (§13.11) adds one more: `GripVerticalIcon`,
-    for the new drag handle - Lucide's own `grip-vertical` glyph, the conventional
-    vertical-drag-handle icon, following the same dedicated-path convention.
+    own path rather than a transform. T48 (§13.11) added one more, `GripVerticalIcon`,
+    for its drag handle; **T52 removed both the handle and the icon** - the whole row
+    is the grab surface now, so there is no handle left to hang a glyph on (§13.11).
 34. `RawViewDialog` - read-only overlay showing the active target's exact current
     raw text, no diff (§11)
 35. `ExternalChangeDialog` - external-change/drift warning modal shown after a
@@ -1520,7 +1520,7 @@ document's convention.
 `a_comment_block_attached_to_the_lower_row_is_excluded_from_the_gap_count`) - no
 replacement coverage is needed since the UI surface they tested no longer exists.
 
-### 13.11 Drag-and-drop reordering (T48)
+### 13.11 Drag-and-drop reordering (T48; grab surface revised by T52)
 
 **The problem**: T40/T41 gave every row Move up/Move down buttons - a precise,
 keyboard-operable, fully accessible way to change an entry's position, and the only one
@@ -1539,59 +1539,138 @@ completely unchanged under a drag; see §13.11's closing subsection below for th
 place this is worth spelling out anyway, even though nothing there requires a code or
 doc change.
 
-**Drag handle vs. whole-row grab.** Decision: a dedicated drag handle, not whole-row
-grab. Two independent reasons converge on the same answer:
+**Drag handle vs. whole-row grab.** T48 shipped a dedicated grip handle (in the Actions
+cell, leftmost of the Move up/Move down group, with its own `GripVerticalIcon`);
+**T52 replaced it with a whole-row grab**, on the repo owner's own direct instruction
+after using T48's drag live - "drag should start from anywhere on the row, not just that
+small icon." Everything else about the gesture was explicitly kept: the threshold
+stepping, the `translateY` animation of displaced rows, the insertion line, the
+one-`on_move`-per-pointer-event rule. Only the grab surface changed. The handle and its
+icon are gone (§9 item 33).
 
-- A mechanical one: `EntryRow`'s entire `<tr>` already carries an `onclick` that toggles
-  the row's expansion panel (T32, §9 item 6). A whole-row `pointerdown` has no clean way
-  to tell "the user is starting to drag this row" apart from "the user is clicking to
-  expand/collapse it" - both begin as the same `pointerdown` on the same element, and
-  only a pointer-move-distance threshold or long-press timer could disambiguate them
-  after the fact, which means every ordinary click-to-expand would carry an added few
-  pixels/milliseconds of hesitation before it registers, degrading the one gesture this
-  row already supports today. A handle sidesteps the disambiguation problem entirely:
-  `pointerdown` on the handle is unambiguously "start a drag," `pointerdown` anywhere
-  else on the row is unambiguously the existing click-to-expand gesture, exactly as
-  today.
-- A visual-language one, the same standard §13.1 already used to weigh drag-and-drop
-  against Move buttons in the first place: this app's whole surface is deliberately
-  calm and explicit - named icon buttons with `aria-label`s, no hover-reveal "mystery
-  meat" controls (§8's accessibility baseline). A whole-row grab is exactly that
-  mystery-meat failure mode: nothing about a plain row tells a new user "you can pick
-  this up," so discovering the gesture at all would depend on accidentally holding the
-  mouse down too long. A handle is a permanently visible, named affordance - the same
-  pattern as Edit/Delete/Move up/Move down - so it stays discoverable without
-  hover-reveal and without guessing.
+T48's own reasoning for a handle was not wrong, it is outranked: the handle existed
+precisely to dodge a collision with T32's row-expand click, and with the row as the grab
+surface that collision has to be solved for real instead of avoided. It is solved
+structurally, as follows.
 
-**Handle placement.** Decision: inside the existing Actions cell, as a third, leftmost
-element of the existing "position" button group - immediately to the left of Move up -
-not a new table column and not inside the Actions cell's "content" group (Edit/Delete).
-§13.2 already groups the Actions cell into two clusters by what they act on: "change
-this entry's position" (Move up, Move down) and "change this entry's content/existence"
-(Edit, Delete), separated by a spacing-only divider. A drag handle is categorically the
-same kind of thing as Move up/Move down - another way to change this entry's position -
-so it belongs inside that same first cluster, not as a new third group of its own.
-Concretely, the Actions cell's row order becomes: drag handle, Move up, Move down,
-[divider], Edit, Delete - for both `EntryRow` and `UnparsedEntryRow`. Two alternatives
-were weighed and rejected:
+**Two-phase gesture: pending press → committed drag.** `EntryRow`'s `<tr>` now carries
+both T32's expand `onclick` and the drag's `pointerdown`, so the two gestures are told
+apart by pointer *travel*, not by which element was hit:
 
-- **A new leftmost table column**, parallel to the existing expand-chevron column.
-  Rejected: it is a materially bigger structural change for no real benefit - a new
-  `<th>`, a `colspan` bump everywhere `colspan="8"` is hardcoded today (the expanded
-  detail row, `UnparsedEntryRow`'s single merged cell), and one more column competing
-  for width exactly where §8's own responsive breakpoint already says space is tight
-  (`< 760px` already drops Dump/Pass into an overflow menu to make room). Reusing the
-  existing Actions cell needs none of that.
-- **Placed after Delete, as its own third group.** Rejected: it would group a
-  "position" control with the "content/existence" cluster by proximity, working against
-  the "the cell reads as two groups" reasoning §13.2 was built on, and risks a mis-click
-  between "drag" and "delete" at exactly the only place in this UI where a stray pointer
-  action is destructive.
+- A `pointerdown` on the row records a **pending** gesture only - pointer id, the row's
+  render position, the press's client x/y - and captures the pointer. It deliberately
+  does *not* measure row geometry, does not touch any state that renders, and calls
+  neither `preventDefault` nor `stopPropagation`. A press that never travels therefore
+  remains, as far as the browser is concerned, exactly the plain click it was before
+  this feature existed, and T32's expand/collapse toggle runs unchanged on the `click`
+  the browser synthesises after `pointerup`.
+- **Threshold: 5px of Euclidean travel** (`sqrt(dx² + dy²)`, both axes) from the press
+  position. The first `pointermove` that clears it promotes the pending gesture: rows
+  are measured, the layout freezes, a real drag state exists, and only then is
+  `preventDefault` called. A distance over both axes rather than a per-axis test,
+  because a drag is a drag however diagonally it starts (two 4px components are ~5.7px
+  of real travel, which a per-axis 5px test would not notice). Small enough that a
+  deliberate drag never feels like it has to be "unstuck," comfortably above the hand
+  jitter an ordinary click carries. The promoted drag is anchored to the **original
+  press position**, not to the point the threshold happened to be crossed, so the
+  stepping geometry sees the gesture's true start and the dragged row does not jump by
+  the threshold distance at the moment of promotion.
+- **Click suppression is structurally outside the framework's render cycle, not a timing
+  hope.** A promoted gesture still ends in a `click` the browser synthesises from the
+  same mouse interaction, dispatched synchronously right after `pointerup` - before
+  Yew's scheduler is guaranteed to have re-rendered with the drag state cleared. A
+  handler built on the current render's `use_state` snapshot therefore cannot be trusted
+  to see "this press just finished dragging"; that is a race, and this project's own
+  "verify, don't assume" standard does not allow shipping one. Instead, promotion raises
+  a plain shared mutable cell (a `use_mut_ref` flag, living outside the render cycle
+  entirely), and the row's toggle handler checks *and clears* that flag synchronously as
+  its very first act. One flag per table, not one per row per render: several renders
+  happen between promotion and the synthetic click, so a cell re-allocated on each
+  render would not be the same cell the click reads - the shared identity is the whole
+  point. Any subsequent `pointerdown` on a row also clears the flag, so a promoted
+  gesture whose synthetic click never arrived (released off the table, cancelled) cannot
+  swallow a later, unrelated click.
+- **Excluded descendants bail out before anything happens at all.** A `pointerdown`
+  whose target is inside `button, pre` (resolved with `closest()`) returns immediately -
+  no pointer capture, no pending gesture, no `preventDefault`, no `stopPropagation` - so
+  those elements' native behaviour is left completely untouched rather than fought with
+  `stopPropagation` after the fact. `button` covers Move up/Move down, Edit and Delete
+  (and, for defence in depth, the expanded detail panel's copy/open-in-file-manager
+  buttons, which sit on a row that carries no pointer wiring anyway). `pre` is
+  `UnparsedEntryRow`'s raw-line block, and it is the load-bearing exclusion: that row has
+  **no copy button for its raw text**, so selecting the text with a click-drag is the
+  only way to copy the line at all, and a literal "anywhere on the row" grab would
+  hijack every such selection into a reorder the instant it passed 5px - a real
+  regression, in exactly the one place in this table where manual text selection is the
+  only available affordance (`EntryRow`'s Source/Mount point have copy buttons in the
+  detail panel; this row has nothing). Excluding `pre` preserves that selection and
+  still leaves the rest of the row (its padding, the warning icon and message text, the
+  amber background) fully grabbable.
+- **Scope: the main `<tr>` only.** The pointer handlers go exactly where T32's `onclick`
+  already lived - `EntryRow`'s main row, and `UnparsedEntryRow`'s single row - and
+  deliberately **not** on `EntryRow`'s expanded detail `<tr>`, which is a separate
+  element. That is the same surface T32 used, not a narrowing, and it has a useful
+  side effect: the detail panel's plain-text fields that have no copy button
+  (Description, Trailing comment) stay normally selectable for free, by the same
+  reasoning as the `pre` exclusion and without needing a selector of their own. Both
+  row kinds get the whole-row grab, the same parity T48 had.
 
-Putting the handle leftmost within its group, before Move up, also makes the cell read
-left-to-right as "pick it up (handle) → nudge it explicitly (Move up/down) → change what
-it is (Edit/Delete)" - from the least precise/most continuous action to the most
-discrete/precise one.
+**Cursor at rest: unchanged, and deliberately no new resting grab affordance.**
+`EntryRow` keeps `cursor-pointer` (it is still, far more often, a click-to-expand row);
+`UnparsedEntryRow` keeps the default cursor. T48's handle showed `cursor-grab` at rest
+because the handle *was* this gesture's entire discoverable surface; with the whole row
+grabbable, showing "grab" everywhere at rest would compete with - and, on a dense table,
+visually drown out - the click-to-expand affordance that remains the much more common
+interaction. The `cursor-grabbing` treatment stays exactly as T48 shipped it: applied at
+the row level and at the document level once a drag is actually in progress, never at
+rest. This is a settled decision rather than an oversight - the repo owner's live
+feedback settled "whole row grab," not a new discoverability design, and Move up/Move
+down remain the fully discoverable, keyboard-operable baseline (see **Accessibility**
+below), so the drag gesture needs no hover affordance to be justified.
+
+**Text selection during a drag (T52 fix to a T48 bug).** T48 blocked text selection with
+`user-select: none` on `<body>`, applied from an effect keyed on "is a drag in progress."
+That lost a race it could not win: an effect cannot run until the framework has processed
+a state update and re-rendered, whereas the browser's own "press, then move, therefore
+select text" behavior is gated on nothing - so dragging a row visibly highlighted its
+text (reported from live use; present since T48, and T52's pending phase, which exists
+before any drag state at all, only widened the window). The fix is to stop routing a
+latency-critical style change through the render cycle: a non-excluded `pointerdown` sets
+`user-select: none` on `<body>` **synchronously, inside the handler itself**, and the
+gesture's `pointerup`/`pointercancel` handler clears it again, also synchronously, inside
+the same pointer-id gate the rest of the teardown uses. A press that stays a plain click
+therefore sets and clears it within one synchronous handler pair, before the synthetic
+`click` is even dispatched; a real drag holds it for exactly the gesture's duration.
+`button`/`pre` presses are unaffected, since this sits after the exclusion bail-out -
+`UnparsedEntryRow`'s raw-line selection keeps working. The effect is kept as-is for
+`cursor: grabbing` (not latency-critical) and is now merely an idempotent backstop for
+`user-select` plus the unmount-mid-gesture cleanup path.
+
+`preventDefault()` on `pointerdown` was considered as the alternative fix and
+**deliberately rejected**: per the Pointer Events spec it suppresses that interaction's
+compatibility mouse events, which for mouse input plausibly includes the native
+`mousedown`/`mouseup`/`click` sequence - i.e. the exact click-to-expand path this
+two-phase gesture exists to preserve. Whether WebKitGTK does that cannot be settled
+without a live session, and `user-select` is orthogonal to click synthesis, so the CSS
+route sidesteps the question instead of assuming an answer. The `preventDefault()` call
+at the moment of *promotion* (once the gesture is already committed to being a drag) is
+unchanged.
+
+**What is and is not verified about this fix.** There is no DOM/pointer test harness in
+the frontend crate (§13.12), so "WebKitGTK no longer starts a selection" is not
+unit-tested and was not visually confirmed in a browser by the implementation. What is
+guaranteed by code trace is the structural property the fix rests on: the style mutation
+happens synchronously inside the `pointerdown` handler, which runs to completion before
+the browser dispatches any subsequent native pointer event for the same input stream, so
+there is no window of any size between "the press began" and "selection is disabled."
+
+**Touch (T52 note).** T48's handle carried `touch-action: none`, which a whole-row grab
+cannot inherit: putting `touch-action: none` on every row would make the table
+unscrollable by touch, a far worse regression than losing touch-drag. So a touch drag on
+a row is preempted by the browser's own scrolling - the gesture receives
+`pointercancel`, ends cleanly, and keeps whatever steps it had already committed - and
+touch users reorder with Move up/Move down, which remain the baseline path for every
+input modality. Mouse/trackpad drag is unaffected.
 
 **Visual treatment, drop indicator, animation.** For the one row following the pointer
 (the orchestrator's own note that other rows must visibly slide to make room is assumed
@@ -1607,9 +1686,10 @@ job, not specified here):
   faded drag image feeling disconnected from what is actually being moved. Staying close
   to fully opaque keeps the dragged row reading as "the real row, just lifted," not a
   ghost.
-- Cursor: `cursor-grab` on the handle at rest, `cursor-grabbing` on the handle and, for
-  the duration of the gesture, at the document level (so it does not flicker back to
-  default as the pointer crosses other rows).
+- Cursor: `cursor-grabbing` on the rows and, for the duration of the gesture, at the
+  document level (so it does not flicker back to default as the pointer crosses other
+  rows). T48 also had `cursor-grab` on the handle at rest; T52 removed that along with
+  the handle and adds no resting replacement - see "Cursor at rest" above.
 - Elevated above sibling rows in paint order for the duration of the gesture only
   (whatever `z-index`/portal mechanism the implementer's FLIP approach supports), since
   it visually overlaps neighbors as it translates past them.
@@ -1649,53 +1729,36 @@ the `sky-50`/`sky-900/20` tint used for the Reordered diff card and the row-expa
 accent border, since this is a transient, actively-watched indicator rather than a
 resting background tint, but still the same hue family, not a new token.
 
-**Icon.** A new dedicated icon, `GripVerticalIcon`, added to the `icons` module (§9 item
-33) alongside `ChevronUpIcon`/`ChevronDownIcon` (T40) - Lucide's own `grip-vertical`
-glyph (https://lucide.dev/icons/grip-vertical): six dots arranged in two vertical
-columns of three, `<circle cx="9" cy="5" r="1"/>`, `<circle cx="9" cy="12" r="1"/>`,
-`<circle cx="9" cy="19" r="1"/>`, `<circle cx="15" cy="5" r="1"/>`,
-`<circle cx="15" cy="12" r="1"/>`, `<circle cx="15" cy="19" r="1"/>`, drawn with the same
-`icon_svg!` wrapper (`viewBox="0 0 24 24"`, `stroke="currentColor"`, 16px) every other
-icon in the module already uses - no new wrapper convention. The implementer should
-confirm these six circle coordinates directly against lucide.dev's currently published
-markup before shipping, the same "copied from Lucide" sourcing discipline the module's
-own doc comment already states for every existing icon - this value is given from the
-designer's own knowledge of the published icon, not re-fetched byte-for-byte here.
-`grip-vertical` is the conventional glyph for a vertical-list drag handle across
-virtually every design system that has one (it is the Lucide icon's own stated use
-case), so there is no competing candidate worth naming - not a toss-up. Rejected:
-reusing an existing icon (e.g. the two chevrons together, or `FolderOpenIcon`'s shape) -
-none of them read as "grab and drag" to a user, and §9 item 33's own stated convention
-is that every permanently-distinct action gets its own dedicated path rather than a
-transformed reuse of an unrelated glyph, the exact reasoning §13.2 already used for why
-Move up/down got their own paths instead of a rotated chevron.
+**Icon: none (T52).** T48 added a dedicated `GripVerticalIcon` (Lucide's
+`grip-vertical`) to the `icons` module for the handle. T52 removed the handle, so the
+icon has no call site left and was deleted along with it (§9 item 33) rather than kept
+as dead code - the module's own stated convention is one dedicated path per
+*permanently-distinct action*, and this one no longer names anything the UI renders.
+`ChevronUpIcon`/`ChevronDownIcon` (Move up/Move down) are untouched.
 
-**Accessibility.** Confirmed explicitly: the drag handle is never the *only* way to
+**Accessibility.** Confirmed explicitly: the drag gesture is never the *only* way to
 reorder. Move up/Move down (§13.2/§13.3) already satisfy this app's accessibility
 baseline - keyboard-operable, visible-focus, real `disabled` boundary states - entirely
 on their own, before this task existed; nothing here changes that, and nothing here is
 allowed to regress it, per the brief's own "Move buttons must stay exactly as they are"
 instruction.
 
-Decision: the handle itself is **not** keyboard-focusable, and carries no `aria-label` -
-rendered `aria-hidden="true"`, outside the tab order (no `tabindex`, not a focusable
-element at all; a plain `<span>`/`<div>`, not a `<button>`). Reasoning: a focusable
-control implies an activation the keyboard can trigger, and there is no sensible
-keyboard activation for "start a continuous pointer drag" - Enter/Space on a focused
-handle could, at best, do nothing (a control that visibly takes focus but does nothing
-on activation is worse than one that was never reachable, the same "don't fake an
-affordance" standard this app already applies via real `disabled` buttons rather than
-fake dimming), or, at worst, invite a future "fix" that bolts on a redundant
-keyboard-reorder mode duplicating Move up/Move down with a second, independent
-implementation to keep in sync. Since Move up/Move down already are that
-keyboard-operable path, and are not being replaced, there is no accessibility gap here
-to patch by making the handle focusable. A `title` tooltip - `"Drag to reorder"` for
-`EntryRow`, `"Drag to reorder raw entry"` for `UnparsedEntryRow`, mirroring the exact
-wording pattern Move up/down's own `aria-label`s already use for the two row kinds
-(§13.2) - is still present for a sighted mouse user hovering the handle, the same native
-tooltip mechanism §3's row-warning tooltip and §13.2's disabled-button tooltip both
-already use, so the handle's purpose stays discoverable without being part of the
-accessibility tree.
+T48's decision was that the handle must not be keyboard-focusable, because a focusable
+control implies an activation the keyboard can trigger and there is no sensible keyboard
+activation for "start a continuous pointer drag" - Enter/Space on it could at best do
+nothing (a control that takes focus but does nothing is worse than one that was never
+reachable, the same "don't fake an affordance" standard this app applies via real
+`disabled` buttons rather than fake dimming), or at worst invite a future "fix" bolting
+on a redundant keyboard-reorder mode that duplicates Move up/Move down. **T52 preserves
+that outcome by construction, and more cleanly:** there is no handle, nothing new is
+focusable, nothing new is in the tab order, and the rows themselves are no more
+focusable than they were before (they were never focusable; the pointer gesture adds no
+`tabindex`, no `role` and no ARIA attribute to them). The handle's `title` tooltips
+("Drag to reorder" / "Drag to reorder raw entry") are gone with the handle; the gesture
+is now an undiscoverable-by-tooltip mouse enhancement on top of two permanently visible,
+labelled buttons that do the same job - the deliberate tradeoff recorded under "Cursor at
+rest" above. Nothing about the keyboard path changed: Tab order, focus rings and the
+Move buttons' `aria-label`s/`disabled` states are exactly as §13.2 specifies.
 
 **Interaction with §13.6 and §13.7 (documentation-only notes).** Both are structurally
 unaffected, confirmed independently here as well, not just taken on the orchestrator's
@@ -1726,13 +1789,23 @@ No code, test, or copy change is implied by either note - they exist here purely
 reviewer reading a live drag does not mistake either behavior for new, task-specific
 logic that needs its own spec.
 
-### 13.12 Required test coverage addendum - drag-and-drop (T48)
+### 13.12 Required test coverage addendum - drag-and-drop (T48, extended by T52)
 
 Matching §13.10's own split between what a pure function can cover and what needs a
-live DOM, prose descriptions only:
+live DOM, prose descriptions only. There is deliberately **no DOM/pointer test harness
+in the frontend crate** (no `wasm-bindgen-test`), which is exactly why the split below
+exists and why every decision worth testing is extracted into a pure function first.
 
 **Unit-testable (pure functions, no DOM):**
 
+0. **Click vs. drag (T52):** given the pointer's travel from where it went down, whether
+   that press has become a drag - the 5px Euclidean threshold predicate, extracted as
+   its own pure function in the same spirit as items 1-4 below. Covers: zero travel is
+   still a click; sub-pixel jitter is still a click; just-under/just-over the threshold
+   in both directions on both axes; purely horizontal travel counts as a drag too; a
+   diagonal combination where neither axis clears 5px alone but the real distance does
+   (the case a per-axis test would get wrong); and that exactly-on-the-threshold counts
+   as travel, so there is no gap between "click" and "drag".
 1. Given a pointer Y position, a row's own top/height, and the direction of travel,
    which side of the row's midpoint (or whatever exact threshold the implementer picks -
    e.g. 50% of row height) the pointer currently sits on, and therefore whether a given
@@ -1757,23 +1830,37 @@ live DOM, prose descriptions only:
 **Manual/code-review only (needs a real DOM, pointer events, and visual judgment - no
 meaningful unit test exists for these):**
 
-5. The actual `pointerdown`/`pointermove`/`pointerup` wiring on the handle: that a
-   `pointerdown` there starts a drag without also firing the row's own `onclick`-driven
-   expand/collapse toggle, and that a plain click anywhere else on the row still toggles
-   expansion exactly as before (T32) - the specific collision §13.11's handle-vs-whole-
-   row decision exists to avoid.
+5. **The whole-row `pointerdown`/`pointermove`/`pointerup` wiring (T52)**, i.e. the
+   collision §13.11's two-phase gesture exists to resolve, in three scenarios that all
+   need real pointer events on a real DOM and so are verified by code trace plus manual
+   use, never by a unit test:
+   - A plain press-and-release anywhere on a row's own surface (no travel, or under 5px)
+     still toggles the expansion panel exactly as before T52 - nothing captured the
+     click, nothing prevented the default, the toggle handler's suppression flag is
+     clear.
+   - A press that travels past 5px reorders the row and does **not** toggle expansion:
+     the synthetic `click` the browser fires after `pointerup` is swallowed by the
+     promotion flag (§13.11), and the flag is cleared by that same click so the next one
+     toggles normally.
+   - A press that lands on an excluded descendant (`button, pre`) behaves natively and is
+     wholly unaffected: the Move/Edit/Delete buttons still activate on click, and
+     `UnparsedEntryRow`'s raw-line text can still be selected by click-dragging across
+     it without the row being picked up.
 6. That the dragged row visually tracks the pointer with no lag while other rows animate
    with the specified 150ms ease-out transition, that the drop-indicator line renders at
    the correct boundary as the pointer moves, and that releasing the pointer commits
    whatever the indicator was last showing.
 7. `prefers-reduced-motion` actually suppresses the row-slide transition (rows snap
    instantly) without breaking the drag itself.
-8. Keyboard-only operation: confirm the handle is unreachable by Tab (never receives
-   focus) and that Move up/Move down remain fully operable and unaffected by any of this
-   task's changes - the direct regression check for "Move buttons must stay exactly as
-   they are."
-9. Both `EntryRow` and `UnparsedEntryRow` get a working handle, in the same cell
-   position, with the row-kind-appropriate tooltip wording.
+8. Keyboard-only operation: confirm the drag gesture adds nothing to the tab order (T48:
+   the handle was unreachable by Tab; T52: there is no handle, and the rows are not
+   focusable) and that Move up/Move down remain fully operable and unaffected by any of
+   this task's changes - the direct regression check for "Move buttons must stay exactly
+   as they are."
+9. Both `EntryRow` and `UnparsedEntryRow` are grabbable from their own main `<tr>` (T52),
+   with `UnparsedEntryRow`'s raw-line `<pre>` excluded; `EntryRow`'s expanded detail
+   `<tr>` carries no pointer wiring at all, so a press inside the open detail panel never
+   starts a drag.
 
 ---
 
