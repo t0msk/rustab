@@ -855,7 +855,9 @@ Flat checklist for T10 (shell/mock data), T11 (table + form data wiring), and T1
     T40 (§13) adds two more to this module: `ChevronUpIcon`/`ChevronDownIcon`, for the
     Move up/Move down buttons - dedicated Lucide glyphs, not a CSS-rotated reuse of
     `ChevronRightIcon`, consistent with every other icon in this module getting its
-    own path rather than a transform.
+    own path rather than a transform. T48 (§13.11) adds one more: `GripVerticalIcon`,
+    for the new drag handle - Lucide's own `grip-vertical` glyph, the conventional
+    vertical-drag-handle icon, following the same dedicated-path convention.
 34. `RawViewDialog` - read-only overlay showing the active target's exact current
     raw text, no diff (§11)
 35. `ExternalChangeDialog` - external-change/drift warning modal shown after a
@@ -1499,6 +1501,261 @@ document's convention.
 `several_freestanding_lines_between_two_entries_are_counted_and_pluralized`,
 `a_comment_block_attached_to_the_lower_row_is_excluded_from_the_gap_count`) - no
 replacement coverage is needed since the UI surface they tested no longer exists.
+
+### 13.11 Drag-and-drop reordering (T48)
+
+**The problem**: T40/T41 gave every row Move up/Move down buttons - a precise,
+keyboard-operable, fully accessible way to change an entry's position, and the only one
+this app had until now. The repo owner asked for a second, additive way to do the same
+thing: real pointer-based drag-and-drop, a mouse/touch enhancement, not a replacement -
+the Move buttons stay exactly as specified in §13.2/§13.3/§13.8, unchanged, forever the
+accessible baseline. Native HTML5 Drag and Drop is ruled out (clunky default ghost,
+inconsistent cross-engine behavior - another WebKitGTK quirk, per `README.md`/
+`docs/FLATPAK.md` §1.5); the mandated technique is `pointerdown`/`pointermove`/
+`pointerup` plus a CSS `transition: transform` (FLIP-style: measure before, measure
+after, animate the delta). Every discrete step a drag commits is the exact same
+`stage_move`/`on_move((from, to))` call a Move-button click already makes - never a new
+reorder algorithm, never more than one `on_move` emission per pointer event - so §13.4's
+attached-comment-block semantics and §13.7's `Reordered` diff category keep working
+completely unchanged under a drag; see §13.11's closing subsection below for the one
+place this is worth spelling out anyway, even though nothing there requires a code or
+doc change.
+
+**Drag handle vs. whole-row grab.** Decision: a dedicated drag handle, not whole-row
+grab. Two independent reasons converge on the same answer:
+
+- A mechanical one: `EntryRow`'s entire `<tr>` already carries an `onclick` that toggles
+  the row's expansion panel (T32, §9 item 6). A whole-row `pointerdown` has no clean way
+  to tell "the user is starting to drag this row" apart from "the user is clicking to
+  expand/collapse it" - both begin as the same `pointerdown` on the same element, and
+  only a pointer-move-distance threshold or long-press timer could disambiguate them
+  after the fact, which means every ordinary click-to-expand would carry an added few
+  pixels/milliseconds of hesitation before it registers, degrading the one gesture this
+  row already supports today. A handle sidesteps the disambiguation problem entirely:
+  `pointerdown` on the handle is unambiguously "start a drag," `pointerdown` anywhere
+  else on the row is unambiguously the existing click-to-expand gesture, exactly as
+  today.
+- A visual-language one, the same standard §13.1 already used to weigh drag-and-drop
+  against Move buttons in the first place: this app's whole surface is deliberately
+  calm and explicit - named icon buttons with `aria-label`s, no hover-reveal "mystery
+  meat" controls (§8's accessibility baseline). A whole-row grab is exactly that
+  mystery-meat failure mode: nothing about a plain row tells a new user "you can pick
+  this up," so discovering the gesture at all would depend on accidentally holding the
+  mouse down too long. A handle is a permanently visible, named affordance - the same
+  pattern as Edit/Delete/Move up/Move down - so it stays discoverable without
+  hover-reveal and without guessing.
+
+**Handle placement.** Decision: inside the existing Actions cell, as a third, leftmost
+element of the existing "position" button group - immediately to the left of Move up -
+not a new table column and not inside the Actions cell's "content" group (Edit/Delete).
+§13.2 already groups the Actions cell into two clusters by what they act on: "change
+this entry's position" (Move up, Move down) and "change this entry's content/existence"
+(Edit, Delete), separated by a spacing-only divider. A drag handle is categorically the
+same kind of thing as Move up/Move down - another way to change this entry's position -
+so it belongs inside that same first cluster, not as a new third group of its own.
+Concretely, the Actions cell's row order becomes: drag handle, Move up, Move down,
+[divider], Edit, Delete - for both `EntryRow` and `UnparsedEntryRow`. Two alternatives
+were weighed and rejected:
+
+- **A new leftmost table column**, parallel to the existing expand-chevron column.
+  Rejected: it is a materially bigger structural change for no real benefit - a new
+  `<th>`, a `colspan` bump everywhere `colspan="8"` is hardcoded today (the expanded
+  detail row, `UnparsedEntryRow`'s single merged cell), and one more column competing
+  for width exactly where §8's own responsive breakpoint already says space is tight
+  (`< 760px` already drops Dump/Pass into an overflow menu to make room). Reusing the
+  existing Actions cell needs none of that.
+- **Placed after Delete, as its own third group.** Rejected: it would group a
+  "position" control with the "content/existence" cluster by proximity, working against
+  the "the cell reads as two groups" reasoning §13.2 was built on, and risks a mis-click
+  between "drag" and "delete" at exactly the only place in this UI where a stray pointer
+  action is destructive.
+
+Putting the handle leftmost within its group, before Move up, also makes the cell read
+left-to-right as "pick it up (handle) → nudge it explicitly (Move up/down) → change what
+it is (Edit/Delete)" - from the least precise/most continuous action to the most
+discrete/precise one.
+
+**Visual treatment, drop indicator, animation.** For the one row following the pointer
+(the orchestrator's own note that other rows must visibly slide to make room is assumed
+as the required visual result; the mechanism behind that slide is the implementer's
+job, not specified here):
+
+- Elevation: `shadow-lg` - the existing drawer/modal elevation token (§8), reused rather
+  than inventing a new shadow value, strong enough to read as "lifted off the table"
+  against the row's own optional `shadow-sm` hover lift and the table's own `shadow-sm`
+  container.
+- Opacity: `opacity-90`, not a stronger fade. Deliberately subtle: the repo owner's own
+  objection to native HTML5 drag-and-drop was its "clunky default ghost" - a heavily
+  faded drag image feeling disconnected from what is actually being moved. Staying close
+  to fully opaque keeps the dragged row reading as "the real row, just lifted," not a
+  ghost.
+- Cursor: `cursor-grab` on the handle at rest, `cursor-grabbing` on the handle and, for
+  the duration of the gesture, at the document level (so it does not flicker back to
+  default as the pointer crosses other rows).
+- Elevated above sibling rows in paint order for the duration of the gesture only
+  (whatever `z-index`/portal mechanism the implementer's FLIP approach supports), since
+  it visually overlaps neighbors as it translates past them.
+- No `transition` on the dragged row's own transform - it must track the pointer's Y
+  position 1:1, every `pointermove`, with zero easing delay. Only the *other*, displaced
+  rows get an animated transition (next point); applying the same transition to the
+  dragged row itself would make it visibly lag behind the cursor, breaking the "glued to
+  the pointer" feel a drag interaction depends on - a usability defect, not a style
+  nitpick.
+
+For the other, displaced rows: `transition: transform 150ms ease-out` - reusing the
+drawer's own existing motion duration/easing (§8 "Motion": "drawer slides in/out over
+150-200ms ease-out"), the closest existing precedent to a "something moves into view"
+animation this app already specifies, rather than inventing a new arbitrary duration.
+Per §8's existing `prefers-reduced-motion` rule ("disabling the transform/scale and
+keeping only an opacity fade"): an opacity fade does not make sense for a pure position
+change, so the reduced-motion fallback here is to skip the animated transform outright
+and let every affected row snap directly to its post-move position with no transition at
+all - the cleanest equivalent of that rule's intent for a case it was not originally
+written for.
+
+Drop-target indicator: the live, animated slide itself is the primary indicator - every
+displaced row genuinely slides toward the gap that is about to open at the dragged
+entry's prospective new position, so the visible gap, not a separate marker, is what
+tells the user where it will land (matching the task brief's own framing: "other rows
+visibly slide to make room"). On top of that, add one explicit insertion line -
+`border-t-2 border-sky-500 dark:border-sky-400`, full row width, drawn at the exact
+boundary the dragged row would land on if released now, visible only while a drag is in
+progress. Not purely decorative: the dragged row itself is elevated and can visually sit
+over more than one candidate gap as it moves, so an explicit line removes any remaining
+ambiguity about exactly which boundary is current - the same "precision matters more
+here than in a kanban board" standard §13.1 already used to prefer Move buttons'
+exactness over drag-and-drop's fuzziness; this line gives the drag gesture that same
+precision. Sky, not a new color: §13.9 already names sky as "this app's only notable,
+non-alarming color," reused here at full `sky-500`/`sky-400` - a stronger weight than
+the `sky-50`/`sky-900/20` tint used for the Reordered diff card and the row-expand
+accent border, since this is a transient, actively-watched indicator rather than a
+resting background tint, but still the same hue family, not a new token.
+
+**Icon.** A new dedicated icon, `GripVerticalIcon`, added to the `icons` module (§9 item
+33) alongside `ChevronUpIcon`/`ChevronDownIcon` (T40) - Lucide's own `grip-vertical`
+glyph (https://lucide.dev/icons/grip-vertical): six dots arranged in two vertical
+columns of three, `<circle cx="9" cy="5" r="1"/>`, `<circle cx="9" cy="12" r="1"/>`,
+`<circle cx="9" cy="19" r="1"/>`, `<circle cx="15" cy="5" r="1"/>`,
+`<circle cx="15" cy="12" r="1"/>`, `<circle cx="15" cy="19" r="1"/>`, drawn with the same
+`icon_svg!` wrapper (`viewBox="0 0 24 24"`, `stroke="currentColor"`, 16px) every other
+icon in the module already uses - no new wrapper convention. The implementer should
+confirm these six circle coordinates directly against lucide.dev's currently published
+markup before shipping, the same "copied from Lucide" sourcing discipline the module's
+own doc comment already states for every existing icon - this value is given from the
+designer's own knowledge of the published icon, not re-fetched byte-for-byte here.
+`grip-vertical` is the conventional glyph for a vertical-list drag handle across
+virtually every design system that has one (it is the Lucide icon's own stated use
+case), so there is no competing candidate worth naming - not a toss-up. Rejected:
+reusing an existing icon (e.g. the two chevrons together, or `FolderOpenIcon`'s shape) -
+none of them read as "grab and drag" to a user, and §9 item 33's own stated convention
+is that every permanently-distinct action gets its own dedicated path rather than a
+transformed reuse of an unrelated glyph, the exact reasoning §13.2 already used for why
+Move up/down got their own paths instead of a rotated chevron.
+
+**Accessibility.** Confirmed explicitly: the drag handle is never the *only* way to
+reorder. Move up/Move down (§13.2/§13.3) already satisfy this app's accessibility
+baseline - keyboard-operable, visible-focus, real `disabled` boundary states - entirely
+on their own, before this task existed; nothing here changes that, and nothing here is
+allowed to regress it, per the brief's own "Move buttons must stay exactly as they are"
+instruction.
+
+Decision: the handle itself is **not** keyboard-focusable, and carries no `aria-label` -
+rendered `aria-hidden="true"`, outside the tab order (no `tabindex`, not a focusable
+element at all; a plain `<span>`/`<div>`, not a `<button>`). Reasoning: a focusable
+control implies an activation the keyboard can trigger, and there is no sensible
+keyboard activation for "start a continuous pointer drag" - Enter/Space on a focused
+handle could, at best, do nothing (a control that visibly takes focus but does nothing
+on activation is worse than one that was never reachable, the same "don't fake an
+affordance" standard this app already applies via real `disabled` buttons rather than
+fake dimming), or, at worst, invite a future "fix" that bolts on a redundant
+keyboard-reorder mode duplicating Move up/Move down with a second, independent
+implementation to keep in sync. Since Move up/Move down already are that
+keyboard-operable path, and are not being replaced, there is no accessibility gap here
+to patch by making the handle focusable. A `title` tooltip - `"Drag to reorder"` for
+`EntryRow`, `"Drag to reorder raw entry"` for `UnparsedEntryRow`, mirroring the exact
+wording pattern Move up/down's own `aria-label`s already use for the two row kinds
+(§13.2) - is still present for a sighted mouse user hovering the handle, the same native
+tooltip mechanism §3's row-warning tooltip and §13.2's disabled-button tooltip both
+already use, so the handle's purpose stays discoverable without being part of the
+accessibility tree.
+
+**Interaction with §13.6 and §13.7 (documentation-only notes).** Both are structurally
+unaffected, confirmed independently here as well, not just taken on the orchestrator's
+own word - with two things worth writing down explicitly so a future reader is not
+surprised by live behavior that is correct but easy to misread as a bug:
+
+1. **§13.6 (live validation feedback) may visibly flicker during a multi-row drag, not
+   just once at drop.** Because each row-boundary crossed during a drag commits its own
+   `stage_move` the moment the pointer crosses the threshold (per the orchestrator's own
+   binding "at most one `on_move` emission per discrete pointer event" rule), a drag
+   spanning several rows re-runs the whole-document `validate_candidate` effect once per
+   boundary crossed while the pointer is still moving - exactly as if the user had
+   clicked Move several times in a row in quick succession. A row's amber warning border
+   can therefore appear and disappear more than once during a single drag gesture,
+   settling on its final state only once the pointer stops (or the drag ends). This is
+   the same behavior §13.6 already specifies for repeated Move clicks, not a new code
+   path - stated here only so it is not mistaken for a bug during manual testing.
+2. **§13.7's `Reordered` category is computed from final-vs-original document state, not
+   from a count of steps**, so a drag that crosses five row boundaries produces exactly
+   the same `Reordered` set as five individual Move-button clicks that reach the same
+   final arrangement - never a drag-specific entry, never a different count than the
+   equivalent button clicks would have produced. The "one click can report two
+   `Reordered` lines" behavior T40's own final write-up already called out as deliberate
+   (ranking individual lines, not operations) carries over unchanged: a drag is just a
+   sequence of those same operations.
+
+No code, test, or copy change is implied by either note - they exist here purely so a
+reviewer reading a live drag does not mistake either behavior for new, task-specific
+logic that needs its own spec.
+
+### 13.12 Required test coverage addendum - drag-and-drop (T48)
+
+Matching §13.10's own split between what a pure function can cover and what needs a
+live DOM, prose descriptions only:
+
+**Unit-testable (pure functions, no DOM):**
+
+1. Given a pointer Y position, a row's own top/height, and the direction of travel,
+   which side of the row's midpoint (or whatever exact threshold the implementer picks -
+   e.g. 50% of row height) the pointer currently sits on, and therefore whether a given
+   row-boundary has been "crossed" yet - the pure geometry decision behind "should this
+   `pointermove` trigger a step" at all.
+2. Given a list of row heights/positions and a currently-dragged row's index, which
+   other rows need a transform applied for the "slide to make room" effect, and by how
+   much (the FLIP delta computation) - independent of whether that transform is actually
+   animated in a live browser.
+3. The "at most one `on_move` emission per discrete pointer event" rule itself: given a
+   sequence of pointer Y positions that collectively cross more than one row boundary,
+   confirm the chosen step logic calls out at most one boundary-crossing per event
+   (whatever data structure records "pending steps" or "already-committed-for-this-
+   event" state), never a synchronous loop of several moves derived from one event.
+4. Reuse of the existing move mechanism: a drag's single committed step, given the same
+   `from`/`to` candidate indices a Move-button click would have produced for the same
+   adjacent pair, calls the same `on_move`/`stage_move` path with the same arguments -
+   i.e. this needs no new move-resolution logic of its own, only new pointer-position-
+   to-`(from, to)` translation (verifiable as a direct equality/trace assertion against
+   §13.8's existing `on_move` contract, not a new algorithm to test from scratch).
+
+**Manual/code-review only (needs a real DOM, pointer events, and visual judgment - no
+meaningful unit test exists for these):**
+
+5. The actual `pointerdown`/`pointermove`/`pointerup` wiring on the handle: that a
+   `pointerdown` there starts a drag without also firing the row's own `onclick`-driven
+   expand/collapse toggle, and that a plain click anywhere else on the row still toggles
+   expansion exactly as before (T32) - the specific collision §13.11's handle-vs-whole-
+   row decision exists to avoid.
+6. That the dragged row visually tracks the pointer with no lag while other rows animate
+   with the specified 150ms ease-out transition, that the drop-indicator line renders at
+   the correct boundary as the pointer moves, and that releasing the pointer commits
+   whatever the indicator was last showing.
+7. `prefers-reduced-motion` actually suppresses the row-slide transition (rows snap
+   instantly) without breaking the drag itself.
+8. Keyboard-only operation: confirm the handle is unreachable by Tab (never receives
+   focus) and that Move up/Move down remain fully operable and unaffected by any of this
+   task's changes - the direct regression check for "Move buttons must stay exactly as
+   they are."
+9. Both `EntryRow` and `UnparsedEntryRow` get a working handle, in the same cell
+   position, with the row-kind-appropriate tooltip wording.
 
 ---
 

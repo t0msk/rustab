@@ -23,6 +23,16 @@ web-sys = { version = "0.3", features = [
   "Window",
   "Navigator",
   "Clipboard",
+  # The entries table's drag-to-reorder gesture (T48): one
+  # `getBoundingClientRect` sweep over the rows at `pointerdown`, pointer
+  # capture on the handle, and the document-level grabbing cursor.
+  "Document",
+  "Element",
+  "DomRect",
+  "Node",
+  "NodeList",
+  "HtmlElement",
+  "CssStyleDeclaration",
 ] }
 js-sys = "0.3"
 serde = { version = "1.0", features = ["derive"] }

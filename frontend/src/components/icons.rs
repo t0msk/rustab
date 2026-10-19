@@ -18,7 +18,8 @@
 //! disclosure chevron, and the Mount point value's copy-to-clipboard /
 //! open-in-file-manager buttons (the latter swaps to `CheckIcon` briefly
 //! after a successful copy). `ChevronUpIcon`/`ChevronDownIcon` were added
-//! for the entries-table Move up/Move down buttons (T40).
+//! for the entries-table Move up/Move down buttons (T40), and
+//! `GripVerticalIcon` for the drag-and-drop reorder handle (T48).
 
 use yew::prelude::*;
 
@@ -96,6 +97,32 @@ pub fn chevron_up_icon() -> Html {
 pub fn chevron_down_icon() -> Html {
     icon_svg!(html! {
         <path d="m6 9 6 6 6-6" />
+    })
+}
+
+/// Drag-handle glyph for entry reordering (T48, `docs/UI_DESIGN.md`
+/// §13.11) - Lucide's `grip-vertical`, six dots in two columns of three.
+/// The conventional drag-handle glyph across design systems, and (unlike
+/// the chevrons above) it names a *grab affordance* rather than a discrete
+/// action, which is why it is its own path and not a reuse of either
+/// chevron.
+///
+/// The six `r="1"` circles are deliberately left to the shared wrapper's
+/// `fill="none"`/`stroke="currentColor"`/`stroke-width="2"` attributes,
+/// with no per-icon override: a 1-unit circle stroked 2 units wide renders
+/// as a solid 4-unit dot, which is exactly how Lucide's own published
+/// markup for this icon draws them.
+#[function_component(GripVerticalIcon)]
+pub fn grip_vertical_icon() -> Html {
+    icon_svg!(html! {
+        <>
+            <circle cx="9" cy="5" r="1" />
+            <circle cx="9" cy="12" r="1" />
+            <circle cx="9" cy="19" r="1" />
+            <circle cx="15" cy="5" r="1" />
+            <circle cx="15" cy="12" r="1" />
+            <circle cx="15" cy="19" r="1" />
+        </>
     })
 }
 
