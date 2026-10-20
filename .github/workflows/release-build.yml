@@ -21,6 +21,14 @@ on:
   push:
     branches: [release]
 
+  # Manual trigger so this packaging recipe can be run against any branch
+  # from the Actions tab - e.g. to CI-verify a change to this workflow
+  # itself on a feature branch before it ever touches `release`, without
+  # needing a throwaway push to `release` just to get a build to test
+  # against. Takes no inputs: `ref` defaults to whatever branch the user
+  # picks in the "Run workflow" branch selector.
+  workflow_dispatch:
+
   # Entry point for the (separate) version-bump workflow, so the packaging
   # recipe lives in exactly one place instead of being duplicated there.
   # `ref` lets a caller package an exact commit - e.g. the freshly created
