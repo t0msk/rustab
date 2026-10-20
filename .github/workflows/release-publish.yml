@@ -404,3 +404,77 @@ jobs:
             --generate-notes \
             dist/*
           echo "Release $TAG published with $(find dist -maxdepth 1 -type f | wc -l) assets." >> "$GITHUB_STEP_SUMMARY"
+
+  # Without this, `master` silently drifts one version behind every
+  # release: the `bump` job above only ever commits/tags on `release`
+  # (deliberately - see that job's own comment on why a routine merge must
+  # never auto-cut a release), so nothing brings vX.Y.Z's version fields
+  # back onto `master` on its own. Runs only after `publish` actually
+  # succeeds - there is nothing to merge back for a release that never
+  # got published, and `publish` failing is recoverable by re-running
+  # failed jobs on this same run (see `bump`'s own comment), which would
+  # then reach this job normally.
+  merge-back:
+    name: Merge the version bump back into master
+    needs: [bump, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      # Opening and auto-merging a PR needs both.
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # `actions/checkout`'s default refspec does not necessarily pull
+      # every branch - only explicitly fetch master so the ancestor check
+      # below has something real to compare against, rather than assuming
+      # origin/master already exists locally.
+      - name: Fetch master
+        run: git fetch origin master
+
+      # A PR (opened and auto-merged), not a direct push to master, on
+      # purpose: it stays in master's history as a visible, auditable
+      # record that this was an automated merge-back rather than a
+      # surprise direct push, and it degrades gracefully instead of
+      # silently bypassing anything if master ever grows branch
+      # protection (required reviews, status checks) later - the PR would
+      # just sit there waiting instead of a blocked push hard-failing the
+      # run. The bump commit only ever touches version fields (SPEC §12's
+      # four lockstep files, both Cargo.locks), so a real conflict with
+      # unrelated work landed on master in the meantime is expected to be
+      # rare - but if `gh pr merge --auto` still can't complete one
+      # (conflicts, or checks that never pass), that is reported as a
+      # warning, not a failed run: the release itself already succeeded,
+      # which is the actual deliverable here, and a merge-back that
+      # needs a human is a strictly better state than today's fully
+      # manual "Compare & pull request" click every single time.
+      - name: Open and auto-merge a PR bringing the bump commit into master
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.bump.outputs.tag }}
+          BUMP_SHA: ${{ needs.bump.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor "$BUMP_SHA" origin/master 2>/dev/null; then
+            echo "master already contains ${TAG}'s bump commit ($BUMP_SHA) - nothing to merge back."
+            exit 0
+          fi
+
+          pr_url="$(gh pr create \
+            --base master \
+            --head release \
+            --title "chore(release): merge $TAG version bump back into master" \
+            --body "Automated merge-back of the version bump commit from \`release\` after publishing $TAG, so master's own version fields don't drift behind what was actually released. See docs/SPEC.md §13 for why \`release-publish\` never bumps master directly.")"
+          echo "Opened $pr_url" >> "$GITHUB_STEP_SUMMARY"
+
+          if gh pr merge --auto --merge "$pr_url"; then
+            echo "Auto-merge enabled for $pr_url." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not enable auto-merge for $pr_url (branch protection, conflicts, or checks that never pass) - merge it manually."
+          fi
