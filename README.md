@@ -66,64 +66,56 @@ All screenshots below show Rustab pointed at a throwaway test file via `RUSTAB_T
 <tr>
 <td width="50%">
 
-**Main entries table** - source, mount point, filesystem type, options, and dump/pass at a glance, covering `UUID=`, `PARTUUID=`, `LABEL=`, `PARTLABEL=`, swap, and bind-mount sources:
-
 ![Entries table](docs/screenshots/entries-table.png)
+<sub>**Main entries table** - source, mount point, filesystem type, options, and dump/pass at a glance, covering `UUID=`, `PARTUUID=`, `LABEL=`, `PARTLABEL=`, swap, and bind-mount sources.</sub>
 
 </td>
 <td width="50%">
-
-**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options:
 
 ![Edit entry](docs/screenshots/edit-entry.png)
+<sub>**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options.</sub>
 
 </td>
 </tr>
 <tr>
 <td width="50%">
-
-**Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save:
 
 ![Add entry](docs/screenshots/add-entry.png)
+<sub>**Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save.</sub>
 
 </td>
 <td width="50%">
-
-**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand:
 
 ![Device picker](docs/screenshots/device-picker.png)
+<sub>**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand.</sub>
 
 </td>
 </tr>
 <tr>
 <td width="50%">
-
-**Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click:
 
 ![Pending changes](docs/screenshots/pending-changes.png)
+<sub>**Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click.</sub>
 
 </td>
 <td width="50%">
 
-**Review before saving - Summary view** - exactly what changed, grouped (here, a reorder), before anything touches disk:
-
 ![Review & Save - summary](docs/screenshots/review-save-summary.png)
+<sub>**Review before saving - Summary view** - exactly what changed, grouped (here, a reorder), before anything touches disk.</sub>
 
 </td>
 </tr>
 <tr>
 <td width="50%">
 
-**Review before saving - Raw diff view** - the same review step as a unified text diff, for anyone who prefers reading it that way:
-
 ![Review & Save - raw diff](docs/screenshots/review-save-raw-diff.png)
+<sub>**Review before saving - Raw diff view** - the same review step as a unified text diff, for anyone who prefers reading it that way.</sub>
 
 </td>
 <td width="50%">
 
-**Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version:
-
 ![Backups](docs/screenshots/backups.png)
+<sub>**Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version.</sub>
 
 </td>
 </tr>
