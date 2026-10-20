@@ -18,6 +18,7 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - [Screenshot Placeholder](#screenshot-placeholder)
 - [Roadmap](#roadmap)
 - [Safety Notes](#safety-notes)
+- [Installation](#installation)
 - [Prerequisites](#prerequisites)
 - [Building & Running](#building--running)
 - [Testing](#testing)
@@ -119,6 +120,29 @@ This draft is what you're actually editing day to day - its job is to protect yo
 **Backups are backups of the real file, too.** The Backups panel lists, creates, and deletes backups of `/etc/fstab` itself, not the local draft - so if your system won't boot, you can restore one from a rescue CD/USB straight onto the real file. By default (no `RUSTAB_TARGET_PATH`), creating or deleting a backup is a privileged operation: expect a `pkexec` prompt, same as a save.
 
 **For development and testing without touching the real file**, point Rustab at a throwaway file instead via `RUSTAB_TARGET_PATH` - see `CONTRIBUTING.md`'s "Safety-first contribution notes" and `.env.example` in the repository root for details. Setting `RUSTAB_TARGET_PATH` to anything other than `/etc/fstab` makes that path the target outright, with no dual-write to the real file and no draft-mirroring involved.
+
+## Installation
+
+No packaged release exists yet - packaging for the channels below is planned
+and will be added gradually, not all at once:
+
+| Channel | Status |
+| --- | --- |
+| Ubuntu PPA | Planned - work in progress |
+| Debian repo | Planned - work in progress |
+| Arch Linux (AUR) | Planned - work in progress |
+| Fedora repo (Copr) | Planned - work in progress |
+| Flathub | Planned - work in progress (see `docs/FLATPAK.md`) |
+
+The detailed packaging plan for the PPA/Debian/AUR/Fedora channels - exact
+steps, prerequisites, and what's already blocked on a public release existing
+- is tracked in `docs/PACKAGING_DISTROS.md`.
+
+**For now, building from source is the only way to run Rustab** - see
+[Building & Running](#building--running) below. CI already produces `.deb`,
+`.rpm`, and `.AppImage` bundles on every tagged release once one is cut, which
+is a head start for several of the channels above but not a substitute for
+them.
 
 ## Prerequisites
 
