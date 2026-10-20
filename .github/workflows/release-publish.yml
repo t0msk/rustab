@@ -1,5 +1,16 @@
 name: Release publish
 
+# NOTE: this file is unchanged in substance by this commit - it is edited
+# here purely to force GitHub to (re-)register it as a workflow. It did not
+# appear in the Actions UI's workflow list or `Run workflow` button even
+# though it was present and valid from the repo's very first push
+# (confirmed with `actionlint`, and its content on GitHub matched the local
+# blob SHA exactly) - ci.yml and release-build.yml, both touched by a later
+# commit, registered fine; this one, never touched again after the initial
+# push, did not. A trivial edit that shows up in a push diff is the known
+# workaround for GitHub's workflow-discovery missing a file on a very large
+# initial push.
+#
 # Maintainer-triggered version bump + GitHub Release (docs/SPEC.md §13
 # point 2). This is the ONLY thing in the repository that ever advances the
 # version: `release-build.yml` builds packages on every push to `release`
