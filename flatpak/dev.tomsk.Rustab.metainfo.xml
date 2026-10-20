@@ -34,31 +34,36 @@
   <launchable type="desktop-id">dev.tomsk.Rustab.desktop</launchable>
 
   <!--
-    Screenshot URLs are pinned to the v0.1.0 tag - raw.githubusercontent.com
-    only serves a given path from a real commit/tag, so these must be
-    re-pointed at the current release's tag on every subsequent release
-    (same substitution the manifest's own sources[0].tag needs) - never
-    left pointing at a stale tag.
+    Screenshot URLs are pinned to the v0.1.2 tag, via jsDelivr's GitHub CDN
+    mirror rather than a direct raw.githubusercontent.com link. Flathub's
+    build time screenshot mirroring step (appstreamcli compose, with the
+    media baseurl/media dir flags) fetches each URL to re host it, and
+    raw.githubusercontent.com has repeatedly failed that fetch from
+    Flathub's build infrastructure (appstream missing screenshots lint
+    error on flathub/flathub#10723), while jsDelivr has not.
+    These must be re-pointed at the current release's tag on every
+    subsequent release (same substitution the manifest's own
+    sources[0].tag needs) - never left pointing at a stale tag.
   -->
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/entries-table.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/entries-table.png</image>
       <caption>The main entries table, with UUID/PARTUUID/LABEL/PARTLABEL/swap/bind-mount sources</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/edit-entry.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/edit-entry.png</image>
       <caption>Editing an entry's fields, options, and mount point</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/add-entry.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/add-entry.png</image>
       <caption>Adding an entry with inline validation feedback as you type</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/review-save-summary.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/review-save-summary.png</image>
       <caption>Reviewing exactly what changed before anything is written to disk</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/backups.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/backups.png</image>
       <caption>Automatic, timestamped backups on every save</caption>
     </screenshot>
   </screenshots>
@@ -68,6 +73,12 @@
     release - see docs/FLATPAK.md's "keeping this file in sync" note.
   -->
   <releases>
+    <release version="0.1.1" date="2026-10-20">
+      <description>
+        <p>Native aarch64 (ARM64) builds for the .deb, .rpm, and AppImage packages, so Rustab runs on devices like the Raspberry Pi.</p>
+      </description>
+      <url>https://github.com/t0msk/rustab/releases/tag/v0.1.1</url>
+    </release>
     <release version="0.1.0" date="2026-10-20">
       <description>
         <p>First public release of Rustab.</p>
