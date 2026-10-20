@@ -122,6 +122,7 @@ use yew::prelude::*;
 use crate::api;
 use crate::candidate::resolve_moved_indices;
 use crate::components::empty_state::EmptyState;
+use crate::components::entry_detail_drawer::{Severity, ValidationMessage};
 use crate::components::icons::{
     CheckIcon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CopyIcon, DeleteIcon, EditIcon,
     FolderOpenIcon,
@@ -1215,6 +1216,10 @@ pub struct EntryRowProps {
     pub entry: EntryDto,
     /// Document-wide warning messages about this row specifically (see
     /// `EntriesTableProps::row_warnings`). Empty means no known warning.
+    /// Drives the collapsed row's `border-l-4` highlight and `title`
+    /// tooltip *and* (once this findmnt per-row decomposition work lands)
+    /// a full-width "Warnings" section inside the row's own detail panel -
+    /// the tooltip was the only place the actual text was visible before.
     #[prop_or_default]
     pub warnings: Vec<AttrValue>,
     /// Whether this row's detail panel is currently open (T32) - owned by
@@ -1546,6 +1551,16 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                 <tr class={detail_class} style={drag_style} data-row-position={row_position}>
                     <td colspan="8" class="px-6 py-5">
                         <div class="grid grid-cols-[minmax(0,1fr)_minmax(200px,auto)] gap-x-8 gap-y-5">
+                            if has_warnings {
+                                <div class="col-span-2">
+                                    <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
+                                        { "Warnings" }
+                                    </p>
+                                    { for props.warnings.iter().map(|message| html! {
+                                        <ValidationMessage message={message.clone()} severity={Severity::Warning} />
+                                    }) }
+                                </div>
+                            }
                             <div>
                                 <p class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">
                                     { "Source" }

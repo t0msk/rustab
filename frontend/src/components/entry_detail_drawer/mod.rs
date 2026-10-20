@@ -36,6 +36,7 @@ mod validation_summary;
 
 pub use form_action_bar::FormActionBar;
 pub use source_type_select::SourceType;
+pub use validation_message::{Severity, ValidationMessage};
 pub use validation_summary::ValidationSummary;
 
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
@@ -49,7 +50,6 @@ use mount_point_field::MountPointField;
 use options_tag_input::OptionsTagInput;
 use source_type_select::SourceTypeSelect;
 use trailing_comment_field::TrailingCommentField;
-use validation_message::{Severity, ValidationMessage};
 
 use crate::api;
 use crate::components::status_toast::ToastKind;
@@ -570,10 +570,12 @@ pub fn entry_detail_drawer(props: &EntryDetailDrawerProps) -> Html {
                 </div>
 
                 <div class="flex-1 overflow-y-auto px-6 py-6">
-                    if !is_raw_mode {
-                        { for warning_messages.iter().map(|message| html! {
-                            <ValidationMessage message={message.clone()} severity={Severity::Warning} />
-                        }) }
+                    if !is_raw_mode && !warning_messages.is_empty() {
+                        <div class="mb-4">
+                            { for warning_messages.iter().map(|message| html! {
+                                <ValidationMessage message={message.clone()} severity={Severity::Warning} />
+                            }) }
+                        </div>
                     }
 
                     if let DrawerMode::EditRaw(_) = &props.mode {
