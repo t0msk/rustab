@@ -1,10 +1,28 @@
-# Rustab
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="120" alt="Rustab icon" />
+</p>
 
-[![CI](https://github.com/t0msk/rustab/actions/workflows/ci.yml/badge.svg)](https://github.com/t0msk/rustab/actions/workflows/ci.yml) [![Release build](https://github.com/t0msk/rustab/actions/workflows/release-build.yml/badge.svg)](https://github.com/t0msk/rustab/actions/workflows/release-build.yml)
+<h1 align="center">Rustab</h1>
 
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/vymDkeQnpj) [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/t0msk) [![X](https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white)](https://x.com/TomskDEV)
+<p align="center"><b>A modern, safety-first GUI for editing /etc/fstab on Linux.</b></p>
 
-A modern, native Linux desktop GUI for viewing, editing, adding, and removing entries in `/etc/fstab`, built with stability and data safety as the top priority.
+<p align="center">View, edit, validate, and back up your fstab entries - atomic writes, automatic backups, and a mandatory diff review before anything touches your real <code>/etc/fstab</code>.</p>
+
+<p align="center">
+  <img src="https://img.shields.io/github/v/release/t0msk/rustab?label=release&color=orange" alt="release" />
+  <img src="https://img.shields.io/github/downloads/t0msk/rustab/total?label=downloads&color=blue" alt="downloads" />
+  <a href="https://github.com/t0msk/rustab/actions/workflows/ci.yml"><img src="https://github.com/t0msk/rustab/actions/workflows/ci.yml/badge.svg" alt="build" /></a>
+  <img src="https://img.shields.io/badge/platform-linux-4c1?logo=linux&logoColor=white" alt="platform" />
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational" alt="license" />
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/vymDkeQnpj"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://github.com/sponsors/t0msk"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white" alt="Sponsor" /></a>
+  <a href="https://x.com/TomskDEV"><img src="https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white" alt="X" /></a>
+</p>
+
+---
 
 Rustab combines a clean, intuitive interface with a powerful safety-first architecture:
 - **Full fstab syntax support**: UUIDs, LABELs, device paths, network sources, bind mounts, swap entries, systemd-generator options (`x-systemd.*`), comments - everything fstab and systemd support, round-tripping perfectly.
