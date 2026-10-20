@@ -348,13 +348,14 @@ jobs:
       contents: write
 
     steps:
-      # Same run, so the six artifacts release-build.yml uploaded (deb/rpm/
-      # AppImage, each built once per architecture in its x86_64/aarch64
-      # matrix) are directly addressable. `merge-multiple` flattens all of
-      # them into dist/ instead of one subdirectory per artifact name -
-      # safe here because each bundler already tags its own filename with
-      # the target architecture (e.g. amd64/arm64 for .deb, x86_64/aarch64
-      # for .rpm and .AppImage), so none of the six collide once flattened.
+      # Same run, so the eight artifacts release-build.yml uploaded (deb/
+      # rpm/AppImage/AppImage.zsync, each built once per architecture in
+      # its x86_64/aarch64 matrix) are directly addressable.
+      # `merge-multiple` flattens all of them into dist/ instead of one
+      # subdirectory per artifact name - safe here because each bundler
+      # already tags its own filename with the target architecture (e.g.
+      # amd64/arm64 for .deb, x86_64/aarch64 for .rpm and .AppImage/
+      # .AppImage.zsync), so none of the eight collide once flattened.
       - name: Download the packaged bundles
         uses: actions/download-artifact@v8
         with:
@@ -365,13 +366,13 @@ jobs:
       # A Release missing an asset is worse than a failed run: assert
       # exactly one per architecture (two total) of each format before
       # publishing anything.
-      - name: Verify the six expected assets
+      - name: Verify the eight expected assets
         shell: bash
         run: |
           set -euo pipefail
           ls -l dist
           status=0
-          for ext in deb rpm AppImage; do
+          for ext in deb rpm AppImage AppImage.zsync; do
             count="$(find dist -maxdepth 1 -type f -name "*.$ext" | wc -l)"
             if [[ "$count" -ne 2 ]]; then
               echo "::error::Expected exactly two *.$ext in dist (one per architecture), found $count."
