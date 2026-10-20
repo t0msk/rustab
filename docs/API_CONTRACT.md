@@ -1187,12 +1187,17 @@ input it is about, instead of only in a flat list:
 - `line_index` is the 0-based index, into the `DocumentDto.lines` array that
   was sent to `validate_candidate`, of the single line the finding is about -
   the same identity scheme `LineDto` already uses elsewhere in this
-  contract (a line's identity is simply its index in `lines`). It is set
-  exactly when `field` is set (both or neither).
-- Both are `null` for every document-level finding: duplicate mount point
-  (spans two or more lines, not one), a malformed line present (not a parsed
-  entry), the `findmnt --verify` output, and the degraded-mode warning
-  (`findmnt` unavailable) - none of these are about exactly one field/line.
+  contract (a line's identity is simply its index in `lines`). Usually set
+  exactly when `field` is set (both or neither) - **except** a `malformed`
+  line present finding, which sets `line_index` alone: it is about exactly
+  one identifiable line, but that line was never a parsed entry with fields
+  to localize to, so `field` stays `null`. A consumer must treat
+  `line_index: <N>, field: null` as "about this whole line, not one field of
+  it," not assume the pairing always holds.
+- Both are `null` for every truly document-level finding: duplicate mount
+  point (spans two or more lines, not one), the `findmnt --verify` output,
+  and the degraded-mode warning (`findmnt` unavailable) - none of these are
+  about exactly one line.
 
 Because `validate_candidate` can be called against a document containing
 several entries, a response can carry several independent findings with the

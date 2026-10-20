@@ -147,9 +147,15 @@ pub struct Finding {
     /// the lines array (already documented on `LineDto` in both DTO
     /// crates) rather than inventing a new identity scheme - a caller that
     /// knows which `Document`/`DocumentDto` was validated can use this
-    /// index to look the exact line back up. `None` for the same reason
-    /// [`Self::field`] is `None`: the finding is not about exactly one
-    /// line.
+    /// index to look the exact line back up.
+    ///
+    /// Usually set exactly when [`Self::field`] is set (both or neither) -
+    /// but a [`Line::Malformed`] line is the one exception: it is a single,
+    /// identifiable line, so `line_index` is set for it, while `field`
+    /// stays `None` because it was never a parsed entry with fields to
+    /// localize to in the first place. A consumer must therefore treat
+    /// `line_index: Some, field: None` as "about this whole line, not one
+    /// field of it" - not assume the pairing always holds.
     pub line_index: Option<usize>,
 }
 
@@ -196,6 +202,20 @@ impl Finding {
             severity: Severity::Warning,
             message: message.into(),
             field: Some(field),
+            line_index: Some(line_index),
+        }
+    }
+
+    /// Constructs an advisory [`Severity::Warning`] finding localized to a
+    /// single *line* that is not a parsed entry at all, so there is no
+    /// [`FindingField`] to attach - see [`Self::line_index`]'s doc comment
+    /// for why this is the one place `line_index` is set while `field`
+    /// stays `None`.
+    fn warning_at_line(message: impl Into<String>, line_index: usize) -> Self {
+        Finding {
+            severity: Severity::Warning,
+            message: message.into(),
+            field: None,
             line_index: Some(line_index),
         }
     }
@@ -290,13 +310,29 @@ fn structural_findings(doc: &Document) -> Vec<Finding> {
 /// line the parser could not understand is not, by itself, a reason to
 /// refuse to save the *rest* of the file (the parser's `Display` impl
 /// re-renders malformed lines verbatim, so nothing is lost either way).
+///
+/// Tagged with [`Finding::line_index`] (via [`Finding::warning_at_line`]) so
+/// a consumer - the GUI's per-entry drawer, specifically - can scope this
+/// finding to the one line it is actually about, same as every other
+/// line-specific finding. It was originally left completely untagged
+/// (T21.3), which meant it read as "document-level" to that scoping and
+/// surfaced inside *every* entry's add/edit drawer regardless of which line
+/// was open - confusing in exactly the way a direct user report already
+/// got the cross-entry-warning case fixed for (`docs/UI_DESIGN.md` §5).
+/// There is still no [`FindingField`] for it (a malformed line was never a
+/// parsed entry with fields to localize to), so `field` stays `None`.
 fn malformed_line_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
-        .filter_map(|line| match line {
-            Line::Malformed(raw) => Some(Finding::warning(format!(
-                "line could not be understood as a valid entry and was preserved as-is: {raw:?}"
-            ))),
+        .enumerate()
+        .filter_map(|(idx, line)| match line {
+            Line::Malformed(raw) => Some(Finding::warning_at_line(
+                format!(
+                    "line could not be understood as a valid entry and was preserved as-is: \
+                     {raw:?}"
+                ),
+                idx,
+            )),
             _ => None,
         })
         .collect()
@@ -1052,10 +1088,14 @@ mod tests {
         let findings = malformed_line_findings(&doc);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
-        // Regression guard: a malformed line is not a parsed entry, so it
-        // must never be tagged with a field/line.
+        // A malformed line is not a parsed entry, so it must never be
+        // tagged with a `FindingField` - but it is still exactly one
+        // identifiable line, so `line_index` must point at it (regression
+        // guard: leaving this `None` made the finding read as
+        // "document-level" to the GUI's per-drawer scoping and surfaced it
+        // inside every entry's add/edit drawer, not just this line's own).
         assert_eq!(findings[0].field, None);
-        assert_eq!(findings[0].line_index, None);
+        assert_eq!(findings[0].line_index, Some(0));
     }
 
     // --- Structural: mount point existence (advisory) ---
