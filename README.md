@@ -1,5 +1,7 @@
 # Rustab
 
+[![CI](https://github.com/t0msk/rustab/actions/workflows/ci.yml/badge.svg)](https://github.com/t0msk/rustab/actions/workflows/ci.yml) [![Release build](https://github.com/t0msk/rustab/actions/workflows/release-build.yml/badge.svg)](https://github.com/t0msk/rustab/actions/workflows/release-build.yml)
+
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/vymDkeQnpj) [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/t0msk) [![X](https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white)](https://x.com/TomskDEV)
 
 A modern, native Linux desktop GUI for viewing, editing, adding, and removing entries in `/etc/fstab`, built with stability and data safety as the top priority.
@@ -153,8 +155,22 @@ This draft is what you're actually editing day to day - its job is to protect yo
 
 ## Installation
 
-No packaged release exists yet - packaging for the channels below is planned
-and will be added gradually, not all at once:
+### Download a prebuilt package
+
+Every [tagged release](https://github.com/t0msk/rustab/releases/latest) ships a `.deb`, `.rpm`, and `.AppImage`, built and attached automatically by CI. Download the one for your distro and install it:
+
+| Distro | Package | Install |
+| --- | --- | --- |
+| Debian / Ubuntu / Mint | `.deb` | `sudo apt install ./rustab_*_amd64.deb` |
+| Fedora / RHEL | `.rpm` | `sudo dnf install ./rustab-*.x86_64.rpm` |
+| openSUSE | `.rpm` | `sudo zypper install ./rustab-*.x86_64.rpm` |
+| Any Linux (portable, no install) | `.AppImage` | `chmod +x rustab_*_amd64.AppImage && ./rustab_*_amd64.AppImage` (or just double-click it in a file manager) |
+
+`pkexec`/polkit is required at runtime regardless of install method - see [Prerequisites](#prerequisites).
+
+### Distro package managers (coming gradually)
+
+No native repo/store package exists yet for any of these - planned, and will be added gradually, not all at once:
 
 | Channel | Status |
 | --- | --- |
@@ -165,14 +181,12 @@ and will be added gradually, not all at once:
 | Flathub | Planned - work in progress (see `docs/FLATPAK.md`) |
 
 The detailed packaging plan for the PPA/Debian/AUR/Fedora channels - exact
-steps, prerequisites, and what's already blocked on a public release existing
-- is tracked in `docs/PACKAGING_DISTROS.md`.
+steps, prerequisites, and current blockers - is tracked in
+`docs/PACKAGING_DISTROS.md`.
 
-**For now, building from source is the only way to run Rustab** - see
-[Building & Running](#building--running) below. CI already produces `.deb`,
-`.rpm`, and `.AppImage` bundles on every tagged release once one is cut, which
-is a head start for several of the channels above but not a substitute for
-them.
+### Build from source
+
+See [Building & Running](#building--running) below.
 
 ## Prerequisites
 
