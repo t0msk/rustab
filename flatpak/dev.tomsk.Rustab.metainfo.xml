@@ -34,28 +34,42 @@
   <launchable type="desktop-id">dev.tomsk.Rustab.desktop</launchable>
 
   <!--
-    SUBMISSION BLOCKER - do not submit without fixing this first.
-
-    Flathub requires at least one real <screenshots> entry for every
-    graphical application, pointing at an image hosted at a stable tagged
-    commit/release URL (not a branch, which can change). This project has
-    no real screenshots yet - README.md's own "Screenshot Placeholder"
-    section (as of this writing) is literally an HTML comment with no
-    image. Take real screenshots of the running app (table view, entry
-    drawer, diff view, backup panel are the obvious candidates - see
-    README's Features list), host them at a tagged release/commit URL, and
-    add a block like this before submitting:
-
-    <screenshots>
-      <screenshot type="default">
-        <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/main-table.png</image>
-        <caption>The main entries table</caption>
-      </screenshot>
-    </screenshots>
-
-    appstreamcli validate (and therefore flatpak-builder-lint) will reject
-    this file outright without it - this is not optional polish.
+    REMAINING SUBMISSION BLOCKER (narrowed, not resolved): the real
+    screenshots now exist, committed at docs/screenshots/ in this repo
+    (table view, entry drawer, add-entry validation, device picker,
+    pending-changes bar, both Review & Save views, and the backups panel -
+    see README.md's own "Screenshots" section for the same images with
+    fuller captions). What's still missing is a *stable tagged* URL to
+    point at - raw.githubusercontent.com only serves a given path from a
+    real commit/tag, and no public GitHub repo or tagged release exists
+    yet (confirmed: `git remote -v` is empty, and this file's own
+    sources[0].tag is still the vX.Y.Z placeholder). Once both exist,
+    replace vX.Y.Z below with the real tag (the same substitution this
+    manifest's own source tag needs) - do not submit with a vX.Y.Z URL
+    still in place, it will 404.
   -->
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/entries-table.png</image>
+      <caption>The main entries table, with UUID/PARTUUID/LABEL/PARTLABEL/swap/bind-mount sources</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/edit-entry.png</image>
+      <caption>Editing an entry's fields, options, and mount point</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/add-entry.png</image>
+      <caption>Adding an entry with inline validation feedback as you type</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/review-save-summary.png</image>
+      <caption>Reviewing exactly what changed before anything is written to disk</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/backups.png</image>
+      <caption>Automatic, timestamped backups on every save</caption>
+    </screenshot>
+  </screenshots>
 
   <!--
     SUBMISSION BLOCKER - do not submit without fixing this first.

@@ -15,7 +15,7 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 ## Contents
 
 - [Features](#features)
-- [Screenshot Placeholder](#screenshot-placeholder)
+- [Screenshots](#screenshots)
 - [Roadmap](#roadmap)
 - [Safety Notes](#safety-notes)
 - [Installation](#installation)
@@ -41,9 +41,41 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Persistent working draft** - your in-progress edits survive restarting the app; the draft only gets overwritten from the real file if the real file itself changed since Rustab last looked
 - **Privilege escalation gating** - an explicit confirmation checkbox and danger banner appear before every save, which always writes `/etc/fstab` through a single privilege-escalated (`pkexec`) call
 
-## Screenshot Placeholder
+## Screenshots
 
-<!-- TODO: screenshot/GIF demonstrating the main table view, add entry form, diff review, and backup panel -->
+All screenshots below show Rustab pointed at a throwaway test file via `RUSTAB_TARGET_PATH` (see the green banner in each one) - never the real `/etc/fstab` - populated with real, reachable device identifiers from a real machine so every entry validates cleanly.
+
+**Main entries table** - source, mount point, filesystem type, options, and dump/pass at a glance, covering `UUID=`, `PARTUUID=`, `LABEL=`, `PARTLABEL=`, swap, and bind-mount sources:
+
+![Entries table](docs/screenshots/entries-table.png)
+
+**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options:
+
+![Edit entry](docs/screenshots/edit-entry.png)
+
+**Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save:
+
+![Add entry](docs/screenshots/add-entry.png)
+
+**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand:
+
+![Device picker](docs/screenshots/device-picker.png)
+
+**Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click:
+
+![Pending changes](docs/screenshots/pending-changes.png)
+
+**Review before saving - Summary view** - exactly what changed, grouped (here, a reorder), before anything touches disk:
+
+![Review & Save - summary](docs/screenshots/review-save-summary.png)
+
+**Review before saving - Raw diff view** - the same review step as a unified text diff, for anyone who prefers reading it that way:
+
+![Review & Save - raw diff](docs/screenshots/review-save-raw-diff.png)
+
+**Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version:
+
+![Backups](docs/screenshots/backups.png)
 
 ## Roadmap
 

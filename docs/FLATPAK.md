@@ -526,11 +526,17 @@ scattered elsewhere):
   **Two fields in this file are explicitly marked as submission blockers
   in its own XML comments, not silently left incomplete:**
   - **Screenshots** - Flathub requires at least one real screenshot for
-    every graphical app, hosted at a stable tagged URL. This project has
-    none yet (README's own "Screenshot Placeholder" section is literally
-    an empty HTML comment, confirmed by reading it). No `<screenshots>`
-    tag was added, because fabricating a fake one would be worse than
-    omitting it.
+    every graphical app, hosted at a stable tagged URL. Real screenshots
+    now exist, committed at `docs/screenshots/` (also shown in README.md's
+    "Screenshots" section) and wired into a real `<screenshots>` block in
+    the metainfo file - but every `<image>` URL still points at the
+    `vX.Y.Z` placeholder tag, because no public GitHub repo or tagged
+    release exists yet to point a stable `raw.githubusercontent.com` URL
+    at (same blocker the manifest's own `sources[0].tag` already has).
+    `appstreamcli validate` confirms the block itself is well-formed -
+    its only complaints are 5 `screenshot-image-not-found` warnings for
+    the still-placeholder URLs, which is expected and resolves itself the
+    moment `vX.Y.Z` is swapped for a real tag post-release.
   - **Releases** - Flathub requires a `<releases>` tag to pass validation.
     This project has not cut its first tagged release (every crate is at
     `0.0.0` in lockstep, per `docs/SPEC.md` §12). A single placeholder
@@ -571,8 +577,10 @@ of it).
 **Before starting**: push this repo to a public `https://github.com/t0msk/rustab`
 (or wherever it actually ends up living - update the manifest's `url` if
 not), cut a real tagged release (`docs/SPEC.md` §13's `release-publish.yml`
-workflow), re-point the manifest's `sources[0].tag` at that real tag
-instead of the `vX.Y.Z` placeholder, add real screenshots and a real
+workflow), re-point the manifest's `sources[0].tag` *and* every
+`<screenshot>` `<image>` URL in the metainfo file at that real tag instead
+of the `vX.Y.Z` placeholder (the screenshots themselves already exist, at
+`docs/screenshots/` - only the URL needs updating), add a real
 `<releases>` entry to the metainfo file, regenerate both
 `cargo-sources.json` files and `node-sources.json` fresh (§2.2-2.3), and
 resolve §2.4's Trunk offline-build problem for real - this is a long list
@@ -734,8 +742,11 @@ habits, not one-time steps.
       AI-drafted version in this repo must not be submitted as-is
 - [ ] Decide on `src-tauri/tauri.conf.json`'s identifier vs. the Flatpak
       app ID mismatch (§1.3) - reconcile or consciously leave as-is
-- [ ] Take real screenshots, host them at a tagged URL, add a real
-      `<screenshots>` block to `flatpak/dev.tomsk.Rustab.metainfo.xml`
+- [x] Take real screenshots and add a real `<screenshots>` block to
+      `flatpak/dev.tomsk.Rustab.metainfo.xml` - done, committed at
+      `docs/screenshots/`; the remaining step is swapping each `<image>`
+      URL's `vX.Y.Z` placeholder for the real tag once one is cut (same
+      substitution the manifest's `sources[0].tag` already needs)
 - [ ] Add a real `<release>` entry for the actual cut version
 - [ ] Run `flatpak-cargo-generator` against **both** `Cargo.lock` files
 - [ ] Run `flatpak-node-generator` against `frontend/package-lock.json`
