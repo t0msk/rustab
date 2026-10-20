@@ -62,37 +62,72 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 
 All screenshots below show Rustab pointed at a throwaway test file via `RUSTAB_TARGET_PATH` (see the green banner in each one) - never the real `/etc/fstab` - populated with real, reachable device identifiers from a real machine so every entry validates cleanly.
 
+<table>
+<tr>
+<td width="50%">
+
 **Main entries table** - source, mount point, filesystem type, options, and dump/pass at a glance, covering `UUID=`, `PARTUUID=`, `LABEL=`, `PARTLABEL=`, swap, and bind-mount sources:
 
 ![Entries table](docs/screenshots/entries-table.png)
+
+</td>
+<td width="50%">
 
 **Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options:
 
 ![Edit entry](docs/screenshots/edit-entry.png)
 
+</td>
+</tr>
+<tr>
+<td width="50%">
+
 **Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save:
 
 ![Add entry](docs/screenshots/add-entry.png)
+
+</td>
+<td width="50%">
 
 **Device picker** - pick a real, currently-attached device instead of typing a UUID by hand:
 
 ![Device picker](docs/screenshots/device-picker.png)
 
+</td>
+</tr>
+<tr>
+<td width="50%">
+
 **Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click:
 
 ![Pending changes](docs/screenshots/pending-changes.png)
+
+</td>
+<td width="50%">
 
 **Review before saving - Summary view** - exactly what changed, grouped (here, a reorder), before anything touches disk:
 
 ![Review & Save - summary](docs/screenshots/review-save-summary.png)
 
+</td>
+</tr>
+<tr>
+<td width="50%">
+
 **Review before saving - Raw diff view** - the same review step as a unified text diff, for anyone who prefers reading it that way:
 
 ![Review & Save - raw diff](docs/screenshots/review-save-raw-diff.png)
 
+</td>
+<td width="50%">
+
 **Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version:
 
 ![Backups](docs/screenshots/backups.png)
+
+</td>
+</tr>
+</table>
 
 ## Roadmap
 
@@ -174,16 +209,16 @@ This draft is what you're actually editing day to day - its job is to protect yo
 
 ### Download a prebuilt package
 
-Every [tagged release](https://github.com/t0msk/rustab/releases/latest) ships a `.deb`, `.rpm`, and `.AppImage`, built and attached automatically by CI. Download the one for your distro and install it:
+Every [tagged release](https://github.com/t0msk/rustab/releases/latest) ships a `.deb`, `.rpm`, and `.AppImage` for **both x86_64 and ARM64** (built natively on each architecture, not cross-compiled or emulated - includes Raspberry Pi 4/5 and other 64-bit ARM boards running a 64-bit OS). Download the one matching your distro and CPU architecture and install it:
 
-| Distro | Package | Install |
-| --- | --- | --- |
-| Debian / Ubuntu / Mint | `.deb` | `sudo apt install ./rustab_*_amd64.deb` |
-| Fedora / RHEL | `.rpm` | `sudo dnf install ./rustab-*.x86_64.rpm` |
-| openSUSE | `.rpm` | `sudo zypper install ./rustab-*.x86_64.rpm` |
-| Any Linux (portable, no install) | `.AppImage` | `chmod +x rustab_*_amd64.AppImage && ./rustab_*_amd64.AppImage` (or just double-click it in a file manager) |
+| Distro | Package | Install (x86_64) | Install (ARM64 / Raspberry Pi) |
+| --- | --- | --- | --- |
+| Debian / Ubuntu / Mint | `.deb` | `sudo apt install ./rustab_*_amd64.deb` | `sudo apt install ./rustab_*_arm64.deb` |
+| Fedora / RHEL | `.rpm` | `sudo dnf install ./rustab-*.x86_64.rpm` | `sudo dnf install ./rustab-*.aarch64.rpm` |
+| openSUSE | `.rpm` | `sudo zypper install ./rustab-*.x86_64.rpm` | `sudo zypper install ./rustab-*.aarch64.rpm` |
+| Any Linux (portable, no install) | `.AppImage` | `chmod +x rustab_*_amd64.AppImage && ./rustab_*_amd64.AppImage` | `chmod +x rustab_*_aarch64.AppImage && ./rustab_*_aarch64.AppImage` |
 
-`pkexec`/polkit is required at runtime regardless of install method - see [Prerequisites](#prerequisites).
+(or just double-click the `.AppImage` in a file manager). `pkexec`/polkit is required at runtime regardless of install method - see [Prerequisites](#prerequisites).
 
 ### Distro package managers (coming gradually)
 
