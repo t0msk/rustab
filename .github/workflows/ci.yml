@@ -47,6 +47,27 @@ jobs:
             .
             frontend
 
+      # `cargo clippy --workspace` compiles `src-tauri` (it's a real build,
+      # not just a lint pass over syntax), which transitively depends on
+      # the gtk-rs/webkit2gtk system bindings - without these packages the
+      # build fails at glib-sys's build script with a pkg-config error
+      # ("Package glib-2.0 was not found"), as a real CI run hit. Same set
+      # `build-tauri` below installs, per the official Tauri 2 Linux
+      # prerequisites (https://v2.tauri.app/start/prerequisites/#linux).
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file
+
       - name: cargo clippy --workspace (native workspace, -D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -64,6 +85,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # `cargo test --workspace` compiles `src-tauri`, which transitively
+      # depends on the gtk-rs/webkit2gtk system bindings - without these
+      # packages the build fails at glib-sys's build script with a
+      # pkg-config error ("Package glib-2.0 was not found"), as a real CI
+      # run hit. Same set `build-tauri` below installs, per the official
+      # Tauri 2 Linux prerequisites
+      # (https://v2.tauri.app/start/prerequisites/#linux).
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file
 
       # Runs fstab-core's unit/integration tests (incl. atomicity
       # failure-injection tests) alongside src-tauri's tests. This is the

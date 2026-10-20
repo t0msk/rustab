@@ -127,7 +127,20 @@ jobs:
       # artifacts it promises, regardless of what "all" expands to in a
       # future CLI version. `beforeBuildCommand` runs `trunk build
       # --release` for the frontend as part of this step.
+      #
+      # `working-directory: src-tauri` is load-bearing, not cosmetic:
+      # confirmed by reproducing locally that `cargo tauri build` run from
+      # the repo root resolves `beforeBuildCommand`'s `cd frontend` against
+      # the WRONG directory (`frontend/` *inside* the already-resolved
+      # frontend dist path, which does not exist) and fails with
+      # "cd: frontend: No such file or directory" - the exact failure a
+      # real run of this workflow hit. Running from `src-tauri/` is also
+      # what `CONTRIBUTING.md` documents as the only supported invocation
+      # directory for `cargo tauri dev`/`build`, so this just makes CI
+      # match that convention instead of relying on cargo-tauri's cwd
+      # resolution behaving the same from the repo root.
       - name: Build bundles (cargo tauri build)
+        working-directory: src-tauri
         run: cargo tauri build --ci --bundles deb,rpm,appimage
 
       # Uploaded as three separate artifacts so each package can be
