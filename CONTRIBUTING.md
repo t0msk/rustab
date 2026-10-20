@@ -123,8 +123,8 @@ For safe, reproducible testing, use the hand-written sample fstab files in `test
 cargo test --workspace
 ```
 
-This runs **160 tests** (109 in `fstab-core` - 105 unit tests plus 4
-parser round-trip integration tests - and 51 in the `src-tauri`/`rustab`
+This runs **325 tests** (164 in `fstab-core` - 160 unit tests plus 4
+parser round-trip integration tests - and 161 in the `src-tauri`/`rustab`
 crate), covering:
 - `fstab-core` parser, validator, and atomic writer logic.
 - Atomicity and failure-injection tests.
@@ -137,7 +137,7 @@ crate), covering:
 cd frontend && cargo test
 ```
 
-This runs **9 tests** for the Yew component logic (Rust compiling to native `x86_64` - the test code itself does not need WebAssembly).
+This runs **74 tests** for the Yew component logic (Rust compiling to native `x86_64` - the test code itself does not need WebAssembly).
 
 ## Code style and quality gates
 

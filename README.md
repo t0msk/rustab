@@ -33,7 +33,8 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Support for all fstab device identifiers**: raw device paths, UUID, LABEL, PARTUUID, PARTLABEL, and network sources
 - **Advanced option handling**: toggles for common options, checklist/tag input for custom options, first-class support for `x-systemd.*` options
 - **Device and mount-point pickers** for easier entry creation (via `lsblk`/`findmnt`; soft failure if tools unavailable)
-- **Mandatory diff review before saving** - see exactly what will change in a side-by-side Summary or unified Raw format
+- **Drag-and-drop (or button-based) entry reordering** - reorder entries by dragging a row, or with per-row Move up/down buttons
+- **Mandatory diff review before saving** - see exactly what will change in a side-by-side Summary or unified Raw format, with a one-click "Discard changes" to revert all pending edits at once
 - **Automatic backup management** - every save creates a timestamped backup; restore any previous state with one click
 - **Comment and blank-line preservation** - your existing comments and formatting survive edits and round-trip without loss
 - **Persistent working draft** - your in-progress edits survive restarting the app; the draft only gets overwritten from the real file if the real file itself changed since Rustab last looked
@@ -91,8 +92,6 @@ these for an afternoon's work):**
   needed before), and new backend/DTO plumbing to carry per-field conflict
   state across the IPC boundary. Realistically comparable in size to this
   project's largest single features to date, not a drop-in change.
-- **Drag-and-drop entry reordering** (replacing/supplementing the Move
-  up/down buttons) with a real, animated drag interaction.
 
 Have an idea not listed here, or want to weigh in on priority? Open an issue - see
 [Contact & Support](#contact--support).
@@ -192,9 +191,9 @@ The repository includes an automated test suite covering the parser, validator, 
 cargo test --workspace
 ```
 
-Runs 160 tests across:
-- `crates/fstab-core`: 105 unit tests + 4 fixture-based integration tests
-- `src-tauri/rustab_lib`: 51 command and privilege-escalation tests
+Runs 325 tests across:
+- `crates/fstab-core`: 160 unit tests + 4 fixture-based integration tests
+- `src-tauri/rustab_lib`: 161 command and privilege-escalation tests
 
 **Frontend (Yew/WASM):**
 
@@ -202,9 +201,9 @@ Runs 160 tests across:
 cd frontend && cargo test
 ```
 
-Runs 9 tests for components and diff logic (native Rust target, not WASM, so tests run on the host).
+Runs 74 tests for components and diff logic (native Rust target, not WASM, so tests run on the host).
 
-**Total:** 169 automated tests, all passing.
+**Total:** 399 automated tests, all passing.
 
 Run `cargo fmt --check` and `cargo clippy -- -D warnings` locally to catch style issues before committing. Both are gated in CI.
 
@@ -214,7 +213,7 @@ Rustab is dual-licensed under the MIT License or the Apache License 2.0 - your c
 
 ## AI Use Disclosure
 
-Rustab's development made use of AI code assistance (Claude Code) to accelerate initial implementation. This is disclosed openly: the maintainer is a senior software developer with 10+ years of production experience, and personally code-reviewed and tested every change before merging. The codebase is backed by a comprehensive automated test suite (227 tests, all passing) in addition to manual review and repeated live testing of the real application through its documented entrypoint (`cargo tauri dev`). AI assistance was a development tool, not a replacement for professional engineering judgment or testing discipline.
+Rustab's development made use of AI code assistance (Claude Code) to accelerate initial implementation. This is disclosed openly: the maintainer is a senior software developer with 10+ years of production experience, and personally code-reviewed and tested every change before merging. The codebase is backed by a comprehensive automated test suite (399 tests, all passing) in addition to manual review and repeated live testing of the real application through its documented entrypoint (`cargo tauri dev`). AI assistance was a development tool, not a replacement for professional engineering judgment or testing discipline.
 
 ## Contributing
 
