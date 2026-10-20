@@ -466,11 +466,14 @@ jobs:
             exit 0
           fi
 
-          pr_url="$(gh pr create \
+          if ! pr_url="$(gh pr create \
             --base master \
             --head release \
             --title "chore(release): merge $TAG version bump back into master" \
-            --body "Automated merge-back of the version bump commit from \`release\` after publishing $TAG, so master's own version fields don't drift behind what was actually released. See docs/SPEC.md §13 for why \`release-publish\` never bumps master directly.")"
+            --body "Automated merge-back of the version bump commit from \`release\` after publishing $TAG, so master's own version fields don't drift behind what was actually released. See docs/SPEC.md §13 for why \`release-publish\` never bumps master directly.")"; then
+            echo "::warning::Could not open a merge-back PR for $TAG (e.g. this repo's Settings -> Actions -> General -> Workflow permissions does not have \"Allow GitHub Actions to create and approve pull requests\" enabled) - merge release into master manually."
+            exit 0
+          fi
           echo "Opened $pr_url" >> "$GITHUB_STEP_SUMMARY"
 
           if gh pr merge --auto --merge "$pr_url"; then
