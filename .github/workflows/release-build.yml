@@ -4,8 +4,11 @@ name: Release build
 # point 1). Deliberately kept separate from `ci.yml`, which gates every
 # push/PR to `master` with fmt/clippy/test/build: this workflow's only job
 # is to turn whatever is currently on `release` into installable packages
-# (.deb / .rpm / .AppImage) and upload them as run artifacts, so there is
-# always a downloadable build of the latest `release` state.
+# (.deb / .rpm / .AppImage, each natively for both x86_64 and aarch64 -
+# see the build matrix below - plus an AppImage.zsync delta file per
+# architecture for AppImageUpdate-style self-updating) and upload them as
+# run artifacts, so there is always a downloadable build of the latest
+# `release` state.
 #
 # This workflow never changes the version. A plain push to `release` must
 # not bump anything - the version bump plus GitHub Release is a separate,
@@ -17,6 +20,14 @@ name: Release build
 on:
   push:
     branches: [release]
+
+  # Manual trigger so this packaging recipe can be run against any branch
+  # from the Actions tab - e.g. to CI-verify a change to this workflow
+  # itself on a feature branch before it ever touches `release`, without
+  # needing a throwaway push to `release` just to get a build to test
+  # against. Takes no inputs: `ref` defaults to whatever branch the user
+  # picks in the "Run workflow" branch selector.
+  workflow_dispatch:
 
   # Entry point for the (separate) version-bump workflow, so the packaging
   # recipe lives in exactly one place instead of being duplicated there.
@@ -159,13 +170,89 @@ jobs:
         working-directory: src-tauri
         run: cargo tauri build --ci --bundles deb,rpm,appimage
 
-      # Uploaded as three separate artifacts per architecture so each
-      # package can be downloaded on its own. The arch suffix is required,
-      # not cosmetic: artifact names must be unique across the whole
-      # workflow run, and this matrix now produces two builds of each
-      # format. `if-no-files-found: error` is deliberate: a bundler that
-      # silently produced nothing must fail the run rather than leave an
-      # empty artifact behind.
+      # Re-packages the AppImage with embedded update information and a
+      # .zsync delta file, so AppImageUpdate (or any zsync-aware updater)
+      # pointed at this GitHub repo can fetch only the changed blocks on a
+      # future update instead of the whole file again. Tauri's own
+      # bundler already built a working .AppImage via linuxdeploy's
+      # embedded appimagetool, which also leaves the AppDir it built from
+      # behind at target/release/bundle/appimage/*.AppDir (confirmed with
+      # a real local build, 2026-10-20) - this step re-runs a standalone
+      # appimagetool directly against that same AppDir with
+      # `-u`/`--updateinformation`, producing a byte-different .AppImage
+      # that REPLACES Tauri's own output (same filename, so nothing
+      # downstream needs to change) plus a `.AppImage.zsync` file
+      # alongside it.
+      #
+      # Load-bearing details, each verified against a real build rather
+      # than assumed:
+      # - `appimagetool -u` only works when given an AppDir to build from,
+      #   not an already-built .AppImage (confirmed: passing an existing
+      #   .AppImage as the source prints "To be implemented" and does
+      #   nothing) - hence re-building from the AppDir, not re-stamping
+      #   Tauri's output.
+      # - zsyncmake must be on PATH *before* appimagetool runs, or it
+      #   silently skips zsync generation with only a warning, never
+      #   failing the build - the `command -v zsyncmake` check below turns
+      #   that silent skip into a hard CI failure instead.
+      # - zsyncmake writes the .zsync file into the *current working
+      #   directory* using the bare basename of its target, not next to
+      #   the output path it was given - confirmed by running this same
+      #   invocation from the repo root first (the .zsync landed in the
+      #   repo root) versus from inside the bundle directory (landed
+      #   correctly next to the .AppImage). This step therefore runs with
+      #   `working-directory` set to the bundle directory itself, passing
+      #   only bare filenames, not paths.
+      - name: Re-package the AppImage with update information + zsync
+        # Repo-root-relative, NOT src-tauri/target/... - Cargo workspaces
+        # share one target/ directory at the workspace root regardless of
+        # which member directory a command is run from (confirmed: the
+        # "Build bundles" step above runs with working-directory:
+        # src-tauri yet the Upload steps below it already reference
+        # target/release/bundle/... with no src-tauri/ prefix, and those
+        # have worked in a real release - v0.1.0's assets prove it).
+        working-directory: target/release/bundle/appimage
+        env:
+          ARCH: ${{ matrix.arch }}
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage
+        run: |
+          set -euo pipefail
+
+          sudo apt-get install -y zsync
+          command -v zsyncmake >/dev/null || { echo "::error::zsyncmake not on PATH after installing zsync - appimagetool would silently skip .zsync generation."; exit 1; }
+
+          curl -fL -o appimagetool "$APPIMAGETOOL_URL"
+          chmod +x appimagetool
+
+          appimage_path="$(find . -maxdepth 1 -type f -name '*.AppImage')"
+          appdir_path="$(find . -maxdepth 1 -type d -name '*.AppDir')"
+          if [[ -z "$appimage_path" || -z "$appdir_path" ]]; then
+            echo "::error::Expected exactly one *.AppImage and one *.AppDir in $(pwd) from the cargo tauri build step above; found AppImage='$appimage_path' AppDir='$appdir_path'. Tauri's bundler output layout may have changed."
+            exit 1
+          fi
+          appimage_name="$(basename "$appimage_path")"
+          appdir_name="$(basename "$appdir_path")"
+          # e.g. rustab_0.1.1_amd64.AppImage -> rustab_*_amd64.AppImage.zsync
+          # - the version segment is the only part that changes release to
+          # release, so it's the only part replaced with a glob.
+          zsync_glob="$(echo "$appimage_name" | sed -E 's/_[0-9]+\.[0-9]+\.[0-9]+_/_*_/').zsync"
+
+          rm -f "$appimage_name"
+          ./appimagetool -u "gh-releases-zsync|t0msk|rustab|latest|${zsync_glob}" "$appdir_name" "$appimage_name"
+
+          if [[ ! -f "${appimage_name}.zsync" ]]; then
+            echo "::error::${appimage_name}.zsync was not produced - zsync generation failed silently."
+            exit 1
+          fi
+          rm -f appimagetool
+
+      # Uploaded as four separate artifacts per architecture (deb, rpm,
+      # AppImage, and its .zsync) so each package can be downloaded on its
+      # own. The arch suffix is required, not cosmetic: artifact names
+      # must be unique across the whole workflow run, and this matrix now
+      # produces two builds of each format. `if-no-files-found: error` is
+      # deliberate: a bundler that silently produced nothing must fail the
+      # run rather than leave an empty artifact behind.
       - name: Upload .deb
         uses: actions/upload-artifact@v7
         with:
@@ -185,4 +272,11 @@ jobs:
         with:
           name: rustab-appimage-${{ matrix.arch }}
           path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+      - name: Upload .AppImage.zsync
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustab-appimage-zsync-${{ matrix.arch }}
+          path: target/release/bundle/appimage/*.AppImage.zsync
           if-no-files-found: error
