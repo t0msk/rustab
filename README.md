@@ -9,8 +9,7 @@
 <p align="center">View, edit, validate, and back up your fstab entries - atomic writes, automatic backups, and a mandatory diff review before anything touches your real <code>/etc/fstab</code>.</p>
 
 <p align="center">
-  <img src="https://img.shields.io/github/v/release/t0msk/rustab?label=release&color=orange" alt="release" />
-  <img src="https://img.shields.io/github/downloads/t0msk/rustab/total?label=downloads&color=blue" alt="downloads" />
+  <img src="https://img.shields.io/github/v/release/t0msk/rustab?label=release&color=blue" alt="release" />
   <a href="https://github.com/t0msk/rustab/actions/workflows/ci.yml"><img src="https://github.com/t0msk/rustab/actions/workflows/ci.yml/badge.svg" alt="build" /></a>
   <img src="https://img.shields.io/badge/platform-linux-4c1?logo=linux&logoColor=white" alt="platform" />
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational" alt="license" />
