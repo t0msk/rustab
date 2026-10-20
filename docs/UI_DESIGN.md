@@ -431,9 +431,17 @@ severity looks and behaves:
   this draft's own position in the document) renders inline, directly below the
   mount point input, using the same `ValidationMessage` styling. The flat warning
   stack described below is deliberately scoped to **document-level findings only**
-  (no `line_index` at all - e.g. a duplicate mount point spanning two lines, or a
-  `findmnt --verify` dump) plus any other non-mount-point warning about this same
-  draft's own line. A warning tagged to some *other* line entirely (e.g. "mount
+  (no `line_index` at all - e.g. a duplicate mount point spanning two lines, or
+  the degraded-mode notice when `findmnt` is unavailable) plus any other
+  non-mount-point warning about this same draft's own line. `findmnt --verify`
+  complaints are *usually* per-line now, not document-level: the backend splits
+  `findmnt`'s mount-point-grouped output into one finding per complaint, each
+  tagged with the `line_index` of the entry it names, so they land on that
+  entry's row and drawer like any other line-specific warning. Only when
+  attribution fails (unrecognized `findmnt` output, or a mount point matching no
+  entry or more than one) does the backend fall back to a single untagged
+  finding carrying the whole raw dump, which then shows in this stack. A warning
+  tagged to some *other* line entirely (e.g. "mount
   point X does not exist" for an unrelated, already-saved entry elsewhere in the
   document) is real, and still surfaces inline the next time *that* entry's own
   drawer is opened - but is not shown inside a drawer editing a different entry,

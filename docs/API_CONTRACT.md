@@ -1163,7 +1163,8 @@ whose saves write `/etc/fstab` and whose backups are `/etc/fstab`'s.
 
 `severity` is `"error"` (blocks a save) or `"warning"` (advisory). `message`
 is written for a user and is safe to display verbatim; it may be multi-line
-(the `findmnt` finding includes `findmnt`'s own output). `has_errors` is
+(the fallback `findmnt` finding described below carries `findmnt`'s whole
+raw output). `has_errors` is
 precomputed so the UI's "can I save?" test cannot disagree with the backend's.
 
 `field` and `line_index` let the UI render a finding next to the specific
@@ -1188,16 +1189,35 @@ input it is about, instead of only in a flat list:
   was sent to `validate_candidate`, of the single line the finding is about -
   the same identity scheme `LineDto` already uses elsewhere in this
   contract (a line's identity is simply its index in `lines`). Usually set
-  exactly when `field` is set (both or neither) - **except** a `malformed`
-  line present finding, which sets `line_index` alone: it is about exactly
-  one identifiable line, but that line was never a parsed entry with fields
-  to localize to, so `field` stays `null`. A consumer must treat
+  exactly when `field` is set (both or neither) - with two exceptions, both
+  of which set `line_index` alone and leave `field` null. One is a
+  `malformed` line present finding: it is about exactly one identifiable
+  line, but that line was never a parsed entry with fields to localize to.
+  The other is a `findmnt --verify` finding (see below): `findmnt` names the
+  mount point each of its complaints is about, which identifies the line,
+  but not which of that entry's fields is at fault. A consumer must treat
   `line_index: <N>, field: null` as "about this whole line, not one field of
   it," not assume the pairing always holds.
-- Both are `null` for every truly document-level finding: duplicate mount
-  point (spans two or more lines, not one), the `findmnt --verify` output,
-  and the degraded-mode warning (`findmnt` unavailable) - none of these are
-  about exactly one line.
+- `findmnt --verify` findings are, most of the time, tagged exactly like any
+  other line-specific finding - `line_index` set, `field` null, the same
+  shape as the malformed-line case above. `findmnt` groups its output by
+  mount point, so the backend splits it into one finding per complaint
+  (each carrying its own `error`/`warning` severity, from `findmnt`'s own
+  `[E]`/`[W]` marker) and attaches each to the entry whose mount point it
+  names. A UI can therefore render these per row and per drawer, not as one
+  unscoped blob. The untagged whole-document form (both fields `null`, one
+  finding whose `message` carries `findmnt`'s entire raw output) is the
+  fallback, used only when the output cannot be confidently attributed:
+  `findmnt` printed something the backend does not recognize, or it named a
+  mount point matching no entry or more than one (e.g. the `none` several
+  swap entries share). The fallback is all-or-nothing - a response never
+  mixes per-line `findmnt` findings with a raw dump of the same run - so a
+  consumer must handle both forms, and must not assume a `findmnt` finding
+  always has a `line_index`.
+- Both are `null` for a finding that is genuinely about no single line:
+  duplicate mount point (spans two or more lines, not one), the
+  degraded-mode warning (`findmnt` unavailable), and the `findmnt --verify`
+  fallback described above.
 
 Because `validate_candidate` can be called against a document containing
 several entries, a response can carry several independent findings with the
@@ -1208,9 +1228,11 @@ both missing their mount point) - a caller must key off *both* `field` and
 
 Typical findings: duplicate mount point, empty filesystem type, malformed
 `UUID=`/`PARTUUID=` value, mount point missing on disk (warning),
-malformed lines present (warning),
-`findmnt --verify` output, and a warning that the semantic check ran in
-degraded mode because `findmnt` is unavailable.
+malformed lines present (warning), a `findmnt --verify` complaint about one
+entry (usually per-line, falling back to one untagged finding carrying
+`findmnt`'s whole output when attribution fails - see above), and a warning
+that the semantic check ran in degraded mode because `findmnt` is
+unavailable.
 
 ---
 

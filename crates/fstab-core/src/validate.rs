@@ -94,8 +94,9 @@ pub enum Severity {
 /// field. [`Finding::field`] being `None` does not mean "unknown"; it means
 /// the finding is not about exactly one field/line at all - either it spans
 /// multiple lines (e.g. a mount point shared by two entries), or it isn't
-/// about a parsed entry in the first place (e.g. a [`Line::Malformed`] line,
-/// or the whole-document `findmnt --verify` result).
+/// about a parsed entry in the first place (e.g. a [`Line::Malformed`]
+/// line), or it is about one identifiable line but names no field of it
+/// (a `findmnt --verify` diagnostic - see [`findmnt_detail_line_findings`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingField {
     /// The entry's mount point (second fstab field).
@@ -150,12 +151,17 @@ pub struct Finding {
     /// index to look the exact line back up.
     ///
     /// Usually set exactly when [`Self::field`] is set (both or neither) -
-    /// but a [`Line::Malformed`] line is the one exception: it is a single,
-    /// identifiable line, so `line_index` is set for it, while `field`
-    /// stays `None` because it was never a parsed entry with fields to
-    /// localize to in the first place. A consumer must therefore treat
-    /// `line_index: Some, field: None` as "about this whole line, not one
-    /// field of it" - not assume the pairing always holds.
+    /// with two exceptions, both of which set `line_index` alone. A
+    /// [`Line::Malformed`] line is one: it is a single, identifiable line,
+    /// so `line_index` is set for it, while `field` stays `None` because it
+    /// was never a parsed entry with fields to localize to in the first
+    /// place. A `findmnt --verify` diagnostic attributed to one entry (see
+    /// [`findmnt_detail_line_findings`]) is the other: `findmnt` names the
+    /// mount point its complaint is about, which is enough to identify the
+    /// line, but not which of that entry's fields is at fault. A consumer
+    /// must therefore treat `line_index: Some, field: None` as "about this
+    /// whole line, not one field of it" - not assume the pairing always
+    /// holds.
     pub line_index: Option<usize>,
 }
 
@@ -207,13 +213,27 @@ impl Finding {
     }
 
     /// Constructs an advisory [`Severity::Warning`] finding localized to a
-    /// single *line* that is not a parsed entry at all, so there is no
-    /// [`FindingField`] to attach - see [`Self::line_index`]'s doc comment
-    /// for why this is the one place `line_index` is set while `field`
-    /// stays `None`.
+    /// single *line* without naming one of its [`FindingField`]s - see
+    /// [`Self::line_index`]'s doc comment for why `line_index` is set here
+    /// while `field` stays `None`.
     fn warning_at_line(message: impl Into<String>, line_index: usize) -> Self {
         Finding {
             severity: Severity::Warning,
+            message: message.into(),
+            field: None,
+            line_index: Some(line_index),
+        }
+    }
+
+    /// Constructs a blocking [`Severity::Error`] finding localized to a
+    /// single *line* without naming one of its [`FindingField`]s - the
+    /// [`Severity::Error`] counterpart of [`Self::warning_at_line`], used by
+    /// [`findmnt_detail_line_findings`] for a `findmnt --verify` `[E]`
+    /// diagnostic that could be attributed to exactly one entry but names no
+    /// specific fstab field.
+    fn error_at_line(message: impl Into<String>, line_index: usize) -> Self {
+        Finding {
+            severity: Severity::Error,
             message: message.into(),
             field: None,
             line_index: Some(line_index),
@@ -602,7 +622,7 @@ struct FindmntRunResult {
 fn semantic_findings(doc: &Document) -> Vec<Finding> {
     let rendered = doc.to_string();
     let result = run_findmnt_verify(&rendered);
-    interpret_findmnt_result(&result)
+    interpret_findmnt_result(doc, &result)
 }
 
 /// Pure decision logic: given the result of attempting to run
@@ -619,7 +639,24 @@ fn semantic_findings(doc: &Document) -> Vec<Finding> {
 ///   (structural checks only), never silently treated as success, per
 ///   `docs/SPEC.md` §6.
 /// - `Ok(run)` with `run.success == true` → no findings.
-/// - `Ok(run)` with `run.success == false` → `findmnt --verify` prints a
+/// - `Ok(run)` with `run.success == false` → first, the preferred path:
+///   `findmnt`'s output is grouped by mount point, so
+///   [`parse_findmnt_detail`] tries to decompose it into one diagnostic per
+///   mount point, and [`findmnt_detail_line_findings`] tries to attribute
+///   each of those to exactly one [`Line::Entry`] of `doc`. When *both*
+///   succeed (every line of `findmnt`'s output was recognized, and every
+///   mount point it named resolved to exactly one entry), the result is one
+///   per-line [`Finding`] per diagnostic, carrying the real
+///   [`Finding::line_index`] of the entry it is about and the severity of
+///   its own `[E]`/`[W]` marker - and no whole-output dump at all. That is
+///   what lets a GUI put each complaint on the row/drawer it belongs to
+///   instead of showing one unscoped blob on every entry.
+///
+///   If anything about the output is unexpected, or any mount point is
+///   ambiguous (matches zero, or two or more entries), the whole result
+///   falls back - all-or-nothing, never partially attributed - to the
+///   original behavior below, which is the safety net and deliberately
+///   unchanged: `findmnt --verify` prints a
 ///   final summary line shaped like
 ///   `"<N> parse error(s), <M> error(s), <K> warning(s)"` and exits
 ///   non-zero whenever `N > 0` *or* `M > 0` - i.e. it conflates "a line
@@ -640,7 +677,7 @@ fn semantic_findings(doc: &Document) -> Vec<Finding> {
 ///       this falls back to the original conservative behavior - a
 ///       blocking [`Severity::Error`] - rather than ever silently treating
 ///       an unrecognized failure as a pass.
-fn interpret_findmnt_result(result: &io::Result<FindmntRunResult>) -> Vec<Finding> {
+fn interpret_findmnt_result(doc: &Document, result: &io::Result<FindmntRunResult>) -> Vec<Finding> {
     match result {
         Err(err) => vec![Finding::warning(format!(
             "semantic verification (equivalent to `findmnt --verify`) was skipped because \
@@ -650,6 +687,23 @@ fn interpret_findmnt_result(result: &io::Result<FindmntRunResult>) -> Vec<Findin
         ))],
         Ok(run) if run.success => Vec::new(),
         Ok(run) => {
+            // Preferred path: decompose findmnt's output into per-entry
+            // findings. Both halves have to agree before anything is
+            // reported this way - an unrecognized output shape, or a mount
+            // point that cannot be pinned to exactly one entry, drops the
+            // whole result through to the unchanged fallback below rather
+            // than reporting a partially-attributed (and therefore
+            // possibly incomplete) set of findings.
+            let (detail_lines, had_unrecognized_content) =
+                parse_findmnt_detail(&run.combined_output);
+            if !had_unrecognized_content {
+                if let Some(findings) = findmnt_detail_line_findings(doc, &detail_lines) {
+                    if !findings.is_empty() {
+                        return findings;
+                    }
+                }
+            }
+
             let detail = run.combined_output.trim();
             match parse_findmnt_summary(&run.combined_output) {
                 Some(summary) if summary.errors == 0 => {
@@ -675,6 +729,220 @@ fn interpret_findmnt_result(result: &io::Result<FindmntRunResult>) -> Vec<Findin
             }
         }
     }
+}
+
+/// One `[E]`/`[W]` diagnostic line from `findmnt --verify`'s output,
+/// together with the mount point of the block it appeared under (see
+/// [`parse_findmnt_detail`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FindmntDetailLine {
+    /// The mount-point text from the block header this diagnostic appeared
+    /// under, verbatim as `findmnt` printed it - which is verbatim as the
+    /// candidate document contained it, since the candidate was rendered
+    /// via [`Document`]'s `Display` impl before being handed to `findmnt`.
+    mount_point: String,
+    /// [`Severity::Error`] for a `[E]` marker, [`Severity::Warning`] for a
+    /// `[W]` one. Taken from this line's own marker, never re-derived from
+    /// the summary line's aggregate counts.
+    severity: Severity,
+    /// The diagnostic text after the marker, e.g. `"unreachable on boot
+    /// required target: No such file or directory"`.
+    message: String,
+}
+
+/// The exact indentation `findmnt --verify` puts before each `[E]`/`[W]`
+/// diagnostic line (confirmed against util-linux 2.42.2). Matched exactly,
+/// not as "some whitespace": a different indentation is something this
+/// parser has not seen and must not guess about.
+const FINDMNT_DETAIL_INDENT: &str = "   ";
+
+/// Decomposes `findmnt --verify`'s combined stdout+stderr text into one
+/// [`FindmntDetailLine`] per `[E]`/`[W]` diagnostic, returning them along
+/// with a `had_unrecognized_content` flag that is `true` if *anything* in
+/// `text` could not be cleanly explained.
+///
+/// `findmnt --verify` groups its diagnostics by mount point: an unindented
+/// line holding the mount-point text verbatim, followed by one or more
+/// lines of [`FINDMNT_DETAIL_INDENT`] + `[E] `/`[W] ` + message. Real
+/// captured output (util-linux 2.42.2), as
+/// [`run_findmnt_verify`] assembles it (stdout, then stderr):
+///
+/// ```text
+/// /mnt/unreachable
+///    [E] unreachable on boot required target: No such file or directory
+///    [E] unreachable on boot required source: UUID=deadbeef-0000-...
+///
+/// findmnt: /tmp/x.fstab: parse error at line 1 -- ignored
+///
+/// 1 parse error, 2 errors, 0 warnings
+/// ```
+///
+/// Everything else this recognizes is deliberately *discarded* rather than
+/// surfaced:
+///
+/// - Blank lines, which carry no information. A blank line also closes any
+///   block currently open, since real output never separates a header from
+///   its own diagnostics.
+/// - The summary line (via [`parse_findmnt_summary_line`]); its counts are
+///   aggregates of the per-line diagnostics, so reporting them too would
+///   just repeat what the per-line findings already say.
+/// - A `findmnt: <path>: parse error at line N -- ignored` stderr line.
+///   This one is pure duplication: a line `findmnt` could not parse is
+///   already reported by [`malformed_line_findings`], which has that line's
+///   own correct `line_index` - and the path in it is the throwaway temp
+///   file, which means nothing to a user.
+///
+/// The flag is set to `true` for anything else at all: an unknown line
+/// shape, a `[E]`/`[W]` line with no block header open above it, or a
+/// header with no diagnostics under it. The caller must then fall back
+/// (see [`interpret_findmnt_result`]) - the point of the flag is that a
+/// future `findmnt` whose output this parser only *partly* understands must
+/// never result in silently dropped diagnostics.
+fn parse_findmnt_detail(text: &str) -> (Vec<FindmntDetailLine>, bool) {
+    let mut detail_lines: Vec<FindmntDetailLine> = Vec::new();
+    let mut had_unrecognized_content = false;
+    // The block currently open: its mount-point header text, and how many
+    // diagnostic lines have been attributed to it so far.
+    let mut open_block: Option<(String, usize)> = None;
+
+    for line in text.lines() {
+        if let Some((severity, message)) = parse_findmnt_detail_message_line(line) {
+            match open_block.as_mut() {
+                Some((mount_point, count)) => {
+                    *count += 1;
+                    detail_lines.push(FindmntDetailLine {
+                        mount_point: mount_point.clone(),
+                        severity,
+                        message: message.to_string(),
+                    });
+                }
+                // A diagnostic with nothing to attribute it to.
+                None => had_unrecognized_content = true,
+            }
+            continue;
+        }
+
+        // Any non-diagnostic line ends the block above it; a header that
+        // collected no diagnostics is not a shape this parser has seen.
+        if let Some((_, count)) = open_block.take() {
+            if count == 0 {
+                had_unrecognized_content = true;
+            }
+        }
+
+        if line.trim().is_empty()
+            || parse_findmnt_summary_line(line).is_some()
+            || is_findmnt_parse_error_line(line)
+        {
+            continue;
+        }
+
+        if looks_like_findmnt_mount_point_header(line) {
+            open_block = Some((line.to_string(), 0));
+            continue;
+        }
+
+        had_unrecognized_content = true;
+    }
+
+    if let Some((_, count)) = open_block {
+        if count == 0 {
+            had_unrecognized_content = true;
+        }
+    }
+
+    (detail_lines, had_unrecognized_content)
+}
+
+/// Recognizes one indented `findmnt --verify` diagnostic line, returning
+/// its severity and the message after the marker. Requires exactly
+/// [`FINDMNT_DETAIL_INDENT`] followed by exactly `"[E] "` or `"[W] "` -
+/// anything else (other indentation, an unknown marker letter) is not
+/// recognized, so the caller treats it as unexplained content.
+fn parse_findmnt_detail_message_line(line: &str) -> Option<(Severity, &str)> {
+    let rest = line.strip_prefix(FINDMNT_DETAIL_INDENT)?;
+    if let Some(message) = rest.strip_prefix("[E] ") {
+        return Some((Severity::Error, message));
+    }
+    rest.strip_prefix("[W] ")
+        .map(|message| (Severity::Warning, message))
+}
+
+/// Returns `true` for `findmnt`'s own `findmnt: <path>: parse error at line
+/// N -- ignored` stderr line. See [`parse_findmnt_detail`] for why this line
+/// is recognized only in order to discard it.
+fn is_findmnt_parse_error_line(line: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with("findmnt: ")
+        && line.contains(": parse error at line ")
+        && line.ends_with(" -- ignored")
+}
+
+/// Returns `true` if `line` could be a `findmnt --verify` block header, i.e.
+/// an fstab mount-point text printed on its own line.
+///
+/// A mount point is a single whitespace-free token: the fstab format splits
+/// its fields on whitespace, and a mount point containing a space carries it
+/// as an octal escape (`\040`) which this crate deliberately stores and
+/// renders raw (see `docs/SPEC.md`). So "contains no whitespace at all" both
+/// matches every real header and rejects `findmnt`'s prose lines (its own
+/// `findmnt: ...` messages, the summary line, and any future wording), which
+/// is what keeps an unrecognized line from being mistaken for a header.
+fn looks_like_findmnt_mount_point_header(line: &str) -> bool {
+    !line.is_empty() && !line.chars().any(char::is_whitespace)
+}
+
+/// Resolves [`FindmntDetailLine`]s against `doc`, returning one per-line
+/// [`Finding`] per diagnostic - or `None` if any single one of them cannot
+/// be attributed to exactly one entry.
+///
+/// Matching is plain string equality against [`crate::model::FstabEntry::mount_point`]
+/// as stored (raw, octal escapes and all), the same way
+/// [`mount_point_missing_findings`] matches: `findmnt` was given this very
+/// document rendered by its own serializer, so the header text it echoes
+/// back is byte-identical to what the model holds.
+///
+/// `None` is all-or-nothing on purpose. A mount point that matches *no*
+/// entry means this function and `findmnt` disagree about the document,
+/// and one that matches *two or more* (e.g. the `none` several swap entries
+/// share) means there is no single right line to blame. Either way, guessing
+/// risks pinning a real problem to the wrong row - worse than the honest
+/// unscoped fallback - and a *partial* result risks dropping a diagnostic
+/// entirely, so neither is attempted.
+fn findmnt_detail_line_findings(
+    doc: &Document,
+    lines: &[FindmntDetailLine],
+) -> Option<Vec<Finding>> {
+    let mut findings = Vec::with_capacity(lines.len());
+
+    for detail in lines {
+        let mut matching = doc
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| match line {
+                Line::Entry(entry) => entry.mount_point == detail.mount_point,
+                _ => false,
+            })
+            .map(|(idx, _)| idx);
+
+        let line_index = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+
+        // The message is prefixed with its source so a user reading it on
+        // its own row knows this is `findmnt`'s verdict, not rustab's own
+        // wording - the fallback whole-output findings say so explicitly,
+        // and these must not lose that attribution by being shorter.
+        let message = format!("findmnt --verify: {}", detail.message);
+        findings.push(match detail.severity {
+            Severity::Error => Finding::error_at_line(message, line_index),
+            Severity::Warning => Finding::warning_at_line(message, line_index),
+        });
+    }
+
+    Some(findings)
 }
 
 /// The three counts `findmnt --verify` reports in its final summary line
@@ -712,16 +980,24 @@ struct FindmntSummary {
 /// free pass, since this function has no way to tell the two cases apart
 /// once the shape is unrecognized.
 fn parse_findmnt_summary(text: &str) -> Option<FindmntSummary> {
-    text.lines().find_map(|line| {
-        let fields: Vec<&str> = line.trim().split(", ").collect();
-        let [parse_field, error_field, warning_field] = fields.as_slice() else {
-            return None;
-        };
-        Some(FindmntSummary {
-            parse_errors: parse_count_field(parse_field, "parse error", "parse errors")?,
-            errors: parse_count_field(error_field, "error", "errors")?,
-            warnings: parse_count_field(warning_field, "warning", "warnings")?,
-        })
+    text.lines().find_map(parse_findmnt_summary_line)
+}
+
+/// Parses a single line as `findmnt --verify`'s summary line, returning
+/// `None` if it is not one. Factored out of [`parse_findmnt_summary`] (which
+/// is just this applied across every line of the output) so
+/// [`parse_findmnt_detail`] can use the identical test when classifying a
+/// line, rather than keeping a second copy of the summary-line shape that
+/// could drift from this one.
+fn parse_findmnt_summary_line(line: &str) -> Option<FindmntSummary> {
+    let fields: Vec<&str> = line.trim().split(", ").collect();
+    let [parse_field, error_field, warning_field] = fields.as_slice() else {
+        return None;
+    };
+    Some(FindmntSummary {
+        parse_errors: parse_count_field(parse_field, "parse error", "parse errors")?,
+        errors: parse_count_field(error_field, "error", "errors")?,
+        warnings: parse_count_field(warning_field, "warning", "warnings")?,
     })
 }
 
@@ -1331,7 +1607,7 @@ mod tests {
     #[test]
     fn findmnt_not_found_is_degraded_mode_warning_not_error() {
         let result: io::Result<FindmntRunResult> = Err(io::Error::from(io::ErrorKind::NotFound));
-        let findings = interpret_findmnt_result(&result);
+        let findings = interpret_findmnt_result(&Document::from_lines(vec![]), &result);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].message.contains("degraded"));
@@ -1341,7 +1617,7 @@ mod tests {
     fn findmnt_other_launch_failure_is_also_degraded_mode_warning() {
         let result: io::Result<FindmntRunResult> =
             Err(io::Error::other("simulated launch failure"));
-        let findings = interpret_findmnt_result(&result);
+        let findings = interpret_findmnt_result(&Document::from_lines(vec![]), &result);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].message.contains("simulated launch failure"));
@@ -1353,7 +1629,7 @@ mod tests {
             success: true,
             combined_output: String::new(),
         });
-        assert!(interpret_findmnt_result(&result).is_empty());
+        assert!(interpret_findmnt_result(&Document::from_lines(vec![]), &result).is_empty());
     }
 
     #[test]
@@ -1363,7 +1639,7 @@ mod tests {
             combined_output: "/data\n   [E] unreachable on boot required source: UUID=dead"
                 .to_string(),
         });
-        let findings = interpret_findmnt_result(&result);
+        let findings = interpret_findmnt_result(&Document::from_lines(vec![]), &result);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
         assert!(findings[0]
@@ -1468,7 +1744,7 @@ mod tests {
                               directory"
                 .to_string(),
         });
-        let findings = interpret_findmnt_result(&result);
+        let findings = interpret_findmnt_result(&Document::from_lines(vec![]), &result);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].message.contains("parse error"));
@@ -1485,12 +1761,345 @@ mod tests {
                               UUID=deadbeef-0000-0000-0000-000000000000"
                 .to_string(),
         });
-        let findings = interpret_findmnt_result(&result);
+        let findings = interpret_findmnt_result(&Document::from_lines(vec![]), &result);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
         assert!(findings[0]
             .message
             .contains("unreachable on boot required source"));
+    }
+
+    // --- Semantic: per-line decomposition of findmnt's detail output ---
+
+    /// Real `findmnt --verify` output for a document with one unparseable
+    /// line, one `noauto` entry with a nonexistent UUID (two `[W]`s), and
+    /// one auto-mounted entry with a nonexistent UUID (two `[E]`s), in the
+    /// order [`run_findmnt_verify`] assembles it: stdout (the detail
+    /// blocks), a blank separator, then stderr (the parse-error line, a
+    /// blank line, and the summary line). Captured by hand against
+    /// util-linux 2.42.2, with stdout/stderr redirected to separate files to
+    /// confirm which stream each part comes from.
+    fn real_two_block_findmnt_output() -> String {
+        "/mnt/data\n\
+         \u{20}\u{20}\u{20}[W] unreachable target: No such file or directory\n\
+         /mnt/unreachable\n\
+         \u{20}\u{20}\u{20}[E] unreachable on boot required target: No such file or directory\n\
+         \u{20}\u{20}\u{20}[E] unreachable on boot required source: \
+         UUID=deadbeef-0000-0000-0000-000000000000\n\
+         \n\
+         findmnt: /tmp/rustab-findmnt-verify-1-0.tmp: parse error at line 1 -- ignored\n\
+         \n\
+         1 parse error, 2 errors, 0 warnings\n"
+            .to_string()
+    }
+
+    /// A document matching [`real_two_block_findmnt_output`]: the two
+    /// entries it names, deliberately *not* at indices 0 and 1 (a malformed
+    /// line precedes them and a blank line separates them) so a correct
+    /// `line_index` cannot pass by coincidence.
+    fn doc_for_real_two_block_output() -> Document {
+        Document::from_lines(vec![
+            Line::Malformed("this line is garbage and cannot be parsed".to_string()),
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+                "/mnt/data",
+                "ext4",
+                Options::from_vec(vec![crate::model::FstabOption::Flag("noauto".into())]),
+                0,
+                2,
+            )),
+            Line::Blank,
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("deadbeef-0000-0000-0000-000000000000".into()),
+                "/mnt/unreachable",
+                "ext4",
+                Options::from_vec(vec![crate::model::FstabOption::Flag("defaults".into())]),
+                0,
+                2,
+            )),
+        ])
+    }
+
+    #[test]
+    fn findmnt_detail_output_is_parsed_into_per_mount_point_diagnostics() {
+        let (detail, had_unrecognized_content) =
+            parse_findmnt_detail(&real_two_block_findmnt_output());
+        assert!(
+            !had_unrecognized_content,
+            "every line of real findmnt output must be explained, got: {detail:?}"
+        );
+        assert_eq!(
+            detail,
+            vec![
+                FindmntDetailLine {
+                    mount_point: "/mnt/data".to_string(),
+                    severity: Severity::Warning,
+                    message: "unreachable target: No such file or directory".to_string(),
+                },
+                FindmntDetailLine {
+                    mount_point: "/mnt/unreachable".to_string(),
+                    severity: Severity::Error,
+                    message: "unreachable on boot required target: No such file or directory"
+                        .to_string(),
+                },
+                FindmntDetailLine {
+                    mount_point: "/mnt/unreachable".to_string(),
+                    severity: Severity::Error,
+                    message: "unreachable on boot required source: \
+                              UUID=deadbeef-0000-0000-0000-000000000000"
+                        .to_string(),
+                },
+            ]
+        );
+    }
+
+    /// (a) The whole point of this change: each of findmnt's diagnostics
+    /// lands on the one entry it is about, with its own `[E]`/`[W]`
+    /// severity - and no unscoped whole-output dump is produced alongside
+    /// them (which is what made every entry's drawer show the same blob).
+    #[test]
+    fn findmnt_failure_decomposes_into_per_line_findings_with_no_document_level_dump() {
+        let result: io::Result<FindmntRunResult> = Ok(FindmntRunResult {
+            success: false,
+            combined_output: real_two_block_findmnt_output(),
+        });
+
+        let findings = interpret_findmnt_result(&doc_for_real_two_block_output(), &result);
+
+        assert_eq!(findings.len(), 3, "got: {findings:?}");
+
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].line_index, Some(1));
+        assert_eq!(
+            findings[0].message,
+            "findmnt --verify: unreachable target: No such file or directory"
+        );
+
+        assert_eq!(findings[1].severity, Severity::Error);
+        assert_eq!(findings[1].line_index, Some(3));
+        assert_eq!(
+            findings[1].message,
+            "findmnt --verify: unreachable on boot required target: No such file or directory"
+        );
+
+        assert_eq!(findings[2].severity, Severity::Error);
+        assert_eq!(findings[2].line_index, Some(3));
+        assert_eq!(
+            findings[2].message,
+            "findmnt --verify: unreachable on boot required source: \
+             UUID=deadbeef-0000-0000-0000-000000000000"
+        );
+
+        // Same shape as the malformed-line case: one identifiable line, but
+        // no single field of it to blame.
+        assert!(findings.iter().all(|f| f.field.is_none()));
+        // The regression this change is about: nothing may be left
+        // untagged, or the GUI reads it as document-level and shows it in
+        // every entry's drawer regardless of which line is open.
+        assert!(
+            findings.iter().all(|f| f.line_index.is_some()),
+            "no leftover document-level finding is allowed on the clean path, got: {findings:?}"
+        );
+        // And findmnt's raw text must not also be dumped wholesale.
+        assert!(findings
+            .iter()
+            .all(|f| !f.message.contains("parse error") && !f.message.contains("[E]")));
+    }
+
+    /// (b) Fallback safety, ambiguous match: several swap entries
+    /// legitimately share the mount point `none`, so a diagnostic naming
+    /// `none` has no single line to blame. That must produce today's
+    /// unchanged single whole-output finding, not a guess.
+    #[test]
+    fn findmnt_detail_naming_an_ambiguous_mount_point_falls_back_to_the_whole_text_finding() {
+        let doc = Document::from_lines(vec![
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sda5".into()),
+                "none",
+                "swap",
+                Options::from_vec(vec![crate::model::FstabOption::Flag("sw".into())]),
+                0,
+                0,
+            )),
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sdb5".into()),
+                "none",
+                "swap",
+                Options::from_vec(vec![crate::model::FstabOption::Flag("sw".into())]),
+                0,
+                0,
+            )),
+        ]);
+        let combined_output = "none\n\
+                               \u{20}\u{20}\u{20}[E] unreachable on boot required source: \
+                               /dev/sdb5\n\
+                               \n\
+                               0 parse errors, 1 error, 0 warnings\n";
+        let result: io::Result<FindmntRunResult> = Ok(FindmntRunResult {
+            success: false,
+            combined_output: combined_output.to_string(),
+        });
+
+        // Precondition: the output itself is perfectly recognizable - this
+        // test is about the *resolution* step refusing, not the parser.
+        let (detail, had_unrecognized_content) = parse_findmnt_detail(combined_output);
+        assert!(!had_unrecognized_content);
+        assert_eq!(detail.len(), 1);
+        assert_eq!(findmnt_detail_line_findings(&doc, &detail), None);
+
+        let findings = interpret_findmnt_result(&doc, &result);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].field, None);
+        assert_eq!(findings[0].line_index, None);
+        assert!(findings[0]
+            .message
+            .contains("findmnt --verify reported a problem with this fstab"));
+        assert!(findings[0]
+            .message
+            .contains("unreachable on boot required source"));
+    }
+
+    /// (b, second half) Fallback safety, zero matches: a mount point that
+    /// names no entry in the document at all means this code and findmnt
+    /// disagree about what was verified, which must also fall back rather
+    /// than drop the diagnostic.
+    #[test]
+    fn findmnt_detail_naming_an_unknown_mount_point_falls_back_to_the_whole_text_finding() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Path("/dev/sda1".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let combined_output = "/mnt/somewhere-else\n\
+                               \u{20}\u{20}\u{20}[W] unreachable target: No such file or \
+                               directory\n\
+                               \n\
+                               0 parse errors, 0 errors, 1 warning\n";
+        let result: io::Result<FindmntRunResult> = Ok(FindmntRunResult {
+            success: false,
+            combined_output: combined_output.to_string(),
+        });
+
+        let (detail, had_unrecognized_content) = parse_findmnt_detail(combined_output);
+        assert!(!had_unrecognized_content);
+        assert_eq!(findmnt_detail_line_findings(&doc, &detail), None);
+
+        let findings = interpret_findmnt_result(&doc, &result);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert_eq!(findings[0].line_index, None);
+        // `errors == 0`, so the unchanged fallback logic still calls this a
+        // non-blocking warning rather than inventing a new verdict.
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].message.contains("/mnt/somewhere-else"));
+    }
+
+    /// (c) Fallback safety, unrecognized shape: a line this parser cannot
+    /// explain (here, a hypothetical future findmnt message) must flip the
+    /// whole result back to the full-text fallback, so the unexplained text
+    /// still reaches the user instead of being silently dropped - even
+    /// though the rest of the output was perfectly attributable.
+    #[test]
+    fn unrecognized_findmnt_output_falls_back_without_dropping_anything() {
+        let combined_output = "/mnt/data\n\
+                               \u{20}\u{20}\u{20}[W] unreachable target: No such file or \
+                               directory\n\
+                               findmnt: some future wording nobody anticipated\n\
+                               \n\
+                               0 parse errors, 1 error, 0 warnings\n";
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Path("/dev/sda1".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let result: io::Result<FindmntRunResult> = Ok(FindmntRunResult {
+            success: false,
+            combined_output: combined_output.to_string(),
+        });
+
+        let (detail, had_unrecognized_content) = parse_findmnt_detail(combined_output);
+        assert!(
+            had_unrecognized_content,
+            "an unexplained line must flip the flag, got: {detail:?}"
+        );
+
+        let findings = interpret_findmnt_result(&doc, &result);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].line_index, None);
+        // Both the attributable diagnostic *and* the unexplained line are
+        // still in front of the user.
+        assert!(findings[0].message.contains("unreachable target"));
+        assert!(findings[0]
+            .message
+            .contains("some future wording nobody anticipated"));
+    }
+
+    #[test]
+    fn findmnt_detail_parser_rejects_structurally_surprising_output() {
+        // A mount-point header with no diagnostics under it.
+        let (detail, unrecognized) = parse_findmnt_detail("/mnt/data\n/mnt/other\n   [E] boom\n");
+        assert!(unrecognized, "got: {detail:?}");
+
+        // A diagnostic line with no header above it to attribute it to.
+        let (detail, unrecognized) = parse_findmnt_detail("   [E] boom with nothing above it\n");
+        assert!(unrecognized, "got: {detail:?}");
+        assert!(detail.is_empty());
+
+        // An unknown marker letter where a diagnostic was expected.
+        let (detail, unrecognized) = parse_findmnt_detail("/mnt/data\n   [I] some new severity\n");
+        assert!(unrecognized, "got: {detail:?}");
+
+        // Indentation other than the confirmed three spaces.
+        let (detail, unrecognized) = parse_findmnt_detail("/mnt/data\n\t[E] tab-indented\n");
+        assert!(unrecognized, "got: {detail:?}");
+
+        // A trailing header left open at end of input.
+        let (detail, unrecognized) = parse_findmnt_detail("/mnt/data\n   [E] boom\n/mnt/other\n");
+        assert!(unrecognized, "got: {detail:?}");
+    }
+
+    #[test]
+    fn findmnt_parse_error_line_is_recognized_only_to_be_discarded() {
+        assert!(is_findmnt_parse_error_line(
+            "findmnt: /tmp/rustab-findmnt-verify-1-0.tmp: parse error at line 3 -- ignored"
+        ));
+        assert!(!is_findmnt_parse_error_line(
+            "findmnt: some other message entirely"
+        ));
+        assert!(!is_findmnt_parse_error_line("/mnt/data"));
+
+        // Discarded, not surfaced: its information is already covered by
+        // `malformed_line_findings`, which has the real line_index.
+        let (detail, unrecognized) = parse_findmnt_detail(
+            "findmnt: /tmp/x.tmp: parse error at line 1 -- ignored\n\n\
+             1 parse error, 0 errors, 0 warnings\n",
+        );
+        assert!(!unrecognized);
+        assert!(detail.is_empty());
+    }
+
+    #[test]
+    fn mount_point_header_recognition_rejects_prose_lines() {
+        assert!(looks_like_findmnt_mount_point_header("/mnt/data"));
+        // An escaped-whitespace mount point is still a single token, since
+        // the model stores and renders it raw.
+        assert!(looks_like_findmnt_mount_point_header("/mnt/my\\040disk"));
+        assert!(looks_like_findmnt_mount_point_header("none"));
+        assert!(!looks_like_findmnt_mount_point_header(""));
+        assert!(!looks_like_findmnt_mount_point_header("   [E] indented"));
+        assert!(!looks_like_findmnt_mount_point_header(
+            "1 parse error, 2 errors, 0 warnings"
+        ));
+        assert!(!looks_like_findmnt_mount_point_header(
+            "findmnt: some future wording"
+        ));
     }
 
     // --- Top-level `validate()` ---
@@ -1650,9 +2259,24 @@ mod tests {
             // Confirm the fix is actually being exercised against real
             // findmnt here, not just passing because findmnt happens to be
             // unavailable (which would degrade to a warning regardless).
+            //
+            // This originally looked for findmnt's own "parse error"
+            // wording in a document-level warning. Per-line decomposition
+            // deliberately removed that: real findmnt reports this document
+            // as `1 parse error, 0 errors, 2 warnings` with both warnings
+            // attributable to the one entry, so the result is now two
+            // per-line warnings and *no* whole-output dump - and findmnt's
+            // parse-error line is dropped as pure duplication of the
+            // malformed-line warning asserted just above, which already
+            // carries that line's own correct `line_index`. The equivalent
+            // (in fact stricter) evidence that real findmnt ran is
+            // therefore its per-entry verdict, tagged to the entry's line.
             assert!(
-                report.warnings().any(|f| f.message.contains("parse error")),
-                "expected findmnt's own parse-error warning when findmnt is available, got: {:?}",
+                report.warnings().any(|f| f.line_index == Some(1)
+                    && f.field.is_none()
+                    && f.message.contains("findmnt --verify: unreachable")),
+                "expected findmnt's own per-entry warning, tagged to the entry's line, when \
+                 findmnt is available, got: {:?}",
                 report.findings
             );
         } else {
