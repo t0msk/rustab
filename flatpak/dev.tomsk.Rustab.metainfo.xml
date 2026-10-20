@@ -34,63 +34,45 @@
   <launchable type="desktop-id">dev.tomsk.Rustab.desktop</launchable>
 
   <!--
-    REMAINING SUBMISSION BLOCKER (narrowed, not resolved): the real
-    screenshots now exist, committed at docs/screenshots/ in this repo
-    (table view, entry drawer, add-entry validation, device picker,
-    pending-changes bar, both Review & Save views, and the backups panel -
-    see README.md's own "Screenshots" section for the same images with
-    fuller captions). What's still missing is a *stable tagged* URL to
-    point at - raw.githubusercontent.com only serves a given path from a
-    real commit/tag, and no public GitHub repo or tagged release exists
-    yet (confirmed: `git remote -v` is empty, and this file's own
-    sources[0].tag is still the vX.Y.Z placeholder). Once both exist,
-    replace vX.Y.Z below with the real tag (the same substitution this
-    manifest's own source tag needs) - do not submit with a vX.Y.Z URL
-    still in place, it will 404.
+    Screenshot URLs are pinned to the v0.1.0 tag - raw.githubusercontent.com
+    only serves a given path from a real commit/tag, so these must be
+    re-pointed at the current release's tag on every subsequent release
+    (same substitution the manifest's own sources[0].tag needs) - never
+    left pointing at a stale tag.
   -->
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/entries-table.png</image>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/entries-table.png</image>
       <caption>The main entries table, with UUID/PARTUUID/LABEL/PARTLABEL/swap/bind-mount sources</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/edit-entry.png</image>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/edit-entry.png</image>
       <caption>Editing an entry's fields, options, and mount point</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/add-entry.png</image>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/add-entry.png</image>
       <caption>Adding an entry with inline validation feedback as you type</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/review-save-summary.png</image>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/review-save-summary.png</image>
       <caption>Reviewing exactly what changed before anything is written to disk</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/t0msk/rustab/vX.Y.Z/docs/screenshots/backups.png</image>
+      <image>https://raw.githubusercontent.com/t0msk/rustab/v0.1.0/docs/screenshots/backups.png</image>
       <caption>Automatic, timestamped backups on every save</caption>
     </screenshot>
   </screenshots>
 
   <!--
-    SUBMISSION BLOCKER - do not submit without fixing this first.
-
-    Flathub also requires a <releases> tag to pass validation. This
-    project has not cut its first tagged release yet (every crate and
-    tauri.conf.json are at 0.0.0 per PROJECT_PLAN.md's versioning policy;
-    see docs/SPEC.md §12 and the release-publish.yml workflow in
-    docs/SPEC.md §13). The entry below is a placeholder "development"
-    release (the same release type AppStream itself uses for its own
-    in-development builds) so this file is well-formed today; replace it
-    with a real dated entry for the actual version once the first tag is
-    cut, and add a new <release> entry (newest first) on every subsequent
-    tagged release from then on - see docs/FLATPAK.md's "keeping this file
-    in sync" best-practice note.
+    Add a new <release> entry (newest first) on every subsequent tagged
+    release - see docs/FLATPAK.md's "keeping this file in sync" note.
   -->
   <releases>
-    <release version="0.0.0" type="development" date="2026-10-16">
+    <release version="0.1.0" date="2026-10-20">
       <description>
-        <p>Pre-release development snapshot. No tagged version has been cut yet.</p>
+        <p>First public release of Rustab.</p>
       </description>
+      <url>https://github.com/t0msk/rustab/releases/tag/v0.1.0</url>
     </release>
   </releases>
 

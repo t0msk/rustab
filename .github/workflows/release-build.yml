@@ -55,14 +55,30 @@ env:
 
 jobs:
   package:
-    name: Build .deb / .rpm / .AppImage
+    name: Build .deb / .rpm / .AppImage (${{ matrix.arch }})
+    # Native GitHub-hosted runners for both architectures - no
+    # cross-compilation and no QEMU emulation. Cross-compiling a Tauri app
+    # (native GTK/WebKit2GTK bindings, not just pure Rust) is fragile
+    # enough that it's deliberately avoided here in favor of just running
+    # the exact same build natively on a real aarch64 machine, same as
+    # x86_64 already does. `fail-fast: false` so one architecture's build
+    # failing doesn't cancel the other mid-run - each arch's result is
+    # independently useful.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
     # Matches the rest of the project's CI. Worth knowing: an AppImage is
     # only as portable as the glibc of the machine that built it, so the
     # artifact produced here requires a target system at least as new as
     # the runner image's Ubuntu. Pinning an older image (e.g.
     # `ubuntu-22.04`) would widen AppImage compatibility at the cost of
     # using a runner image that is closer to end-of-support.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
 
     steps:
       - uses: actions/checkout@v7
@@ -143,27 +159,30 @@ jobs:
         working-directory: src-tauri
         run: cargo tauri build --ci --bundles deb,rpm,appimage
 
-      # Uploaded as three separate artifacts so each package can be
-      # downloaded on its own. `if-no-files-found: error` is deliberate: a
-      # bundler that silently produced nothing must fail the run rather
-      # than leave an empty artifact behind.
+      # Uploaded as three separate artifacts per architecture so each
+      # package can be downloaded on its own. The arch suffix is required,
+      # not cosmetic: artifact names must be unique across the whole
+      # workflow run, and this matrix now produces two builds of each
+      # format. `if-no-files-found: error` is deliberate: a bundler that
+      # silently produced nothing must fail the run rather than leave an
+      # empty artifact behind.
       - name: Upload .deb
         uses: actions/upload-artifact@v7
         with:
-          name: rustab-deb
+          name: rustab-deb-${{ matrix.arch }}
           path: target/release/bundle/deb/*.deb
           if-no-files-found: error
 
       - name: Upload .rpm
         uses: actions/upload-artifact@v7
         with:
-          name: rustab-rpm
+          name: rustab-rpm-${{ matrix.arch }}
           path: target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
       - name: Upload .AppImage
         uses: actions/upload-artifact@v7
         with:
-          name: rustab-appimage
+          name: rustab-appimage-${{ matrix.arch }}
           path: target/release/bundle/appimage/*.AppImage
           if-no-files-found: error

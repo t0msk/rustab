@@ -1,8 +1,27 @@
-# Rustab
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="120" alt="Rustab icon" />
+</p>
 
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/vymDkeQnpj) [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/t0msk) [![X](https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white)](https://x.com/TomskDEV)
+<h1 align="center">Rustab</h1>
 
-A modern, native Linux desktop GUI for viewing, editing, adding, and removing entries in `/etc/fstab`, built with stability and data safety as the top priority.
+<p align="center"><b>A modern, safety-first GUI for editing /etc/fstab on Linux.</b></p>
+
+<p align="center">View, edit, validate, and back up your fstab entries - atomic writes, automatic backups, and a mandatory diff review before anything touches your real <code>/etc/fstab</code>.</p>
+
+<p align="center">
+  <img src="https://img.shields.io/github/v/release/t0msk/rustab?label=release&color=blue" alt="release" />
+  <a href="https://github.com/t0msk/rustab/actions/workflows/ci.yml"><img src="https://github.com/t0msk/rustab/actions/workflows/ci.yml/badge.svg" alt="build" /></a>
+  <img src="https://img.shields.io/badge/platform-linux-4c1?logo=linux&logoColor=white" alt="platform" />
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational" alt="license" />
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/vymDkeQnpj"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://github.com/sponsors/t0msk"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white" alt="Sponsor" /></a>
+  <a href="https://x.com/TomskDEV"><img src="https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white" alt="X" /></a>
+</p>
+
+---
 
 Rustab combines a clean, intuitive interface with a powerful safety-first architecture:
 - **Full fstab syntax support**: UUIDs, LABELs, device paths, network sources, bind mounts, swap entries, systemd-generator options (`x-systemd.*`), comments - everything fstab and systemd support, round-tripping perfectly.
@@ -43,37 +62,64 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 
 All screenshots below show Rustab pointed at a throwaway test file via `RUSTAB_TARGET_PATH` (see the green banner in each one) - never the real `/etc/fstab` - populated with real, reachable device identifiers from a real machine so every entry validates cleanly.
 
-**Main entries table** - source, mount point, filesystem type, options, and dump/pass at a glance, covering `UUID=`, `PARTUUID=`, `LABEL=`, `PARTLABEL=`, swap, and bind-mount sources:
+<table>
+<tr>
+<td width="50%">
 
 ![Entries table](docs/screenshots/entries-table.png)
+<sub>**Main entries table** - source, mount point, filesystem type, options, and dump/pass at a glance, covering `UUID=`, `PARTUUID=`, `LABEL=`, `PARTLABEL=`, swap, and bind-mount sources.</sub>
 
-**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options:
+</td>
+<td width="50%">
 
 ![Edit entry](docs/screenshots/edit-entry.png)
+<sub>**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options.</sub>
 
-**Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save:
+</td>
+</tr>
+<tr>
+<td width="50%">
 
 ![Add entry](docs/screenshots/add-entry.png)
+<sub>**Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save.</sub>
 
-**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand:
+</td>
+<td width="50%">
 
 ![Device picker](docs/screenshots/device-picker.png)
+<sub>**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand.</sub>
 
-**Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click:
+</td>
+</tr>
+<tr>
+<td width="50%">
 
 ![Pending changes](docs/screenshots/pending-changes.png)
+<sub>**Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click.</sub>
 
-**Review before saving - Summary view** - exactly what changed, grouped (here, a reorder), before anything touches disk:
+</td>
+<td width="50%">
 
 ![Review & Save - summary](docs/screenshots/review-save-summary.png)
+<sub>**Review before saving - Summary view** - exactly what changed, grouped (here, a reorder), before anything touches disk.</sub>
 
-**Review before saving - Raw diff view** - the same review step as a unified text diff, for anyone who prefers reading it that way:
+</td>
+</tr>
+<tr>
+<td width="50%">
 
 ![Review & Save - raw diff](docs/screenshots/review-save-raw-diff.png)
+<sub>**Review before saving - Raw diff view** - the same review step as a unified text diff, for anyone who prefers reading it that way.</sub>
 
-**Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version:
+</td>
+<td width="50%">
 
 ![Backups](docs/screenshots/backups.png)
+<sub>**Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version.</sub>
+
+</td>
+</tr>
+</table>
 
 ## Roadmap
 
@@ -153,8 +199,22 @@ This draft is what you're actually editing day to day - its job is to protect yo
 
 ## Installation
 
-No packaged release exists yet - packaging for the channels below is planned
-and will be added gradually, not all at once:
+### Download a prebuilt package
+
+Every [tagged release](https://github.com/t0msk/rustab/releases/latest) ships a `.deb`, `.rpm`, and `.AppImage` for **both x86_64 and ARM64** (built natively on each architecture, not cross-compiled or emulated - includes Raspberry Pi 4/5 and other 64-bit ARM boards running a 64-bit OS). Download the one matching your distro and CPU architecture and install it:
+
+| Distro | Package | Install (x86_64) | Install (ARM64 / Raspberry Pi) |
+| --- | --- | --- | --- |
+| Debian / Ubuntu / Mint | `.deb` | `sudo apt install ./rustab_*_amd64.deb` | `sudo apt install ./rustab_*_arm64.deb` |
+| Fedora / RHEL | `.rpm` | `sudo dnf install ./rustab-*.x86_64.rpm` | `sudo dnf install ./rustab-*.aarch64.rpm` |
+| openSUSE | `.rpm` | `sudo zypper install ./rustab-*.x86_64.rpm` | `sudo zypper install ./rustab-*.aarch64.rpm` |
+| Any Linux (portable, no install) | `.AppImage` | `chmod +x rustab_*_amd64.AppImage && ./rustab_*_amd64.AppImage` | `chmod +x rustab_*_aarch64.AppImage && ./rustab_*_aarch64.AppImage` |
+
+(or just double-click the `.AppImage` in a file manager). `pkexec`/polkit is required at runtime regardless of install method - see [Prerequisites](#prerequisites).
+
+### Distro package managers (coming gradually)
+
+No native repo/store package exists yet for any of these - planned, and will be added gradually, not all at once:
 
 | Channel | Status |
 | --- | --- |
@@ -165,14 +225,12 @@ and will be added gradually, not all at once:
 | Flathub | Planned - work in progress (see `docs/FLATPAK.md`) |
 
 The detailed packaging plan for the PPA/Debian/AUR/Fedora channels - exact
-steps, prerequisites, and what's already blocked on a public release existing
-- is tracked in `docs/PACKAGING_DISTROS.md`.
+steps, prerequisites, and current blockers - is tracked in
+`docs/PACKAGING_DISTROS.md`.
 
-**For now, building from source is the only way to run Rustab** - see
-[Building & Running](#building--running) below. CI already produces `.deb`,
-`.rpm`, and `.AppImage` bundles on every tagged release once one is cut, which
-is a head start for several of the channels above but not a substitute for
-them.
+### Build from source
+
+See [Building & Running](#building--running) below.
 
 ## Prerequisites
 
