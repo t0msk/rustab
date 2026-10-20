@@ -10,8 +10,6 @@ Rustab combines a clean, intuitive interface with a powerful safety-first archit
 - **Mandatory diff review before every save**: see exactly what's changing in a side-by-side Summary or unified Raw view, with an explicit confirmation step, before anything reaches `/etc/fstab`.
 - **A persistent working draft, not a throwaway sandbox**: your in-progress edits live in a local draft file that survives an app restart, so you never lose work mid-edit - and every save still writes straight to your real `/etc/fstab`, which is the whole point of the app.
 
-![Discord Badge](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white) · [GitHub Sponsors](https://github.com/sponsors/t0msk) · [X / Twitter](https://x.com/TomskDEV)
-
 ## Contents
 
 - [Features](#features)
