@@ -44,15 +44,15 @@ the symlink with a real copy) right before you commit there.
 ## Usage
 
 ```
-packaging/sync.sh link flatpak          # once, after cloning the
+packaging/sync.sh link flathub          # once, after cloning the
                                          # downstream repo locally
 # ...edit/test directly in the destination clone, or in this repo -
 # ...it's the same file either way, nothing to keep in sync...
-packaging/sync.sh materialize flatpak   # right before committing there
-git -C "$RUSTAB_PACKAGING_ROOT/flatpak" add -A
-git -C "$RUSTAB_PACKAGING_ROOT/flatpak" commit
-git -C "$RUSTAB_PACKAGING_ROOT/flatpak" push
-packaging/sync.sh link flatpak          # re-link, so later edits stay
+packaging/sync.sh materialize flathub   # right before committing there
+git -C "$RUSTAB_PACKAGING_ROOT/flathub" add -A
+git -C "$RUSTAB_PACKAGING_ROOT/flathub" commit
+git -C "$RUSTAB_PACKAGING_ROOT/flathub" push
+packaging/sync.sh link flathub          # re-link, so later edits stay
                                          # single-source again
 ```
 
@@ -72,14 +72,14 @@ root:
 
 ```
 $RUSTAB_PACKAGING_ROOT/
-└── flatpak/   <- clone of flathub/flathub, checked out on the submission branch
+└── flathub/   <- clone of flathub/flathub, checked out on the submission branch
 ```
 
 Per-target override, if a clone lives somewhere that doesn't fit the
 `$RUSTAB_PACKAGING_ROOT/<target>` convention:
 
 ```
-RUSTAB_PACKAGING_FLATPAK_DIR=/wherever/it/actually/is packaging/sync.sh link flatpak
+RUSTAB_PACKAGING_FLATHUB_DIR=/wherever/it/actually/is packaging/sync.sh link flathub
 ```
 
 Add more targets to `sync.sh`'s `TARGET_FILES`/`TARGET_SRC_DIR` maps once
@@ -89,7 +89,7 @@ worth linking out.
 ## `packaging/clones`
 
 Every run of `sync.sh` also (re)creates `packaging/clones` in this repo as
-a symlink to `$RUSTAB_PACKAGING_ROOT`, so you can `cd packaging/clones/flatpak`
+a symlink to `$RUSTAB_PACKAGING_ROOT`, so you can `cd packaging/clones/flathub`
 instead of remembering (or hardcoding anywhere) where the real clones live
 on this particular machine. It's listed in `.gitignore` - purely a local,
 per-machine convenience, the same reasoning as the file-level symlinks

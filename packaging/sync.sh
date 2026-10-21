@@ -19,7 +19,8 @@ materialize  Replace the destination's symlinks (or any existing file)
              this repo on your machine.
 
 Targets (default: all configured):
-  flatpak   dev.tomsk.Rustab.yml, cargo-sources.json,
+  flathub   this repo's flatpak/ dir -> the Flathub submission clone:
+            dev.tomsk.Rustab.yml, cargo-sources.json,
             frontend-cargo-sources.json, node-sources.json
 
 Destination root:
@@ -28,7 +29,7 @@ Destination root:
                              e.g. RUSTAB_PACKAGING_FLATPAK_DIR=/some/path
 
 Every run also (re)creates packaging/clones in this repo as a symlink to
-RUSTAB_PACKAGING_ROOT, so you can e.g. 'cd packaging/clones/flatpak'
+RUSTAB_PACKAGING_ROOT, so you can e.g. 'cd packaging/clones/flathub'
 without remembering the real path. It's gitignored - purely a local,
 per-machine convenience, never tracked or pushed.
 
@@ -37,15 +38,15 @@ version and is not already a symlink to it (link mode only; materialize
 always overwrites, that's its job).
 
 Typical workflow:
-  packaging/sync.sh link flatpak          # once, after cloning the
+  packaging/sync.sh link flathub          # once, after cloning the
                                            # downstream repo locally
   ...edit/test directly in the destination clone, or in this repo -
   ...it's the same file either way...
-  packaging/sync.sh materialize flatpak   # right before committing there
-  git -C "$RUSTAB_PACKAGING_ROOT/flatpak" add -A
-  git -C "$RUSTAB_PACKAGING_ROOT/flatpak" commit
-  git -C "$RUSTAB_PACKAGING_ROOT/flatpak" push
-  packaging/sync.sh link flatpak          # re-link, so later edits stay
+  packaging/sync.sh materialize flathub   # right before committing there
+  git -C "$RUSTAB_PACKAGING_ROOT/flathub" add -A
+  git -C "$RUSTAB_PACKAGING_ROOT/flathub" commit
+  git -C "$RUSTAB_PACKAGING_ROOT/flathub" push
+  packaging/sync.sh link flathub          # re-link, so later edits stay
                                            # single-source again
 EOF
 }
@@ -81,8 +82,8 @@ PACKAGING_ROOT="${RUSTAB_PACKAGING_ROOT:-$HOME/rustab-packaging}"
 declare -A TARGET_SRC_DIR
 declare -A TARGET_FILES
 
-TARGET_SRC_DIR[flatpak]="$REPO_ROOT/flatpak"
-TARGET_FILES[flatpak]="dev.tomsk.Rustab.yml cargo-sources.json frontend-cargo-sources.json node-sources.json"
+TARGET_SRC_DIR[flathub]="$REPO_ROOT/flatpak"
+TARGET_FILES[flathub]="dev.tomsk.Rustab.yml cargo-sources.json frontend-cargo-sources.json node-sources.json"
 
 if [ "${#TARGETS[@]}" -eq 0 ]; then
   TARGETS=("${!TARGET_FILES[@]}")
