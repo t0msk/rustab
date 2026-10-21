@@ -17,12 +17,17 @@
 //!   lossless conversions to and from `fstab-core`'s domain types.
 //! - [`backups`]: listing backups of the active target and resolving a
 //!   frontend-supplied backup path against that list.
+//! - `backup_location`: whether this process can manage the real
+//!   `/etc/fstab`'s backups in `/etc/` at all, and the per-user fallback
+//!   directory its manual backups go to when it cannot (a Flatpak sandbox
+//!   granted only `--filesystem=/etc/fstab:rw` cannot).
 //! - [`privileged`]: both halves of the three elevated operations (writing the
 //!   real `/etc/fstab`, deleting one of its backups, and creating a manual
 //!   backup of it) - the `pkexec` re-exec on the unprivileged side and the
 //!   single hidden internal subcommand on the elevated side.
 //! - [`commands`]: the `#[tauri::command]` functions themselves.
 
+mod backup_location;
 pub mod backups;
 pub mod commands;
 pub mod dto;

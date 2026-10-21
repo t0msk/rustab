@@ -1399,6 +1399,13 @@ pub fn app_shell() -> Html {
         .map(|t| t.is_real || t.source == TargetSource::SandboxDefault)
         .unwrap_or(false);
     let target_path = target.as_ref().map(|t| t.path.clone()).unwrap_or_default();
+    // `TargetInfoDto.real_target_backup_fallback_dir` (API_CONTRACT.md §6),
+    // threaded down to `BackupPanel` unchanged so it can show the
+    // persistent fallback notice (T39).
+    let backup_fallback_dir: Option<AttrValue> = target
+        .as_ref()
+        .and_then(|t| t.real_target_backup_fallback_dir.clone())
+        .map(AttrValue::from);
 
     html! {
         <div class="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100">
@@ -1466,6 +1473,7 @@ pub fn app_shell() -> Html {
                         on_restore={on_restore}
                         on_view_diff={on_view_diff}
                         on_delete={on_backup_delete}
+                        backup_fallback_dir={backup_fallback_dir}
                     />
                 }
             </main>

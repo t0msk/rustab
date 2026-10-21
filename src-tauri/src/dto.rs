@@ -96,10 +96,69 @@ pub struct TargetInfoDto {
     pub is_real: bool,
     /// Where the path came from, so the UI can explain itself.
     pub source: TargetSourceDto,
+    /// The directory this session's backups of the **real `/etc/fstab`** are
+    /// being kept in *instead of* beside the file itself, or `None` when they
+    /// are beside it after all (T39).
+    ///
+    /// Precisely, this is `Some(dir)` when **both** of these hold:
+    ///
+    /// 1. this session's backups are the real `/etc/fstab`'s - i.e.
+    ///    `source == "sandbox_default"` (the default launch, whose saves write
+    ///    that file) or `is_real == true` (an explicit
+    ///    `RUSTAB_TARGET_PATH=/etc/fstab`); **and**
+    /// 2. this process cannot manage files in `/etc/` - in practice, it is
+    ///    running inside a Flatpak sandbox, which is granted only
+    ///    `--filesystem=/etc/fstab:rw` because Flathub rejects `/etc:rw`, and
+    ///    so sees a different `/etc` than the host's.
+    ///
+    /// It is `None` in every other case, which includes **every**
+    /// `source == "environment"` target that is not `/etc/fstab` itself: such
+    /// a target's backups are its own, in its own directory, and nothing about
+    /// `/etc/` applies to them.
+    ///
+    /// When it is `Some(dir)`, `dir` is the real, user-owned directory that
+    /// `list_backups`, `create_backup` and `delete_backup` act in - the same
+    /// directory `open_backup_location` opens - and two things are true that
+    /// the UI has to say out loud (`docs/UI_DESIGN.md` §7,
+    /// `docs/API_CONTRACT.md` §3.6):
+    ///
+    /// - backups the user creates explicitly land in `dir`, not in `/etc/`,
+    ///   and need no password prompt;
+    /// - the automatic backups each save takes are still written beside the
+    ///   real `/etc/fstab` by the elevated writer, and are **not listed**,
+    ///   because this process cannot enumerate that directory. They are not
+    ///   lost - they are recoverable from a rescue environment - they just
+    ///   cannot be shown or managed in-app.
+    ///
+    /// A display path, never a path to send back: no command accepts a
+    /// directory, and the backup-path-taking commands match what they are
+    /// given against the real backup list regardless (see
+    /// [`path_to_wire`]).
+    pub real_target_backup_fallback_dir: Option<String>,
 }
 
-impl From<&crate::target::ActiveTarget> for TargetInfoDto {
-    fn from(target: &crate::target::ActiveTarget) -> Self {
+impl TargetInfoDto {
+    /// Describes `target` for the frontend, with the fallback backup directory
+    /// this session is using for the real `/etc/fstab`'s backups (`None` when
+    /// it is using none - see
+    /// [`TargetInfoDto::real_target_backup_fallback_dir`] for exactly when
+    /// each applies).
+    ///
+    /// Deliberately a constructor taking that second argument rather than the
+    /// `From<&ActiveTarget>` conversion this used to be: the fallback
+    /// directory is not a property of the resolved target at all - it is a
+    /// property of *this process's* access to `/etc/`, which an
+    /// [`crate::target::ActiveTarget`] knows nothing about. A `From` impl
+    /// could only have filled the field in with `None`, which would have made
+    /// "no fallback in use" and "this conversion could not tell" the same
+    /// value, and the notice the user needs would have silently depended on
+    /// which command produced the DTO. Every caller now has to pass the
+    /// answer, and there is one helper in `crate::commands`
+    /// (`describe_target`) that computes it.
+    pub(crate) fn describe(
+        target: &crate::target::ActiveTarget,
+        backup_fallback_dir: Option<&Path>,
+    ) -> Self {
         TargetInfoDto {
             path: path_to_wire(&target.path),
             is_real: target.is_real,
@@ -107,6 +166,7 @@ impl From<&crate::target::ActiveTarget> for TargetInfoDto {
                 crate::target::TargetSource::Environment => TargetSourceDto::Environment,
                 crate::target::TargetSource::SandboxDefault => TargetSourceDto::SandboxDefault,
             },
+            real_target_backup_fallback_dir: backup_fallback_dir.map(path_to_wire),
         }
     }
 }
@@ -1268,6 +1328,7 @@ mod tests {
                 path: "/p".to_string(),
                 is_real: false,
                 source: TargetSourceDto::SandboxDefault,
+                real_target_backup_fallback_dir: None,
             },
             exists: true,
             text: "# hi\n".to_string(),
@@ -1278,7 +1339,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&view).expect("serialize"),
-            r##"{"target":{"path":"/p","is_real":false,"source":"sandbox_default"},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}"##
+            r##"{"target":{"path":"/p","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}"##
         );
 
         let report = ValidationReportDto {
@@ -1842,21 +1903,63 @@ mod tests {
 
     #[test]
     fn target_info_reports_the_source_it_was_resolved_from() {
-        let sandbox = TargetInfoDto::from(&ActiveTarget {
-            path: PathBuf::from("/home/u/.local/share/rustab/fstab.sandbox"),
-            is_real: false,
-            source: TargetSource::SandboxDefault,
-        });
+        let sandbox = TargetInfoDto::describe(
+            &ActiveTarget {
+                path: PathBuf::from("/home/u/.local/share/rustab/fstab.sandbox"),
+                is_real: false,
+                source: TargetSource::SandboxDefault,
+            },
+            None,
+        );
         assert_eq!(sandbox.source, TargetSourceDto::SandboxDefault);
         assert!(!sandbox.is_real);
 
-        let explicit = TargetInfoDto::from(&ActiveTarget {
-            path: PathBuf::from("/etc/fstab"),
-            is_real: true,
-            source: TargetSource::Environment,
-        });
+        let explicit = TargetInfoDto::describe(
+            &ActiveTarget {
+                path: PathBuf::from("/etc/fstab"),
+                is_real: true,
+                source: TargetSource::Environment,
+            },
+            None,
+        );
         assert_eq!(explicit.source, TargetSourceDto::Environment);
         assert!(explicit.is_real);
+    }
+
+    /// The T39 field, both ways round, including its exact wire spelling: the
+    /// frontend builds a visible notice out of it, so the name and the `null`
+    /// case are as load-bearing as the path itself.
+    ///
+    /// *Which* target gets a fallback directory is `crate::commands`'s
+    /// decision (`backup_fallback_dir`, asserted there); this layer's job is
+    /// only to carry the answer across the boundary unchanged.
+    #[test]
+    fn target_info_carries_the_real_target_backup_fallback_dir_verbatim() {
+        let default_launch = ActiveTarget {
+            path: PathBuf::from("/home/u/.local/share/rustab/fstab.draft"),
+            is_real: false,
+            source: TargetSource::SandboxDefault,
+        };
+
+        let colocated = TargetInfoDto::describe(&default_launch, None);
+        assert_eq!(colocated.real_target_backup_fallback_dir, None);
+        assert_eq!(
+            serde_json::to_string(&colocated).expect("serialize"),
+            r##"{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null}"##
+        );
+
+        let fallback = TargetInfoDto::describe(
+            &default_launch,
+            Some(Path::new("/home/u/.local/share/rustab/etc-fstab-backups")),
+        );
+        assert_eq!(
+            fallback.real_target_backup_fallback_dir.as_deref(),
+            Some("/home/u/.local/share/rustab/etc-fstab-backups")
+        );
+        assert_eq!(
+            serde_json::to_string(&fallback).expect("serialize"),
+            r##"{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":"/home/u/.local/share/rustab/etc-fstab-backups"}"##
+        );
     }
 
     /// The single most consequential field in this module.
