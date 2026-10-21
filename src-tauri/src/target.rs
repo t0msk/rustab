@@ -966,14 +966,35 @@ fn seed_sandbox_file_if_missing(path: &Path) -> io::Result<()> {
     }
 }
 
-/// The directory the default sandbox file lives in:
-/// `$XDG_DATA_HOME/rustab`, else `$HOME/.local/share/rustab`, else
-/// `<temp dir>/rustab`.
+/// The directory the default sandbox file lives in - Rustab's own data
+/// directory, [`rustab_data_dir`].
+///
+/// A thin alias rather than its own resolution logic: the working draft lives
+/// directly in the data directory, while everything else Rustab keeps for
+/// itself lives in a named subdirectory of it (see
+/// [`crate::backup_location`]). Keeping the two expressed as "the data dir"
+/// and "a subdirectory of the data dir" means nothing has to agree about
+/// *where* that data dir is - there is only one answer, below.
+fn default_sandbox_dir() -> PathBuf {
+    rustab_data_dir()
+}
+
+/// Rustab's own per-user data directory: `$XDG_DATA_HOME/rustab`, else
+/// `$HOME/.local/share/rustab`, else `<temp dir>/rustab`.
+///
+/// The single source of truth for "where does Rustab keep its own files",
+/// used both by [`default_sandbox_dir`] (the working draft and its marker)
+/// and by [`crate::backup_location`] (the fallback backup directory, which is
+/// a subdirectory of this one). Exposed - rather than left private to the
+/// sandbox branch, which is where this logic started - precisely so the
+/// second caller cannot grow a second, drifting copy of the XDG rules; this
+/// module already reasons that way about duplicated logic (see
+/// [`last_known_real_marker`]).
 ///
 /// Resolved with plain XDG rules rather than Tauri's path API so that target
 /// resolution needs no `AppHandle` - the elevated helper subprocess (which
 /// never starts a Tauri runtime) and the unit tests can both use it.
-fn default_sandbox_dir() -> PathBuf {
+pub(crate) fn rustab_data_dir() -> PathBuf {
     let base = non_empty_env("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| {

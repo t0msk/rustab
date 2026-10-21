@@ -83,6 +83,11 @@ pub struct TargetInfoDto {
     pub path: String,
     pub is_real: bool,
     pub source: TargetSource,
+    /// `Some(<directory>)` only when this session's backups are the real
+    /// `/etc/fstab`'s *and* this process can't manage files in `/etc/`
+    /// (in practice: Flatpak); `None` in every other case. Always present
+    /// on the wire (`null`, never omitted) - see `docs/API_CONTRACT.md` §6.
+    pub real_target_backup_fallback_dir: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

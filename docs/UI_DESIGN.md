@@ -595,6 +595,29 @@ user restore one")
 
 Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
+- **Fallback-location notice (T39)**: when `TargetInfoDto.real_target_backup_fallback_dir`
+  (`docs/API_CONTRACT.md` §6) is non-null, a persistent amber notice banner
+  (`bg-amber-50 dark:bg-amber-900/20`, `border-amber-300 dark:border-amber-800`,
+  `text-amber-900 dark:text-amber-200`, `role="status"`) renders above the list/
+  `EmptyState` - i.e. unconditionally whenever this condition holds, not nested inside
+  either branch, since the fact it states applies to the whole panel regardless of
+  whether any backup happens to exist yet. Amber (informational-but-important), not red
+  (nothing has failed) and not a tooltip or toast (a toast disappears; this fact has to
+  still be findable the next time someone opens this tab, possibly in a rescue
+  scenario where guessing wrong about where a backup lives is costly). The copy states
+  two things plainly, both already fixed by the backend and documented in
+  `docs/API_CONTRACT.md` §6: (a) backups created from this panel are being kept in the
+  given directory instead of beside `/etc/fstab`, because this sandboxed install can't
+  manage files in `/etc/` directly, and need no password prompt; (b) the automatic
+  backups each ordinary save takes are **still** written beside the real `/etc/fstab`
+  and are **not shown in this list**, because the sandboxed process cannot enumerate
+  that directory - they are not lost, and remain recoverable from a rescue environment
+  (e.g. booting a live/rescue disk), just not visible or manageable from inside the app.
+  Silently omitting fact (b) would have left a user who only reads the list believing
+  their automatic backups had stopped happening, which is exactly the wrong impression
+  for a rescue scenario. Built from `backup_panel::fallback_notice_text`, a plain
+  function kept separate from the `html!` so its exact wording is unit-testable without
+  a DOM.
 - **"Create backup" button**, living in `HeaderBar`'s top-right contextual action
   slot - the same slot `"+ Add Entry"` occupies while the `Entries` tab is active.
   It renders only while the `Backups` tab is active, and `"+ Add Entry"` is absent

@@ -44,6 +44,26 @@
 //! same reason [`list_entries`] and [`list_backups`] already work against the
 //! real target unprivileged.
 //!
+//! ## T39: *where* the real file's manual backups live
+//!
+//! The third decision, layered on top of the second: a process that cannot
+//! manage files in `/etc/` at all - a Flatpak sandbox granted only
+//! `--filesystem=/etc/fstab:rw`, since Flathub rejects `/etc:rw` - keeps the
+//! real `/etc/fstab`'s **manually managed** backups in a per-user fallback
+//! directory instead (see [`crate::backup_location`]). [`backup_target_path`]
+//! points every backup command at a mirror file inside that directory in that
+//! case, which redirects all of them with no change to the functions that do
+//! the work, and [`backups_are_elevated`] then answers `false`, because that
+//! directory belongs to the user and needs no `pkexec` at all.
+//!
+//! Nothing about *writing* changes: [`save_document_with`] and everything
+//! under it are untouched by T39, so a save still writes the real `/etc/fstab`
+//! through the elevated helper and still leaves its automatic backup beside it
+//! in `/etc/`. The accepted consequence - those automatic backups are not
+//! visible in a fallback-mode [`list_backups`] - is spelled out in
+//! [`crate::backup_location`]'s module docs and surfaced to the user through
+//! [`TargetInfoDto::real_target_backup_fallback_dir`].
+//!
 //! ## Why every command is `#[tauri::command(async)]`
 //!
 //! Several of these do blocking work: `lsblk`, `findmnt`, file I/O, and in
@@ -64,6 +84,7 @@
 //! once and then debugs for an hour. Pinning the argument case to snake_case
 //! makes the whole payload, at every level, snake_case.
 
+use crate::backup_location::{self, BackupLocation};
 use crate::backups;
 use crate::dto::{
     BackupInfoDto, CommandErrorDto, CommandErrorKindDto, CreateBackupErrorDto,
@@ -79,8 +100,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Returns the active target: which file this session reads and writes, and
-/// whether it is the real `/etc/fstab`.
+/// Returns the active target: which file this session reads and writes,
+/// whether it is the real `/etc/fstab`, and - since T39 - whether that file's
+/// backups are being kept in a fallback directory instead of beside it.
 ///
 /// Resolving the target can create the sandbox file, which is why this can
 /// fail; see [`target::active_target`].
@@ -91,7 +113,11 @@ use std::path::{Path, PathBuf};
 /// determined.
 #[tauri::command(async)]
 pub fn get_target_info() -> Result<TargetInfoDto, CommandErrorDto> {
-    Ok(TargetInfoDto::from(&resolve_target()?))
+    let target = resolve_target()?;
+    Ok(describe_target(
+        &target,
+        backup_location::real_target_location(),
+    ))
 }
 
 /// Reads the active target and returns its text together with its parsed
@@ -110,7 +136,7 @@ pub fn get_target_info() -> Result<TargetInfoDto, CommandErrorDto> {
 #[tauri::command(async)]
 pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
     let target = resolve_target()?;
-    let info = TargetInfoDto::from(&target);
+    let info = describe_target(&target, backup_location::real_target_location());
 
     let (exists, text) = match fs::read(&target.path) {
         Ok(bytes) => {
@@ -181,7 +207,11 @@ pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
 /// valid UTF-8.
 #[tauri::command(async)]
 pub fn resync_external_change() -> Result<DocumentViewDto, CommandErrorDto> {
-    resync_external_change_with(&resolve_target()?, real_fstab())
+    resync_external_change_with(
+        &resolve_target()?,
+        real_fstab(),
+        backup_location::real_target_location(),
+    )
 }
 
 /// Validates a candidate document without writing anything.
@@ -261,6 +291,14 @@ pub fn save(
 /// world-readable, the same reason [`list_entries`] can read the real target
 /// unprompted.
 ///
+/// Since T39, a session that cannot manage files in `/etc/` at all lists the
+/// real file's backups from the fallback directory instead
+/// ([`crate::backup_location`]) - and therefore does **not** list the
+/// automatic backups each save leaves beside `/etc/fstab`, which such a
+/// process cannot enumerate. The frontend says so, out of
+/// [`TargetInfoDto::real_target_backup_fallback_dir`]; see that field and
+/// `docs/API_CONTRACT.md` §3.6.
+///
 /// # Errors
 ///
 /// [`CommandErrorKindDto::TargetResolution`] if the target could not be
@@ -269,7 +307,11 @@ pub fn save(
 #[tauri::command(async)]
 pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
     let target = resolve_target()?;
-    list_backups_for(&target, real_fstab())
+    list_backups_for(
+        &target,
+        real_fstab(),
+        backup_location::real_target_location(),
+    )
 }
 
 /// Restores a previously taken backup onto the active target.
@@ -322,6 +364,7 @@ pub fn restore_backup(
     restore_backup_with(
         &target,
         real_fstab(),
+        backup_location::real_target_location(),
         &backup_path,
         allow_external_change,
         privileged::save_elevated,
@@ -354,7 +397,12 @@ pub fn restore_backup(
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn read_backup(backup_path: String) -> Result<String, CommandErrorDto> {
     let target = resolve_target()?;
-    read_backup_of(&target, real_fstab(), &backup_path)
+    read_backup_of(
+        &target,
+        real_fstab(),
+        backup_location::real_target_location(),
+        &backup_path,
+    )
 }
 
 /// Deletes one of the active target's backups.
@@ -374,13 +422,23 @@ pub fn read_backup(backup_path: String) -> Result<String, CommandErrorDto> {
 /// rejects with a [`DeleteBackupErrorDto`] rather than a [`WriteErrorDto`]:
 /// there is no `target_unchanged` question to answer.
 ///
+/// T39 adds one case where the real file's backups are *not* elevated: when
+/// they live in the fallback directory rather than in `/etc/`, that directory
+/// is the user's own, so the unlink happens in-process with no prompt (see
+/// [`backups_are_elevated`]).
+///
 /// # Errors
 ///
 /// A [`DeleteBackupErrorDto`]; see [`DeleteBackupErrorKindDto`] for the kinds.
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
     let target = resolve_target_for_delete()?;
-    delete_backup_from(&target, real_fstab(), &backup_path)
+    delete_backup_from(
+        &target,
+        real_fstab(),
+        backup_location::real_target_location(),
+        &backup_path,
+    )
 }
 
 /// Creates a backup of the active target right now, without changing it.
@@ -402,6 +460,12 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
 /// through a single elevated re-exec, because its backups have to be created
 /// in root-owned `/etc/`.
 ///
+/// Since T39, a session that cannot manage files in `/etc/` copies the real
+/// file's *current* content into the fallback directory instead, in-process
+/// and with no prompt - see [`create_backup_with`] for the mirror refresh that
+/// keeps "current" honest, and [`crate::backup_location`] for why only the
+/// manual backups move.
+///
 /// This never opens, renames or writes the target file; it only reads it.
 /// That is why it rejects with a [`CreateBackupErrorDto`] rather than a
 /// [`WriteErrorDto`], for the same reason [`delete_backup`] does: there is no
@@ -416,7 +480,11 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
 #[tauri::command(async)]
 pub fn create_backup() -> Result<BackupInfoDto, CreateBackupErrorDto> {
     let target = resolve_target_for_create_backup()?;
-    create_backup_of(&target, real_fstab())
+    create_backup_of(
+        &target,
+        real_fstab(),
+        backup_location::real_target_location(),
+    )
 }
 
 /// Lists block devices for the source picker.
@@ -438,7 +506,9 @@ pub fn discover_devices() -> DeviceDiscoveryDto {
 /// directory that is follows [`backup_target_path`], not the resolved target:
 /// since T35 a default launch opens `/etc/`, where the backups
 /// [`list_backups`] just listed actually are, rather than the working draft's
-/// own directory, which holds none of them.
+/// own directory, which holds none of them. By the same rule, since T39 a
+/// session whose real-file backups are in the fallback directory opens *that*
+/// directory: it is still "where the rows on screen are".
 ///
 /// **No privilege escalation, for either target kind.** `/etc/` is
 /// world-readable and world-executable, which is the same reasoning
@@ -454,7 +524,11 @@ pub fn discover_devices() -> DeviceDiscoveryDto {
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn open_backup_location() -> Result<(), CommandErrorDto> {
     let target = resolve_target()?;
-    open_backup_location_of(&target, real_fstab())
+    open_backup_location_of(
+        &target,
+        real_fstab(),
+        backup_location::real_target_location(),
+    )
 }
 
 /// `open_external_link(link) -> null` (API_CONTRACT.md §3.13). Opens one
@@ -576,11 +650,135 @@ fn real_fstab() -> &'static Path {
 /// injectable-collaborator seam as the `elevate` parameters, for the same
 /// reason - `cargo test` must never read, write or even list the machine's own
 /// `/etc/fstab`.
-fn backup_target_path(target: &ActiveTarget, real_fstab: &Path) -> PathBuf {
+///
+/// ## T39: the same decision, plus "and in which directory"
+///
+/// Since T39 this function answers the backup-owning question in two steps.
+/// The first is the T35 `match` above, unchanged, and is still the whole
+/// answer whenever the real file's backups are colocated. The second applies
+/// only when they are not ([`backup_fallback_dir`]): the path returned is then
+/// the **mirror file** inside the fallback directory
+/// ([`backup_location::mirror_path`]), not the real file.
+///
+/// That one substitution is what redirects the entire backup surface, because
+/// every function underneath derives "the backup directory" from "the target
+/// file's own parent directory" - so pointing them at a file inside the
+/// fallback directory makes all of them work there, with no change to a single
+/// signature in [`backups`] or [`fstab_core::writer`] (see
+/// [`crate::backup_location::mirror_path`]).
+fn backup_target_path(
+    target: &ActiveTarget,
+    real_fstab: &Path,
+    location: &BackupLocation,
+) -> PathBuf {
+    match backup_fallback_dir(target, location) {
+        Some(dir) => backup_location::mirror_path(dir),
+        None => colocated_backup_target_path(target, real_fstab),
+    }
+}
+
+/// The backup-owning path as it is when the real file's backups live beside
+/// it: the T35 answer, and still the production answer on every launch that is
+/// not sandboxed away from `/etc/`.
+///
+/// Split out from [`backup_target_path`] because two callers need exactly
+/// this, and must not get the fallback substitution: [`backup_target_path`]
+/// itself (as the colocated branch) and [`refresh_backup_mirror`], which has
+/// to know the file the mirror is a *copy of*.
+fn colocated_backup_target_path(target: &ActiveTarget, real_fstab: &Path) -> PathBuf {
     match target.source {
         TargetSource::SandboxDefault => real_fstab.to_path_buf(),
         TargetSource::Environment => target.path.clone(),
     }
+}
+
+/// The directory this session's backups are kept in **instead of** beside the
+/// file they belong to, or `None` when they are kept beside it after all.
+///
+/// `Some(dir)` requires *both* halves to hold, and this is the only place
+/// either is asked:
+///
+/// 1. the backups in question are the real `/etc/fstab`'s
+///    ([`backups_belong_to_the_real_fstab`]), and
+/// 2. this process cannot manage files in that file's own directory
+///    ([`BackupLocation::fallback_dir`]).
+///
+/// Order matters, and `&&`-style short-circuiting is the point: an explicit
+/// `RUSTAB_TARGET_PATH` naming some other, user-owned file fails the first
+/// half and so **never consults `location` at all**. Its backups are its own,
+/// in its own directory, exactly as before T39 - whatever this process can or
+/// cannot do with `/etc/` has nothing to do with them (asserted by
+/// `an_explicit_override_never_consults_the_backup_location`).
+fn backup_fallback_dir<'a>(
+    target: &ActiveTarget,
+    location: &'a BackupLocation,
+) -> Option<&'a Path> {
+    if backups_belong_to_the_real_fstab(target) {
+        location.fallback_dir()
+    } else {
+        None
+    }
+}
+
+/// Whether this session's backups are the real `/etc/fstab`'s - `true` for a
+/// default launch (whose saves write that file) and for an explicit
+/// `RUSTAB_TARGET_PATH=/etc/fstab`, `false` only for an explicit override
+/// naming some other file.
+///
+/// The T35 predicate, named for what it *is* rather than for what it used to
+/// imply. Before T39 "these are the real file's backups" and "mutating them
+/// needs `pkexec`" were the same sentence, so one function answered both;
+/// they are now two questions, because in fallback mode the real file's
+/// backups live in a user-owned directory and need no elevation at all. This
+/// is the first; [`backups_are_elevated`] is the second, and is defined in
+/// terms of this one so the two cannot drift.
+fn backups_belong_to_the_real_fstab(target: &ActiveTarget) -> bool {
+    target.is_real || target.source == TargetSource::SandboxDefault
+}
+
+/// Refreshes the fallback directory's mirror file from the file it mirrors, so
+/// that a backup taken from it is a copy of the real `/etc/fstab` **as of
+/// now**.
+///
+/// A no-op - not even a read - in colocated mode and for a non-real target,
+/// where there is no mirror to keep fresh.
+///
+/// Called by [`create_backup_with`] and deliberately by nothing else:
+/// `list_backups` and `delete_backup` only enumerate or remove files that are
+/// already in that directory, so a fresh mirror would cost them a read and a
+/// write of the whole file for no effect on their result.
+///
+/// # Errors
+///
+/// The underlying [`io::Error`] from [`backup_location::refresh_mirror`],
+/// including [`io::ErrorKind::NotFound`] when the file being mirrored does not
+/// exist - which the caller turns into "there is nothing to back up yet",
+/// exactly the answer `fstab_core::writer::create_backup` gives for a missing
+/// target of its own.
+fn refresh_backup_mirror(
+    target: &ActiveTarget,
+    real_fstab: &Path,
+    location: &BackupLocation,
+) -> io::Result<()> {
+    match backup_fallback_dir(target, location) {
+        Some(dir) => {
+            backup_location::refresh_mirror(dir, &colocated_backup_target_path(target, real_fstab))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The [`TargetInfoDto`] for `target` in this session - the one place that
+/// builds it, so every command that returns target info reports the same
+/// thing.
+///
+/// Exists because the DTO's T39 field cannot be derived from an
+/// [`ActiveTarget`] alone: it is [`backup_fallback_dir`]'s answer, rendered
+/// for display, which is what makes the notice the user sees and the directory
+/// the backup commands actually act on one answer rather than two that could
+/// disagree.
+fn describe_target(target: &ActiveTarget, location: &BackupLocation) -> TargetInfoDto {
+    TargetInfoDto::describe(target, backup_fallback_dir(target, location))
 }
 
 /// Whether *mutating* this session's backups needs the elevated helper.
@@ -594,23 +792,40 @@ fn backup_target_path(target: &ActiveTarget, real_fstab: &Path) -> PathBuf {
 ///
 /// `true` for a default launch (its backups are `/etc/fstab`'s, in root-owned
 /// `/etc/`) and for an explicit `RUSTAB_TARGET_PATH=/etc/fstab`; `false` only
-/// for an explicit override naming some other, user-owned file.
+/// for an explicit override naming some other, user-owned file - **and**,
+/// since T39, `false` for the real file's backups when they are not in
+/// `/etc/` at all.
+///
+/// That second `false` is the point of the T39 change here: in fallback mode
+/// the real file's manual backups live in a directory inside the user's own
+/// data directory ([`crate::backup_location`]), which is never root-owned, so
+/// creating or unlinking one there must **not** drag the user through a
+/// `pkexec` prompt for a file they already own. Writing the real `/etc/fstab`
+/// itself is a different question with a different answer and is decided
+/// elsewhere, in [`save_document_with`], which T39 does not touch: a restore
+/// still elevates in fallback mode, because it writes `/etc/fstab`.
 ///
 /// Note what this does *not* gate: [`list_backups`], [`read_backup`] and
 /// [`open_backup_location`] never consult it, because `/etc/` and the backups
 /// in it are world-readable - only creating and unlinking a file there needs
 /// root.
-fn backups_are_elevated(target: &ActiveTarget) -> bool {
-    target.is_real || target.source == TargetSource::SandboxDefault
+fn backups_are_elevated(target: &ActiveTarget, location: &BackupLocation) -> bool {
+    backups_belong_to_the_real_fstab(target) && backup_fallback_dir(target, location).is_none()
 }
 
-/// The body of [`list_backups`], with the target and the real-file path passed
-/// in (see [`backup_target_path`] for why the latter is a parameter).
+/// The body of [`list_backups`], with the target, the real-file path and the
+/// real file's backup location passed in (see [`backup_target_path`] for why
+/// the latter two are parameters).
+///
+/// Deliberately does **not** refresh the fallback directory's mirror file:
+/// listing enumerates files that are already there, and the mirror is not one
+/// of them (see [`refresh_backup_mirror`]).
 fn list_backups_for(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
 ) -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
-    backups::list(&backup_target_path(target, real_fstab))
+    backups::list(&backup_target_path(target, real_fstab, location))
         .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::ListBackups, err.to_string()))
 }
 
@@ -655,6 +870,7 @@ fn list_backups_for(
 fn resync_external_change_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
 ) -> Result<DocumentViewDto, CommandErrorDto> {
     if target.source != TargetSource::SandboxDefault {
         return Err(CommandErrorDto::new(
@@ -708,7 +924,12 @@ fn resync_external_change_with(
 
     let document = parser::parse(&text);
     Ok(DocumentViewDto {
-        target: TargetInfoDto::from(target),
+        // The same target info `list_entries` reports, built the same way, so
+        // the view this command returns cannot describe the session
+        // differently from the view the one before it did - `location` is a
+        // parameter purely so that this stays true (it plays no part in the
+        // re-sync itself, which never touches a backup).
+        target: describe_target(target, location),
         exists,
         text,
         has_malformed_lines: document.has_malformed_lines(),
@@ -729,9 +950,17 @@ fn resync_external_change_with(
 ///    write code of its own - and, since T36, inherits the external-change
 ///    check in the same way, from the same place, for free. `real_fstab` and
 ///    `allow_external_change` are passed straight through for that reason.
+///
+/// T39 changed only the first step again, and only for the real file in
+/// fallback mode: the backup is then resolved against the fallback directory's
+/// list, because that is the list [`list_backups`] offered. **Step 2 is
+/// untouched** - restoring still writes the real `/etc/fstab` through the same
+/// single elevated call, since where a backup is *stored* says nothing about
+/// where restoring it has to write.
 fn restore_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
     backup_path: &str,
     allow_external_change: bool,
     elevate: impl Fn(
@@ -740,7 +969,7 @@ fn restore_backup_with(
         &target::ExternalChangeGuard,
     ) -> Result<WriteOutcomeDto, WriteErrorDto>,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
-    let owner = backup_target_path(target, real_fstab);
+    let owner = backup_target_path(target, real_fstab, location);
 
     // Both failure modes - "the list could not be read" and "the requested
     // path is not in it" - are reported as `InvalidBackup`: from the
@@ -968,9 +1197,10 @@ fn save_document_with(
 fn read_backup_of(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
     backup_path: &str,
 ) -> Result<String, CommandErrorDto> {
-    let owner = backup_target_path(target, real_fstab);
+    let owner = backup_target_path(target, real_fstab, location);
     let backup = backups::resolve_requested(&owner, backup_path)
         .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::InvalidBackup, err.to_string()))?;
 
@@ -995,8 +1225,9 @@ fn read_backup_of(
 fn open_backup_location_of(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
 ) -> Result<(), CommandErrorDto> {
-    open_backup_location_with(target, real_fstab, open_in_file_manager)
+    open_backup_location_with(target, real_fstab, location, open_in_file_manager)
 }
 
 /// [`open_backup_location_of`], with the actual launch of a GUI program
@@ -1011,9 +1242,10 @@ fn open_backup_location_of(
 fn open_backup_location_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
     opener: impl Fn(&Path) -> io::Result<()>,
 ) -> Result<(), CommandErrorDto> {
-    let dir = backups::containing_dir(&backup_target_path(target, real_fstab));
+    let dir = backups::containing_dir(&backup_target_path(target, real_fstab, location));
     opener(&dir).map_err(|err| {
         CommandErrorDto::new(
             CommandErrorKindDto::OpenLocation,
@@ -1096,11 +1328,13 @@ fn open_path_in_file_manager_with(
 fn delete_backup_from(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
     backup_path: &str,
 ) -> Result<(), DeleteBackupErrorDto> {
     delete_backup_with(
         target,
         real_fstab,
+        location,
         backup_path,
         privileged::delete_backup_elevated,
     )
@@ -1146,10 +1380,11 @@ fn delete_backup_from(
 fn delete_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
     backup_path: &str,
     elevate: impl Fn(&Path, &str) -> Result<(), DeleteBackupErrorDto>,
 ) -> Result<(), DeleteBackupErrorDto> {
-    let owner = backup_target_path(target, real_fstab);
+    let owner = backup_target_path(target, real_fstab, location);
     let backup = backups::resolve_requested(&owner, backup_path).map_err(|err| {
         DeleteBackupErrorDto::new(
             DeleteBackupErrorKindDto::InvalidBackup,
@@ -1157,7 +1392,7 @@ fn delete_backup_with(
         )
     })?;
 
-    if backups_are_elevated(target) {
+    if backups_are_elevated(target, location) {
         elevate(&owner, &backup.to_string_lossy())
     } else {
         fs::remove_file(&backup).map_err(|err| {
@@ -1174,8 +1409,14 @@ fn delete_backup_with(
 fn create_backup_of(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
 ) -> Result<BackupInfoDto, CreateBackupErrorDto> {
-    create_backup_with(target, real_fstab, privileged::create_backup_elevated)
+    create_backup_with(
+        target,
+        real_fstab,
+        location,
+        privileged::create_backup_elevated,
+    )
 }
 
 /// The one dispatch point between the two backup-creation paths, with the
@@ -1209,14 +1450,59 @@ fn create_backup_of(
 /// rows with, so a freshly created backup is described exactly the way the
 /// next `list_backups` will describe it - including its `is_manual` flag,
 /// which is read back from the naming scheme rather than assumed here.
+///
+/// ## T39: the one operation that needs a fresh mirror
+///
+/// In fallback mode `owner` is the mirror file rather than the real
+/// `/etc/fstab`, so this is the one backup operation that has to *write*
+/// before it reads: [`refresh_backup_mirror`] copies the real file's current
+/// bytes onto the mirror first, and only then is the mirror copied to a
+/// backup. The result is therefore a snapshot of `/etc/fstab` as of the moment
+/// the user pressed the button, which is the only thing that would make this
+/// button honest. The dispatch below then takes the in-process branch (see
+/// [`backups_are_elevated`]), because the fallback directory is the user's
+/// own - the elevated helper is neither needed nor asked for.
 fn create_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    location: &BackupLocation,
     elevate: impl Fn(&Path) -> Result<CreateBackupOutcomeDto, CreateBackupErrorDto>,
 ) -> Result<BackupInfoDto, CreateBackupErrorDto> {
-    let owner = backup_target_path(target, real_fstab);
+    let owner = backup_target_path(target, real_fstab, location);
 
-    let outcome = if backups_are_elevated(target) {
+    // Fallback mode only (a no-op otherwise): `owner` is then the mirror file,
+    // so it has to be brought up to date with the real `/etc/fstab` *before*
+    // it is copied - a backup of a stale mirror would be a snapshot of
+    // something that is no longer true.
+    refresh_backup_mirror(target, real_fstab, location).map_err(|err| {
+        let source = colocated_backup_target_path(target, real_fstab);
+        if err.kind() == io::ErrorKind::NotFound {
+            // The same answer `writer::create_backup` gives for a target that
+            // is not on disk yet, reported with the same kind so the frontend
+            // needs no second case for it.
+            CreateBackupErrorDto::new(
+                CreateBackupErrorKindDto::TargetMissing,
+                format!(
+                    "{} does not exist yet, so there is nothing to back up; \
+                     save the file once first",
+                    source.display()
+                ),
+            )
+        } else {
+            CreateBackupErrorDto::new(
+                CreateBackupErrorKindDto::Backup,
+                format!(
+                    "could not copy {} into {} to back it up ({err}); no backup was created, \
+                     and {} itself is unchanged",
+                    source.display(),
+                    owner.display(),
+                    source.display()
+                ),
+            )
+        }
+    })?;
+
+    let outcome = if backups_are_elevated(target, location) {
         elevate(&owner)?
     } else {
         writer::create_backup(&owner)
@@ -1352,6 +1638,28 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     /// the whole point of the parameter (see [`backup_target_path`]).
     fn unused_real_fstab() -> &'static Path {
         Path::new("/nonexistent/rustab-tests-must-never-touch-this/fstab")
+    }
+
+    /// The backup location every launch outside a Flatpak sandbox gets, and
+    /// the one every test written before T39 assumes: the real file's own
+    /// directory is usable, so backups stay beside it and nothing is
+    /// redirected anywhere (see [`crate::backup_location::BackupLocation`]).
+    ///
+    /// Passing it explicitly - rather than letting the production
+    /// [`backup_location::real_target_location`] probe decide - is what keeps
+    /// these tests off the machine's own `/etc/`, the same reason
+    /// `real_fstab` is a parameter (see [`backup_target_path`]).
+    fn colocated() -> &'static BackupLocation {
+        static COLOCATED: BackupLocation = BackupLocation::Colocated;
+        &COLOCATED
+    }
+
+    /// A fallback location whose directory is `dir` - what a Flatpak session's
+    /// probe produces (see [`crate::backup_location::detect`]).
+    fn fallback_to(dir: &Path) -> BackupLocation {
+        BackupLocation::Fallback {
+            dir: dir.to_path_buf(),
+        }
     }
 
     /// An elevate stand-in that records what it was asked to write - path,
@@ -1636,12 +1944,12 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let oldest = &listed[listed.len() - 1];
 
         assert_eq!(
-            read_backup_of(&target, unused_real_fstab(), &oldest.path)
+            read_backup_of(&target, unused_real_fstab(), colocated(), &oldest.path)
                 .expect("a real backup must be readable"),
             ORIGINAL
         );
         assert_eq!(
-            read_backup_of(&target, unused_real_fstab(), &listed[0].path)
+            read_backup_of(&target, unused_real_fstab(), colocated(), &listed[0].path)
                 .expect("a real backup must be readable"),
             valid_candidate("/mnt/save-0").to_string()
         );
@@ -1693,7 +2001,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
 
         for requested in &refused {
-            let error = read_backup_of(&target, unused_real_fstab(), requested)
+            let error = read_backup_of(&target, unused_real_fstab(), colocated(), requested)
                 .expect_err("only this target's own backups may be read");
             assert_eq!(
                 error.kind,
@@ -1717,8 +2025,13 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let backup = dir.join("fstab.draft.rustab-backup.0000000001.000000002");
         fs::write(&backup, [0xff, 0xfe, 0x00]).expect("write invalid UTF-8");
 
-        let error = read_backup_of(&target, unused_real_fstab(), &backup.to_string_lossy())
-            .expect_err("invalid UTF-8 must be refused");
+        let error = read_backup_of(
+            &target,
+            unused_real_fstab(),
+            colocated(),
+            &backup.to_string_lossy(),
+        )
+        .expect_err("invalid UTF-8 must be refused");
         assert_eq!(error.kind, CommandErrorKindDto::NotUtf8);
         assert!(backup.exists(), "a refused read must not remove anything");
     }
@@ -1737,7 +2050,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target = override_target(path.clone());
 
         let calls = std::cell::RefCell::new(Vec::new());
-        open_backup_location_with(&target, unused_real_fstab(), |opened| {
+        open_backup_location_with(&target, unused_real_fstab(), colocated(), |opened| {
             calls.borrow_mut().push(opened.to_path_buf());
             Ok(())
         })
@@ -1756,7 +2069,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
-        let error = open_backup_location_with(&target, unused_real_fstab(), |_| {
+        let error = open_backup_location_with(&target, unused_real_fstab(), colocated(), |_| {
             Err(io::Error::from(io::ErrorKind::NotFound))
         })
         .expect_err("a launch failure must be reported");
@@ -1869,7 +2182,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target_content = fs::read_to_string(&path).expect("read the target");
 
         let doomed = before[1].path.clone();
-        delete_backup_from(&target, unused_real_fstab(), &doomed)
+        delete_backup_from(&target, unused_real_fstab(), colocated(), &doomed)
             .expect("deleting a real backup must succeed");
 
         assert!(
@@ -1901,7 +2214,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             &path.to_string_lossy(),
             &dir.join("fstab.draft.rustab-backup.1.2").to_string_lossy(),
         ] {
-            let error = delete_backup_from(&target, unused_real_fstab(), requested)
+            let error = delete_backup_from(&target, unused_real_fstab(), colocated(), requested)
                 .expect_err("only this target's own backups may be deleted");
             assert_eq!(
                 error.kind,
@@ -1929,9 +2242,9 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target = override_target(path.clone());
         let backup = backups::list(&path).expect("listing")[0].path.clone();
 
-        delete_backup_from(&target, unused_real_fstab(), &backup)
+        delete_backup_from(&target, unused_real_fstab(), colocated(), &backup)
             .expect("the first delete must succeed");
-        let error = delete_backup_from(&target, unused_real_fstab(), &backup)
+        let error = delete_backup_from(&target, unused_real_fstab(), colocated(), &backup)
             .expect_err("the second delete must not claim success");
         assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
         assert!(backups::list(&path).expect("listing").is_empty());
@@ -1959,6 +2272,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         delete_backup_with(
             &target,
             unused_real_fstab(),
+            colocated(),
             &wanted,
             |elevated_target, elevated_backup| {
                 calls
@@ -2004,9 +2318,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target = override_target(path.clone());
         let backup = backups::list(&path).expect("listing")[0].path.clone();
 
-        delete_backup_with(&target, unused_real_fstab(), &backup, |_, _| {
-            panic!("an explicit non-real override's backup deletion must never escalate");
-        })
+        delete_backup_with(
+            &target,
+            unused_real_fstab(),
+            colocated(),
+            &backup,
+            |_, _| {
+                panic!("an explicit non-real override's backup deletion must never escalate");
+            },
+        )
         .expect("the delete should succeed");
 
         assert!(!Path::new(&backup).exists());
@@ -2027,9 +2347,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             source: TargetSource::Environment,
         };
 
-        let error = delete_backup_with(&target, unused_real_fstab(), "/etc/shadow", |_, _| {
-            panic!("a path that is not a backup must not reach the elevated deleter");
-        })
+        let error = delete_backup_with(
+            &target,
+            unused_real_fstab(),
+            colocated(),
+            "/etc/shadow",
+            |_, _| {
+                panic!("a path that is not a backup must not reach the elevated deleter");
+            },
+        )
         .expect_err("an arbitrary path must be refused");
         assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
     }
@@ -2046,8 +2372,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let info =
-            create_backup_of(&target, unused_real_fstab()).expect("creating a backup must succeed");
+        let info = create_backup_of(&target, unused_real_fstab(), colocated())
+            .expect("creating a backup must succeed");
 
         assert!(
             info.is_manual,
@@ -2080,9 +2406,11 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let first = create_backup_of(&target, unused_real_fstab()).expect("first backup");
+        let first =
+            create_backup_of(&target, unused_real_fstab(), colocated()).expect("first backup");
         fs::write(&path, "# changed by hand\n").expect("change the target");
-        let second = create_backup_of(&target, unused_real_fstab()).expect("second backup");
+        let second =
+            create_backup_of(&target, unused_real_fstab(), colocated()).expect("second backup");
 
         assert_ne!(first.path, second.path);
         assert_eq!(fs::read_to_string(&first.path).unwrap(), ORIGINAL);
@@ -2106,7 +2434,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
-        let error = create_backup_of(&target, unused_real_fstab())
+        let error = create_backup_of(&target, unused_real_fstab(), colocated())
             .expect_err("there is nothing to back up");
 
         assert_eq!(error.kind, CreateBackupErrorKindDto::TargetMissing);
@@ -2124,7 +2452,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let manual = create_backup_of(&target, unused_real_fstab()).expect("a manual backup");
+        let manual =
+            create_backup_of(&target, unused_real_fstab(), colocated()).expect("a manual backup");
         for i in 0..(writer::MAX_BACKUPS + 3) {
             save_document(
                 &target,
@@ -2172,18 +2501,23 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         // also pins what the command does with an outcome it cannot verify:
         // it refuses rather than inventing a row.
         let calls = std::cell::RefCell::new(Vec::new());
-        let error = create_backup_with(&target, unused_real_fstab(), |elevated_target| {
-            calls.borrow_mut().push(elevated_target.to_path_buf());
-            Ok(CreateBackupOutcomeDto {
-                target: elevated_target.to_string_lossy().into_owned(),
-                backup: format!(
-                    "{}.rustab-backup.0000000001.000000002.manual",
-                    path.display()
-                ),
-                pruned_backups: Vec::new(),
-                notes: Vec::new(),
-            })
-        })
+        let error = create_backup_with(
+            &target,
+            unused_real_fstab(),
+            colocated(),
+            |elevated_target| {
+                calls.borrow_mut().push(elevated_target.to_path_buf());
+                Ok(CreateBackupOutcomeDto {
+                    target: elevated_target.to_string_lossy().into_owned(),
+                    backup: format!(
+                        "{}.rustab-backup.0000000001.000000002.manual",
+                        path.display()
+                    ),
+                    pruned_backups: Vec::new(),
+                    notes: Vec::new(),
+                })
+            },
+        )
         .expect_err("a backup that is not on disk must not be reported as a row");
         assert_eq!(error.kind, CreateBackupErrorKindDto::Backup);
 
@@ -2215,7 +2549,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let info = create_backup_with(&target, unused_real_fstab(), |_| {
+        let info = create_backup_with(&target, unused_real_fstab(), colocated(), |_| {
             panic!("an explicit non-real override's backup must never escalate");
         })
         .expect("the backup should succeed");
@@ -2233,8 +2567,9 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let manual = create_backup_of(&target, unused_real_fstab()).expect("a manual backup");
-        delete_backup_from(&target, unused_real_fstab(), &manual.path)
+        let manual =
+            create_backup_of(&target, unused_real_fstab(), colocated()).expect("a manual backup");
+        delete_backup_from(&target, unused_real_fstab(), colocated(), &manual.path)
             .expect("deleting a manual backup must succeed");
 
         assert!(!Path::new(&manual.path).exists());
@@ -2286,7 +2621,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         seed_backups(&real, 3);
         let target = default_draft_target(draft.clone());
 
-        let listed = list_backups_for(&target, &real).expect("listing must succeed");
+        let listed = list_backups_for(&target, &real, colocated()).expect("listing must succeed");
 
         assert_eq!(
             listed,
@@ -2321,7 +2656,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         seed_backups(&real, 3);
         let target = override_target(draft.clone());
 
-        let listed = list_backups_for(&target, &real).expect("listing must succeed");
+        let listed = list_backups_for(&target, &real, colocated()).expect("listing must succeed");
 
         assert_eq!(listed, backups::list(&draft).expect("the draft's listing"));
         assert_eq!(listed.len(), 2);
@@ -2357,7 +2692,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(marker_of(&draft), "# stale marker content\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
 
-        let view = resync_external_change_with(&target, &real)
+        let view = resync_external_change_with(&target, &real, colocated())
             .expect("a sandbox-default resync must succeed");
 
         assert!(view.exists);
@@ -2393,7 +2728,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         .expect("seed marker");
         let target = override_target(draft.clone());
 
-        let error = resync_external_change_with(&target, &real)
+        let error = resync_external_change_with(&target, &real, colocated())
             .expect_err("a non-SandboxDefault target must be refused");
 
         assert_eq!(error.kind, CommandErrorKindDto::Resync);
@@ -2432,7 +2767,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             source: TargetSource::Environment,
         };
 
-        let error = resync_external_change_with(&target, &real)
+        let error = resync_external_change_with(&target, &real, colocated())
             .expect_err("an is_real: true, Environment-sourced target must still be refused");
 
         assert_eq!(error.kind, CommandErrorKindDto::Resync);
@@ -2460,7 +2795,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(marker_of(&draft), "# a stale marker\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
 
-        let view = resync_external_change_with(&target, &real)
+        let view = resync_external_change_with(&target, &real, colocated())
             .expect("a missing real file must not be an error");
 
         assert!(!view.exists);
@@ -2491,7 +2826,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(marker_of(&draft), "# a marker that must survive\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
 
-        let error = resync_external_change_with(&target, &real)
+        let error = resync_external_change_with(&target, &real, colocated())
             .expect_err("non-UTF-8 content must be refused");
 
         assert_eq!(error.kind, CommandErrorKindDto::NotUtf8);
@@ -2521,7 +2856,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&draft, "# a draft that disagrees with the real file\n").expect("seed draft");
         let target = default_draft_target(draft.clone());
 
-        resync_external_change_with(&target, &real).expect("the resync must succeed");
+        resync_external_change_with(&target, &real, colocated()).expect("the resync must succeed");
 
         let guard = target::ExternalChangeGuard::from_marker(&target.path, false);
         assert_eq!(
@@ -2545,13 +2880,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
         let real_backup = backups::list(&real).expect("listing")[0].path.clone();
         assert_eq!(
-            read_backup_of(&target, &real, &real_backup).expect("a real backup must be readable"),
+            read_backup_of(&target, &real, colocated(), &real_backup)
+                .expect("a real backup must be readable"),
             ORIGINAL,
             "the real file's backup holds the content it had before its save"
         );
 
         let draft_backup = backups::list(&draft).expect("listing")[0].path.clone();
-        let error = read_backup_of(&target, &real, &draft_backup)
+        let error = read_backup_of(&target, &real, colocated(), &draft_backup)
             .expect_err("the draft's backups are not this session's backups any more");
         assert_eq!(error.kind, CommandErrorKindDto::InvalidBackup);
     }
@@ -2567,7 +2903,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target = default_draft_target(draft.clone());
 
         let calls = std::cell::RefCell::new(Vec::new());
-        open_backup_location_with(&target, &real, |opened| {
+        open_backup_location_with(&target, &real, colocated(), |opened| {
             calls.borrow_mut().push(opened.to_path_buf());
             Ok(())
         })
@@ -2604,7 +2940,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         // way the real-override test does, which also pins that an unverifiable
         // outcome is refused rather than turned into an invented row.
         let calls = std::cell::RefCell::new(Vec::new());
-        let error = create_backup_with(&target, &real, |elevated_target| {
+        let error = create_backup_with(&target, &real, colocated(), |elevated_target| {
             calls.borrow_mut().push(elevated_target.to_path_buf());
             Ok(CreateBackupOutcomeDto {
                 target: elevated_target.to_string_lossy().into_owned(),
@@ -2652,6 +2988,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         delete_backup_with(
             &target,
             &real,
+            colocated(),
             &wanted,
             |elevated_target, elevated_backup| {
                 calls
@@ -2696,7 +3033,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target = default_draft_target(draft.clone());
         let draft_backup = backups::list(&draft).expect("listing")[0].path.clone();
 
-        let error = delete_backup_with(&target, &real, &draft_backup, |_, _| {
+        let error = delete_backup_with(&target, &real, colocated(), &draft_backup, |_, _| {
             panic!("a path that is not one of the real file's backups must not escalate");
         })
         .expect_err("the draft's backups are not this session's backups any more");
@@ -2705,6 +3042,434 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         assert!(
             Path::new(&draft_backup).exists(),
             "and a refused delete removes nothing"
+        );
+    }
+
+    // -- T39: where the real file's manual backups live ---------------------
+    //
+    // Every test here uses the same `draft_and_real_stand_in` fixture as the
+    // T35 section above, plus a third directory standing in for the fallback
+    // one, and passes `fallback_to(...)` where the T35 tests pass
+    // `colocated()`. The capability probe itself
+    // (`crate::backup_location::detect`) is tested in its own module, against
+    // its own temp directories; what is asserted *here* is what each command
+    // does once the answer is known - which is the half that could silently
+    // elevate, or act on the wrong directory.
+
+    /// The fallback directory for these tests, in a third directory distinct
+    /// from both the draft's and the real file's, so "which directory did this
+    /// command act on" is answerable from the paths alone.
+    ///
+    /// Created up front because that is what production does the moment it
+    /// selects fallback mode (see `crate::backup_location::detect`), and
+    /// listing a directory that does not exist is an error rather than an
+    /// empty list.
+    fn fallback_dir_in(dir: &TempDir) -> PathBuf {
+        let fallback = dir.join("share/rustab/etc-fstab-backups");
+        fs::create_dir_all(&fallback).expect("mkdir the fallback directory");
+        fallback
+    }
+
+    /// The headline: in fallback mode an explicitly created backup of the real
+    /// `/etc/fstab` lands in the fallback directory, holds the real file's
+    /// current content, is named exactly as it would have been in `/etc/`, and
+    /// is created **without the elevated helper being called at all** - the
+    /// directory is the user's own.
+    #[test]
+    fn a_fallback_launch_creates_a_manual_backup_in_the_fallback_directory_without_elevating() {
+        let dir = TempDir::new("fallback-create");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let target = default_draft_target(draft.clone());
+
+        let info = create_backup_with(&target, &real, &fallback_to(&fallback), |_| {
+            panic!("a backup in the user's own directory must never ask for a password")
+        })
+        .expect("creating a backup in the fallback directory must succeed");
+
+        let created = PathBuf::from(&info.path);
+        assert_eq!(
+            created.parent(),
+            Some(fallback.as_path()),
+            "the backup must be in the fallback directory: {info:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&created).expect("read the backup"),
+            ORIGINAL,
+            "the backup must hold the real file's content, not the draft's"
+        );
+        assert!(info.is_manual);
+        assert!(
+            info.file_name.starts_with("fstab.rustab-backup.")
+                && info.file_name.ends_with(".manual"),
+            "the name must be the one this backup would have had in /etc/: {info:?}"
+        );
+        // The real file and the draft are both left exactly as they were: no
+        // backup beside either, and neither file touched.
+        assert!(backups::list(&real).expect("listing").is_empty());
+        assert!(backups::list(&draft).expect("listing").is_empty());
+        assert_eq!(fs::read_to_string(&real).expect("read"), ORIGINAL);
+        assert_eq!(fs::read_to_string(&draft).expect("read"), ORIGINAL);
+    }
+
+    /// The backup is a snapshot of the real file **as of the moment the user
+    /// asked for it**, not of whatever the mirror happened to hold from a
+    /// previous run - which is the one thing the mirror refresh exists for.
+    #[test]
+    fn a_fallback_launch_backs_up_the_real_files_content_as_of_now() {
+        let dir = TempDir::new("fallback-fresh");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft.clone());
+        let never_elevate = |_: &Path| -> Result<CreateBackupOutcomeDto, CreateBackupErrorDto> {
+            panic!("fallback mode must never elevate")
+        };
+
+        let first = create_backup_with(&target, &real, &location, never_elevate)
+            .expect("the first backup must succeed");
+
+        // Something else - a save through the elevated writer, say - changes
+        // the real file between the two button presses.
+        let changed = "# the real file moved on\nLABEL=new /mnt/new ext4 noauto 0 2\n";
+        fs::write(&real, changed).expect("change the real stand-in");
+
+        let second = create_backup_with(&target, &real, &location, never_elevate)
+            .expect("the second backup must succeed");
+
+        assert_eq!(
+            fs::read_to_string(&first.path).expect("read the first backup"),
+            ORIGINAL
+        );
+        assert_eq!(
+            fs::read_to_string(&second.path).expect("read the second backup"),
+            changed,
+            "the second backup must hold what the real file holds now"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_location::mirror_path(&fallback)).expect("read the mirror"),
+            changed,
+            "and the mirror must have been refreshed before the copy"
+        );
+    }
+
+    /// A real file that does not exist yet is reported as "nothing to back up"
+    /// in fallback mode too, with the same kind
+    /// `fstab_core::writer::create_backup` reports for a missing target of its
+    /// own - rather than quietly backing up a stale mirror.
+    #[test]
+    fn a_fallback_launch_reports_a_missing_real_file_as_nothing_to_back_up() {
+        let dir = TempDir::new("fallback-create-missing");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        fs::write(backup_location::mirror_path(&fallback), "# stale\n").expect("stale mirror");
+        fs::remove_file(&real).expect("the real file is gone");
+        let target = default_draft_target(draft);
+
+        let error = create_backup_with(&target, &real, &fallback_to(&fallback), |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect_err("there is nothing to back up");
+
+        assert_eq!(error.kind, CreateBackupErrorKindDto::TargetMissing);
+        assert!(
+            backups::list(&backup_location::mirror_path(&fallback))
+                .expect("listing")
+                .is_empty(),
+            "a refused create must not have copied the stale mirror"
+        );
+    }
+
+    /// Listing in fallback mode reports exactly the fallback directory's
+    /// backups - and, the accepted trade-off T39 makes, **not** the automatic
+    /// backups the elevated writer leaves beside the real `/etc/fstab`, which
+    /// this process cannot enumerate. Asserted explicitly, because it is a
+    /// deliberate consequence the user is told about rather than a bug.
+    #[test]
+    fn a_fallback_launch_lists_the_fallback_directorys_backups_and_not_the_real_files() {
+        let dir = TempDir::new("fallback-list");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft.clone());
+        // Two automatic backups beside the real file (what saves leave there)
+        // and one backup beside the draft, none of which may be listed.
+        seed_backups(&real, 2);
+        seed_backups(&draft, 1);
+
+        assert!(
+            list_backups_for(&target, &real, &location)
+                .expect("listing an empty fallback directory must succeed")
+                .is_empty(),
+            "nothing has been created in the fallback directory yet"
+        );
+
+        let created = create_backup_with(&target, &real, &location, |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect("creating a backup must succeed");
+
+        let listed = list_backups_for(&target, &real, &location).expect("listing must succeed");
+        assert_eq!(listed, vec![created.clone()]);
+        assert_eq!(
+            listed[0].path, created.path,
+            "the row must be the backup that was just created"
+        );
+        // And the ones that exist elsewhere are still there, just invisible.
+        assert_eq!(backups::list(&real).expect("listing").len(), 2);
+        assert_eq!(backups::list(&draft).expect("listing").len(), 1);
+    }
+
+    /// Deleting in fallback mode unlinks the file in-process, with no
+    /// `pkexec` prompt - and refuses anything that is not in the list
+    /// `list_backups` offered, including one of the real file's own backups,
+    /// before any dispatch.
+    #[test]
+    fn a_fallback_launch_deletes_a_fallback_backup_in_process_and_refuses_the_real_files() {
+        let dir = TempDir::new("fallback-delete");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft.clone());
+        seed_backups(&real, 1);
+        let real_backup = backups::list(&real).expect("listing")[0].path.clone();
+
+        let created = create_backup_with(&target, &real, &location, |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect("creating a backup must succeed");
+
+        // One of the real file's backups is not one of this session's any
+        // more: refused, nothing unlinked, nothing escalated.
+        let error = delete_backup_with(&target, &real, &location, &real_backup, |_, _| {
+            panic!("a path outside the fallback directory must not escalate")
+        })
+        .expect_err("only the fallback directory's backups are this session's");
+        assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
+        assert!(Path::new(&real_backup).exists());
+
+        delete_backup_with(&target, &real, &location, &created.path, |_, _| {
+            panic!("a backup in the user's own directory must never ask for a password")
+        })
+        .expect("deleting a fallback backup must succeed");
+
+        assert!(!Path::new(&created.path).exists());
+        assert!(list_backups_for(&target, &real, &location)
+            .expect("listing")
+            .is_empty());
+        assert!(
+            backup_location::mirror_path(&fallback).exists(),
+            "the mirror itself is not a backup and must not be deleted"
+        );
+    }
+
+    /// The three operations above are the *only* ones that stop elevating.
+    /// A restore still writes the real `/etc/fstab`, so it still goes through
+    /// the single elevated write - the backup it restores just comes from the
+    /// fallback directory now. This is the test that would fail if fallback
+    /// mode had been allowed to leak into the write path.
+    #[test]
+    fn a_fallback_launch_still_elevates_a_restore_of_a_fallback_backup() {
+        let dir = TempDir::new("fallback-restore");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft.clone());
+
+        let created = create_backup_with(&target, &real, &location, |_| {
+            panic!("creating must not elevate")
+        })
+        .expect("creating a backup must succeed");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = restore_backup_with(
+            &target,
+            &real,
+            &location,
+            &created.path,
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("the restore must succeed");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "exactly one elevated write");
+        assert_eq!(
+            calls[0].0, real,
+            "the elevated write must be aimed at the real file"
+        );
+        assert_eq!(
+            calls[0].1,
+            parser::parse(ORIGINAL),
+            "and must carry the backup's content"
+        );
+        assert!(outcome.elevated);
+    }
+
+    /// `open_backup_location` opens the directory whose backups were just
+    /// listed - the fallback one, not `/etc/`, which in fallback mode holds
+    /// none of the rows on screen (and which the file manager could not show
+    /// the user's own backups in anyway).
+    #[test]
+    fn a_fallback_launch_opens_the_fallback_directory() {
+        let dir = TempDir::new("fallback-open");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let target = default_draft_target(draft);
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        open_backup_location_with(&target, &real, &fallback_to(&fallback), |opened| {
+            calls.borrow_mut().push(opened.to_path_buf());
+            Ok(())
+        })
+        .expect("the opener stand-in succeeds");
+
+        assert_eq!(calls.into_inner(), vec![fallback]);
+    }
+
+    /// `read_backup` follows the same list as everything else: a backup in the
+    /// fallback directory is readable, one beside the real file is refused
+    /// before being used as a path.
+    #[test]
+    fn a_fallback_launch_reads_the_fallback_directorys_backups_only() {
+        let dir = TempDir::new("fallback-read");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft);
+        seed_backups(&real, 1);
+        let real_backup = backups::list(&real).expect("listing")[0].path.clone();
+        // `seed_backups` saves, so this - not `ORIGINAL` - is what the real
+        // file holds by the time the backup below is taken.
+        let real_now = fs::read_to_string(&real).expect("read the real stand-in");
+
+        let created = create_backup_with(&target, &real, &location, |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect("creating a backup must succeed");
+
+        assert_eq!(
+            read_backup_of(&target, &real, &location, &created.path)
+                .expect("a fallback backup must be readable"),
+            real_now
+        );
+        let error = read_backup_of(&target, &real, &location, &real_backup)
+            .expect_err("a backup beside the real file is not in this session's list");
+        assert_eq!(error.kind, CommandErrorKindDto::InvalidBackup);
+    }
+
+    /// An explicit `RUSTAB_TARGET_PATH=/etc/fstab` is the second half of
+    /// "these are the real file's backups" (`is_real`), so it gets the same
+    /// fallback treatment as a default launch: same directory, same
+    /// in-process create.
+    #[test]
+    fn an_explicit_real_override_also_uses_the_fallback_directory() {
+        let dir = TempDir::new("fallback-real-override");
+        let (_draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        // What `active_target()` produces for `RUSTAB_TARGET_PATH=/etc/fstab`,
+        // with the stand-in standing in for that path.
+        let target = ActiveTarget {
+            path: real.clone(),
+            is_real: true,
+            source: TargetSource::Environment,
+        };
+
+        assert_eq!(
+            backup_target_path(&target, unused_real_fstab(), &location),
+            backup_location::mirror_path(&fallback)
+        );
+        assert!(!backups_are_elevated(&target, &location));
+
+        let created = create_backup_with(&target, unused_real_fstab(), &location, |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect("creating a backup must succeed");
+        assert_eq!(
+            PathBuf::from(&created.path).parent(),
+            Some(fallback.as_path())
+        );
+        assert_eq!(
+            fs::read_to_string(&created.path).expect("read the backup"),
+            ORIGINAL,
+            "the backup must be a copy of the named real file"
+        );
+    }
+
+    /// The other side of that line, and the one the T39 design promises
+    /// outright: an explicit override naming some **other** file never
+    /// consults the backup location at all.
+    ///
+    /// Proved rather than assumed: the location passed in is a fallback one
+    /// pointing at a directory that does not exist and must never be created.
+    /// If any of these operations consulted it, they would act in (and create)
+    /// that directory instead of the target's own - so the final assertion
+    /// that it is still absent is the "never consulted" claim itself, not just
+    /// "still passes".
+    #[test]
+    fn an_explicit_override_never_consults_the_backup_location() {
+        let dir = TempDir::new("override-ignores-location");
+        let path = dir.join("custom/fstab.custom");
+        fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        fs::write(&path, ORIGINAL).expect("seed the target");
+        let target = override_target(path.clone());
+        let poison = dir.join("must-never-be-touched");
+        let location = fallback_to(&poison);
+
+        // The two decisions, directly.
+        assert_eq!(
+            backup_target_path(&target, unused_real_fstab(), &location),
+            path
+        );
+        assert!(!backups_are_elevated(&target, &location));
+        assert_eq!(
+            describe_target(&target, &location).real_target_backup_fallback_dir,
+            None,
+            "and the frontend is told there is no fallback in play"
+        );
+
+        // And the three operations end to end, through the production
+        // wrappers, acting on the target's own directory throughout.
+        let created = create_backup_of(&target, unused_real_fstab(), &location)
+            .expect("creating a backup must succeed");
+        assert_eq!(PathBuf::from(&created.path).parent(), path.parent());
+        assert_eq!(
+            list_backups_for(&target, unused_real_fstab(), &location).expect("listing"),
+            vec![created.clone()]
+        );
+        delete_backup_from(&target, unused_real_fstab(), &location, &created.path)
+            .expect("deleting must succeed");
+        assert!(list_backups_for(&target, unused_real_fstab(), &location)
+            .expect("listing")
+            .is_empty());
+
+        assert!(
+            !poison.exists(),
+            "a non-real override must not have looked at the fallback location at all"
+        );
+    }
+
+    /// What the frontend is told, in both modes, for the default launch - the
+    /// contract `docs/UI_DESIGN.md` §7's notice is built from.
+    #[test]
+    fn target_info_reports_the_fallback_directory_only_when_one_is_in_use() {
+        let dir = TempDir::new("fallback-target-info");
+        let (draft, _real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let target = default_draft_target(draft);
+
+        assert_eq!(
+            describe_target(&target, colocated()).real_target_backup_fallback_dir,
+            None,
+            "a colocated launch must report no fallback"
+        );
+        assert_eq!(
+            describe_target(&target, &fallback_to(&fallback))
+                .real_target_backup_fallback_dir
+                .as_deref(),
+            Some(fallback.to_string_lossy().as_ref()),
+            "a fallback launch must report the directory its backups are in"
         );
     }
 
@@ -2769,17 +3534,25 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     #[test]
     fn target_info_dto_mirrors_the_resolved_target() {
-        let info = TargetInfoDto::from(&override_target(PathBuf::from("/tmp/rustab/fstab.draft")));
+        let info = describe_target(
+            &override_target(PathBuf::from("/tmp/rustab/fstab.draft")),
+            colocated(),
+        );
         assert_eq!(info.path, "/tmp/rustab/fstab.draft");
         assert!(!info.is_real);
         assert_eq!(info.source, TargetSourceDto::Environment);
+        assert_eq!(info.real_target_backup_fallback_dir, None);
 
-        let real = TargetInfoDto::from(&ActiveTarget {
-            path: PathBuf::from(target::REAL_FSTAB_PATH),
-            is_real: true,
-            source: TargetSource::Environment,
-        });
+        let real = describe_target(
+            &ActiveTarget {
+                path: PathBuf::from(target::REAL_FSTAB_PATH),
+                is_real: true,
+                source: TargetSource::Environment,
+            },
+            colocated(),
+        );
         assert!(real.is_real);
+        assert_eq!(real.real_target_backup_fallback_dir, None);
     }
 
     // -- T34 save dispatch ---------------------------------------------------
@@ -3093,6 +3866,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = restore_backup_with(
             &target,
             &real,
+            colocated(),
             &real_backup,
             false,
             recording_elevate(&calls),
@@ -3128,9 +3902,16 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         // The other half of T35's resolution change: a backup of the *draft*
         // is not one of this session's backups any more, and is refused
         // before anything is written.
-        let error = restore_backup_with(&target, &real, &draft_backup, false, |_, _, _| {
-            panic!("a path that is not one of the real file's backups must not be written");
-        })
+        let error = restore_backup_with(
+            &target,
+            &real,
+            colocated(),
+            &draft_backup,
+            false,
+            |_, _, _| {
+                panic!("a path that is not one of the real file's backups must not be written");
+            },
+        )
         .expect_err("the draft's backups are not this session's restore points");
         assert_eq!(error.kind, WriteErrorKindDto::InvalidBackup);
         assert!(error.target_unchanged);
@@ -3296,7 +4077,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&real, external).expect("let the real file drift");
         let target = default_draft_target(draft.clone());
 
-        let error = restore_backup_with(&target, &real, &backup, false, |_, _, _| {
+        let error = restore_backup_with(&target, &real, colocated(), &backup, false, |_, _, _| {
             panic!("a detected external change must not reach the elevated writer")
         })
         .expect_err("an external change must block the restore");
@@ -3317,8 +4098,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
         // And the user's second way forward works for a restore too.
         let calls = std::cell::RefCell::new(Vec::new());
-        restore_backup_with(&target, &real, &backup, true, recording_elevate(&calls))
-            .expect("an explicit write-anyway must let the restore through");
+        restore_backup_with(
+            &target,
+            &real,
+            colocated(),
+            &backup,
+            true,
+            recording_elevate(&calls),
+        )
+        .expect("an explicit write-anyway must let the restore through");
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].2.allow_external_change);

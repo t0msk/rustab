@@ -186,6 +186,13 @@ Which file this session reads and writes. Call it on startup and after any
 save; everything else in the UI that mentions the target should come from
 here rather than being remembered.
 
+Since T39 it also answers a second question - *where this session's backups of
+the real `/etc/fstab` are being kept* - in
+`real_target_backup_fallback_dir` (§6). That field is `null` on an ordinary
+desktop install and names a directory only when this process cannot manage
+files in `/etc/` at all, which in practice means the Flatpak build; the UI
+shows a visible notice in that case (§3.6, `docs/UI_DESIGN.md` §7).
+
 Resolving can create the sandbox file, which is why it can fail. Error kinds:
 `target_resolution`.
 
@@ -405,6 +412,36 @@ Error kinds: `target_resolution`, `list_backups`.
 > `writes_real_file` confirmation checkbox a save has (`docs/UI_DESIGN.md` §2).
 > Listing and reading stayed unprivileged - `/etc/` is world-readable.
 
+> **T39: when `/etc/` cannot be managed at all, the real file's manual backups
+> move.** Flathub's linter rejects `--filesystem=/etc:rw`, so the Flatpak build
+> is granted only `--filesystem=/etc/fstab:rw` - the file, not its directory.
+> Writing is unaffected (every write already goes through the `pkexec` re-exec,
+> which runs unsandboxed as root and still leaves each save's **automatic**
+> backup beside `/etc/fstab`), but a process in that sandbox cannot usefully
+> enumerate or create files in `/etc/`: the directory it sees there is the
+> runtime's, not the host's.
+>
+> In that situation - and *only* in that situation, reported by
+> `real_target_backup_fallback_dir` (§6) - the three manual-management
+> operations move together into a per-user fallback directory
+> (`$XDG_DATA_HOME/rustab/etc-fstab-backups/`): this command lists that
+> directory, `create_backup` (§3.11) copies the real file's current content
+> into it, `delete_backup` (§3.10) unlinks from it, and neither of the latter
+> two escalates, because that directory belongs to the user. `restore_backup`
+> (§3.7) resolves its `backup_path` against that same list but is otherwise
+> untouched: it still writes `/etc/fstab`, so it still elevates.
+>
+> The deliberate, accepted trade-off - the frontend must say it, not imply it:
+> in that mode this command does **not** report the automatic backups sitting
+> beside `/etc/fstab`. They are still being created, and still recoverable from
+> a rescue environment; a sandboxed process simply cannot list them. Rows in
+> that mode therefore all describe the fallback directory, and their
+> `target_path` is the mirror file inside it (`<fallback dir>/fstab`, a
+> byte-for-byte copy of `/etc/fstab` as of the moment the backup was taken)
+> rather than `/etc/fstab` itself - the file name, timestamp and `is_manual`
+> flag follow the usual scheme, so such a file can be copied back into `/etc/`
+> by hand and is still recognized as a backup of the real file.
+
 ### 3.7 `restore_backup`
 
 ```
@@ -531,6 +568,14 @@ paths fail closed with `invalid_backup` and nothing is removed.
   in-process with no prompt. The frontend's delete confirmation is gated on
   that same predicate, so a default launch's delete now carries the explicit
   acknowledgement checkbox too (`docs/UI_DESIGN.md` §2).
+- **T39's one exception to that:** when `real_target_backup_fallback_dir` (§6)
+  is set, the real file's backups are not in `/etc/` but in a directory inside
+  the user's own data directory, so the unlink happens in-process with **no**
+  prompt - there is no root-owned file involved to need one. The backup being
+  deleted is one of that directory's own; anything else, including a backup
+  sitting beside the real `/etc/fstab`, is not in §3.6's list for that session
+  and fails closed with `invalid_backup` exactly as any other foreign path
+  does.
 - Resolution happens *before* the dispatch in both branches, so a
   `backup_path` that cannot work is refused without costing the user a
   password prompt. That is a courtesy only: the elevated process re-resolves
@@ -582,6 +627,16 @@ copy of the draft could not be.
   the same single `pkexec` re-exec - see §4, and the same `is_real || source
   == sandbox_default` predicate as §3.10. Only an explicit override naming
   some other, user-owned file is copied in-process with no prompt.
+- **T39: and, now, a real file whose backups are not in `/etc/`.** When
+  `real_target_backup_fallback_dir` (§6) is set, this command reads the real
+  `/etc/fstab`'s current bytes, stages them in that directory's mirror file and
+  copies *that* to a new manual backup there - all in-process, with no prompt,
+  because the directory is the user's own. The resulting backup is therefore
+  still a snapshot of `/etc/fstab` as it is at the moment the button is
+  pressed, which is the only thing that would make the button honest. If the
+  real file cannot be read at all, the rejection is the usual
+  `target_missing` (it does not exist) or `backup` (any other I/O failure),
+  and nothing is created.
 - **A target that does not exist yet is an error, not a no-op.** The kind is
   `target_missing`, and the UI should say what the message says: there is no
   file to back up yet, save once first. An explicit "back this up now" must
@@ -612,7 +667,9 @@ Which directory that is follows §3.6, not the resolved target: since T35 a
 **default launch opens `/etc/`**, where the backups `list_backups` just
 listed actually are, rather than the working draft's own directory, which
 holds none of them. An explicit `RUSTAB_TARGET_PATH` opens that path's own
-directory, unchanged.
+directory, unchanged. By the same rule, since T39 a session whose
+`real_target_backup_fallback_dir` (§6) is set opens *that* directory - it is
+still "where the rows on screen are".
 
 **No privilege escalation, for either case.** `/etc/` is world-readable and
 world-executable, the same reasoning §3.9 already gives for reading a
@@ -1136,7 +1193,8 @@ trip byte-faithful.
 ```json
 { "path": "/home/u/.local/share/rustab/fstab.draft",
   "is_real": false,
-  "source": "sandbox_default" }
+  "source": "sandbox_default",
+  "real_target_backup_fallback_dir": null }
 ```
 
 `source` is `"environment"` or `"sandbox_default"` (see §2). Read **both**
@@ -1145,6 +1203,45 @@ since T35, whose backups this session acts on (§3.6), while `is_real` says
 only whether `path` itself is the real file. A `"sandbox_default"` target
 with `is_real: false` - the shape above, the default launch - is still one
 whose saves write `/etc/fstab` and whose backups are `/etc/fstab`'s.
+
+`real_target_backup_fallback_dir` (T39) is the directory this session's
+backups of the **real `/etc/fstab`** are being kept in *instead of* beside the
+file itself - or `null` when they are beside it after all, which is what every
+ordinary desktop install reports. It is a string only when **both** of these
+hold:
+
+1. this session's backups are the real `/etc/fstab`'s - i.e.
+   `source == "sandbox_default"` (the default launch, whose saves write that
+   file) or `is_real == true` (an explicit `RUSTAB_TARGET_PATH=/etc/fstab`);
+   **and**
+2. this process cannot manage files in `/etc/` - in practice it is running
+   inside the Flatpak sandbox, which is granted only
+   `--filesystem=/etc/fstab:rw` (Flathub's linter rejects `/etc:rw` as a
+   reserved path) and therefore sees a different `/etc` than the host's.
+
+So it is `null` for **every** `"environment"` target that is not `/etc/fstab`
+itself: such a target's backups are its own, in its own directory, and nothing
+about `/etc/` applies to them. It is also `null` for the real file whenever
+`/etc/` *is* usable, which is the case this whole mechanism is designed to
+leave completely unchanged.
+
+When it is a string, that directory is exactly where `list_backups` (§3.6),
+`create_backup` (§3.11) and `delete_backup` (§3.10) act, and what
+`open_backup_location` (§3.12) opens - and two things are true that the UI has
+to state plainly rather than imply (`docs/UI_DESIGN.md` §7):
+
+- backups the user creates explicitly land in that directory, not in `/etc/`,
+  and need no password prompt at all;
+- the automatic backups each save takes are **still written beside the real
+  `/etc/fstab`** by the elevated writer, and are **not listed**, because this
+  process cannot enumerate that directory. They are not lost - they are still
+  recoverable from a rescue environment, which is the whole reason they are put
+  there - the in-app list simply cannot prove they exist.
+
+Treat it as display text. No command accepts a directory, and the three
+commands that do take a path (§3.7, §3.9, §3.10) match what they are given
+against the real backup list regardless, so nothing here is a path to be sent
+back.
 
 ---
 
@@ -1479,7 +1576,7 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 ```
 
 ```json
-{"target":{"path":"/p","is_real":false,"source":"sandbox_default"},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}
+{"target":{"path":"/p","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}
 {"findings":[{"severity":"warning","message":"m","field":null,"line_index":null}],"has_errors":false}
 {"findings":[{"severity":"warning","message":"m","field":"mount_point","line_index":2}],"has_errors":false}
 {"target":"/p","backup":"/p.bak","pruned_backups":[],"validation_warnings":[],"notes":["n"],"elevated":true,"draft_sync_warning":null}
@@ -1492,6 +1589,17 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 {"kind":"target_missing","message":"m"}
 {"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}
 ```
+
+`TargetInfoDto` (§6) is pinned on its own as well, in both of its T39 states,
+by `dto::tests::target_info_carries_the_real_target_backup_fallback_dir_verbatim`:
+
+```json
+{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null}
+{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":"/home/u/.local/share/rustab/etc-fstab-backups"}
+```
+
+Note that the field is always present: `null` is sent, never omitted, so a
+frontend may read it unconditionally.
 
 Line by line after the `DocumentViewDto`: the next two are both
 `ValidationReportDto`, showing an untagged (`field`/`line_index` both `null`)
