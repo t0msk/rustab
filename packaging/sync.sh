@@ -27,6 +27,11 @@ Destination root:
   Per-target override:      RUSTAB_PACKAGING_<TARGET>_DIR
                              e.g. RUSTAB_PACKAGING_FLATPAK_DIR=/some/path
 
+Every run also (re)creates packaging/clones in this repo as a symlink to
+RUSTAB_PACKAGING_ROOT, so you can e.g. 'cd packaging/clones/flatpak'
+without remembering the real path. It's gitignored - purely a local,
+per-machine convenience, never tracked or pushed.
+
 --force overwrites a destination file that differs from this repo's
 version and is not already a symlink to it (link mode only; materialize
 always overwrites, that's its job).
@@ -82,6 +87,30 @@ TARGET_FILES[flatpak]="dev.tomsk.Rustab.yml cargo-sources.json frontend-cargo-so
 if [ "${#TARGETS[@]}" -eq 0 ]; then
   TARGETS=("${!TARGET_FILES[@]}")
 fi
+
+ensure_clones_convenience_link() {
+  local link="$REPO_ROOT/packaging/clones"
+
+  if [ -L "$link" ]; then
+    local current
+    current="$(readlink -f -- "$link" 2>/dev/null || true)"
+    if [ "$current" = "$(readlink -f -- "$PACKAGING_ROOT" 2>/dev/null || printf '%s' "$PACKAGING_ROOT")" ]; then
+      return 0
+    fi
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    ln -sfn "$PACKAGING_ROOT" "$link"
+    return 0
+  fi
+
+  if [ -e "$link" ]; then
+    echo "warn: $link exists and is not a symlink - leaving it alone (packaging/clones is meant to be gitignored and machine-local)" >&2
+    return 0
+  fi
+
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  mkdir -p "$PACKAGING_ROOT"
+  ln -s "$PACKAGING_ROOT" "$link"
+}
 
 dest_dir_for() {
   local name="$1"
@@ -199,6 +228,8 @@ run_target() {
   done
   return "$status"
 }
+
+ensure_clones_convenience_link
 
 status=0
 for t in "${TARGETS[@]}"; do

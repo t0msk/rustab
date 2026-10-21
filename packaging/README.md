@@ -85,3 +85,13 @@ RUSTAB_PACKAGING_FLATPAK_DIR=/wherever/it/actually/is packaging/sync.sh link fla
 Add more targets to `sync.sh`'s `TARGET_FILES`/`TARGET_SRC_DIR` maps once
 a channel (Debian, AUR) actually has a canonical source file in this repo
 worth linking out.
+
+## `packaging/clones`
+
+Every run of `sync.sh` also (re)creates `packaging/clones` in this repo as
+a symlink to `$RUSTAB_PACKAGING_ROOT`, so you can `cd packaging/clones/flatpak`
+instead of remembering (or hardcoding anywhere) where the real clones live
+on this particular machine. It's listed in `.gitignore` - purely a local,
+per-machine convenience, the same reasoning as the file-level symlinks
+above: never committed, never pushed, nothing for another machine or CI to
+resolve.
