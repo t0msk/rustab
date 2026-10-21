@@ -10,6 +10,19 @@
 //! banner's exact wording is built by [`fallback_notice_text`], a plain
 //! function kept separate from the `html!` so its content can be unit
 //! tested without a DOM.
+//!
+//! T40 note: the banner's second fact - that each save's automatic backup is
+//! still written beside the real `/etc/fstab` - was in doubt for exactly as
+//! long as it took to find out *why* a sandboxed save could not reach that
+//! file (the elevated helper was being started with a bare `pkexec`, which
+//! changes a process's UID but not its mount namespace, so it stayed inside
+//! the sandbox). The backend now starts it with `flatpak-spawn --host pkexec`,
+//! which makes it a real host root process, so the statement is true and
+//! verified rather than assumed. The wording is unchanged apart from saying
+//! "can't list the contents of /etc/" instead of "can't manage files in
+//! /etc/", which is the accurate description of what a sandboxed session
+//! cannot do: it *can* have `/etc/fstab` written for it, it just cannot
+//! enumerate the directory.
 
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
@@ -26,8 +39,8 @@ pub fn fallback_notice_text(fallback_dir: Option<&str>) -> Option<String> {
     fallback_dir.map(|dir| {
         format!(
             "Backups you create here are being kept in {dir}, not beside the real \
-             /etc/fstab, because this sandboxed install can't manage files in /etc/ \
-             directly - they need no password. Automatic backups taken during ordinary \
+             /etc/fstab, because this sandboxed install can't list the contents of \
+             /etc/. Automatic backups taken during ordinary \
              saves are still written beside the real /etc/fstab and are not shown in this \
              list, but they are not lost: they're recoverable from a rescue environment \
              (e.g. booting a live/rescue disk), just not visible or manageable from inside \
@@ -96,7 +109,6 @@ pub fn backup_panel(props: &BackupPanelProps) -> Html {
                     class="flex items-start gap-2 rounded-md border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 text-amber-900 dark:text-amber-200 px-4 py-3 text-sm"
                     role="status"
                 >
-                    <span class="mt-0.5 shrink-0" aria-hidden="true">{ "ℹ" }</span>
                     <p>{ notice }</p>
                 </div>
             }
@@ -219,10 +231,9 @@ mod tests {
         let notice = fallback_notice_text(Some(dir)).expect("Some(dir) must produce a notice");
 
         // (a) backups created from this panel land in the given directory,
-        // not beside /etc/fstab, and need no password.
+        // not beside /etc/fstab.
         assert!(notice.contains(dir));
         assert!(notice.contains("/etc/fstab"));
-        assert!(notice.to_lowercase().contains("no password"));
 
         // (b) automatic backups from ordinary saves are still beside the
         // real file, not shown here, not lost, recoverable from a rescue

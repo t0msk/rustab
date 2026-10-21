@@ -88,6 +88,26 @@
 //! the user can cancel, or ask for the write anyway, which threads
 //! `allow_external_change` through and skips the check for that one request.
 //!
+//! ## How the real `/etc/fstab` is read at all (T40)
+//!
+//! Every read of the real file in this module goes through an injected
+//! [`crate::host::RealFileReader`] rather than `fs::read` directly, because
+//! this process may be inside a Flatpak sandbox, where the `/etc` it can see
+//! is the runtime's and the real file is not reachable by any path at all.
+//! Production fills that seam in with [`crate::host::real_file_reader`], which
+//! is a plain `fs::read` on an ordinary install and a
+//! `flatpak-spawn --host` read of the host's own file inside a sandbox; the
+//! tests pass [`crate::host::DirectFs`] (or a double) pointed at a temp file,
+//! exactly as they already pass the real file's path rather than letting this
+//! module read the constant. See [`crate::host`] for the mechanism and for why
+//! the "file does not exist" case has to stay distinguishable from every other
+//! read failure.
+//!
+//! The *draft* and its marker are never read that way: they live in the
+//! user's own data directory, which a sandboxed process owns and sees
+//! normally. The seam is only for the one file that may be on the other side
+//! of a sandbox boundary.
+//!
 //! Rule 2 deliberately applies to **release builds too**, and the real file
 //! is still only ever *read* here, never written: the elevated writer
 //! (`crate::privileged`) is the one and only thing that writes `/etc/fstab`.
@@ -112,6 +132,7 @@
 //! [`TargetSource::Environment`] branch of a save needs in order to know
 //! whether writing *that path* requires elevation.
 
+use crate::host::{self, RealFileReader};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -356,25 +377,29 @@ pub fn active_target() -> Result<ActiveTarget, TargetError> {
         env::var_os(TARGET_PATH_ENV).as_deref(),
         &default_sandbox_dir(),
         Path::new(REAL_FSTAB_PATH),
+        host::real_file_reader(),
         &SANDBOX_REFRESH_STATE,
     )
 }
 
 /// The env-independent core of [`active_target`], parameterized on the raw
 /// env value, the directory the sandbox would live in, the file the sandbox
-/// is refreshed from, and the once-per-process refresh barrier.
+/// is refreshed from, *how* that file is read (T40), and the once-per-process
+/// refresh barrier.
 ///
 /// Split out so tests can exercise every branch of the policy without
 /// mutating process-global environment state (which races with other tests
 /// in the same process) - and, for the same reason, without reading or
 /// writing the machine's real `/etc/fstab` or a shared refresh barrier.
-/// Production passes `Path::new(REAL_FSTAB_PATH)` and the single static
-/// barrier in [`active_target`]; tests pass a temp file and a barrier of
-/// their own.
+/// Production passes `Path::new(REAL_FSTAB_PATH)`,
+/// [`crate::host::real_file_reader`] and the single static barrier in
+/// [`active_target`]; tests pass a temp file, [`crate::host::DirectFs`] (or a
+/// counting double) and a barrier of their own.
 fn resolve(
     env_value: Option<&OsStr>,
     sandbox_dir: &Path,
     real_fstab_path: &Path,
+    real_reader: &dyn RealFileReader,
     refresh_state: &SandboxRefreshState,
 ) -> Result<ActiveTarget, TargetError> {
     match env_value.filter(|value| !is_blank(value)) {
@@ -388,7 +413,7 @@ fn resolve(
         }
         None => {
             let path = sandbox_dir.join(SANDBOX_FILE_NAME);
-            ensure_sandbox_file(&path, real_fstab_path, refresh_state)?;
+            ensure_sandbox_file(&path, real_fstab_path, real_reader, refresh_state)?;
             // Belt and braces: the sandbox path is constructed from a data
             // dir and a fixed file name and so cannot be `/etc/fstab`, but
             // the flag is computed the same way for both branches rather
@@ -478,6 +503,7 @@ pub(crate) fn is_same_file(path: &Path, other: &Path) -> bool {
 fn ensure_sandbox_file(
     path: &Path,
     real_fstab_path: &Path,
+    real_reader: &dyn RealFileReader,
     refresh_state: &SandboxRefreshState,
 ) -> Result<(), TargetError> {
     if let Some(parent) = path.parent() {
@@ -489,7 +515,7 @@ fn ensure_sandbox_file(
     refresh_state
         .ensure_once(|| {
             migrate_legacy_sandbox_file_name(path);
-            if refresh_sandbox_if_real_changed(path, real_fstab_path) {
+            if refresh_sandbox_if_real_changed(path, real_fstab_path, real_reader) {
                 Ok(())
             } else {
                 seed_sandbox_file_if_missing(path).map_err(SandboxSetupFailure::from)
@@ -622,8 +648,23 @@ fn migrate_legacy_backups(legacy_path: &Path, new_path: &Path) {
 /// draft, forever). A marker that is older than the draft - what a crash
 /// between the two leaves behind - only costs the next launch one redundant
 /// copy of bytes it already has, after which the marker is correct again.
-fn refresh_sandbox_if_real_changed(sandbox_path: &Path, real_fstab_path: &Path) -> bool {
-    let Ok(real_bytes) = fs::read(real_fstab_path) else {
+///
+/// ## Why the read goes through `real_reader` (T40)
+///
+/// This is the read that makes a sandboxed Rustab show the user their actual
+/// `/etc/fstab` instead of the blank seed: inside a Flatpak sandbox a plain
+/// `fs::read` of `/etc/fstab` fails with "no such file", because Flatpak
+/// reserves `/etc` and the real file is not mapped into the sandbox under any
+/// path. `real_reader` is what crosses that boundary (see [`crate::host`]).
+/// Every failure mode is still treated identically here - `false`, "fall back
+/// to seeding" - so a sandbox whose host access is broken behaves exactly like
+/// the pre-T40 build rather than failing a launch.
+fn refresh_sandbox_if_real_changed(
+    sandbox_path: &Path,
+    real_fstab_path: &Path,
+    real_reader: &dyn RealFileReader,
+) -> bool {
+    let Ok(real_bytes) = real_reader.read(real_fstab_path) else {
         return false;
     };
     if sandbox_is_in_sync(sandbox_path, &real_bytes) {
@@ -853,12 +894,42 @@ impl ExternalChangeGuard {
     /// a real file whose bytes are not UTF-8 necessarily differs from a
     /// recorded expectation that is, so the verdict never depends on that
     /// conversion.
+    ///
+    /// ## Why this form reads `real_fstab` directly, and who may use it
+    ///
+    /// This is the check as the **elevated helper** performs it
+    /// (`crate::privileged::handle_write`), and that process is always looking
+    /// at the real filesystem: it is started by `pkexec` on an ordinary
+    /// install, and - since T40 - by `flatpak-spawn --host pkexec` from inside
+    /// a Flatpak sandbox, which runs it *outside* the sandbox altogether. So a
+    /// plain `fs::read` is exactly right there, and is the one reading in
+    /// Rustab that is authoritative (see [`Self::detect_with`] for the
+    /// unprivileged side's courtesy check, which may have a sandbox boundary
+    /// in the way).
     pub fn detect(&self, real_fstab: &Path) -> Option<ExternalChange> {
+        self.detect_with(real_fstab, &host::DirectFs)
+    }
+
+    /// [`Self::detect`] with the read of `real_fstab` injected, for the
+    /// unprivileged GUI process - which, inside a Flatpak sandbox, cannot read
+    /// that file with `fs::read` at all (T40, [`crate::host`]).
+    ///
+    /// The distinction matters only for *where the bytes come from*; the
+    /// verdict is computed identically, by the same code, for both callers.
+    /// An unreadable real file still means "nothing can be established, report
+    /// no change", which is what makes a sandbox with broken host access
+    /// degrade to the pre-T40 behaviour (no courtesy check, the elevated
+    /// side's authoritative check unaffected) instead of blocking saves.
+    pub(crate) fn detect_with(
+        &self,
+        real_fstab: &Path,
+        real_reader: &dyn RealFileReader,
+    ) -> Option<ExternalChange> {
         if self.allow_external_change {
             return None;
         }
         let last_known = self.last_known_real_content.as_deref()?;
-        let current = fs::read(real_fstab).ok()?;
+        let current = real_reader.read(real_fstab).ok()?;
         if current == last_known.as_bytes() {
             return None;
         }
@@ -1017,6 +1088,7 @@ fn non_empty_env(name: &str) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{DirectFs, StubReader};
     use crate::testutil::TempDir;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
@@ -1048,6 +1120,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             Some(explicit.as_os_str()),
             &sandbox_dir,
             &no_real_fstab(&dir),
+            &DirectFs,
             &SandboxRefreshState::new(),
         )
         .expect("an explicit path must resolve");
@@ -1079,6 +1152,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             Some(explicit.as_os_str()),
             &sandbox_dir,
             &real_fstab,
+            &DirectFs,
             &refresh_state,
         )
         .expect("an explicit path must resolve");
@@ -1090,7 +1164,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         );
         // And the proof that "pending" means it is still available: a later
         // sandbox resolution sharing this state does get its refresh.
-        let target = resolve(None, &sandbox_dir, &real_fstab, &refresh_state)
+        let target = resolve(None, &sandbox_dir, &real_fstab, &DirectFs, &refresh_state)
             .expect("the sandbox must resolve");
         assert_eq!(
             fs::read(&target.path).expect("read"),
@@ -1111,6 +1185,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
                 Some(OsStr::new(blank)),
                 &sandbox_dir,
                 &real_fstab,
+                &DirectFs,
                 &refresh_state,
             )
             .expect("a blank override must fall back to the sandbox");
@@ -1128,6 +1203,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             None,
             &sandbox_dir,
             &no_real_fstab(&dir),
+            &DirectFs,
             &SandboxRefreshState::new(),
         )
         .expect("the sandbox must resolve");
@@ -1170,8 +1246,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let real_fstab = dir.join("real-fstab");
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
-        let target = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("the sandbox must resolve");
+        let target = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("the sandbox must resolve");
 
         assert_eq!(target.source, TargetSource::SandboxDefault);
         assert_eq!(
@@ -1200,14 +1282,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
         let refresh_state = SandboxRefreshState::new();
 
-        let target =
-            resolve(None, &sandbox_dir, &real_fstab, &refresh_state).expect("first resolution");
+        let target = resolve(None, &sandbox_dir, &real_fstab, &DirectFs, &refresh_state)
+            .expect("first resolution");
 
         // The user edits and saves in this session.
         fs::write(&target.path, "# edited by the user\n").expect("write");
 
         for _ in 0..3 {
-            let again = resolve(None, &sandbox_dir, &real_fstab, &refresh_state)
+            let again = resolve(None, &sandbox_dir, &real_fstab, &DirectFs, &refresh_state)
                 .expect("the sandbox must resolve again");
             assert_eq!(again.path, target.path);
             assert_eq!(
@@ -1229,15 +1311,27 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let real_fstab = dir.join("real-fstab");
         fs::write(&real_fstab, "# first launch\n").expect("write");
 
-        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("first process");
+        let first = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("first process");
         fs::write(&first.path, "# left over from the previous session\n").expect("write");
 
         // Something outside Rustab edited the real file between launches.
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
-        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("second process");
+        let second = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("second process");
 
         assert_eq!(second.path, first.path);
         assert_eq!(
@@ -1263,15 +1357,27 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let real_fstab = dir.join("real-fstab");
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
-        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("first process");
+        let first = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("first process");
         // The user edits in that session and does not save.
         let draft = "# an unsaved draft the user wants back after a restart\n";
         fs::write(&first.path, draft).expect("write");
 
         // A new launch. Nothing touched the real file in the meantime.
-        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("second process");
+        let second = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("second process");
 
         assert_eq!(second.path, first.path);
         assert_eq!(
@@ -1295,8 +1401,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
         assert!(!marker_of(&sandbox_file).exists());
 
-        let target = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("the sandbox must resolve");
+        let target = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("the sandbox must resolve");
 
         assert_eq!(
             fs::read(&target.path).expect("read"),
@@ -1320,16 +1432,28 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let real_fstab = dir.join("real-fstab");
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
-        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("first process");
+        let first = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("first process");
         fs::remove_file(&first.path).expect("remove the draft");
         assert!(
             marker_of(&first.path).exists(),
             "the marker must have survived"
         );
 
-        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("second process");
+        let second = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("second process");
 
         assert_eq!(
             fs::read(&second.path).expect("the draft must be back"),
@@ -1349,8 +1473,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let real_fstab = dir.join("real-fstab");
         fs::write(&real_fstab, "# before the save\n").expect("write");
 
-        let first = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("first process");
+        let first = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("first process");
 
         // A T34 save: the elevated writer puts these bytes into the real file
         // (here: the stand-in for it), and the save path then calls this.
@@ -1368,8 +1498,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         // The user then edits again without saving, and restarts.
         let unsaved = "# edited after the save, not saved yet\n";
         fs::write(&first.path, unsaved).expect("write");
-        let second = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("second process");
+        let second = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("second process");
 
         assert_eq!(
             fs::read_to_string(&second.path).expect("read"),
@@ -1394,7 +1530,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
         assert!(
-            refresh_sandbox_if_real_changed(&sandbox_file, &real_fstab),
+            refresh_sandbox_if_real_changed(&sandbox_file, &real_fstab, &DirectFs),
             "an unwritable marker must not make the sync report failure"
         );
         assert_eq!(
@@ -1441,6 +1577,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             None,
             &sandbox_dir,
             &no_real_fstab(&dir),
+            &DirectFs,
             &SandboxRefreshState::new(),
         )
         .expect("the sandbox must resolve even with no real fstab");
@@ -1473,6 +1610,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             None,
             &sandbox_dir,
             &no_real_fstab(&dir),
+            &DirectFs,
             &SandboxRefreshState::new(),
         )
         .expect("the sandbox must resolve even with no real fstab");
@@ -1483,6 +1621,112 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             "# from an earlier session\n",
             "an existing sandbox must not be replaced with the blank seed"
         );
+    }
+
+    // --- T40: the real file is read through the injected reader -------------
+
+    /// The T40 property, stated as a test: the refresh takes its bytes from
+    /// the injected [`RealFileReader`] and from nowhere else. The real-file
+    /// path given here does **not exist on disk at all**, so a draft holding
+    /// the stub's bytes can only have come through the seam - which is exactly
+    /// the situation a Flatpak sandbox is in, where `/etc/fstab` is reachable
+    /// only via `flatpak-spawn --host`.
+    #[test]
+    fn a_refresh_takes_the_real_files_bytes_from_the_injected_reader() {
+        let dir = TempDir::new("target-reader-refresh");
+        let sandbox_dir = dir.join("data/rustab");
+        // Deliberately never created: a plain `fs::read` of this path fails.
+        let unreachable_real = dir.join("not-on-this-disk/fstab");
+        let reader = StubReader::serving(REAL_FSTAB_SAMPLE.as_bytes());
+
+        let target = resolve(
+            None,
+            &sandbox_dir,
+            &unreachable_real,
+            &reader,
+            &SandboxRefreshState::new(),
+        )
+        .expect("the sandbox must resolve");
+
+        assert_eq!(
+            fs::read_to_string(&target.path).expect("read the draft"),
+            REAL_FSTAB_SAMPLE,
+            "the draft must hold what the reader served, byte for byte"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_of(&target.path)).expect("read the marker"),
+            REAL_FSTAB_SAMPLE,
+            "the marker must record what the reader served"
+        );
+        assert_eq!(
+            reader.asked(),
+            vec![unreachable_real],
+            "the reader must have been asked for the real file, once"
+        );
+    }
+
+    /// A reader that cannot reach the real file at all - a sandbox whose host
+    /// access is missing or denied - degrades exactly like an unreadable real
+    /// file always has: the draft is seeded, nothing fails.
+    #[test]
+    fn a_reader_that_cannot_reach_the_host_falls_back_to_the_seed() {
+        let dir = TempDir::new("target-reader-unreachable");
+        let sandbox_dir = dir.join("data/rustab");
+        let reader = StubReader::failing(
+            io::ErrorKind::Other,
+            "Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown",
+        );
+
+        let target = resolve(
+            None,
+            &sandbox_dir,
+            Path::new("/etc/fstab"),
+            &reader,
+            &SandboxRefreshState::new(),
+        )
+        .expect("a sandbox with no host access must still resolve");
+
+        assert!(target.path.exists(), "the draft must have been seeded");
+        assert!(
+            fs::read_to_string(&target.path)
+                .expect("read")
+                .contains("NOT your /etc/fstab"),
+            "an unreachable real file must leave the blank seed, not an empty draft"
+        );
+        // The hardcoded real path is used here purely as the name handed to
+        // the stub; it is never read, listed or written by this test.
+        assert_eq!(reader.asked(), vec![PathBuf::from("/etc/fstab")]);
+    }
+
+    /// The external-change check's unprivileged form reads through the seam
+    /// too - again proven by a real-file path that does not exist locally.
+    #[test]
+    fn the_unprivileged_external_change_check_reads_through_the_seam() {
+        let dir = TempDir::new("target-reader-guard");
+        let draft = dir.join("fstab.draft");
+        fs::write(&draft, "# unsaved edits\n").expect("seed the draft");
+        fs::write(marker_of(&draft), "# what rustab knew\n").expect("seed the marker");
+        let unreachable_real = dir.join("not-on-this-disk/fstab");
+        let guard = ExternalChangeGuard::from_marker(&draft, false);
+
+        let changed = StubReader::serving(b"# somebody else wrote this\n");
+        let detected = guard
+            .detect_with(&unreachable_real, &changed)
+            .expect("the reader's content differs from the marker");
+        assert_eq!(detected.last_known, "# what rustab knew\n");
+        assert_eq!(detected.current, "# somebody else wrote this\n");
+
+        let unchanged = StubReader::serving(b"# what rustab knew\n");
+        assert_eq!(
+            guard.detect_with(&unreachable_real, &unchanged),
+            None,
+            "bytes equal to the marker's are no external change"
+        );
+
+        // And the reader-less form - the one the elevated host-side helper
+        // uses - still reads the filesystem directly, which for this
+        // nonexistent path means "nothing can be established".
+        assert_eq!(guard.detect(&unreachable_real), None);
     }
 
     /// Lists the entry names of a directory, sorted, so a test can assert
@@ -1525,8 +1769,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         let real_fstab = dir.join("real-fstab");
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
-        let target = resolve(None, &sandbox_dir, &real_fstab, &SandboxRefreshState::new())
-            .expect("the sandbox must resolve");
+        let target = resolve(
+            None,
+            &sandbox_dir,
+            &real_fstab,
+            &DirectFs,
+            &SandboxRefreshState::new(),
+        )
+        .expect("the sandbox must resolve");
 
         assert_eq!(entry_names(&sandbox_dir), synced_dir_entries());
         assert_eq!(
@@ -1555,7 +1805,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
         fs::write(&real_fstab, REAL_FSTAB_SAMPLE).expect("write");
 
         assert!(
-            !refresh_sandbox_if_real_changed(&sandbox_path, &real_fstab),
+            !refresh_sandbox_if_real_changed(&sandbox_path, &real_fstab, &DirectFs),
             "a refresh that cannot be swapped into place must report failure"
         );
 
@@ -1757,8 +2007,9 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2
             for _ in 0..THREADS {
                 scope.spawn(|| {
                     all_ready.wait();
-                    let target = resolve(None, &sandbox_dir, &real_fstab, &refresh_state)
-                        .expect("every concurrent resolution must succeed");
+                    let target =
+                        resolve(None, &sandbox_dir, &real_fstab, &DirectFs, &refresh_state)
+                            .expect("every concurrent resolution must succeed");
                     // Exactly what `commands::list_entries` does: its own
                     // read of the path, after resolution returned.
                     let content = fs::read(&target.path).expect("the sandbox must be readable");

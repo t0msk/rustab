@@ -412,35 +412,78 @@ Error kinds: `target_resolution`, `list_backups`.
 > `writes_real_file` confirmation checkbox a save has (`docs/UI_DESIGN.md` §2).
 > Listing and reading stayed unprivileged - `/etc/` is world-readable.
 
-> **T39: when `/etc/` cannot be managed at all, the real file's manual backups
-> move.** Flathub's linter rejects `--filesystem=/etc:rw`, so the Flatpak build
-> is granted only `--filesystem=/etc/fstab:rw` - the file, not its directory.
-> Writing is unaffected (every write already goes through the `pkexec` re-exec,
-> which runs unsandboxed as root and still leaves each save's **automatic**
-> backup beside `/etc/fstab`), but a process in that sandbox cannot usefully
-> enumerate or create files in `/etc/`: the directory it sees there is the
-> runtime's, not the host's.
+> **T39/T40: when `/etc/` cannot be *enumerated*, the real file's manual
+> backups move.** Flatpak reserves the whole `/etc` path space: the `/etc` a
+> sandboxed process sees is the runtime's own, and **no `--filesystem=` grant
+> under `/etc` is honoured at all** - neither `/etc:rw` (which Flathub's linter
+> rejects anyway) nor the single-file `/etc/fstab:rw`, which the sandbox
+> refuses outright (`Path "/etc" is reserved by Flatpak`). So a sandboxed
+> Rustab cannot list `/etc/`, and cannot create a file beside the real
+> `/etc/fstab` in-process.
 >
-> In that situation - and *only* in that situation, reported by
-> `real_target_backup_fallback_dir` (§6) - the three manual-management
+> **The T39-era open question is resolved (T40), and the answer is "yes,
+> writing works - but not for the reason T39 gave".** T39 assumed the `pkexec`
+> re-exec "runs unsandboxed as root". It does not: `pkexec` changes a
+> process's UID, not its mount namespace, so a `pkexec` child of a sandboxed
+> process is root *inside the same sandbox* and cannot touch the host's
+> `/etc/fstab` either. T40 replaced that mechanism with the one that does
+> work, confirmed end-to-end against a real build: the unprivileged side reads
+> the real file with `flatpak-spawn --host`, and the elevated helper is started
+> with `flatpak-spawn --host pkexec <host path of the binary>`, which runs it
+> as a genuine **host** root process outside every sandbox (needs only
+> `--talk-name=org.freedesktop.Flatpak`, no `--filesystem=` at all). So under
+> the Flatpak build a save really does write the real `/etc/fstab`, and
+> `write_document`'s **automatic** backup and atomic-rename temp file really
+> are created in the host's `/etc/` - the colocation property those backups
+> exist for is intact.
+>
+> What stays exactly as T39 built it, and why: the three **manual-management**
 > operations move together into a per-user fallback directory
-> (`$XDG_DATA_HOME/rustab/etc-fstab-backups/`): this command lists that
-> directory, `create_backup` (§3.11) copies the real file's current content
-> into it, `delete_backup` (§3.10) unlinks from it, and neither of the latter
-> two escalates, because that directory belongs to the user. `restore_backup`
+> (`$XDG_DATA_HOME/rustab/etc-fstab-backups/`, which under Flatpak is
+> `~/.var/app/dev.tomsk.Rustab/data/rustab/etc-fstab-backups/`), reported by
+> `real_target_backup_fallback_dir` (§6). This command lists that directory,
+> `create_backup` (§3.11) copies the real file's current content into it,
+> `delete_backup` (§3.10) unlinks from it, and neither of the latter two
+> escalates, because that directory belongs to the user. `restore_backup`
 > (§3.7) resolves its `backup_path` against that same list but is otherwise
 > untouched: it still writes `/etc/fstab`, so it still elevates.
 >
-> The deliberate, accepted trade-off - the frontend must say it, not imply it:
-> in that mode this command does **not** report the automatic backups sitting
-> beside `/etc/fstab`. They are still being created, and still recoverable from
-> a rescue environment; a sandboxed process simply cannot list them. Rows in
-> that mode therefore all describe the fallback directory, and their
-> `target_path` is the mirror file inside it (`<fallback dir>/fstab`, a
-> byte-for-byte copy of `/etc/fstab` as of the moment the backup was taken)
-> rather than `/etc/fstab` itself - the file name, timestamp and `is_manual`
-> flag follow the usual scheme, so such a file can be copied back into `/etc/`
-> by hand and is still recognized as a backup of the real file.
+> The reason they stay there even though creating and deleting *could* now
+> happen in the host's `/etc/` (both already go through the elevated helper) is
+> **this command**: `list_backups` is deliberately unprivileged - `/etc/` is
+> world-readable, and prompting for a password to read a directory would be
+> absurd - so it runs in the sandboxed GUI process and enumerates the
+> directory *there*, where `/etc` is the runtime's. Moving creation and
+> deletion without it would mean a backup the user just created never appearing
+> in the list it was created from, which is worse than a consistent fallback.
+> The alternative - a second, never-elevated internal re-exec flag that
+> host-spawns this binary just to list, read and resolve backups in the host's
+> `/etc/` - was considered and rejected; `src-tauri/src/backup_location.rs`'s
+> module docs carry the full reasoning (it is not one flag but a second
+> request/response protocol covering `list_backups`, `read_backup` and the
+> `backup_path` resolution all three path-taking commands depend on, and it
+> would put the most fragile mechanism in the app - executing the
+> runtime-linked binary on the host - on a routine read path).
+>
+> **The accepted consequence, which the frontend states plainly rather than
+> implying** (`docs/UI_DESIGN.md` §7): in fallback mode this command does
+> **not** report the automatic backups each save leaves beside `/etc/fstab`.
+> Since T40 those are confirmed to be getting written; a sandboxed process
+> simply cannot enumerate them. They remain recoverable from a rescue
+> environment, which is the property they exist for - the in-app list just
+> cannot prove they are there. Rows in fallback mode therefore all describe the
+> fallback directory, and their `target_path` is the mirror file inside it
+> (`<fallback dir>/fstab`, a byte-for-byte copy of `/etc/fstab` as of the
+> moment the backup was taken) rather than `/etc/fstab` itself - the file name,
+> timestamp and `is_manual` flag follow the usual scheme, so such a file can be
+> copied back into `/etc/` by hand and is still recognized as a backup of the
+> real file.
+>
+> Fallback mode is also what a sandbox with **no** host access falls back to
+> (no `flatpak-spawn` in the runtime, the `org.freedesktop.Flatpak` talk-name
+> missing or revoked): such a session cannot read or save the real `/etc/fstab`
+> at all, but it can still take, list and restore manual backups in a directory
+> it owns.
 
 ### 3.7 `restore_backup`
 
@@ -862,11 +905,36 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    pre-check, since its request carries no path but the target. None of these
    write anything and none is **the safety net** (see §4.6) - each has a
    counterpart inside the elevated process, which is the one that decides.
-2. It re-executes **its own binary** (`std::env::current_exe()`) as
+2. It re-executes **its own binary** as
    `pkexec <rustab> --internal-privileged-write`, with stdin, stdout and
    stderr piped. (The flag's name is historical - it predates the two backup
    operations and now carries any of them. It is deliberately unchanged: the
    point is that there is exactly one such string.)
+
+   Which `<rustab>` and *where* that `pkexec` runs depends on one thing, and
+   it is the only part of this mechanism that is environment-dependent (T40):
+
+   - **ordinary install**: `std::env::current_exe()`, `pkexec` run directly;
+   - **inside a Flatpak sandbox** (detected by `/.flatpak-info`):
+     `flatpak-spawn --host pkexec <host path of this binary>
+     --internal-privileged-write`. `pkexec` alone would not do: it changes a
+     process's UID, not its mount namespace, so a `pkexec` child of a
+     sandboxed process is root *inside the same sandbox*, where `/etc` is the
+     runtime's own and the host's `/etc/fstab` is unreachable by any path
+     (Flatpak reserves `/etc` and refuses even `--filesystem=/etc/fstab:rw`).
+     `flatpak-spawn --host` is what puts the process on the host; `pkexec`
+     behind it is what makes it root. The host path is resolved from the
+     `app-path` key Flatpak itself writes into the sandbox's `/.flatpak-info`,
+     falling back to the user and system Flatpak installation layouts, and the
+     operation fails with a `privilege_escalation` error naming those paths if
+     none of them exists - it never guesses. Needs
+     `--talk-name=org.freedesktop.Flatpak` in the manifest and nothing else.
+
+   Everything in steps 3-6 below is identical either way: `flatpak-spawn
+   --host` passes stdio through and exits with the child's status, and the
+   elevated process - being outside the sandbox - has no `/.flatpak-info` of
+   its own, so its own reads and writes are ordinary filesystem access to the
+   real `/etc/`.
 3. It writes one JSON request to the child's stdin and closes the pipe. The
    request is a union tagged by `op`:
    ```json
@@ -1214,16 +1282,24 @@ hold:
    `source == "sandbox_default"` (the default launch, whose saves write that
    file) or `is_real == true` (an explicit `RUSTAB_TARGET_PATH=/etc/fstab`);
    **and**
-2. this process cannot manage files in `/etc/` - in practice it is running
-   inside the Flatpak sandbox, which is granted only
-   `--filesystem=/etc/fstab:rw` (Flathub's linter rejects `/etc:rw` as a
-   reserved path) and therefore sees a different `/etc` than the host's.
+2. this process cannot **enumerate** the real file's own directory - in
+   practice it is running inside the Flatpak sandbox, where the `/etc` it sees
+   is the runtime's own and no `--filesystem=` grant under `/etc` is honoured
+   at all (Flatpak reserves that path space; Flathub's linter rejects
+   `/etc:rw` on top of that).
 
 So it is `null` for **every** `"environment"` target that is not `/etc/fstab`
 itself: such a target's backups are its own, in its own directory, and nothing
 about `/etc/` applies to them. It is also `null` for the real file whenever
-`/etc/` *is* usable, which is the case this whole mechanism is designed to
+`/etc/` *is* enumerable, which is the case this whole mechanism is designed to
 leave completely unchanged.
+
+Note what this field does **not** say anything about, since T40: whether this
+session can read or save the real `/etc/fstab`. A Flatpak session reports a
+fallback directory here *and* reads and writes the real file normally, through
+`flatpak-spawn --host` (§3.6, §4). The field answers one narrow question -
+"where are this session's manual backups of `/etc/fstab`?" - and nothing
+broader.
 
 When it is a string, that directory is exactly where `list_backups` (§3.6),
 `create_backup` (§3.11) and `delete_backup` (§3.10) act, and what
@@ -1233,10 +1309,12 @@ to state plainly rather than imply (`docs/UI_DESIGN.md` §7):
 - backups the user creates explicitly land in that directory, not in `/etc/`,
   and need no password prompt at all;
 - the automatic backups each save takes are **still written beside the real
-  `/etc/fstab`** by the elevated writer, and are **not listed**, because this
-  process cannot enumerate that directory. They are not lost - they are still
-  recoverable from a rescue environment, which is the whole reason they are put
-  there - the in-app list simply cannot prove they exist.
+  `/etc/fstab`** by the elevated writer - which since T40 is a verified fact
+  rather than an assumption, because that writer now runs as a real host root
+  process (§3.6) - and are **not listed**, because this process cannot
+  enumerate that directory. They are not lost: they remain recoverable from a
+  rescue environment, which is the whole reason they are put there - the
+  in-app list simply cannot prove they exist.
 
 Treat it as display text. No command accepts a directory, and the three
 commands that do take a path (§3.7, §3.9, §3.10) match what they are given

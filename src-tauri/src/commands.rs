@@ -47,22 +47,42 @@
 //! ## T39: *where* the real file's manual backups live
 //!
 //! The third decision, layered on top of the second: a process that cannot
-//! manage files in `/etc/` at all - a Flatpak sandbox granted only
-//! `--filesystem=/etc/fstab:rw`, since Flathub rejects `/etc:rw` - keeps the
-//! real `/etc/fstab`'s **manually managed** backups in a per-user fallback
-//! directory instead (see [`crate::backup_location`]). [`backup_target_path`]
-//! points every backup command at a mirror file inside that directory in that
-//! case, which redirects all of them with no change to the functions that do
-//! the work, and [`backups_are_elevated`] then answers `false`, because that
-//! directory belongs to the user and needs no `pkexec` at all.
+//! **enumerate** `/etc/` - a Flatpak sandbox, where the `/etc` it sees is the
+//! runtime's, because Flatpak reserves that path space and honours no
+//! `--filesystem=` grant under it - keeps the real `/etc/fstab`'s **manually
+//! managed** backups in a per-user fallback directory instead (see
+//! [`crate::backup_location`]). [`backup_target_path`] points every backup
+//! command at a mirror file inside that directory in that case, which
+//! redirects all of them with no change to the functions that do the work, and
+//! [`backups_are_elevated`] then answers `false`, because that directory
+//! belongs to the user and needs no `pkexec` at all.
 //!
 //! Nothing about *writing* changes: [`save_document_with`] and everything
-//! under it are untouched by T39, so a save still writes the real `/etc/fstab`
+//! under it are untouched, so a save still writes the real `/etc/fstab`
 //! through the elevated helper and still leaves its automatic backup beside it
 //! in `/etc/`. The accepted consequence - those automatic backups are not
 //! visible in a fallback-mode [`list_backups`] - is spelled out in
 //! [`crate::backup_location`]'s module docs and surfaced to the user through
 //! [`TargetInfoDto::real_target_backup_fallback_dir`].
+//!
+//! ## T40: *how* the real file is read, and how the elevated helper is started
+//!
+//! Orthogonal to all three decisions above, and the reason the Flatpak build
+//! works at all: inside a sandbox neither the real `/etc/fstab` nor a
+//! `pkexec`'d child of this process can be reached by the obvious means. Every
+//! read of the real file in this module therefore goes through an injected
+//! [`crate::host::RealFileReader`] - production passes
+//! [`crate::host::real_file_reader`], which crosses the sandbox boundary with
+//! `flatpak-spawn --host` when there is one to cross, and the tests pass
+//! [`crate::host::DirectFs`] or a double. The three functions that read it -
+//! [`resync_external_change_with`], [`save_document_with`]'s courtesy
+//! external-change check, and [`refresh_backup_mirror`] (the one write-side
+//! reader: it copies the real file onto the fallback mirror before a manual
+//! backup) - take the reader as a parameter for exactly the reason
+//! `real_fstab` is one: `cargo test` must never read the machine's own
+//! `/etc/fstab`, and now also must never spawn `flatpak-spawn`. The elevated
+//! write path's own change is in [`crate::privileged`] and [`crate::host`];
+//! nothing in this module's dispatch moved.
 //!
 //! ## Why every command is `#[tauri::command(async)]`
 //!
@@ -92,6 +112,7 @@ use crate::dto::{
     DeleteBackupErrorKindDto, DeviceDiscoveryDto, DocumentDto, DocumentViewDto, ExternalLinkDto,
     TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
+use crate::host::{self, RealFileReader};
 use crate::privileged;
 use crate::target::{self, ActiveTarget, TargetSource};
 use fstab_core::model::Document;
@@ -210,6 +231,7 @@ pub fn resync_external_change() -> Result<DocumentViewDto, CommandErrorDto> {
     resync_external_change_with(
         &resolve_target()?,
         real_fstab(),
+        host::real_file_reader(),
         backup_location::real_target_location(),
     )
 }
@@ -277,6 +299,7 @@ pub fn save(
     save_document(
         &target,
         real_fstab(),
+        host::real_file_reader(),
         &Document::from(candidate),
         allow_external_change,
     )
@@ -291,13 +314,21 @@ pub fn save(
 /// world-readable, the same reason [`list_entries`] can read the real target
 /// unprompted.
 ///
-/// Since T39, a session that cannot manage files in `/etc/` at all lists the
-/// real file's backups from the fallback directory instead
-/// ([`crate::backup_location`]) - and therefore does **not** list the
-/// automatic backups each save leaves beside `/etc/fstab`, which such a
-/// process cannot enumerate. The frontend says so, out of
-/// [`TargetInfoDto::real_target_backup_fallback_dir`]; see that field and
-/// `docs/API_CONTRACT.md` §3.6.
+/// Since T39, a session that cannot enumerate `/etc/` lists the real file's
+/// backups from the fallback directory instead ([`crate::backup_location`]) -
+/// and therefore does **not** list the automatic backups each save leaves
+/// beside `/etc/fstab`, which such a process cannot enumerate. Those backups
+/// are, since T40, confirmed to be getting written (the elevated writer runs
+/// on the host); they are simply invisible from here. The frontend says so,
+/// out of [`TargetInfoDto::real_target_backup_fallback_dir`]; see that field
+/// and `docs/API_CONTRACT.md` §3.6.
+///
+/// This is also the one backup operation T40 could *not* move back into
+/// `/etc/` for a sandboxed session, and the reason the other two stayed with
+/// it: it is unprivileged by design and calls
+/// [`writer::list_backups`] in-process, where the `/etc` it would enumerate is
+/// the runtime's. See [`crate::backup_location`]'s module docs for the full
+/// decision.
 ///
 /// # Errors
 ///
@@ -364,6 +395,7 @@ pub fn restore_backup(
     restore_backup_with(
         &target,
         real_fstab(),
+        host::real_file_reader(),
         backup_location::real_target_location(),
         &backup_path,
         allow_external_change,
@@ -483,6 +515,7 @@ pub fn create_backup() -> Result<BackupInfoDto, CreateBackupErrorDto> {
     create_backup_of(
         &target,
         real_fstab(),
+        host::real_file_reader(),
         backup_location::real_target_location(),
     )
 }
@@ -758,12 +791,15 @@ fn backups_belong_to_the_real_fstab(target: &ActiveTarget) -> bool {
 fn refresh_backup_mirror(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
 ) -> io::Result<()> {
     match backup_fallback_dir(target, location) {
-        Some(dir) => {
-            backup_location::refresh_mirror(dir, &colocated_backup_target_path(target, real_fstab))
-        }
+        Some(dir) => backup_location::refresh_mirror(
+            dir,
+            &colocated_backup_target_path(target, real_fstab),
+            real_reader,
+        ),
         None => Ok(()),
     }
 }
@@ -870,6 +906,7 @@ fn list_backups_for(
 fn resync_external_change_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
 ) -> Result<DocumentViewDto, CommandErrorDto> {
     if target.source != TargetSource::SandboxDefault {
@@ -883,7 +920,7 @@ fn resync_external_change_with(
         ));
     }
 
-    let (exists, text) = match fs::read(real_fstab) {
+    let (exists, text) = match real_reader.read(real_fstab) {
         Ok(bytes) => {
             // Deliberately *not* `from_utf8_lossy` - see `list_entries`, whose
             // reasoning applies identically here: a lossy load would publish
@@ -960,6 +997,7 @@ fn resync_external_change_with(
 fn restore_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
     backup_path: &str,
     allow_external_change: bool,
@@ -999,6 +1037,7 @@ fn restore_backup_with(
     save_document_with(
         target,
         real_fstab,
+        real_reader,
         &parser::parse(&text),
         allow_external_change,
         elevate,
@@ -1020,12 +1059,14 @@ fn restore_backup_with(
 fn save_document(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     candidate: &Document,
     allow_external_change: bool,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
     save_document_with(
         target,
         real_fstab,
+        real_reader,
         candidate,
         allow_external_change,
         privileged::save_elevated,
@@ -1130,6 +1171,7 @@ fn save_document(
 fn save_document_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     candidate: &Document,
     allow_external_change: bool,
     elevate: impl Fn(
@@ -1146,7 +1188,7 @@ fn save_document_with(
             // before the password prompt, not instead of the elevated side's
             // own check. Nothing has been opened for writing here, which is
             // why the error can promise `target_unchanged`.
-            if let Some(change) = guard.detect(real_fstab) {
+            if let Some(change) = guard.detect_with(real_fstab, real_reader) {
                 return Err(WriteErrorDto::external_change(
                     real_fstab,
                     &change.last_known,
@@ -1409,11 +1451,13 @@ fn delete_backup_with(
 fn create_backup_of(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
 ) -> Result<BackupInfoDto, CreateBackupErrorDto> {
     create_backup_with(
         target,
         real_fstab,
+        real_reader,
         location,
         privileged::create_backup_elevated,
     )
@@ -1465,6 +1509,7 @@ fn create_backup_of(
 fn create_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
     elevate: impl Fn(&Path) -> Result<CreateBackupOutcomeDto, CreateBackupErrorDto>,
 ) -> Result<BackupInfoDto, CreateBackupErrorDto> {
@@ -1474,7 +1519,7 @@ fn create_backup_with(
     // so it has to be brought up to date with the real `/etc/fstab` *before*
     // it is copied - a backup of a stale mirror would be a snapshot of
     // something that is no longer true.
-    refresh_backup_mirror(target, real_fstab, location).map_err(|err| {
+    refresh_backup_mirror(target, real_fstab, real_reader, location).map_err(|err| {
         let source = colocated_backup_target_path(target, real_fstab);
         if err.kind() == io::ErrorKind::NotFound {
             // The same answer `writer::create_backup` gives for a target that
@@ -1577,6 +1622,7 @@ mod tests {
     use super::*;
     use crate::backups::BackupError;
     use crate::dto::{LineDto, SeverityDto, SourceKindDto, TargetSourceDto};
+    use crate::host::{DirectFs, StubReader};
     use crate::testutil::TempDir;
     use fstab_core::model::{FstabEntry, FstabOption, Line, Options, SourceId};
     use std::path::{Path, PathBuf};
@@ -1732,7 +1778,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let target = override_target(path.clone());
 
         let candidate = valid_candidate("/mnt/saved");
-        let outcome = save_document(&target, unused_real_fstab(), &candidate, false)
+        let outcome = save_document(&target, unused_real_fstab(), &DirectFs, &candidate, false)
             .expect("the save should succeed");
 
         assert_eq!(
@@ -1778,8 +1824,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
         assert_eq!(round_tripped, candidate, "the DTO must round-trip exactly");
 
-        save_document(&target, unused_real_fstab(), &round_tripped, false)
-            .expect("the save should succeed");
+        save_document(
+            &target,
+            unused_real_fstab(),
+            &DirectFs,
+            &round_tripped,
+            false,
+        )
+        .expect("the save should succeed");
         assert_eq!(
             fs::read_to_string(&path).expect("read the target"),
             candidate.to_string()
@@ -1796,6 +1848,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = save_document(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             &valid_candidate("/mnt/first"),
             false,
         )
@@ -1814,8 +1867,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let error = save_document(&target, unused_real_fstab(), &invalid_candidate(), false)
-            .expect_err("an invalid candidate must be refused");
+        let error = save_document(
+            &target,
+            unused_real_fstab(),
+            &DirectFs,
+            &invalid_candidate(),
+            false,
+        )
+        .expect_err("an invalid candidate must be refused");
 
         assert_eq!(error.kind, WriteErrorKindDto::Validation);
         assert!(error.target_unchanged);
@@ -1845,6 +1904,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = save_document(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             &valid_candidate("/mnt/nope"),
             false,
         )
@@ -1875,6 +1935,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         save_document(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             &valid_candidate("/mnt/second"),
             false,
         )
@@ -1885,8 +1946,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let resolved =
             backups::resolve_requested(&path, &first_backup).expect("it is a real backup");
         let text = backups::read_text(&resolved).expect("readable");
-        let outcome = save_document(&target, unused_real_fstab(), &parser::parse(&text), false)
-            .expect("the restore succeeds");
+        let outcome = save_document(
+            &target,
+            unused_real_fstab(),
+            &DirectFs,
+            &parser::parse(&text),
+            false,
+        )
+        .expect("the restore succeeds");
 
         assert_eq!(
             fs::read_to_string(&path).expect("read the target"),
@@ -2372,7 +2439,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let info = create_backup_of(&target, unused_real_fstab(), colocated())
+        let info = create_backup_of(&target, unused_real_fstab(), &DirectFs, colocated())
             .expect("creating a backup must succeed");
 
         assert!(
@@ -2406,11 +2473,11 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let first =
-            create_backup_of(&target, unused_real_fstab(), colocated()).expect("first backup");
+        let first = create_backup_of(&target, unused_real_fstab(), &DirectFs, colocated())
+            .expect("first backup");
         fs::write(&path, "# changed by hand\n").expect("change the target");
-        let second =
-            create_backup_of(&target, unused_real_fstab(), colocated()).expect("second backup");
+        let second = create_backup_of(&target, unused_real_fstab(), &DirectFs, colocated())
+            .expect("second backup");
 
         assert_ne!(first.path, second.path);
         assert_eq!(fs::read_to_string(&first.path).unwrap(), ORIGINAL);
@@ -2434,7 +2501,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let path = dir.join("fstab.draft");
         let target = override_target(path.clone());
 
-        let error = create_backup_of(&target, unused_real_fstab(), colocated())
+        let error = create_backup_of(&target, unused_real_fstab(), &DirectFs, colocated())
             .expect_err("there is nothing to back up");
 
         assert_eq!(error.kind, CreateBackupErrorKindDto::TargetMissing);
@@ -2452,12 +2519,13 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let manual =
-            create_backup_of(&target, unused_real_fstab(), colocated()).expect("a manual backup");
+        let manual = create_backup_of(&target, unused_real_fstab(), &DirectFs, colocated())
+            .expect("a manual backup");
         for i in 0..(writer::MAX_BACKUPS + 3) {
             save_document(
                 &target,
                 unused_real_fstab(),
+                &DirectFs,
                 &valid_candidate(&format!("/mnt/n{i}")),
                 false,
             )
@@ -2504,6 +2572,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = create_backup_with(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             colocated(),
             |elevated_target| {
                 calls.borrow_mut().push(elevated_target.to_path_buf());
@@ -2549,7 +2618,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let info = create_backup_with(&target, unused_real_fstab(), colocated(), |_| {
+        let info = create_backup_with(&target, unused_real_fstab(), &DirectFs, colocated(), |_| {
             panic!("an explicit non-real override's backup must never escalate");
         })
         .expect("the backup should succeed");
@@ -2567,8 +2636,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&path, ORIGINAL).expect("seed the target");
         let target = override_target(path.clone());
 
-        let manual =
-            create_backup_of(&target, unused_real_fstab(), colocated()).expect("a manual backup");
+        let manual = create_backup_of(&target, unused_real_fstab(), &DirectFs, colocated())
+            .expect("a manual backup");
         delete_backup_from(&target, unused_real_fstab(), colocated(), &manual.path)
             .expect("deleting a manual backup must succeed");
 
@@ -2692,7 +2761,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(marker_of(&draft), "# stale marker content\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
 
-        let view = resync_external_change_with(&target, &real, colocated())
+        let view = resync_external_change_with(&target, &real, &DirectFs, colocated())
             .expect("a sandbox-default resync must succeed");
 
         assert!(view.exists);
@@ -2728,7 +2797,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         .expect("seed marker");
         let target = override_target(draft.clone());
 
-        let error = resync_external_change_with(&target, &real, colocated())
+        let error = resync_external_change_with(&target, &real, &DirectFs, colocated())
             .expect_err("a non-SandboxDefault target must be refused");
 
         assert_eq!(error.kind, CommandErrorKindDto::Resync);
@@ -2767,7 +2836,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             source: TargetSource::Environment,
         };
 
-        let error = resync_external_change_with(&target, &real, colocated())
+        let error = resync_external_change_with(&target, &real, &DirectFs, colocated())
             .expect_err("an is_real: true, Environment-sourced target must still be refused");
 
         assert_eq!(error.kind, CommandErrorKindDto::Resync);
@@ -2795,7 +2864,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(marker_of(&draft), "# a stale marker\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
 
-        let view = resync_external_change_with(&target, &real, colocated())
+        let view = resync_external_change_with(&target, &real, &DirectFs, colocated())
             .expect("a missing real file must not be an error");
 
         assert!(!view.exists);
@@ -2812,6 +2881,112 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
     }
 
+    /// T40, and the reason the host reader's `NotFound` mapping has to be
+    /// exact: a *transport* failure (`flatpak-spawn` missing, the
+    /// `org.freedesktop.Flatpak` portal denied, the host read killed) must not
+    /// be mistaken for "the real `/etc/fstab` does not exist", because this
+    /// command's answer to the latter is to **blank the draft and the
+    /// marker**. The two cases are asserted side by side here so neither can
+    /// quietly start behaving like the other.
+    #[test]
+    fn a_host_read_failure_is_not_treated_as_a_missing_real_fstab() {
+        let dir = TempDir::new("resync-host-read-failure");
+        let draft = dir.join("fstab.draft");
+        fs::write(&draft, "# content that must survive a transport failure\n").expect("seed draft");
+        fs::write(marker_of(&draft), "# a marker that must survive\n").expect("seed marker");
+        let target = default_draft_target(draft.clone());
+        let unreachable = StubReader::failing(
+            io::ErrorKind::Other,
+            "Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown",
+        );
+
+        let error = resync_external_change_with(&target, real_fstab(), &unreachable, colocated())
+            .expect_err("an unreachable host read must be reported, not silently accepted");
+
+        assert_eq!(error.kind, CommandErrorKindDto::ReadTarget);
+        assert!(error.message.contains("Portal call failed"));
+        assert_eq!(
+            fs::read_to_string(&draft).expect("read the draft"),
+            "# content that must survive a transport failure\n",
+            "a failed read must leave the draft exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_of(&draft)).expect("read the marker"),
+            "# a marker that must survive\n"
+        );
+        // The only path it asked for is the real file - never the draft.
+        assert_eq!(unreachable.asked(), vec![real_fstab().to_path_buf()]);
+
+        // The genuinely-missing case still clears both, through the same seam.
+        let gone = StubReader::failing(io::ErrorKind::NotFound, "no such file");
+        let view = resync_external_change_with(&target, real_fstab(), &gone, colocated())
+            .expect("a missing real file must not be an error");
+        assert!(!view.exists);
+        assert_eq!(fs::read(&draft).expect("read the draft"), b"");
+    }
+
+    /// T40 - and a defect T39 shipped: fallback mode's `create_backup` copies
+    /// the **real** `/etc/fstab` onto the mirror before backing it up, and in
+    /// the sandbox that is the one case where the file being copied is on the
+    /// other side of the sandbox boundary. With the pre-T40 plain `fs::read`
+    /// that copy always failed with `NotFound`, so a sandboxed install's
+    /// "Create backup" button could only ever report "`/etc/fstab` does not
+    /// exist yet, so there is nothing to back up" - the single operation
+    /// fallback mode exists for. The real-file path here does not exist on
+    /// disk, so a successful backup holding the reader's bytes proves the
+    /// mirror refresh goes through the seam.
+    #[test]
+    fn a_fallback_create_backup_copies_the_real_file_through_the_host_reader() {
+        let dir = TempDir::new("create-fallback-host-read");
+        let draft = dir.join("fstab.draft");
+        fs::write(&draft, "# the draft, which is not what gets backed up\n").expect("seed");
+        let fallback = dir.join("data/rustab/etc-fstab-backups");
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft);
+        let unreachable_real = dir.join("not-on-this-disk/fstab");
+        let real_content = "# the real /etc/fstab, reachable only via the host\n";
+        let reader = StubReader::serving(real_content.as_bytes());
+
+        let info = create_backup_with(&target, &unreachable_real, &reader, &location, |_| {
+            panic!("a fallback-mode backup is the user's own file and must not escalate")
+        })
+        .expect("a fallback-mode backup must succeed when the host read works");
+
+        assert!(info.is_manual);
+        assert_eq!(
+            fs::read_to_string(&info.path).expect("read the backup"),
+            real_content,
+            "the backup must hold the real file's bytes as served by the reader"
+        );
+        assert!(
+            Path::new(&info.path).starts_with(&fallback),
+            "the backup must be in the fallback directory: {}",
+            info.path
+        );
+        assert_eq!(reader.asked(), vec![unreachable_real]);
+    }
+
+    /// The other half of the same fix: when the host read reports the real
+    /// file as genuinely missing, the answer is still "nothing to back up" -
+    /// so the pre-T40 message was not *wrong*, it was simply the only answer
+    /// that case could ever produce.
+    #[test]
+    fn a_fallback_create_backup_still_reports_a_genuinely_missing_real_file() {
+        let dir = TempDir::new("create-fallback-missing-real");
+        let draft = dir.join("fstab.draft");
+        fs::write(&draft, "# a draft\n").expect("seed");
+        let location = fallback_to(&dir.join("data/rustab/etc-fstab-backups"));
+        let target = default_draft_target(draft);
+        let gone = StubReader::failing(io::ErrorKind::NotFound, "no such file");
+
+        let error = create_backup_with(&target, real_fstab(), &gone, &location, |_| {
+            panic!("nothing may escalate")
+        })
+        .expect_err("a missing real file must be reported");
+
+        assert_eq!(error.kind, CreateBackupErrorKindDto::TargetMissing);
+    }
+
     /// A non-UTF-8 real file is refused outright, exactly as `list_entries`
     /// refuses one for its own target - and, because nothing was read
     /// successfully, nothing is published: the draft and the marker are left
@@ -2826,7 +3001,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(marker_of(&draft), "# a marker that must survive\n").expect("seed marker");
         let target = default_draft_target(draft.clone());
 
-        let error = resync_external_change_with(&target, &real, colocated())
+        let error = resync_external_change_with(&target, &real, &DirectFs, colocated())
             .expect_err("non-UTF-8 content must be refused");
 
         assert_eq!(error.kind, CommandErrorKindDto::NotUtf8);
@@ -2856,7 +3031,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&draft, "# a draft that disagrees with the real file\n").expect("seed draft");
         let target = default_draft_target(draft.clone());
 
-        resync_external_change_with(&target, &real, colocated()).expect("the resync must succeed");
+        resync_external_change_with(&target, &real, &DirectFs, colocated())
+            .expect("the resync must succeed");
 
         let guard = target::ExternalChangeGuard::from_marker(&target.path, false);
         assert_eq!(
@@ -2940,7 +3116,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         // way the real-override test does, which also pins that an unverifiable
         // outcome is refused rather than turned into an invented row.
         let calls = std::cell::RefCell::new(Vec::new());
-        let error = create_backup_with(&target, &real, colocated(), |elevated_target| {
+        let error = create_backup_with(&target, &real, &DirectFs, colocated(), |elevated_target| {
             calls.borrow_mut().push(elevated_target.to_path_buf());
             Ok(CreateBackupOutcomeDto {
                 target: elevated_target.to_string_lossy().into_owned(),
@@ -3082,7 +3258,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let fallback = fallback_dir_in(&dir);
         let target = default_draft_target(draft.clone());
 
-        let info = create_backup_with(&target, &real, &fallback_to(&fallback), |_| {
+        let info = create_backup_with(&target, &real, &DirectFs, &fallback_to(&fallback), |_| {
             panic!("a backup in the user's own directory must never ask for a password")
         })
         .expect("creating a backup in the fallback directory must succeed");
@@ -3126,7 +3302,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             panic!("fallback mode must never elevate")
         };
 
-        let first = create_backup_with(&target, &real, &location, never_elevate)
+        let first = create_backup_with(&target, &real, &DirectFs, &location, never_elevate)
             .expect("the first backup must succeed");
 
         // Something else - a save through the elevated writer, say - changes
@@ -3134,7 +3310,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let changed = "# the real file moved on\nLABEL=new /mnt/new ext4 noauto 0 2\n";
         fs::write(&real, changed).expect("change the real stand-in");
 
-        let second = create_backup_with(&target, &real, &location, never_elevate)
+        let second = create_backup_with(&target, &real, &DirectFs, &location, never_elevate)
             .expect("the second backup must succeed");
 
         assert_eq!(
@@ -3166,7 +3342,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::remove_file(&real).expect("the real file is gone");
         let target = default_draft_target(draft);
 
-        let error = create_backup_with(&target, &real, &fallback_to(&fallback), |_| {
+        let error = create_backup_with(&target, &real, &DirectFs, &fallback_to(&fallback), |_| {
             panic!("fallback mode must never elevate")
         })
         .expect_err("there is nothing to back up");
@@ -3204,7 +3380,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             "nothing has been created in the fallback directory yet"
         );
 
-        let created = create_backup_with(&target, &real, &location, |_| {
+        let created = create_backup_with(&target, &real, &DirectFs, &location, |_| {
             panic!("fallback mode must never elevate")
         })
         .expect("creating a backup must succeed");
@@ -3234,7 +3410,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         seed_backups(&real, 1);
         let real_backup = backups::list(&real).expect("listing")[0].path.clone();
 
-        let created = create_backup_with(&target, &real, &location, |_| {
+        let created = create_backup_with(&target, &real, &DirectFs, &location, |_| {
             panic!("fallback mode must never elevate")
         })
         .expect("creating a backup must succeed");
@@ -3276,7 +3452,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let location = fallback_to(&fallback);
         let target = default_draft_target(draft.clone());
 
-        let created = create_backup_with(&target, &real, &location, |_| {
+        let created = create_backup_with(&target, &real, &DirectFs, &location, |_| {
             panic!("creating must not elevate")
         })
         .expect("creating a backup must succeed");
@@ -3285,6 +3461,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = restore_backup_with(
             &target,
             &real,
+            &DirectFs,
             &location,
             &created.path,
             false,
@@ -3343,7 +3520,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         // file holds by the time the backup below is taken.
         let real_now = fs::read_to_string(&real).expect("read the real stand-in");
 
-        let created = create_backup_with(&target, &real, &location, |_| {
+        let created = create_backup_with(&target, &real, &DirectFs, &location, |_| {
             panic!("fallback mode must never elevate")
         })
         .expect("creating a backup must succeed");
@@ -3382,10 +3559,11 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
         assert!(!backups_are_elevated(&target, &location));
 
-        let created = create_backup_with(&target, unused_real_fstab(), &location, |_| {
-            panic!("fallback mode must never elevate")
-        })
-        .expect("creating a backup must succeed");
+        let created =
+            create_backup_with(&target, unused_real_fstab(), &DirectFs, &location, |_| {
+                panic!("fallback mode must never elevate")
+            })
+            .expect("creating a backup must succeed");
         assert_eq!(
             PathBuf::from(&created.path).parent(),
             Some(fallback.as_path())
@@ -3431,7 +3609,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
         // And the three operations end to end, through the production
         // wrappers, acting on the target's own directory throughout.
-        let created = create_backup_of(&target, unused_real_fstab(), &location)
+        let created = create_backup_of(&target, unused_real_fstab(), &DirectFs, &location)
             .expect("creating a backup must succeed");
         assert_eq!(PathBuf::from(&created.path).parent(), path.parent());
         assert_eq!(
@@ -3579,6 +3757,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = save_document_with(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             &candidate,
             false,
             recording_elevate(&calls),
@@ -3623,6 +3802,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = save_document_with(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             &valid_candidate("/mnt/custom"),
             false,
             |_, _, _| panic!("an explicit non-real override must never escalate"),
@@ -3662,9 +3842,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let candidate = valid_candidate("/mnt/for-real");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome =
-            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
-                .expect("the elevated stand-in succeeds");
+        let outcome = save_document_with(
+            &target,
+            &real,
+            &DirectFs,
+            &candidate,
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("the elevated stand-in succeeds");
 
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
@@ -3696,9 +3882,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let candidate = valid_candidate("/mnt/mirrored");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome =
-            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
-                .expect("the elevated stand-in succeeds");
+        let outcome = save_document_with(
+            &target,
+            &real,
+            &DirectFs,
+            &candidate,
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("the elevated stand-in succeeds");
 
         assert_eq!(outcome.draft_sync_warning, None, "{outcome:?}");
         assert_eq!(
@@ -3731,8 +3923,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             // Every save after the first moves the marker, so the stand-in is
             // kept in step with it - these are ordinary saves, not drift.
             let candidate = valid_candidate(&format!("/mnt/n{i}"));
-            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
-                .expect("the elevated stand-in succeeds");
+            save_document_with(
+                &target,
+                &real,
+                &DirectFs,
+                &candidate,
+                false,
+                recording_elevate(&calls),
+            )
+            .expect("the elevated stand-in succeeds");
             fs::write(&real, candidate.to_string()).expect("the elevated write, re-enacted");
         }
 
@@ -3754,6 +3953,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = save_document_with(
             &target,
             &real,
+            &DirectFs,
             &valid_candidate("/mnt/nope"),
             false,
             |_, _, _| {
@@ -3803,6 +4003,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = save_document_with(
             &target,
             &real,
+            &DirectFs,
             &valid_candidate("/mnt/warned"),
             false,
             recording_elevate(&calls),
@@ -3866,6 +4067,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let outcome = restore_backup_with(
             &target,
             &real,
+            &DirectFs,
             colocated(),
             &real_backup,
             false,
@@ -3905,6 +4107,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = restore_backup_with(
             &target,
             &real,
+            &DirectFs,
             colocated(),
             &draft_backup,
             false,
@@ -3952,9 +4155,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let candidate = valid_candidate("/mnt/undisturbed");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome =
-            save_document_with(&target, &real, &candidate, false, recording_elevate(&calls))
-                .expect("an unchanged real file must not block a save");
+        let outcome = save_document_with(
+            &target,
+            &real,
+            &DirectFs,
+            &candidate,
+            false,
+            recording_elevate(&calls),
+        )
+        .expect("an unchanged real file must not block a save");
 
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1, "exactly one elevated call must be made");
@@ -3990,6 +4199,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         save_document_with(
             &target,
             &real,
+            &DirectFs,
             &valid_candidate("/mnt/pending"),
             false,
             recording_elevate(&calls),
@@ -4016,6 +4226,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = save_document_with(
             &target,
             &real,
+            &DirectFs,
             &valid_candidate("/mnt/blocked"),
             false,
             |_, _, _| panic!("a detected external change must not reach the elevated writer"),
@@ -4077,9 +4288,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         fs::write(&real, external).expect("let the real file drift");
         let target = default_draft_target(draft.clone());
 
-        let error = restore_backup_with(&target, &real, colocated(), &backup, false, |_, _, _| {
-            panic!("a detected external change must not reach the elevated writer")
-        })
+        let error = restore_backup_with(
+            &target,
+            &real,
+            &DirectFs,
+            colocated(),
+            &backup,
+            false,
+            |_, _, _| panic!("a detected external change must not reach the elevated writer"),
+        )
         .expect_err("an external change must block the restore");
 
         assert_eq!(error.kind, WriteErrorKindDto::ExternalChange);
@@ -4101,6 +4318,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         restore_backup_with(
             &target,
             &real,
+            &DirectFs,
             colocated(),
             &backup,
             true,
@@ -4132,9 +4350,15 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let candidate = valid_candidate("/mnt/anyway");
 
         let calls = std::cell::RefCell::new(Vec::new());
-        let outcome =
-            save_document_with(&target, &real, &candidate, true, recording_elevate(&calls))
-                .expect("an explicit write-anyway must let the save through");
+        let outcome = save_document_with(
+            &target,
+            &real,
+            &DirectFs,
+            &candidate,
+            true,
+            recording_elevate(&calls),
+        )
+        .expect("an explicit write-anyway must let the save through");
 
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1, "exactly one elevated call, as always");
@@ -4187,6 +4411,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         save_document_with(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             &valid_candidate("/mnt/override"),
             false,
             recording_elevate(&calls),

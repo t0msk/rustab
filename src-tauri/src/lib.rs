@@ -20,7 +20,11 @@
 //! - `backup_location`: whether this process can manage the real
 //!   `/etc/fstab`'s backups in `/etc/` at all, and the per-user fallback
 //!   directory its manual backups go to when it cannot (a Flatpak sandbox
-//!   granted only `--filesystem=/etc/fstab:rw` cannot).
+//!   cannot, because the `/etc` it can enumerate is the runtime's).
+//! - `host`: the one place that knows this process may be inside a Flatpak
+//!   sandbox, and therefore that reading the real `/etc/fstab` and starting
+//!   the elevated helper both have to happen *on the host*, through
+//!   `flatpak-spawn --host` (T40).
 //! - [`privileged`]: both halves of the three elevated operations (writing the
 //!   real `/etc/fstab`, deleting one of its backups, and creating a manual
 //!   backup of it) - the `pkexec` re-exec on the unprivileged side and the
@@ -31,6 +35,7 @@ mod backup_location;
 pub mod backups;
 pub mod commands;
 pub mod dto;
+mod host;
 pub mod privileged;
 pub mod target;
 
