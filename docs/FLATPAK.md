@@ -1,11 +1,15 @@
 # Flatpak Packaging Guide for Rustab
 
-**Status: planning document with real scaffolding.** No Flatpak build has
-actually been run against this project yet (no `flatpak-builder`, no
-sandboxed `pkexec` test - see the boundary note at the end of this
-paragraph), but as of this revision there are real packaging files to work
-from in `flatpak/` (manifest, desktop entry, AppStream metainfo), not just
-prose. This revision also corrects several things the previous version got
+**Status: planning document with real scaffolding, plus one part that is now
+settled by experiment.** As of T40, §3 (privilege escalation under Flatpak)
+is **no longer a planning section**: the app has been built with
+`flatpak-builder --user --install`, installed, and exercised in a real
+sandbox, and the mechanism that works is `flatpak-spawn --host pkexec`
+with the single permission `--talk-name=org.freedesktop.Flatpak`. Read §3
+before anything else in here, and treat its Options A and B as a record of
+what does *not* work. Everything else in this guide - the submission
+process, the offline-build chain, the checklists - is still planning
+material, and the scope boundary below still applies to it. This revision also corrects several things the previous version got
 wrong or stale about the actual Flathub submission process - see "What
 changed in this revision" below if you read the old version before.
 
@@ -18,14 +22,23 @@ but stale process. Anywhere this guide says "verified" below, it means
 not "asserted confidently." Anywhere it says "unverified" or "untested," it
 means exactly that - don't read it as false modesty.
 
-**Scope boundary**: nothing in this guide or the files in `flatpak/` was
-submitted anywhere. No GitHub repository was created, no git remote was
-added or changed (this repo has zero remotes configured, deliberately left
-for the maintainer), nothing was pushed, no fork of `flathub/flathub` was
-made, and no `flatpak-builder`/sandboxed-build/sandboxed-`pkexec` test was
-run. Every step below that requires one of those is labelled **[MAINTAINER
-ACTION]** and is real follow-up work, not something this guide pretends was
-already done.
+**Scope boundary**, as originally written and still true of everything
+except §3: nothing in this guide or the files in `flatpak/` was submitted
+anywhere by the session that wrote it. No GitHub repository was created, no
+git remote was added or changed, nothing was pushed, no fork of
+`flathub/flathub` was made. Every step below that requires one of those is
+labelled **[MAINTAINER ACTION]** and is real follow-up work, not something
+this guide pretends was already done.
+
+What *has* happened since, and what §3 now rests on: a local
+`flatpak-builder --user --install` build of this app was run and installed,
+and the sandboxed read/elevate mechanism was exercised against the real host
+`/etc/fstab` (reads and the full helper spawn chain). The one thing still
+untested is a **completed elevated write**: finishing that needs a human at
+a polkit authentication dialog, and no automated session should drive one.
+The maintainer's remaining check is therefore "press Save in the Flatpak
+build, authenticate, confirm `/etc/fstab` changed and a backup appeared
+beside it".
 
 ---
 
@@ -381,15 +394,49 @@ features are ever added, mirror them in the manifest's build-commands too.
 
 ---
 
-## 3. Privilege escalation under Flatpak: the pkexec challenge
+## 3. Privilege escalation under Flatpak: SOLVED (T40)
 
-This section is carried over from the previous version of this guide
-essentially unchanged - it was already specific to this app's actual
-architecture and sound, and the task that produced this revision was
-explicitly told not to weaken it. It remains **the most critical and
-uncertain part** of Rustab's Flatpak packaging.
+> **This section's question is no longer open.** It used to end in "no
+> single correct answer yet - here are three options, none tested". It has
+> since been tested, twice over (two throwaway diagnostic Flatpak apps, then
+> Rustab itself, built with `flatpak-builder --user --install` and exercised
+> in a real sandbox), and the answer is **§3.2's Option D**:
+> `flatpak-spawn --host pkexec <host path of this binary>`, enabled by the
+> single permission `--talk-name=org.freedesktop.Flatpak`.
+>
+> Options A and B below are **kept for the record only**, because both rest
+> on a premise that turned out to be false and someone will otherwise
+> rediscover them as "the obvious thing to try". Read §3.1 first: it is the
+> reason they cannot work.
+>
+> The implementation lives in `src-tauri/src/host.rs` (new in T40) and is
+> documented in `docs/API_CONTRACT.md` §4.3.
 
-### 3.1 Why pkexec doesn't "just work" in a sandbox
+### 3.1 Why pkexec doesn't "just work" in a sandbox - and why no `--filesystem=` grant fixes it
+
+Two independent facts, both confirmed by experiment rather than inference:
+
+1. **`pkexec` does not leave the sandbox.** It changes a process's **UID**,
+   not its **mount namespace**. A `pkexec` child of a sandboxed process is
+   therefore root *inside the same sandbox*, looking at the same filesystem
+   view its parent had. The intuition that "the elevated process runs
+   unsandboxed, so it has full access to `/etc/`" - which earlier revisions
+   of this doc and of `src-tauri/src/backup_location.rs` both relied on - is
+   simply wrong.
+2. **Flatpak reserves the whole `/etc` path space.** `--filesystem=/etc:rw`
+   is rejected by `flatpak-builder-lint` (so it can never pass Flathub
+   review), and the narrower-looking `--filesystem=/etc/fstab:rw` is
+   rejected by the *sandbox itself* at startup:
+   ```
+   F: Not sharing "/etc/fstab" with sandbox: Path "/etc" is reserved by Flatpak
+   ```
+   The sandbox then shows the runtime's own synthetic `/etc` (`ls /etc`
+   inside it lists the runtime's files and no `fstab` at all). Nothing
+   reaches the real file through that grant: not a read, not a write, and -
+   by fact 1 - not an elevated write either.
+
+Together these mean the elevated writer must be made to run as a **genuine
+host process**, not merely as root. That is what §3.2's Option D does.
 
 Rustab's architecture (`docs/API_CONTRACT.md` §4) uses a re-exec
 mechanism: when saving, restoring, deleting, or creating a backup against
@@ -408,14 +455,55 @@ sandbox may not have access to the host's D-Bus system bus where polkit
 listens, the filesystem is restricted to explicitly granted paths, and the
 process cannot arbitrarily spawn host tools.
 
-### 3.2 Possible approaches
+### 3.2 The approaches, and which one is real
 
-There is **no single "correct" answer yet** - these are known approaches,
-each with trade-offs. `flatpak/dev.tomsk.Rustab.yml` currently ships with
-a narrow starting point (Option B's bus-talk line only, no filesystem
-grant) precisely because it is a starting point, not a verified answer.
+#### Option D: `flatpak-spawn --host pkexec` - THE ANSWER, CONFIRMED
 
-#### Option A: Host filesystem access + implicit policy
+```yaml
+finish-args:
+  - --talk-name=org.freedesktop.Flatpak
+```
+
+That is the whole permission set this needs: no `--filesystem=` of any
+kind, no system-bus access. It lets the app call the `org.freedesktop.Flatpak`
+session-bus service, i.e. use `flatpak-spawn --host`, which is part of every
+`org.gnome.Platform`/`org.freedesktop.Platform` runtime (no new dependency).
+
+What was confirmed, from inside a sandbox granted *only* that:
+
+| Command | Result |
+| --- | --- |
+| `flatpak-spawn --host cat /etc/fstab` | prints the real host file (byte-identical, checked by `sha256sum`) |
+| `flatpak-spawn --host id` | the real host user - proof the process is outside the sandbox's mount namespace, not merely outside its cgroup |
+| `flatpak-spawn --host sh -c 'touch /etc/.test'` | `Permission denied` - correct for an unprivileged host process |
+| `flatpak-spawn --host pkexec sh -c 'touch /etc/.test && rm -f /etc/.test'` | **succeeds** - real root on the real `/etc/` |
+| `echo '<request>' \| flatpak-spawn --host <app-path>/bin/rustab --internal-privileged-write` | the helper's own JSON response on stdout, correct exit code - stdio and exit status pass through unchanged |
+
+Two details the implementation has to get right, both in
+`src-tauri/src/host.rs`:
+
+- **The binary must be named by its *host* path.** `std::env::current_exe()`
+  inside the sandbox is `/app/bin/rustab`, which does not exist on the host.
+  The host path comes from the `app-path` key Flatpak writes into the
+  sandbox's own `/.flatpak-info`, with the user/system installation layouts
+  (`$HOME/.local/share/flatpak/app/<id>/current/active/files/bin/rustab`,
+  `/var/lib/flatpak/app/<id>/…`) as fallbacks.
+- **Existence of that path must be checked on the host, not locally.** None
+  of those paths is visible from inside the sandbox, so `Path::exists()`
+  answers `false` for all of them - including the right one. The check is one
+  more `flatpak-spawn --host` call.
+
+The one real caveat, recorded honestly: the binary that runs on the host is
+the Flatpak-built one, dynamically linked against the *runtime's* GTK,
+WebKitGTK and glibc. It runs on a host that can satisfy those (verified here
+with `ldd` and by running it), but a host without `libwebkit2gtk-4.1.so.0`,
+or with an older glibc than the runtime's, would fail at exec and the save
+would fail with a `privilege_escalation` error. If that ever shows up in the
+field, the mitigations are to invoke it through the runtime's own loader
+(`/.flatpak-info` also records `runtime-path`) or to ship a small
+statically-linked helper binary.
+
+#### Option A (KEPT FOR THE RECORD - does not work): Host filesystem access + implicit policy
 
 ```yaml
 finish-args:
@@ -424,11 +512,13 @@ finish-args:
   - --system-bus-talk=org.freedesktop.DBus.Properties
 ```
 
-**Advantage**: the elevated write path works unchanged, if it works at
-all. **Disadvantage**: defeats much of Flatpak's sandboxing for an app
-whose whole purpose is protecting a critical system file.
+**Why it is dead**: `--filesystem=host` does not expose the host's `/etc`
+either (§3.1, fact 2 - the reservation applies regardless of the grant), so
+the elevated write path would *still* not reach `/etc/fstab`, while the app
+would have given up most of its sandbox for nothing. Also: Flathub review
+would rightly question `--filesystem=host` in an fstab editor.
 
-#### Option B: Restricted filesystem access + explicit policy (current manifest's starting point)
+#### Option B (KEPT FOR THE RECORD - does not work): Restricted filesystem access + explicit policy
 
 ```yaml
 finish-args:
@@ -437,10 +527,19 @@ finish-args:
   - --system-bus-talk=org.freedesktop.PolicyKit1
 ```
 
-**Advantage**: narrower sandbox breach - only `/etc/fstab` and Rustab's own
-data directory. **Disadvantage**: still grants system-bus access to
-polkit, and assumes polkit is reachable from the sandbox at all, which has
-not been tested.
+**Why it is dead**: the single-file `/etc/fstab:rw` grant is refused by the
+sandbox outright (§3.1, fact 2), so it buys nothing at all, and the
+`pkexec`-reaches-polkit question it was meant to answer is moot under Option
+D - `pkexec` is invoked by a process that is already on the host, so it uses
+the host's own system bus and needs no proxied access. (Note also that
+`--system-bus-talk` is not a real `flatpak build-finish` option; the correct
+spelling is `--system-talk-name`. The repo's draft manifest carried the
+misspelling for a while, which would have failed the build.)
+
+`--filesystem=xdg-data/rustab:create` is not needed either: under Flatpak
+`XDG_DATA_HOME` already points inside the app's own
+`~/.var/app/dev.tomsk.Rustab/data`, which the app owns by default. That is
+where the working draft and the fallback backup directory live.
 
 #### Option C: Portal-based approach (future)
 
@@ -449,13 +548,17 @@ Use Flatpak's
 for a more principled, tightly-controlled mechanism instead of a bare
 `pkexec` call. Newer and less established for `pkexec`-style workflows.
 
-### 3.3 The testing requirement: do not assume any of these will work
+### 3.3 The testing requirement: what has been done, and what is left
 
 **Non-negotiable**: before submitting to Flathub, any Flatpak manifest
-must be built and tested on an actual Flatpak-enabled system.
-**[MAINTAINER ACTION]** - all of the below, none of it attempted in this
-session (explicitly out of scope: no `flatpak-builder` run, no sandbox
-`pkexec` test, per this task's own boundary):
+must be built and tested on an actual Flatpak-enabled system. Since T40,
+steps 1 and 2 below **have been done** (local `flatpak-builder --user
+--install`, app launches, draft loads from the real `/etc/fstab`), and step
+3's first question is answered (the whole spawn chain reaches the elevated
+helper and gets its JSON response back; `pkexec` is reachable from the
+sandbox via the host). What remains **[MAINTAINER ACTION]** is everything
+that needs a human at an authentication dialog, i.e. step 3's "does the
+write complete" onwards:
 
 1. Build locally:
    ```bash

@@ -605,19 +605,27 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   (nothing has failed) and not a tooltip or toast (a toast disappears; this fact has to
   still be findable the next time someone opens this tab, possibly in a rescue
   scenario where guessing wrong about where a backup lives is costly). The copy states
-  two things plainly, both already fixed by the backend and documented in
+  two things plainly, both now fixed *and verified* by the backend and documented in
   `docs/API_CONTRACT.md` §6: (a) backups created from this panel are being kept in the
   given directory instead of beside `/etc/fstab`, because this sandboxed install can't
-  manage files in `/etc/` directly, and need no password prompt; (b) the automatic
-  backups each ordinary save takes are **still** written beside the real `/etc/fstab`
-  and are **not shown in this list**, because the sandboxed process cannot enumerate
-  that directory - they are not lost, and remain recoverable from a rescue environment
+  *enumerate* `/etc/` directly, and need no password prompt; (b) the automatic backups
+  each ordinary save takes are **still** written beside the real `/etc/fstab` and are
+  **not shown in this list**, because the sandboxed process cannot enumerate that
+  directory - they are not lost, and remain recoverable from a rescue environment
   (e.g. booting a live/rescue disk), just not visible or manageable from inside the app.
   Silently omitting fact (b) would have left a user who only reads the list believing
   their automatic backups had stopped happening, which is exactly the wrong impression
-  for a rescue scenario. Built from `backup_panel::fallback_notice_text`, a plain
-  function kept separate from the `html!` so its exact wording is unit-testable without
-  a DOM.
+  for a rescue scenario.
+  Fact (b) was briefly in doubt during T39 (the reasoning that the elevated `pkexec`
+  writer "runs fully unsandboxed" is wrong - `pkexec` changes UID, not mount namespace),
+  and T40 settled it in the affirmative by fixing the mechanism rather than the wording:
+  the elevated writer is now started with `flatpak-spawn --host pkexec`, so it is a
+  genuine host root process and its backup-before-write step really does land in the
+  host's `/etc/` (`docs/API_CONTRACT.md` §4.3). The banner therefore says it as fact.
+  What the banner deliberately does **not** mention is the mechanism: a user reading a
+  Backups tab does not need to know about `flatpak-spawn`, only where their files are.
+  Built from `backup_panel::fallback_notice_text`, a plain function kept separate from
+  the `html!` so its exact wording is unit-testable without a DOM.
 - **"Create backup" button**, living in `HeaderBar`'s top-right contextual action
   slot - the same slot `"+ Add Entry"` occupies while the `Entries` tab is active.
   It renders only while the `Backups` tab is active, and `"+ Add Entry"` is absent

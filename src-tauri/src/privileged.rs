@@ -88,6 +88,29 @@
 //!   per invocation for either design, so nothing about the user experience
 //!   or the trust model improves.
 //!
+//! ## Where that re-exec happens, inside a Flatpak sandbox (T40)
+//!
+//! One thing about the mechanism - and *only* this one thing - differs when
+//! Rustab runs as a Flatpak: the `pkexec` invocation has to be made on the
+//! **host**, via `flatpak-spawn --host`, and it has to name this binary by its
+//! host-side path rather than by `std::env::current_exe()`. The reason is
+//! worth stating precisely, because the obvious reading of `pkexec` is wrong:
+//! `pkexec` changes a process's **UID**, not its **mount namespace**, so a
+//! `pkexec` child started from inside the sandbox is root *in the sandbox* -
+//! and the `/etc` a sandboxed process sees is the runtime's own, with no path
+//! at all to the host's `/etc/fstab` (Flatpak reserves `/etc` and refuses even
+//! an explicit `--filesystem=/etc/fstab:rw` grant). Such a process would be
+//! authorized to write a file that is not the one the user is editing.
+//!
+//! `flatpak-spawn --host pkexec <host path> --internal-privileged-write`
+//! produces what is actually needed: a genuine host process, outside every
+//! sandbox, running as root. All of it lives in [`crate::host`]; the only line
+//! in this module that knows about it is the one in [`run_elevated`] that asks
+//! for the plan. Nothing else here changes - not this module's protocol, not
+//! its dispatch, not one of its `handle_*` or `interpret_*` functions - and
+//! the single-flag property below is untouched: there is still exactly one
+//! argument, in one binary, that can turn a process into a root process.
+//!
 //! ## The target path, and why the child re-checks it
 //!
 //! `pkexec` deliberately does not forward the caller's environment, so the
@@ -153,7 +176,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 /// The hidden first argument that turns this binary into the elevated helper.
 ///
@@ -676,8 +699,11 @@ fn respond<W: Write>(output: &mut W, response: PrivilegedResponse, code: i32) ->
 /// safety-relevant.
 #[derive(Debug)]
 enum LaunchFailure {
-    /// [`std::env::current_exe`] failed, so there was nothing to re-exec.
-    /// The helper never ran.
+    /// There was no path to re-exec: [`std::env::current_exe`] failed, or -
+    /// inside a Flatpak sandbox, where `current_exe` yields the meaningless
+    /// in-sandbox `/app/bin/rustab` - this binary could not be found at any of
+    /// its host-side paths (see [`crate::host::elevated_self_plan`]). The
+    /// helper never ran.
     NoExePath(io::Error),
     /// The request could not be serialized - a bug between the two halves.
     /// The helper never ran.
@@ -718,13 +744,36 @@ impl LaunchFailure {
 ///
 /// Performs **no filesystem writes of its own** - it serializes JSON to a pipe
 /// and reads bytes back.
+///
+/// ## The one thing T40 changed here
+///
+/// *Which command* is spawned, and nothing else. On an ordinary install it is
+/// still `pkexec <this binary> <flag>`. Inside a Flatpak sandbox it is
+/// `flatpak-spawn --host pkexec <this binary's host path> <flag>`, because
+/// `pkexec` on its own would produce a root process that is **still inside the
+/// sandbox** - and the `/etc` a sandboxed process sees is the runtime's, not
+/// the host's, so such a process cannot write the real `/etc/fstab` no matter
+/// what it is authorized to do (`pkexec` changes the UID, not the mount
+/// namespace; confirmed empirically - see [`crate::host`]). The decision and
+/// the host-path resolution both live in [`crate::host::elevated_self_plan`];
+/// this function only asks for the plan and runs it.
+///
+/// Everything after the spawn is untouched and deliberately so: writing the
+/// request to stdin, closing it, waiting, and handing the exit code, stdout
+/// and stderr to the `interpret_*_output` functions all behave identically
+/// through `flatpak-spawn --host pkexec`, which passes stdio through and exits
+/// with the child's status (confirmed by the T40 diagnostics). The helper on
+/// the other end is the same binary running the same [`INTERNAL_WRITE_FLAG`]
+/// branch; it simply runs on the host, where - having no `/.flatpak-info` of
+/// its own - it reads and writes the real filesystem directly, exactly as the
+/// non-Flatpak case always did.
 fn run_elevated(request: &PrivilegedRequest) -> Result<Output, LaunchFailure> {
-    let exe = std::env::current_exe().map_err(LaunchFailure::NoExePath)?;
+    let plan =
+        crate::host::elevated_self_plan(INTERNAL_WRITE_FLAG).map_err(LaunchFailure::NoExePath)?;
     let payload = serde_json::to_vec(request).map_err(LaunchFailure::Serialize)?;
 
-    let mut child = Command::new("pkexec")
-        .arg(&exe)
-        .arg(INTERNAL_WRITE_FLAG)
+    let mut child = plan
+        .command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -856,8 +905,8 @@ fn write_launch_error(target: &Path, failure: &LaunchFailure) -> WriteErrorDto {
             WriteErrorKindDto::PrivilegeEscalation,
             unchanged,
             format!(
-                "could not determine Rustab's own executable path, so the elevated writer could \
-                 not be started ({err}); nothing was written"
+                "could not determine which Rustab executable to run as root, so the elevated \
+                 writer could not be started ({err}); nothing was written"
             ),
         ),
         LaunchFailure::Serialize(err) => WriteErrorDto::new(
@@ -869,8 +918,9 @@ fn write_launch_error(target: &Path, failure: &LaunchFailure) -> WriteErrorDto {
             WriteErrorKindDto::PrivilegeEscalation,
             unchanged,
             format!(
-                "could not run pkexec to obtain the privileges needed to write {} ({err}); \
-                 nothing was written. Is polkit installed?",
+                "could not start the elevated writer needed to write {} ({err}); nothing was \
+                 written. On an ordinary install that means pkexec (polkit) could not be run; in \
+                 a Flatpak it means flatpak-spawn could not be run.",
                 target.display()
             ),
         ),
@@ -1021,15 +1071,16 @@ pub fn delete_backup_elevated(
 fn delete_launch_error(backup_path: &str, failure: &LaunchFailure) -> DeleteBackupErrorDto {
     let message = match failure {
         LaunchFailure::NoExePath(err) => format!(
-            "could not determine Rustab's own executable path, so the elevated helper could not \
-             be started ({err}); {backup_path} was not deleted"
+            "could not determine which Rustab executable to run as root, so the elevated helper \
+             could not be started ({err}); {backup_path} was not deleted"
         ),
         LaunchFailure::Serialize(err) => {
             format!("could not serialize the delete request ({err}); {backup_path} was not deleted")
         }
         LaunchFailure::Spawn(err) => format!(
-            "could not run pkexec to obtain the privileges needed to delete {backup_path} \
-             ({err}); it was not deleted. Is polkit installed?"
+            "could not start the elevated helper needed to delete {backup_path} ({err}); it \
+             was not deleted. On an ordinary install that means pkexec (polkit) could not be \
+             run; in a Flatpak it means flatpak-spawn could not be run."
         ),
         LaunchFailure::SendRequest(err) => format!(
             "could not hand the delete request to the elevated helper ({err}); {backup_path} was \
@@ -1155,15 +1206,16 @@ fn create_launch_error(target: &Path, failure: &LaunchFailure) -> CreateBackupEr
     let target = target.display();
     let message = match failure {
         LaunchFailure::NoExePath(err) => format!(
-            "could not determine Rustab's own executable path, so the elevated helper could not \
-             be started ({err}); no backup of {target} was created"
+            "could not determine which Rustab executable to run as root, so the elevated helper \
+             could not be started ({err}); no backup of {target} was created"
         ),
         LaunchFailure::Serialize(err) => format!(
             "could not serialize the backup request ({err}); no backup of {target} was created"
         ),
         LaunchFailure::Spawn(err) => format!(
-            "could not run pkexec to obtain the privileges needed to back up {target} ({err}); \
-             no backup was created. Is polkit installed?"
+            "could not start the elevated helper needed to back up {target} ({err}); no backup \
+             was created. On an ordinary install that means pkexec (polkit) could not be run; in \
+             a Flatpak it means flatpak-spawn could not be run."
         ),
         LaunchFailure::SendRequest(err) => format!(
             "could not hand the backup request to the elevated helper ({err}); no backup of \
