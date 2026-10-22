@@ -1,52 +1,30 @@
 //! Domain model for fstab entries and documents - see `docs/SPEC.md` §5.
 //!
-//! This module is pure data modeling: it defines the types that represent a
-//! parsed `/etc/fstab`-style file and small, pure accessor/mutator helpers on
-//! them. It deliberately contains **no** text parsing or serialization logic
-//! (that belongs to `parser.rs`, a later task) and **no** file I/O. The types
-//! here are designed so a future parser can build them from text, and a
-//! future serializer can turn them back into text, without needing to lose
-//! or reinterpret any information along the way.
+//! Pure data modeling: the types representing a parsed `/etc/fstab`-style
+//! file, plus small pure accessor/mutator helpers. No text parsing (see
+//! `parser.rs`), no serialization (see `writer.rs`), no file I/O.
 //!
-//! ## Escaped-whitespace policy (read this before touching `mount_point` or
-//! `SourceId::Path`)
+//! ## Escaped-whitespace policy
 //!
-//! `/etc/fstab` requires literal whitespace inside a field (most commonly a
-//! space in a mount point or device path) to be written as an octal escape
-//! sequence, e.g. `\040` for a space or `\011` for a tab. This module stores
-//! such text **exactly as it appears in the file, escape sequences and all** -
-//! it never decodes `\040` into a real space character, and it never
-//! re-encodes a literal space into `\040`. A raw string field in this module
-//! is therefore always "the literal bytes between field separators", full
-//! stop. Rationale: decoding would require the model to track "was this
-//! field escaped or not" out-of-band to re-encode correctly on write, which
-//! is exactly the kind of lossy round-trip SPEC §5 forbids. Keeping the raw
-//! text is simple, unambiguous, and correct by construction.
+//! `/etc/fstab` escapes literal whitespace in a field as octal (`\040` for a
+//! space, `\011` for a tab). `mount_point` and `SourceId::Path` store that
+//! text **raw, escapes and all** - never decoded, never re-encoded. Decoding
+//! up front would require tracking "was this escaped" out-of-band to
+//! re-encode on write, a lossy round-trip SPEC §5 forbids.
 //!
-//! This crate still never *re-encodes* a literal space back into `\040` -
-//! nothing in this crate writes decoded text back into a model field, so
-//! that half of a decode/encode pair genuinely is not needed. Decoding
-//! *is* needed in more than one place that treats a field as a real
-//! filesystem path rather than model text - e.g. checking whether a mount
-//! point exists on disk ([`crate::validate`]), or a frontend's "open this
-//! path in the file manager" action - so this module exposes
-//! [`decode_escaped_whitespace`] as that one narrow, one-way translation.
-//! Every other consumer of `mount_point`/`SourceId::Path` keeps using the
-//! raw text untouched.
+//! Callers that need the real filesystem path (e.g. [`crate::validate`]
+//! checking whether a mount point exists) use [`decode_escaped_whitespace`]
+//! for that one-way translation; nothing in this crate re-encodes the other
+//! direction.
 
 use std::fmt;
 
-/// Decodes `/etc/fstab`'s `\NNN` octal-escape convention (three octal
-/// digits, e.g. `\040` for a space, `\011` for a tab) into the literal bytes
-/// they represent. See this module's "Escaped-whitespace policy" docs above
-/// for why the model itself never does this, and when callers should.
+/// Decodes `/etc/fstab`'s `\NNN` octal-escape sequences (e.g. `\040` for a
+/// space) into literal bytes. See the module's "Escaped-whitespace policy"
+/// docs for why the model itself never does this.
 ///
-/// A backslash not followed by exactly three octal digits (`0`-`7`) is left
-/// untouched, verbatim - fstab only ever uses this escape for whitespace and
-/// the backslash itself (see util-linux's `mangle()`/`unmangle_to_buffer()`
-/// in `lib/mangle.c`, the reference implementation this matches), so an
-/// unrecognized sequence is far more likely to be a literal backslash in the
-/// path than a malformed escape.
+/// A backslash not followed by three octal digits is left untouched -
+/// matches util-linux's `unmangle_to_buffer()` (`lib/mangle.c`).
 pub fn decode_escaped_whitespace(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
@@ -63,9 +41,7 @@ pub fn decode_escaped_whitespace(raw: &str) -> String {
             out.push(value as char);
             i += 4;
         } else {
-            // Always lands on a UTF-8 char boundary: every byte skipped by
-            // this branch was just checked and is not part of a multi-byte
-            // sequence consumed above.
+            // Always on a UTF-8 boundary: bytes consumed above are only octal escapes.
             let ch = raw[i..].chars().next().expect("i < bytes.len()");
             out.push(ch);
             i += ch.len_utf8();
@@ -113,70 +89,44 @@ mod decode_escaped_whitespace_tests {
     }
 }
 
-/// The source identifier of an fstab entry - the first whitespace-separated
-/// field on a line (traditionally called "device" even though it is not
-/// always a device).
+/// The source identifier of an fstab entry - the first field on a line
+/// (traditionally called "device" even though it isn't always one).
 ///
-/// Each variant stores the *original raw text* of the field it was built
-/// from (including any octal-escaped whitespace, untouched - see the module
-/// docs), so that re-serializing a [`SourceId`] produces byte-identical text
-/// to what it was parsed from. The variant itself only records which
-/// `fstab`-recognized *prefix* (`UUID=`, `LABEL=`, etc.) was present, if any;
-/// it does not attempt to validate the value after the prefix (e.g. it does
-/// not check that a `UUID=` value is a syntactically valid UUID) - that is
-/// `validate.rs`'s job, not the model's.
+/// Each variant stores the raw field text as parsed (escapes untouched), so
+/// re-serializing is byte-identical to the input. The prefix (`UUID=` etc.)
+/// is only recorded, never validated - that's `validate.rs`'s job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceId {
-    /// A raw filesystem path used as the source, e.g. `/dev/sda1` for a
-    /// block device or an arbitrary directory path for a bind mount.
-    /// Stores the path exactly as written, including any octal-escaped
-    /// whitespace.
+    /// A raw filesystem path, e.g. `/dev/sda1` or a bind-mount directory.
     Path(String),
 
-    /// A `UUID=<value>` source. Stores only the `<value>` portion (without
-    /// the `UUID=` prefix); the prefix is re-added by the serializer.
+    /// A `UUID=<value>` source; stores only `<value>`.
     Uuid(String),
 
-    /// A `LABEL=<value>` source. Stores only the `<value>` portion (without
-    /// the `LABEL=` prefix).
+    /// A `LABEL=<value>` source; stores only `<value>`.
     Label(String),
 
-    /// A `PARTUUID=<value>` source. Stores only the `<value>` portion
-    /// (without the `PARTUUID=` prefix).
+    /// A `PARTUUID=<value>` source; stores only `<value>`.
     PartUuid(String),
 
-    /// A `PARTLABEL=<value>` source. Stores only the `<value>` portion
-    /// (without the `PARTLABEL=` prefix).
+    /// A `PARTLABEL=<value>` source; stores only `<value>`.
     PartLabel(String),
 
-    /// The literal `none` source, used for swap files declared without a
-    /// backing device reference, bind mounts, and various pseudo/virtual
-    /// filesystems (`tmpfs`, `proc`, etc.).
+    /// The literal `none` source (swap files, bind mounts, pseudo-filesystems).
     None,
 
-    /// A network filesystem source that doesn't fit the device/UUID/LABEL
-    /// styles above, e.g. `//server/share` (cifs) or `server:/export` (nfs).
-    /// Stored as the full raw text verbatim; this crate does not parse out
-    /// the server/share components, since `fstab`/`mount.cifs`/`mount.nfs`
-    /// accept a wide variety of address forms and guessing wrong would risk
-    /// losing fidelity. A later task may add structured accessors on top of
-    /// this raw text if a concrete UI need arises.
+    /// A network source not matching the styles above, e.g. `//server/share`
+    /// (cifs) or `server:/export` (nfs). Kept as raw text verbatim since this
+    /// crate doesn't parse server/share components.
     Network(String),
 
-    /// Any other source text that does not match a recognized prefix and is
-    /// not a plain path (as best-effort distinguished by the parser) -
-    /// a catch-all that preserves the raw text verbatim so no input is ever
-    /// rejected or silently dropped at the model layer.
+    /// Catch-all for source text matching no recognized prefix, so no input
+    /// is ever rejected at the model layer.
     Other(String),
 }
 
 impl SourceId {
-    /// Returns the raw value stored in this source, **without** re-adding
-    /// any `KEY=` prefix (e.g. for [`SourceId::Uuid`] this returns the UUID
-    /// text alone, not `UUID=<text>`). Useful for callers that already know
-    /// the variant and just want the payload. To reconstruct the exact
-    /// original field text (prefix included), use a future serializer
-    /// (`parser.rs`), not this method.
+    /// Returns the value stored in this source, without any `KEY=` prefix.
     pub fn raw_value(&self) -> &str {
         match self {
             SourceId::Path(s)
@@ -191,27 +141,22 @@ impl SourceId {
     }
 }
 
-/// A single fstab option: either a bare flag (`noauto`) or a `key=value`
-/// pair (`x-systemd.idle-timeout=30`).
+/// A single fstab option: a bare flag (`noauto`) or a `key=value` pair
+/// (`x-systemd.idle-timeout=30`).
 ///
-/// This is intentionally not a closed enum of "known" options (per
-/// `docs/SPEC.md` §5) - recognizing well-known options and offering toggles
-/// for them is a frontend concern for a later task. This type only
-/// distinguishes the two syntactic shapes fstab options can take.
+/// Not a closed enum of "known" options (per `docs/SPEC.md` §5) - that's a
+/// frontend concern. This type only distinguishes the two syntactic shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FstabOption {
-    /// A bare flag with no `=value` part, e.g. `noatime`, `ro`, `bind`.
+    /// A bare flag, e.g. `noatime`, `ro`, `bind`.
     Flag(String),
-    /// A `key=value` pair, e.g. `fmask=0022` or `x-systemd.device-timeout=10`.
-    /// The key and value are stored separately (both raw text, unescaped
-    /// beyond what the comma-separated option list itself required) so
-    /// callers can query/mutate by key without re-splitting on `=`.
+    /// A `key=value` pair, e.g. `fmask=0022`, stored as separate key/value
+    /// so callers can query/mutate by key without re-splitting on `=`.
     KeyValue(String, String),
 }
 
 impl FstabOption {
-    /// Returns this option's key: the flag name for [`FstabOption::Flag`],
-    /// or the part before `=` for [`FstabOption::KeyValue`].
+    /// This option's key: the flag name, or the part before `=`.
     pub fn key(&self) -> &str {
         match self {
             FstabOption::Flag(k) => k,
@@ -219,10 +164,8 @@ impl FstabOption {
         }
     }
 
-    /// Returns this option's value, if it has one. Always `None` for
-    /// [`FstabOption::Flag`]; always `Some` (possibly an empty string, for a
-    /// literal `key=` with nothing after the `=`) for
-    /// [`FstabOption::KeyValue`].
+    /// This option's value, if any. Always `None` for a flag; always
+    /// `Some` (possibly empty) for a `key=value` pair.
     pub fn value(&self) -> Option<&str> {
         match self {
             FstabOption::Flag(_) => None,
@@ -232,10 +175,7 @@ impl FstabOption {
 }
 
 impl fmt::Display for FstabOption {
-    /// Renders the option back to its fstab text form (`key` or
-    /// `key=value`). This is a small, pure text-formatting helper (not a
-    /// parser), consistent with the rest of this module exposing no
-    /// text-to-model parsing logic.
+    /// Renders back to fstab text form (`key` or `key=value`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FstabOption::Flag(k) => write!(f, "{k}"),
@@ -244,32 +184,25 @@ impl fmt::Display for FstabOption {
     }
 }
 
-/// An ordered list of fstab options (the fourth, comma-separated field of an
-/// entry).
+/// An ordered list of fstab options (the fourth, comma-separated field).
 ///
-/// Order and exact spelling of each option are preserved as given -
-/// `Options` never sorts, deduplicates, or normalizes casing on its own.
-/// Mutation methods (`set`/`unset`) describe exactly what they do to order
-/// when an option already exists; see their docs.
+/// Order and spelling are preserved as given - never sorted, deduplicated,
+/// or case-normalized.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Options(Vec<FstabOption>);
 
 impl Options {
-    /// Creates an empty option list (equivalent to an entry whose options
-    /// field is empty, which the serializer may choose to render as
-    /// `defaults` or leave empty - that choice belongs to `parser.rs`, not
-    /// this type).
+    /// Creates an empty option list.
     pub fn new() -> Self {
         Options(Vec::new())
     }
 
-    /// Builds an `Options` list from an already-split sequence of options,
-    /// preserving the given order exactly.
+    /// Builds an `Options` list from an already-split sequence, preserving order.
     pub fn from_vec(options: Vec<FstabOption>) -> Self {
         Options(options)
     }
 
-    /// Returns the options in their current order as a slice.
+    /// Returns the options in order as a slice.
     pub fn as_slice(&self) -> &[FstabOption] {
         &self.0
     }
@@ -279,34 +212,25 @@ impl Options {
         self.0.is_empty()
     }
 
-    /// Returns the number of options in the list.
+    /// Returns the number of options.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Returns `true` if an option with this exact key exists, regardless
-    /// of whether it is a bare flag or a `key=value` pair. Key comparison is
-    /// case-sensitive and exact, matching fstab's own lack of case-folding
-    /// for option names.
+    /// Returns `true` if an option with this exact key exists (flag or
+    /// `key=value`). Case-sensitive, matching fstab itself.
     pub fn contains(&self, key: &str) -> bool {
         self.0.iter().any(|opt| opt.key() == key)
     }
 
-    /// Returns the value of the first `key=value` option with this key, or
-    /// `None` if no option with this key exists *or* it exists only as a
-    /// bare flag. Use [`Options::contains`] first if you need to
-    /// distinguish "absent" from "present but flag-only".
+    /// Returns the value of the `key=value` option with this key, or `None`
+    /// if absent or present only as a bare flag.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0.iter().find(|opt| opt.key() == key)?.value()
     }
 
-    /// Inserts or replaces a `key=value` option.
-    ///
-    /// If an option with this key already exists, its value is replaced
-    /// **in place** (preserving its original position in the list) and it
-    /// is converted to a `key=value` option if it was previously a bare
-    /// flag. If no option with this key exists, a new `key=value` option is
-    /// appended at the end.
+    /// Inserts or replaces a `key=value` option, in place if the key already
+    /// exists (converting a bare flag to `key=value`), else appended.
     pub fn set(&mut self, key: &str, value: impl Into<String>) {
         if let Some(opt) = self.0.iter_mut().find(|opt| opt.key() == key) {
             *opt = FstabOption::KeyValue(key.to_string(), value.into());
@@ -316,11 +240,8 @@ impl Options {
         }
     }
 
-    /// Inserts a bare flag option (e.g. `noauto`) if not already present by
-    /// key. If an option with this key already exists (flag or
-    /// `key=value`), this is a no-op - it does not downgrade an existing
-    /// `key=value` option to a flag, since that would silently discard its
-    /// value.
+    /// Inserts a bare flag if not already present by key. No-op if the key
+    /// already exists, even as `key=value` - never downgrades a value away.
     pub fn set_flag(&mut self, key: impl Into<String>) {
         let key = key.into();
         if !self.contains(&key) {
@@ -328,9 +249,8 @@ impl Options {
         }
     }
 
-    /// Removes any option with this key (flag or `key=value`), returning
-    /// `true` if one was present and removed, `false` if the key was not
-    /// found. Preserves the relative order of the remaining options.
+    /// Removes any option with this key, returning whether one was found.
+    /// Preserves order of the remaining options.
     pub fn unset(&mut self, key: &str) -> bool {
         let len_before = self.0.len();
         self.0.retain(|opt| opt.key() != key);
@@ -339,8 +259,7 @@ impl Options {
 }
 
 impl fmt::Display for Options {
-    /// Renders the options back to fstab's comma-separated text form.
-    /// This is a small, pure text-formatting helper (not a parser).
+    /// Renders back to fstab's comma-separated text form.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, opt) in self.0.iter().enumerate() {
             if i > 0 {
@@ -352,80 +271,52 @@ impl fmt::Display for Options {
     }
 }
 
-/// One logical, successfully-parsed fstab entry - i.e. a non-comment,
-/// non-blank line with all six whitespace-separated fields present and
-/// structurally well-formed enough to split.
+/// One logical, successfully-parsed fstab entry - a non-comment, non-blank
+/// line with all six fields present and well-formed enough to split.
 ///
-/// `mount_point` and `fs_type` are kept as free-form raw text (no closed
-/// enum) per `docs/SPEC.md` §5: fstab accepts arbitrary filesystem type
-/// strings, and rejecting uncommon-but-valid ones would make this crate
-/// less correct than hand-editing the file. `mount_point` follows the same
-/// escaped-whitespace policy as [`SourceId::Path`] - see the module-level
-/// docs.
+/// `mount_point` and `fs_type` are free-form raw text (no closed enum) per
+/// `docs/SPEC.md` §5, since fstab accepts arbitrary filesystem type strings.
+/// `mount_point` follows the same escaped-whitespace policy as
+/// [`SourceId::Path`] - see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FstabEntry {
-    /// The entry's source identifier (first field).
+    /// The source identifier (first field).
     pub source: SourceId,
-    /// The mount point (second field), raw text - may contain
-    /// octal-escaped whitespace, stored undecoded (see module docs).
+    /// The mount point (second field), raw text - may contain undecoded
+    /// octal-escaped whitespace (see module docs).
     pub mount_point: String,
-    /// The filesystem type (third field), free text. No closed enum: any
-    /// string the file contains is preserved as-is.
+    /// The filesystem type (third field), free text.
     pub fs_type: String,
     /// The options list (fourth field).
     pub options: Options,
-    /// The dump field (fifth field) - historically used by the `dump(8)`
-    /// backup utility. Conventionally `0` or `1`; stored as a plain integer
-    /// since fstab itself imposes no tighter range.
+    /// The dump field (fifth field, `dump(8)` backup flag). Conventionally
+    /// `0` or `1`; stored as a plain integer since fstab imposes no range.
     pub dump: u32,
-    /// The pass field (sixth field) - fsck ordering. Conventionally `0`
-    /// (skip), `1` (check first, root filesystem), or `2` (check after
-    /// pass 1); stored as a plain integer since fstab itself imposes no
-    /// tighter range.
+    /// The pass field (sixth field, fsck ordering). Conventionally `0`
+    /// (skip), `1` (root), or `2` (checked after pass 1); stored as a plain
+    /// integer since fstab imposes no range.
     pub pass: u32,
-    /// An optional trailing inline comment: the raw text appearing after
-    /// the six fields on the same physical line, following a `#`, *not*
-    /// including the `#` itself. `None` if the line has no trailing
-    /// comment.
+    /// An inline comment on the same line as the entry, after the six
+    /// fields, following `#` (not including it). `None` if absent.
     pub trailing_comment: Option<String>,
-    /// An optional human-readable note about this entry - what the mount
-    /// point is *for*, in the user's own words (e.g. "photo archive, only
-    /// mounted when backing up").
+    /// A human-readable note about what this mount point is for.
     ///
-    /// This is deliberately **not** the same mechanism as
-    /// [`Self::trailing_comment`], and the two are stored separately. A
-    /// trailing comment lives on the *same physical line*, after the six
-    /// fields. A description instead round-trips to and from the **ordinary
-    /// `#` comment line(s) sitting directly above** this entry - no marker of
-    /// any kind. Adjacency alone decides it: a comment line's own text has no
-    /// bearing on whether it is this entry's description, so e.g. a
-    /// hand-commented-out CIFS mount (`#//server/share ...`, see
-    /// [`SourceId::Network`]) directly above an entry is that entry's
-    /// description like any other comment. The exact rule - how far up the
-    /// walk goes, which blank lines it crosses, and how the value is written
-    /// back out - is documented in `parser.rs`'s "Description block
-    /// absorption" and "Serialization contract" sections; it is not restated
-    /// here.
+    /// Distinct from [`Self::trailing_comment`]: a description round-trips
+    /// to/from the ordinary `#` comment line(s) directly above the entry
+    /// (adjacency alone decides it - no marker), while a trailing comment
+    /// lives on the entry's own line. See `parser.rs`'s "Description block
+    /// absorption" and "Serialization contract" for the exact rule.
     ///
-    /// The value **may contain embedded `\n`**: a description is a
-    /// genuinely multi-line note, stored with one `\n` per comment line it
-    /// came from (no trailing newline, and no `\r` - the parser never
-    /// produces one, and the IPC boundary folds any it is handed). It is
-    /// written back out as one comment line per `\n`-separated piece.
-    ///
-    /// `None` means the entry has no description. An empty or
-    /// whitespace-only value is never stored here - it is normalized to
-    /// `None` by whoever constructs the entry. This field performs no
-    /// normalization itself, consistent with the rest of this module doing
-    /// no validation.
+    /// May contain embedded `\n` (one per source comment line, no trailing
+    /// newline, no `\r`). `None` means no description; empty/whitespace-only
+    /// values are normalized to `None` by the constructor, not this field.
     pub description: Option<String>,
 }
 
 impl FstabEntry {
-    /// Constructs a new entry with no trailing comment and no description.
-    /// All fields are taken verbatim; no validation, normalization, or
-    /// escaping is performed (that is `validate.rs`'s and `parser.rs`'s job
-    /// respectively).
+    /// Constructs a new entry with no trailing comment or description.
+    /// Fields are taken verbatim - no validation or escaping (see
+    /// `validate.rs` and `parser.rs`).
     pub fn new(
         source: SourceId,
         mount_point: impl Into<String>,
@@ -446,18 +337,14 @@ impl FstabEntry {
         }
     }
 
-    /// Returns a copy of this entry with `comment` attached as its trailing
-    /// inline comment. Builder-style helper for use alongside [`Self::new`].
+    /// Builder helper: attaches a trailing inline comment.
     #[must_use]
     pub fn with_trailing_comment(mut self, comment: impl Into<String>) -> Self {
         self.trailing_comment = Some(comment.into());
         self
     }
 
-    /// Returns a copy of this entry with `description` attached as its
-    /// human-readable description. Builder-style helper for use alongside
-    /// [`Self::new`]; see [`Self::description`] for what the value means and
-    /// how it is round-tripped to text.
+    /// Builder helper: attaches a description (see [`Self::description`]).
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
@@ -467,49 +354,32 @@ impl FstabEntry {
 
 /// One line of a parsed fstab document.
 ///
-/// A `Document` is an ordered sequence of `Line`s rather than just a `Vec`
-/// of entries, specifically so that comment lines, blank lines, and
-/// malformed lines retain their original position relative to real entries -
-/// required for byte-faithful round-tripping per `docs/SPEC.md` §5/§6.
+/// `Document` stores an ordered sequence of `Line`s rather than a `Vec` of
+/// entries so comments, blanks, and malformed lines keep their original
+/// position - required for byte-faithful round-tripping per `docs/SPEC.md` §5/§6.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
     /// A successfully parsed fstab entry.
     Entry(FstabEntry),
-    /// A full-line comment: the raw text that followed the line's leading
-    /// `#`, not including the `#` itself. Distinct from
-    /// [`FstabEntry::trailing_comment`], which is an inline comment
-    /// attached to an entry line rather than a comment occupying its own
-    /// line. Also distinct from [`FstabEntry::description`]: a comment line
-    /// that belongs to the comment block attached to an entry is absorbed
-    /// into that entry's `description` by the parser and therefore never
-    /// appears as a `Comment` line. What is left as a `Comment` is every
-    /// comment line no entry claimed - one above a [`Line::Malformed`] line,
-    /// or one with no entry below it at all (see `parser.rs` for the exact
-    /// rule).
+    /// A full-line comment, text after the leading `#` (not including it).
+    /// Distinct from [`FstabEntry::trailing_comment`] (inline, on an entry's
+    /// own line) and [`FstabEntry::description`] (a comment block the
+    /// parser absorbed into an entry). What remains `Comment` is any comment
+    /// line no entry claimed - see `parser.rs` for the exact rule.
     Comment(String),
-    /// A blank (whitespace-only or empty) line, preserved so that visual
-    /// spacing between sections of the original file survives a round
-    /// trip.
+    /// A blank line, preserved so spacing survives a round trip.
     Blank,
-    /// A line that could not be parsed as a valid entry, comment, or blank
-    /// line (e.g. a source-only line with missing fields, or some other
-    /// structurally incomplete content) but must still be preserved
-    /// verbatim rather than dropped. Stores the entire original raw line
-    /// text. Per `docs/SPEC.md` §5, callers should surface this to the user
-    /// as a visible warning rather than silently skipping or rejecting the
-    /// whole file.
+    /// A line that couldn't be parsed as an entry, comment, or blank line,
+    /// preserved verbatim rather than dropped. Per `docs/SPEC.md` §5,
+    /// callers should surface this as a visible warning, not skip it.
     Malformed(String),
 }
 
 /// A whole parsed fstab file: an ordered sequence of [`Line`]s.
 ///
-/// Reconstructing a file from a `Document` (serialization, a later task) is
-/// only guaranteed to be byte-faithful if every line of the original file
-/// was captured as exactly one `Line` in `lines`, in original order - this
-/// type carries no separate "header comment block" or "entries" field
-/// precisely so that invariant is trivially true by construction rather
-/// than something a parser must carefully keep in sync across two
-/// collections.
+/// No separate "header" or "entries" field - everything lives in `lines`,
+/// in original order, so byte-faithful reconstruction is guaranteed by
+/// construction rather than two collections that could drift apart.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Document {
     /// The lines of the document, in original file order.
@@ -522,18 +392,13 @@ impl Document {
         Document { lines: Vec::new() }
     }
 
-    /// Creates a document from an already-ordered sequence of lines, taken
-    /// verbatim.
+    /// Creates a document from an already-ordered sequence of lines.
     pub fn from_lines(lines: Vec<Line>) -> Self {
         Document { lines }
     }
 
-    /// Returns an iterator over just the successfully-parsed entries, in
-    /// document order, skipping comments, blanks, and malformed lines. This
-    /// is a read-only convenience view - it does not let a caller mutate
-    /// entries in place while skipping the surrounding lines; for mutation,
-    /// index into `lines` directly (e.g. via `iter_mut` and matching on
-    /// `Line::Entry`).
+    /// Iterator over just the successfully-parsed entries, in document
+    /// order. Read-only; for mutation, index into `lines` directly.
     pub fn entries(&self) -> impl Iterator<Item = &FstabEntry> {
         self.lines.iter().filter_map(|line| match line {
             Line::Entry(entry) => Some(entry),
@@ -541,9 +406,8 @@ impl Document {
         })
     }
 
-    /// Returns `true` if any line in this document is [`Line::Malformed`].
-    /// Callers (e.g. the GUI) should use this to decide whether to show a
-    /// "some lines could not be understood" warning.
+    /// Returns `true` if any line is [`Line::Malformed`] - callers (e.g.
+    /// the GUI) use this to decide whether to show a warning.
     pub fn has_malformed_lines(&self) -> bool {
         self.lines
             .iter()

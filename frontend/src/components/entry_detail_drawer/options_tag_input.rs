@@ -2,7 +2,7 @@
 //! free tags, rendered as one ordered removable-chip list (§4 item 5).
 //!
 //! All state here is local, in-memory scratch state for the drawer - it
-//! does not read/write the mock entries table or any app-level state.
+//! does not read/write the entries table or any app-level state directly.
 
 use web_sys::HtmlInputElement;
 use yew::prelude::*;

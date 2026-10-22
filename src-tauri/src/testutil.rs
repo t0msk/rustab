@@ -3,14 +3,10 @@
 //! The whole module is `#[cfg(test)]`-gated from `lib.rs`, so none of it is
 //! compiled into the shipped binary.
 //!
-//! It deliberately duplicates the tiny temp-directory helper that
-//! `crates/fstab-core/src/writer.rs` keeps inside its own `mod tests` rather
-//! than promoting that one into shared, published API: `fstab-core` is a
-//! separate crate whose public surface is the fstab domain (parse, validate,
-//! write) and should not grow a test-utility export just because a second
-//! crate wants a scratch directory. A dozen lines of RAII are cheaper than a
-//! `dev-dependencies` cycle or a published helper nobody outside the tests
-//! should call.
+//! Duplicates the tiny temp-directory helper `crates/fstab-core/src/writer.rs`
+//! keeps in its own `mod tests`, rather than promoting it into published
+//! API: `fstab-core`'s public surface is the fstab domain, not a
+//! test-utility export for a second crate's scratch directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};

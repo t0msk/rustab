@@ -1,168 +1,99 @@
-//! The elevated operations: `pkexec` re-exec on the unprivileged side, hidden
-//! internal subcommand on the elevated side - see `docs/SPEC.md` §6 step 6
-//! and `docs/API_CONTRACT.md` §4.
+//! The elevated operations: `pkexec` re-exec on the unprivileged side,
+//! hidden internal subcommand on the elevated side - see `docs/SPEC.md` §6
+//! step 6 and `docs/API_CONTRACT.md` §4.
 //!
 //! ## The three operations, and why there is still only one flag
 //!
-//! Three things in Rustab need root, and only when the active target is the
-//! real `/etc/fstab`: **writing the target** (a save or a restore),
-//! **deleting one of the target's own backups**, and **creating a manual
-//! backup** of it. The latter two are about files in `/etc/`, next to the
-//! target, which an unprivileged process can neither unlink nor create.
+//! Three things need root, only when the active target is the real
+//! `/etc/fstab`: **writing the target** (save/restore), **deleting one of
+//! its backups**, and **creating a manual backup** - the latter two
+//! because an unprivileged process can't unlink or create files in `/etc/`.
 //!
-//! They share one dispatch point. The request on stdin is a union tagged by
-//! `op`, so [`run_internal_if_requested`] still checks exactly one hidden
-//! argument, still reads stdin to EOF exactly once, still writes exactly one
-//! JSON object to stdout and still returns one exit code - for any of the
-//! three. That matters because the security property this module claims is
-//! "when the flag is present, no Tauri runtime, webview, plugin or logger is
-//! ever initialized", and that claim is only as auditable as the number of
-//! places that can turn this process into a root process. There is one. A
-//! second flag would have made it two, and a third would have made it three.
+//! All three share one dispatch point: the stdin request is a union tagged
+//! by `op`, so [`run_internal_if_requested`] still checks exactly one
+//! hidden argument and turns this process into root through exactly one
+//! path, auditable as such. The backup operations are deliberately tiny
+//! (resolve then `remove_file`; resolve then copy) - neither writes the
+//! target, and [`writer::create_backup`] never even opens it for writing.
 //!
-//! Everything below about the write operation is unchanged; the other two are
-//! deliberately tiny by comparison (resolve then `remove_file`; resolve then
-//! copy), because neither writes the target and none of
-//! [`writer::write_document`]'s guarantees apply to them or are needed for
-//! them. In particular [`writer::create_backup`] never opens the target for
-//! writing at all - it only reads it - so the elevated backup operation
-//! cannot damage `/etc/fstab` even in principle.
+//! ## The requirement
 //!
-//! ## The requirement, restated
+//! `docs/SPEC.md` §6 step 6 forbids an unprivileged temp-file write
+//! followed by a separate privileged `mv`: two privileged steps leave a
+//! window where a crash or race can leave `/etc/fstab` in an unplanned
+//! state. The elevated process must either do nothing or complete the
+//! full atomic swap.
 //!
-//! `docs/SPEC.md` §6 step 6 forbids the obvious-but-wrong design: an
-//! unprivileged temp-file write followed by a separate privileged `mv`. Two
-//! privileged steps mean a window in which a crash, a failed second step, or
-//! a race leaves the real `/etc/fstab` in a state nobody planned. The
-//! requirement is that the elevated process "either does nothing or completes
-//! the full atomic swap".
+//! ## How that's guaranteed here
 //!
-//! ## How that is guaranteed here, by construction
+//! The elevated process runs the same binary with a hidden first
+//! argument, and does exactly one thing: [`fstab_core::writer::write_document`] -
+//! the whole §6 algorithm in one function call, inside one process, under
+//! one authorization. The unprivileged side never writes anything: it
+//! serializes the candidate to JSON, hands it to the child on stdin, and
+//! reads one JSON object back. No temp file to move, no partial state to
+//! resume, no second privileged call. The candidate travels as a
+//! `DocumentDto`, not rendered text, so the elevated side reconstructs the
+//! exact `Document` the user saw and lets `write_document` render it - no
+//! second serializer whose output could differ from the first.
 //!
-//! The elevated process runs **the same binary** with a hidden first
-//! argument, and in that mode it does exactly one thing:
-//! [`fstab_core::writer::write_document`] - the whole §6 algorithm
-//! (validate → back up → prune → temp file in the target's own directory →
-//! `fsync` → `fsync` dir → `rename` → `fsync` dir → read back and verify) in
-//! a single function call, inside a single process, under a single
-//! authorization.
+//! ## Why re-exec this binary instead of a separate helper
 //!
-//! The unprivileged side does **not** write anything, anywhere, ever: it
-//! serializes the candidate document to JSON, hands it to the child on
-//! stdin, and reads one JSON object back from stdout. There is no temp file
-//! on this side to be moved, no partial state to resume, and no second
-//! privileged call to make. Delete the elevated process at any moment and the
-//! only possible outcomes are the ones `write_document` itself guarantees,
-//! because `write_document` is the only thing that ever touched the disk.
+//! A separate `rustab-helper` binary was rejected: it would need its own
+//! build/package/sign step and version-lock with the GUI; it could drift
+//! from the audited `write_document` code where a re-exec can't; and it
+//! buys no security benefit, since [`run_internal_if_requested`] already
+//! runs before Tauri/webview/plugins/logger initialize, so the elevated
+//! surface is already minimal. `pkexec` would still prompt per invocation
+//! either way.
 //!
-//! That is also why the candidate travels as a `DocumentDto`, not as rendered
-//! text: the elevated side reconstructs the exact same
-//! [`fstab_core::model::Document`] the user was shown and lets
-//! `write_document` render it, so there is no second serializer anywhere in
-//! the chain whose output could differ from the first one's.
+//! ## Where that re-exec happens, inside a Flatpak sandbox
 //!
-//! ## Why re-exec this binary instead of shipping a helper binary
-//!
-//! A separate `rustab-helper` executable would be the textbook answer. It was
-//! rejected on purpose:
-//!
-//! - **One artifact to build, package, and sign.** A second binary has to be
-//!   added to the Tauri bundle, installed to a known absolute path, kept
-//!   version-locked with the GUI (a stale helper writing a format the GUI no
-//!   longer speaks is a real hazard), and signed separately for distribution
-//!   formats that sign executables. `docs/SPEC.md` §13/§14 describe a
-//!   single-binary bundle; a helper would complicate every one of those paths.
-//! - **It cannot drift from the audited code.** The elevated path calls the
-//!   identical `write_document` compiled from the identical source in the
-//!   same build. There is no way for "the helper's copy" of the write logic
-//!   to fall behind, because there is no copy.
-//! - **No security benefit is given up.** A helper binary's advantage would
-//!   be a smaller elevated code surface. Here the elevated surface is
-//!   *already* minimal and provably so: [`run_internal_if_requested`] runs
-//!   before anything else in `main`, so when the flag is present the Tauri
-//!   runtime, the webview, the logger and the plugins are never initialized -
-//!   the elevated process reads stdin, calls one function, prints JSON, and
-//!   exits. The flag is matched as `argv[1]` exactly, and extra arguments are
-//!   refused.
-//! - **The helper would need the same authorization anyway.** `pkexec` prompts
-//!   per invocation for either design, so nothing about the user experience
-//!   or the trust model improves.
-//!
-//! ## Where that re-exec happens, inside a Flatpak sandbox (T40)
-//!
-//! One thing about the mechanism - and *only* this one thing - differs when
-//! Rustab runs as a Flatpak: the `pkexec` invocation has to be made on the
-//! **host**, via `flatpak-spawn --host`, and it has to name this binary by its
-//! host-side path rather than by `std::env::current_exe()`. The reason is
-//! worth stating precisely, because the obvious reading of `pkexec` is wrong:
-//! `pkexec` changes a process's **UID**, not its **mount namespace**, so a
-//! `pkexec` child started from inside the sandbox is root *in the sandbox* -
-//! and the `/etc` a sandboxed process sees is the runtime's own, with no path
-//! at all to the host's `/etc/fstab` (Flatpak reserves `/etc` and refuses even
-//! an explicit `--filesystem=/etc/fstab:rw` grant). Such a process would be
-//! authorized to write a file that is not the one the user is editing.
-//!
-//! `flatpak-spawn --host pkexec <host path> --internal-privileged-write`
-//! produces what is actually needed: a genuine host process, outside every
-//! sandbox, running as root. All of it lives in [`crate::host`]; the only line
-//! in this module that knows about it is the one in [`run_elevated`] that asks
-//! for the plan. Nothing else here changes - not this module's protocol, not
-//! its dispatch, not one of its `handle_*` or `interpret_*` functions - and
-//! the single-flag property below is untouched: there is still exactly one
-//! argument, in one binary, that can turn a process into a root process.
+//! One thing differs under Flatpak: the `pkexec` invocation must run on
+//! the **host**, via `flatpak-spawn --host`, naming this binary by its
+//! host-side path rather than `std::env::current_exe()`. `pkexec` changes
+//! a process's UID, not its mount namespace, so a `pkexec` child started
+//! inside the sandbox is root *in the sandbox*, with no path to the real
+//! `/etc/fstab` at all. `flatpak-spawn --host pkexec <host path>
+//! --internal-privileged-write` gives a genuine host root process instead.
+//! All of that lives in [`crate::host`]; the only line here that knows
+//! about it is in [`run_elevated`]. Nothing else in this module's
+//! protocol or dispatch changes, and the single-flag property holds.
 //!
 //! ## The target path, and why the child re-checks it
 //!
-//! `pkexec` deliberately does not forward the caller's environment, so the
-//! child cannot re-resolve the target itself - `RUSTAB_TARGET_PATH` does not
-//! survive the transition (that is a feature: it means an env var cannot
-//! influence the elevated process at all). The target therefore travels
-//! inside the request.
+//! `pkexec` doesn't forward the caller's environment, so the child can't
+//! re-resolve the target itself - the target travels inside the request.
+//! Because it arrives as data, the child refuses to act on anything except
+//! the real `/etc/fstab` (literally, or via a resolving symlink).
+//! Escalation only happens when the unprivileged side is acting on the
+//! real file, and in every such case the path handed here is the hardcoded
+//! [`target::REAL_FSTAB_PATH`], never a draft path - so a bug on the
+//! unprivileged side can't turn an elevated write into "write arbitrary
+//! content to an arbitrary root-owned path". The allowed target is a
+//! parameter of [`handle_privileged_request`] purely so tests can exercise
+//! the real code path against a temp file.
 //!
-//! Because the path arrives as data, the child refuses to act on anything
-//! except the real `/etc/fstab` (literally, or via a symlink that resolves to
-//! it). Escalation only ever happens when the unprivileged side is acting on
-//! the real file - which since T34/T35 means `is_real || source ==
-//! SandboxDefault`, not `is_real` alone (a default launch writes `/etc/fstab`
-//! and keeps its backups beside it, while resolving to a draft of its own;
-//! see [`crate::commands`]'s `save_document_with` and `backup_target_path`) -
-//! and in every one of those cases the path handed to this helper is the
-//! hardcoded [`target::REAL_FSTAB_PATH`], never a draft path. So this costs
-//! nothing in normal operation, and it means
-//! a bug on the unprivileged side cannot turn the elevated write into "write
-//! arbitrary content to an arbitrary root-owned path". The allowed target is a
-//! parameter of [`handle_privileged_request`] purely so tests exercise the
-//! real code path against a temp file instead of needing a bypass switch.
+//! The delete operation's `backup_path` arrives as data for the same
+//! reason, with one extra step: the child resolves it through
+//! [`crate::backups::resolve_requested`] against the real backup list of
+//! the target it has *already* verified, so the only files it can ever
+//! unlink are that target's own backups.
 //!
-//! The delete operation's `backup_path` arrives as data for the same reason,
-//! and is re-checked the same way, with one extra step: the child resolves it
-//! through [`crate::backups::resolve_requested`] against the real backup list
-//! of the target it has *already* verified, so the only files it can ever
-//! unlink are that one target's own backups. A bug (or a lie) on the
-//! unprivileged side cannot turn the elevated delete into "unlink an arbitrary
-//! root-owned path" - not `/etc/shadow`, not a different target's backup, not
-//! the target itself.
+//! ## The external-change check lives in the child too
 //!
-//! ## The external-change check lives in the child too (T36)
+//! For the same structural reason: a write request carries what the
+//! unprivileged side believed `/etc/fstab` held, and the elevated side
+//! re-reads and compares immediately before `write_document`. It can't be
+//! checked only on the unprivileged side, since `pkexec` blocks on a human
+//! typing a password - an arbitrarily long window during which anything
+//! else can write the file. The parent's check is a courtesy that avoids a
+//! pointless password prompt; the child's is the one that decides.
 //!
-//! For the same structural reason, and it is worth stating plainly: a write
-//! request carries what the unprivileged side believed `/etc/fstab` held (its
-//! last-known-real marker's content - see [`target::ExternalChangeGuard`]),
-//! and the elevated side re-reads the file and compares, immediately before
-//! [`writer::write_document`]. The reason it cannot be checked only on the
-//! unprivileged side is this module's own mechanism: `pkexec` blocks on a
-//! human typing a password, so the interval between "the parent looked" and
-//! "the write happens" contains an arbitrarily long, human-paced wait during
-//! which anything else can write the file. The parent's check (in
-//! `crate::commands::save_document_with`) is a courtesy that saves a pointless
-//! password prompt; the child's is the one that decides, exactly as it is for
-//! validation.
-//!
-//! The create-backup operation carries only a `target`, and that single
-//! identity check is the whole of its authority: the path it writes is chosen
-//! by [`writer::create_backup`] from the verified target's own name, never by
-//! anything in the request, so there is no second string for the unprivileged
-//! side to get wrong or to lie about.
+//! The create-backup operation carries only a `target`; that single
+//! identity check is its whole authority, since the path it writes is
+//! chosen by [`writer::create_backup`] from the verified target's own
+//! name, never from anything else in the request.
 
 use crate::backups;
 use crate::dto::{
@@ -180,16 +111,14 @@ use std::process::{Output, Stdio};
 
 /// The hidden first argument that turns this binary into the elevated helper.
 ///
-/// Not a public CLI: it is an implementation detail of the escalation
-/// mechanism, its stdin/stdout protocol is unstable, and nothing but
-/// [`save_elevated`], [`delete_backup_elevated`] and [`create_backup_elevated`]
-/// is expected to pass it.
+/// Not a public CLI: an implementation detail of the escalation mechanism,
+/// with an unstable stdin/stdout protocol. Only [`save_elevated`],
+/// [`delete_backup_elevated`], and [`create_backup_elevated`] pass it.
 ///
-/// The name and the spelling are historical - the flag predates the two
-/// backup operations and now carries any [`PrivilegedRequest`] variant. It is
-/// kept as-is on purpose: changing it buys nothing and the whole point of this
-/// module is that there is exactly *one* string that can turn this process
-/// into a root process.
+/// The name predates the two backup operations and now carries any
+/// [`PrivilegedRequest`] variant; kept as-is since changing it buys
+/// nothing, and the whole point is that there's exactly *one* string that
+/// can turn this process into a root process.
 pub const INTERNAL_WRITE_FLAG: &str = "--internal-privileged-write";
 
 /// Exit code of the elevated helper when the requested operation succeeded.
@@ -218,15 +147,14 @@ const PKEXEC_NOT_AUTHORIZED: i32 = 127;
 /// The request the unprivileged side writes to the elevated helper's stdin:
 /// one JSON object, then EOF.
 ///
-/// A union tagged by `op`, so the single hidden flag can carry either
-/// operation. Every variant names its `target` explicitly rather than relying
-/// on the elevated process to re-resolve it (it cannot - see the module docs),
-/// and the elevated side re-checks that name against the one target it is
-/// allowed to touch before doing anything at all.
+/// A union tagged by `op`, so the single hidden flag can carry any
+/// operation. Every variant names its `target` explicitly, since the
+/// elevated process can't re-resolve it (see module docs), and re-checks
+/// that name against the one target it's allowed to touch before doing
+/// anything.
 ///
-/// This protocol is internal, undocumented as a public interface and unstable
-/// by design (`docs/API_CONTRACT.md` §11): nothing but this binary ever speaks
-/// it, to itself, in a single build.
+/// Internal, undocumented, unstable by design (`docs/API_CONTRACT.md`
+/// §11): nothing but this binary ever speaks it, to itself, in one build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PrivilegedRequest {
@@ -236,26 +164,23 @@ pub enum PrivilegedRequest {
         target: String,
         /// The document to write, in the same shape the frontend sent it.
         candidate: DocumentDto,
-        /// What the unprivileged side believes `target` currently holds - the
-        /// content its last-known-real marker records (T36). The elevated side
-        /// re-reads `target` itself and refuses the write if the two differ,
-        /// *immediately* before [`writer::write_document`] runs; see
-        /// [`handle_write`].
+        /// What the unprivileged side believes `target` currently holds (its
+        /// last-known-real marker's content). The elevated side re-reads
+        /// `target` and refuses the write if the two differ, immediately
+        /// before [`writer::write_document`] runs; see [`handle_write`].
         ///
-        /// `None` means the unprivileged side has no usable record and no
-        /// comparison is possible, which is the pre-T36 behaviour (see
-        /// [`target::ExternalChangeGuard`]).
+        /// `None` means no usable record, so no comparison is possible
+        /// (see [`target::ExternalChangeGuard`]).
         ///
-        /// Deliberately **not** `#[serde(default)]`, unlike the additive
-        /// fields on the DTOs that cross the Tauri boundary: this protocol is
-        /// internal to one build speaking to itself, and a missing field
-        /// defaulting to "no record" would be a silently fail-*open* default
-        /// on the one check that exists to fail closed. A request that does
-        /// not carry the field is a protocol error, as it should be.
+        /// Deliberately not `#[serde(default)]`, unlike the DTOs crossing
+        /// the Tauri boundary: this protocol is internal to one build
+        /// speaking to itself, and defaulting a missing field to "no
+        /// record" would silently fail *open* on the one check that
+        /// exists to fail closed.
         last_known_real_content: Option<String>,
-        /// `true` only when the user has already been shown what changed
-        /// externally and asked for the write anyway, which makes the elevated
-        /// side skip the comparison for this one request (T36).
+        /// `true` only when the user has already been shown the external
+        /// change and asked for the write anyway, skipping the comparison
+        /// for this one request.
         allow_external_change: bool,
     },
     /// Unlink one of `target`'s own backups. Never `target` itself.
@@ -282,11 +207,10 @@ pub enum PrivilegedRequest {
 /// The single JSON object the elevated helper prints to stdout before
 /// exiting. Nothing else is ever written to stdout in that mode.
 ///
-/// One type for both operations rather than one per operation, because the
-/// framing errors (stdin unreadable, request unparsable) happen *before* the
-/// helper knows which operation it was asked for, and so cannot be reported in
-/// an operation-specific shape. Those are reported as [`Self::Error`], which
-/// is why the delete path also has to be able to read that variant.
+/// One type for all operations, not one per operation, since framing
+/// errors (unreadable stdin, unparsable request) happen before the helper
+/// knows which operation was asked for, and are reported as
+/// [`Self::Error`] regardless.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PrivilegedResponse {
@@ -357,18 +281,15 @@ pub fn run_internal_if_requested() -> Option<i32> {
     ))
 }
 
-/// The whole of the elevated helper: read one JSON [`PrivilegedRequest`] from
-/// `input`, perform it, write one JSON [`PrivilegedResponse`] to `output`, and
-/// return the exit code.
+/// The whole of the elevated helper: read one JSON [`PrivilegedRequest`]
+/// from `input`, perform it, write one JSON [`PrivilegedResponse`] to
+/// `output`, and return the exit code.
 ///
-/// `allowed_target` is the only target this is permitted to act on (matched
-/// literally or by canonicalized identity) - the only file it may write, and
-/// the only file whose backups it may delete. Production passes `/etc/fstab`;
-/// tests pass a temp file so that this exact function - not a stand-in - is
-/// what they exercise.
+/// `allowed_target` is the only target this may act on (matched literally
+/// or by canonicalized identity). Production passes `/etc/fstab`; tests
+/// pass a temp file, so this exact function is what they exercise.
 ///
-/// Never panics and never returns without having written a response: a caller
-/// (or a test) can rely on stdout holding exactly one JSON object.
+/// Never panics, never returns without writing a response.
 pub fn handle_privileged_request<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
@@ -436,29 +357,22 @@ pub fn handle_privileged_request<R: Read, W: Write>(
     }
 }
 
-/// The elevated write: refuse any target but `allowed_target`, refuse a target
-/// that changed outside Rustab since the unprivileged side last looked, then
-/// perform the complete [`writer::write_document`] operation in this one
-/// process under this one authorization.
+/// The elevated write: refuse any target but `allowed_target`, refuse a
+/// target that changed outside Rustab since the unprivileged side last
+/// looked, then perform the complete [`writer::write_document`] operation
+/// in this one process under this one authorization.
 ///
-/// ## Why the external-change check is *here* (T36)
+/// ## Why the external-change check is *here*
 ///
-/// This is the authoritative one, and it is placed as the last thing before
-/// `write_document` on purpose. [`save_elevated`] spawns `pkexec`, which
-/// blocks on a human reading a dialog and typing a password - an arbitrarily
-/// long wait, during which another tool, another Rustab instance or a text
-/// editor can write `/etc/fstab`. A check made only in the unprivileged parent
-/// before that prompt would therefore leave the largest part of the window
-/// uncovered. So the request carries what the parent believed the file held
-/// ([`target::ExternalChangeGuard`]), this process re-reads the file itself and
-/// compares, and only then writes.
-///
-/// It is exactly the relationship this module already has for *validation*:
-/// [`save_elevated`] validates before prompting as a courtesy (so nobody types
-/// a password for a save that cannot succeed), and `write_document` validates
-/// again in here, where the answer is binding. Both unprivileged pre-checks
-/// could be deleted without weakening any guarantee this function makes;
-/// neither of the checks in here can.
+/// Placed as the last thing before `write_document` on purpose:
+/// [`save_elevated`] spawns `pkexec`, which blocks on a human typing a
+/// password for an arbitrarily long time, during which anything else
+/// could write `/etc/fstab`. A parent-side-only check would leave that
+/// whole window uncovered. So the request carries what the parent
+/// believed the file held ([`target::ExternalChangeGuard`]), and this
+/// process re-reads and compares before writing - the same relationship
+/// this module has for validation, where the parent's pre-check is a
+/// courtesy and this one is binding.
 fn handle_write<W: Write>(
     output: &mut W,
     allowed_target: &Path,
@@ -530,28 +444,20 @@ fn handle_write<W: Write>(
 }
 
 /// The elevated backup deletion, in full: refuse any target but
-/// `allowed_target`, resolve `backup_path` against *that* target's real backup
-/// list, and unlink exactly the path the list yielded.
+/// `allowed_target`, resolve `backup_path` against *that* target's real
+/// backup list, and unlink exactly the path the list yielded.
 ///
-/// Two checks, then one syscall. Neither check trusts anything the
-/// unprivileged side said:
+/// Two checks, then one syscall, neither trusting the unprivileged side:
 ///
-/// 1. `target` must be the one target this process may act on - the identical
-///    [`target::is_same_file`] test [`handle_write`] applies, so "which file
-///    is the real `/etc/fstab`" is decided in one place for both operations.
-/// 2. `backup_path` must resolve, through
-///    [`backups::resolve_requested`] *here*, to one of that target's actual
-///    backups. The path that is then unlinked is the one the backup list
-///    yielded, never the string that arrived in the request.
+/// 1. `target` must pass the same [`target::is_same_file`] test
+///    [`handle_write`] applies.
+/// 2. `backup_path` must resolve, through [`backups::resolve_requested`]
+///    *here*, to one of that target's actual backups - the path unlinked
+///    is the one the backup list yielded, never the request's raw string.
 ///
-/// If either check fails, nothing is unlinked - the response is written before
-/// anything touches the disk, which is the same shape of guarantee
-/// [`handle_write`] gives for an invalid target.
-///
-/// There is deliberately no backup-of-the-backup, no temp file and no rename:
-/// this removes a *backup*, not the target, so none of
-/// [`writer::write_document`]'s atomicity guarantees apply to it or are needed
-/// for it. The target file itself is never opened by this function.
+/// No backup-of-the-backup, no temp file, no rename: this removes a
+/// backup, not the target, so none of `write_document`'s atomicity
+/// guarantees apply. The target file itself is never opened.
 fn handle_delete_backup<W: Write>(
     output: &mut W,
     allowed_target: &Path,
@@ -611,20 +517,14 @@ fn handle_delete_backup<W: Write>(
 /// The elevated manual backup, in full: refuse any target but
 /// `allowed_target`, then call [`writer::create_backup`] on it.
 ///
-/// One check, then one function call - the same shape, and the same "nothing
-/// happens before the check passes" guarantee, as [`handle_write`] and
-/// [`handle_delete_backup`]. The identity test is the identical
-/// [`target::is_same_file`] call those two use, so "which file is the real
-/// `/etc/fstab`" is still decided in exactly one place for every operation.
+/// One check, then one call - the same "nothing happens before the check
+/// passes" shape, and the same [`target::is_same_file`] identity test, as
+/// [`handle_write`] and [`handle_delete_backup`].
 ///
-/// There is nothing else to check, because there is nothing else in the
-/// request: [`writer::create_backup`] derives the backup's path from the
-/// verified target's own name, in the target's own directory, so this
-/// operation cannot be pointed at another file the way an operation taking a
-/// destination path could be. And it never opens the target for writing -
-/// only for reading - so unlike [`handle_write`] it has no atomicity
-/// ceremony to perform and no way to leave `/etc/fstab` in a state nobody
-/// planned.
+/// Nothing else to check: [`writer::create_backup`] derives the backup's
+/// path from the verified target's own name, so there's no destination to
+/// get pointed elsewhere, and it only reads the target, so unlike
+/// [`handle_write`] there's no atomicity ceremony needed.
 fn handle_create_backup<W: Write>(output: &mut W, allowed_target: &Path, target: &str) -> i32 {
     let target_path = PathBuf::from(target);
     if !target::is_same_file(&target_path, allowed_target) {
@@ -690,20 +590,15 @@ fn respond<W: Write>(output: &mut W, response: PrivilegedResponse, code: i32) ->
 /// Why the elevated half could not be run to completion, before it had a
 /// chance to report anything of its own.
 ///
-/// Carries the underlying error but **no message**: each operation words its
-/// own, because the useful wording names what was not done ("nothing was
-/// written" / "nothing was deleted") and the right error `kind` differs
-/// between the two shapes. The *mechanics* - the order of the steps, killing a
-/// child whose stdin could not be delivered, and which of these failures mean
-/// "the helper provably never acted" - are shared, which is the part that is
-/// safety-relevant.
+/// Carries the underlying error but no message: each operation words its
+/// own ("nothing was written" vs. "nothing was deleted"), while the
+/// shared, safety-relevant part is the mechanics - step order, killing a
+/// child whose stdin failed, and which failures mean "provably never acted".
 #[derive(Debug)]
 enum LaunchFailure {
-    /// There was no path to re-exec: [`std::env::current_exe`] failed, or -
-    /// inside a Flatpak sandbox, where `current_exe` yields the meaningless
-    /// in-sandbox `/app/bin/rustab` - this binary could not be found at any of
-    /// its host-side paths (see [`crate::host::elevated_self_plan`]). The
-    /// helper never ran.
+    /// No path to re-exec: [`std::env::current_exe`] failed, or - inside a
+    /// Flatpak sandbox - this binary wasn't found at any host-side path
+    /// (see [`crate::host::elevated_self_plan`]). The helper never ran.
     NoExePath(io::Error),
     /// The request could not be serialized - a bug between the two halves.
     /// The helper never ran.
@@ -736,26 +631,19 @@ impl LaunchFailure {
 /// Re-executes this binary as root with [`INTERNAL_WRITE_FLAG`], hands
 /// `request` to it on stdin, and returns what it printed and exited with.
 ///
-/// The whole `pkexec` plumbing for **both** operations, deliberately in one
-/// function: the spawn, the single stdin write, the pipe close, and the wait
-/// are identical for a write and for a delete, and two copies of them could
-/// drift apart in ways that matter (a forgotten `child.kill()` on a failed
-/// stdin write leaves a root process blocked on a pipe that will never close).
+/// The whole `pkexec` plumbing for **both** operations, in one function,
+/// since the spawn/stdin-write/pipe-close/wait sequence is identical for
+/// both and two copies could drift apart in safety-relevant ways (e.g. a
+/// forgotten `child.kill()` on a failed stdin write leaving a root process
+/// blocked on a pipe forever).
 ///
-/// Performs **no filesystem writes of its own** - it serializes JSON to a pipe
-/// and reads bytes back.
+/// Performs no filesystem writes of its own - just JSON over a pipe.
 ///
-/// ## The one thing T40 changed here
-///
-/// *Which command* is spawned, and nothing else. On an ordinary install it is
-/// still `pkexec <this binary> <flag>`. Inside a Flatpak sandbox it is
-/// `flatpak-spawn --host pkexec <this binary's host path> <flag>`, because
-/// `pkexec` on its own would produce a root process that is **still inside the
-/// sandbox** - and the `/etc` a sandboxed process sees is the runtime's, not
-/// the host's, so such a process cannot write the real `/etc/fstab` no matter
-/// what it is authorized to do (`pkexec` changes the UID, not the mount
-/// namespace; confirmed empirically - see [`crate::host`]). The decision and
-/// the host-path resolution both live in [`crate::host::elevated_self_plan`];
+/// Under Flatpak, *which command* is spawned changes: not `pkexec <this
+/// binary> <flag>` but `flatpak-spawn --host pkexec <host path> <flag>`,
+/// since `pkexec` alone would produce a root process still inside the
+/// sandbox, unable to see the real `/etc/`. That decision and the
+/// host-path resolution both live in [`crate::host::elevated_self_plan`];
 /// this function only asks for the plan and runs it.
 ///
 /// Everything after the spawn is untouched and deliberately so: writing the
@@ -852,15 +740,14 @@ impl NoResponseReason {
 /// Performs a save of `candidate` to `target` as root, by re-executing this
 /// binary under `pkexec` with [`INTERNAL_WRITE_FLAG`].
 ///
-/// This function performs **no filesystem writes of its own**. Everything
-/// that touches disk happens inside the elevated
-/// [`writer::write_document`] call (see the module docs).
+/// No filesystem writes of its own - everything that touches disk happens
+/// inside the elevated [`writer::write_document`] call.
 ///
 /// `guard` is what the caller believes `target` currently holds, plus the
-/// user's "write anyway" answer (T36). It is pure transport here - this
-/// function neither reads `target` nor decides anything from it; the elevated
-/// side re-reads the file and makes the call ([`handle_write`]), which is why
-/// the password wait cannot hide a change from the check.
+/// user's "write anyway" answer. Pure transport here: this function
+/// neither reads `target` nor decides anything from it; the elevated side
+/// re-reads the file and makes the call ([`handle_write`]), which is why
+/// the password wait can't hide a change from the check.
 ///
 /// # Errors
 ///
@@ -944,14 +831,13 @@ fn write_launch_error(target: &Path, failure: &LaunchFailure) -> WriteErrorDto {
 
 /// Maps the elevated writer's exit status, stdout and stderr onto a result.
 ///
-/// Pure: no process spawning, so the interpretation of every outcome
-/// (including the `pkexec`-specific exit codes, which cannot be provoked
-/// reliably in a test) is unit-testable on its own.
+/// Pure, so every outcome (including `pkexec`-specific exit codes that
+/// can't be reliably provoked in a test) is unit-testable on its own.
 ///
-/// A parsable JSON response always wins over the exit code - it is the
-/// helper's own account of what it did. Only when there is no usable response
-/// does the exit code decide, and then the rule is conservative: claim
-/// `target_unchanged` only for the codes that mean the helper never ran.
+/// A parsable JSON response always wins over the exit code - the helper's
+/// own account of what it did. Only without one does the exit code decide,
+/// conservatively: `target_unchanged` only for codes that mean the helper
+/// never ran.
 fn interpret_write_output(
     target: &Path,
     code: Option<i32>,
@@ -1023,15 +909,14 @@ fn interpret_write_output(
 /// Deletes `backup_path` - one of `target`'s own backups - as root, by
 /// re-executing this binary under `pkexec` with [`INTERNAL_WRITE_FLAG`].
 ///
-/// Needed at all because the backups of the real `/etc/fstab` live beside it
-/// in `/etc/`, which an unprivileged process cannot unlink from (see
-/// `crates/fstab-core/src/writer.rs` on backup naming). A non-real target's
-/// backups live in a user-owned directory and never come through here.
+/// Needed because the real `/etc/fstab`'s backups live beside it in
+/// `/etc/`, which an unprivileged process can't unlink from. A non-real
+/// target's backups live in a user-owned directory and never come through here.
 ///
-/// This function performs **no filesystem changes of its own**, and the
-/// elevated half it starts re-resolves `backup_path` against `target`'s real
-/// backup list before unlinking anything, so neither half can be talked into
-/// deleting a file that is not one of this target's backups.
+/// No filesystem changes of its own - the elevated half re-resolves
+/// `backup_path` against `target`'s real backup list before unlinking
+/// anything, so neither half can be talked into deleting a file that
+/// isn't one of this target's backups.
 ///
 /// # Errors
 ///
@@ -1162,18 +1047,17 @@ fn interpret_delete_output(
 
 // -- the manual backup-creation operation ------------------------------------
 
-/// Creates a manual backup of `target` as root, by re-executing this binary
-/// under `pkexec` with [`INTERNAL_WRITE_FLAG`].
+/// Creates a manual backup of `target` as root, by re-executing this
+/// binary under `pkexec` with [`INTERNAL_WRITE_FLAG`].
 ///
-/// Needed at all because a backup of the real `/etc/fstab` has to be created
-/// *in* `/etc/`, which an unprivileged process cannot write to - the mirror
-/// image of why [`delete_backup_elevated`] exists. A non-real target's backups
-/// live in a user-owned directory and never come through here.
+/// Needed because a backup of the real `/etc/fstab` must be created *in*
+/// `/etc/`, which an unprivileged process can't write to - the mirror
+/// image of [`delete_backup_elevated`]. A non-real target's backups never
+/// come through here.
 ///
-/// This function performs **no filesystem changes of its own**, and the
-/// elevated half it starts chooses the backup's path itself from the target it
-/// has verified, so there is no path in this request that could point the
-/// elevated copy at the wrong file.
+/// No filesystem changes of its own - the elevated half chooses the
+/// backup's path itself from the verified target, so there's no path in
+/// this request that could point it at the wrong file.
 ///
 /// # Errors
 ///

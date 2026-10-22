@@ -1,5 +1,5 @@
 //! `DevicePicker` - discovered-device list/combobox for the source value
-//! field (§4 item 2). Backed by `discover_devices` (T11); respects the
+//! field (§4 item 2). Backed by `discover_devices`; respects the
 //! soft-failure contract (`docs/API_CONTRACT.md` §3.8, `docs/SPEC.md` §8):
 //! when `lsblk` is unavailable the picker says so plainly rather than
 //! claiming "no devices found", and manual text entry in the parent field

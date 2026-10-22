@@ -1,25 +1,21 @@
 //! `EntryDetailDrawer` - add/edit form container (§4).
 //!
-//! Slides in from the right, fixed width 520px, **not** dismissible by
-//! backdrop click (changed from the original dismissible-by-click design per
-//! direct user request: a drawer can hold several unsaved, sometimes
-//! carefully-constructed field edits, and a single misclick outside it would
-//! silently discard all of them with no undo - too easy a way to lose real
-//! work for a purely non-destructive-sounding dismiss gesture). Closing the
-//! drawer is only ever explicit now: the header's close (×) button or
-//! `FormActionBar`'s Cancel button, both of which already call the same
-//! `on_close`.
+//! Slides in from the right, fixed width 520px, not dismissible by
+//! backdrop click: a drawer can hold several unsaved, carefully
+//! constructed field edits, and a misclick outside it would silently
+//! discard them with no undo. Closing is only ever explicit: the
+//! header's close (×) button or `FormActionBar`'s Cancel button, both
+//! calling the same `on_close`.
 //!
-//! Wired (T11): prefilled from the real entry being edited, device
-//! discovery for `DevicePicker`, and inline validation via
-//! `validate_candidate` run against the *whole* candidate document (this
-//! draft entry plus every other line already staged), per
-//! `docs/API_CONTRACT.md` §3.3 - duplicate-mount-point-style checks need
-//! the full document, not just this one entry. Clicking "Save entry" never
-//! calls a write command: it emits the finished `EntryDto`/raw text back
-//! to `AppShell`, which stages it into the in-memory candidate document
-//! (see `crate::candidate`). Disk writes only ever happen through T12's
-//! diff-confirm flow.
+//! Prefilled from the real entry being edited, with device discovery for
+//! `DevicePicker` and inline validation via `validate_candidate` run
+//! against the whole candidate document (this draft entry plus every
+//! other line already staged), per `docs/API_CONTRACT.md` §3.3 -
+//! duplicate-mount-point-style checks need the full document. Clicking
+//! "Save entry" never calls a write command: it emits the finished
+//! `EntryDto`/raw text back to `AppShell`, which stages it into the
+//! in-memory candidate document (see `crate::candidate`). Disk writes
+//! only happen through the diff-confirm flow.
 
 mod description_field;
 mod device_picker;
@@ -740,16 +736,12 @@ fn build_entry(
 }
 
 /// `trailing_comment`'s one piece of non-pass-through logic in
-/// `build_entry`: normalize a fully-empty string to `None` ("no trailing
-/// comment" at all, removing the `#` from the written line) rather than a
-/// bare trailing `#` with nothing after it. Deliberately **no** other
-/// trimming - unlike `description`, any non-empty value (including one
-/// that is only whitespace) is preserved exactly as typed, since
-/// `trailing_comment`'s whole contract is verbatim preservation
-/// (`docs/API_CONTRACT.md` §5). Factored out of `build_entry` purely so it
-/// is unit-testable without a `UseStateHandle`, same reasoning
-/// `draft_insertion_index` was factored out of `document_with_draft` for
-/// above.
+/// `build_entry`: normalize a fully-empty string to `None` (no trailing
+/// comment at all) rather than a bare trailing `#`. No other trimming -
+/// unlike `description`, any non-empty value (including whitespace-only)
+/// is preserved exactly as typed, since `trailing_comment`'s contract is
+/// verbatim preservation (`docs/API_CONTRACT.md` §5). Factored out of
+/// `build_entry` so it's unit-testable without a `UseStateHandle`.
 fn normalize_trailing_comment(value: Option<&str>) -> Option<String> {
     value.filter(|s| !s.is_empty()).map(str::to_string)
 }

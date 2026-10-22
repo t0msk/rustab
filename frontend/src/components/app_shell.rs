@@ -1,27 +1,27 @@
 //! `AppShell` - top-level layout: `TargetBanner` + `HeaderBar` + tab content
-//! area (§1). Owns all in-memory view-state for this task (which tab is
-//! active, which overlay is open) using Yew `use_state` - no router, per
+//! area (§1). Owns all in-memory view-state (which tab is active, which
+//! overlay is open) using Yew `use_state` - no router, per
 //! `docs/UI_DESIGN.md` §1.
 //!
-//! **State design (T11, load-bearing for T12):** `AppShell` owns the one
-//! `CandidateDocument` for the session (see `crate::candidate`), seeded
-//! from `list_entries` on mount. `EntriesTable` renders it, deletes/edits
-//! mutate it directly, and `EntryDetailDrawer` stages adds/edits into it
-//! via `DrawerSaveResult` - nothing below `AppShell` ever calls a write
-//! command except the diff-confirm/save and restore flows below.
-//! `original_document`/`original_text` keep the document exactly as loaded
-//! (replaced wholesale only after a successful `save`/`restore_backup`, or
-//! after a failed one that can't guarantee the target is unchanged - see
-//! `on_diff_confirm`/`on_restore_confirm`), so `CandidateDocument`'s own
-//! comparison helpers and `crate::diff` can build the diff view without any
-//! further bookkeeping here.
+//! **State design:** `AppShell` owns the one `CandidateDocument` for the
+//! session (see `crate::candidate`), seeded from `list_entries` on
+//! mount. `EntriesTable` renders it, deletes/edits mutate it directly,
+//! and `EntryDetailDrawer` stages adds/edits into it via
+//! `DrawerSaveResult` - nothing below `AppShell` calls a write command
+//! except the diff-confirm/save and restore flows below.
+//! `original_document`/`original_text` keep the document exactly as
+//! loaded (replaced wholesale only after a successful
+//! `save`/`restore_backup`, or a failed one that can't guarantee the
+//! target is unchanged - see `on_diff_confirm`/`on_restore_confirm`), so
+//! `CandidateDocument`'s comparison helpers and `crate::diff` can build
+//! the diff view with no further bookkeeping here.
 //!
-//! **Safety-gate derivation (T34):** this component is also where
-//! `writes_real_file` - "would confirming write the real `/etc/fstab`?" - is
-//! computed, once, from the live `TargetInfoDto`, and threaded into every
-//! confirm step that goes through the save dispatch (`DiffView`,
-//! `BackupRestoreConfirmDialog`). See the comment on the binding itself near
-//! the bottom of `app_shell` for why it is not `is_real`, and
+//! **Safety-gate derivation:** this component is also where
+//! `writes_real_file` - "would confirming write the real `/etc/fstab`?" -
+//! is computed once from the live `TargetInfoDto`, and threaded into
+//! every confirm step that goes through the save dispatch (`DiffView`,
+//! `BackupRestoreConfirmDialog`). See the comment on the binding itself
+//! near the bottom of `app_shell` for why it isn't `is_real`, and
 //! `docs/UI_DESIGN.md` §2 for the three states it collapses.
 
 use yew::prelude::*;
@@ -87,16 +87,14 @@ async fn reload_backups(
 }
 
 /// Builds the toast for a *successful* `save`/`restore_backup`, given that
-/// call's `draft_sync_warning` (`docs/API_CONTRACT.md` §8, T34).
+/// call's `draft_sync_warning` (`docs/API_CONTRACT.md` §8).
 ///
 /// `Some(message)` means the real `/etc/fstab` was written but the local
-/// working draft beside it could not be updated to match. The write that
-/// mattered succeeded, so this is not an error - but it must not be
-/// swallowed either (`PROJECT_PLAN.md`'s T34 non-negotiables: "a toast, not
-/// a silent swallow"), so it *replaces* `fallback` rather than being shown
-/// alongside it: the backend's message already states that the save
-/// succeeded, and two sentences both claiming success would only bury the
-/// part the user has not already inferred from the dialog closing.
+/// working draft couldn't be updated to match - not an error, but not
+/// something to swallow either, so it replaces `fallback` rather than
+/// being shown alongside it: the backend's message already states the
+/// save succeeded, and two sentences both claiming success would bury
+/// the part the user hasn't already inferred.
 fn success_toast(draft_sync_warning: Option<String>, fallback: &str) -> (ToastKind, String) {
     match draft_sync_warning {
         Some(message) => (ToastKind::Warning, message),
@@ -328,19 +326,18 @@ pub fn app_shell() -> Html {
     let restore_saving = use_state(|| false);
     let restore_error: UseStateHandle<Option<String>> = use_state(|| None);
 
-    // T36: the external-change outcome for each flow, if its last `save`/
+    // The external-change outcome for each flow, if its last `save`/
     // `restore_backup` attempt hit one (`docs/API_CONTRACT.md` §8), plus
-    // the "write anyway" checkbox state for `ExternalChangeDialog`'s own,
+    // the "write anyway" checkbox state for `ExternalChangeDialog`'s own
     // second confirmation - distinct from `diff_confirm_checked`/
-    // `restore_confirm_checked` above, which gate the *first*
+    // `restore_confirm_checked` above, which gate the first
     // `RealTargetConfirmCheckbox` the user already passed to reach here.
-    // `Some(_)` here means `DiffView`/`BackupRestoreConfirmDialog` is
-    // closed and `ExternalChangeDialog` is shown instead - see
-    // `on_diff_confirm`/`on_restore_confirm` below for why that is this
-    // component's documented choice for "go back" on Cancel. `diff_saving`/
+    // `Some(_)` means `DiffView`/`BackupRestoreConfirmDialog` is closed
+    // and `ExternalChangeDialog` is shown instead - see
+    // `on_diff_confirm`/`on_restore_confirm` below. `diff_saving`/
     // `diff_error` and `restore_saving`/`restore_error` are reused for
-    // `ExternalChangeDialog`'s own loading/error slot in each flow, since
-    // the dialog they came from is never shown at the same time.
+    // `ExternalChangeDialog`'s own loading/error slot, since the dialog
+    // they came from is never shown at the same time.
     let diff_external_change: UseStateHandle<Option<ExternalChangeInfo>> = use_state(|| None);
     let diff_external_change_confirm_checked = use_state(|| false);
     let restore_external_change: UseStateHandle<Option<ExternalChangeInfo>> = use_state(|| None);
@@ -654,17 +651,11 @@ pub fn app_shell() -> Html {
                     }
                     Err(write_error) => {
                         if let Some(info) = external_change_info(&write_error) {
-                            // T36: refused before anything was written - not
-                            // a normal save failure, so divert into
-                            // `ExternalChangeDialog` instead of the plain
-                            // error banner. `target_unchanged` is always
-                            // `true` for this kind (API_CONTRACT.md §8), so
-                            // there is nothing to `reload_entries` for.
-                            // Documented choice: close the whole flow back
-                            // to the pending-changes bar rather than
-                            // stacking a second modal on top of `DiffView` -
-                            // less state to juggle here, and `Cancel` on the
-                            // new dialog leaves the user exactly there.
+                            // Refused before anything was written - divert
+                            // into `ExternalChangeDialog` instead of the
+                            // plain error banner, closing the whole flow
+                            // back to the pending-changes bar rather than
+                            // stacking a second modal on top of `DiffView`.
                             diff_view_open.set(false);
                             diff_confirm_checked.set(false);
                             diff_saving.set(false);
@@ -914,18 +905,13 @@ pub fn app_shell() -> Html {
                     }
                     Err(write_error) => {
                         if let Some(info) = external_change_info(&write_error) {
-                            // T36: refused before anything was written.
-                            // Documented choice (mirroring the save flow):
-                            // deliberately does *not* clear `restore_target`
+                            // Refused before anything was written. Mirrors
+                            // the save flow: doesn't clear `restore_target`
                             // here - `BackupRestoreConfirmDialog` is hidden
-                            // (see the render below) rather than closed, so
-                            // "write anyway" can resolve the same
-                            // `backup_path` again, and `on_restore_
-                            // external_change_cancel` is what actually
-                            // closes the whole flow back to the Backups
-                            // panel. `target_unchanged` is always `true`
-                            // for this kind, so there is nothing to
-                            // `reload_entries` for.
+                            // rather than closed, so "write anyway" can
+                            // resolve the same `backup_path` again, and
+                            // `on_restore_external_change_cancel` is what
+                            // actually closes the flow back to the Backups panel.
                             restore_confirm_checked.set(false);
                             restore_saving.set(false);
                             restore_external_change_confirm_checked.set(false);
@@ -1375,25 +1361,21 @@ pub fn app_shell() -> Html {
 
     let is_real = target.as_ref().map(|t| t.is_real).unwrap_or(false);
     // "Will confirming this action write the real `/etc/fstab`?" - the one
-    // predicate every consequential confirm step in this app is gated on
-    // since T34, derived here exactly once so the three dialogs below (and
-    // `confirm_disabled`) cannot drift apart on it.
+    // predicate every consequential confirm step is gated on, derived
+    // once here so the three dialogs below and `confirm_disabled` can't
+    // drift apart on it.
     //
-    // It is deliberately *not* `is_real`: per
-    // `src-tauri/src/commands.rs::save_document_with`, a save dispatches on
-    // the target's `source`, and a `SandboxDefault` target (the default,
-    // unconfigured launch - `is_real == false`) writes the real
-    // `/etc/fstab` through `pkexec` and then mirrors it into the local
-    // working draft. So every launch writes the real file except one: an
-    // explicit `RUSTAB_TARGET_PATH` naming some other file.
+    // Not `is_real`: per `src-tauri/src/commands.rs::save_document_with`,
+    // a save dispatches on the target's `source`, and a `SandboxDefault`
+    // target (the default launch, `is_real == false`) writes the real
+    // `/etc/fstab` through `pkexec` and mirrors it into the local draft.
+    // So every launch writes the real file except an explicit
+    // `RUSTAB_TARGET_PATH` naming some other file.
     //
-    // `unwrap_or(false)` while the target is still loading is safe without
-    // being optimistic: no confirm dialog can be open before
-    // `get_target_info` has resolved (they are all reached through buttons
-    // rendered below the banner, which itself renders "Loading target…"
-    // until then), and a `false` here only ever *shows* a calmer state, it
-    // cannot send a write anywhere - the backend resolves the target for
-    // itself on every call.
+    // `unwrap_or(false)` while loading is safe: no confirm dialog can be
+    // open before `get_target_info` resolves, and a `false` here only
+    // ever shows a calmer state - the backend resolves the target itself
+    // on every call.
     let writes_real_file = target
         .as_ref()
         .map(|t| t.is_real || t.source == TargetSource::SandboxDefault)

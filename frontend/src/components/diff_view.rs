@@ -1,13 +1,14 @@
-//! `DiffView` - the pending-changes/diff confirmation modal (§6), plus its
-//! `DiffSummaryList` and `DiffRawText` sub-views.
+//! `DiffView` - the pending-changes/diff confirmation modal (§6), plus
+//! its `DiffSummaryList` and `DiffRawText` sub-views.
 //!
-//! Purely presentational: `AppShell` computes the Added/Modified/
-//! Reordered/Removed grouping (`crate::diff::compute_summary_diff`) and the raw unified diff
+//! Purely presentational: `AppShell` computes the
+//! Added/Modified/Reordered/Removed grouping
+//! (`crate::diff::compute_summary_diff`) and the raw unified diff
 //! (`crate::diff::compute_raw_diff`, fed by the real `render_candidate`
 //! call) and hands both down as props, along with the save-in-flight/error
-//! state for the confirm button (T12) and the two target flags below
-//! (`writes_real_file`/`is_real`), which since T34 are not the same question:
-//! see `docs/UI_DESIGN.md` §2/§6.
+//! state for the confirm button and the two target flags below
+//! (`writes_real_file`/`is_real`), which are not the same question - see
+//! `docs/UI_DESIGN.md` §2/§6.
 
 use yew::prelude::*;
 

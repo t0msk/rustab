@@ -3,106 +3,86 @@
 //!
 //! ## Shape of this module
 //!
-//! Each command is a thin, boring wrapper: it resolves the active target
-//! through [`crate::target`], converts DTOs through [`crate::dto`], and
-//! delegates the real work to `fstab-core`. No command re-implements
-//! validation, serialization, backup naming or writing, and no command takes
-//! a *target* path from the frontend. The carefully bounded exceptions -
-//! [`restore_backup`], [`read_backup`] and [`delete_backup`], which take a
-//! *backup* path - never use it as a path until it has been matched against
-//! the active target's real backup list (see [`crate::backups`]).
+//! Each command is a thin wrapper: resolve the active target via
+//! [`crate::target`], convert DTOs via [`crate::dto`], delegate the real
+//! work to `fstab-core`. No command re-implements validation,
+//! serialization, backup naming, or writing, and no command takes a
+//! *target* path from the frontend. The bounded exceptions
+//! ([`restore_backup`], [`read_backup`], [`delete_backup`], which take a
+//! *backup* path) never use it until it's matched against the active
+//! target's real backup list (see [`crate::backups`]).
 //!
-//! The genuinely interesting logic - "which save path do I take" - is
-//! [`save_document_with`]. Since T34 it has three cases rather than two, all
-//! of them ending in the same [`writer::write_document`] call, some with a
-//! `pkexec` re-exec in front of it (see [`crate::privileged`]): the default
-//! target's save writes the real `/etc/fstab` and then mirrors the same
-//! content into the working draft, while an explicit `RUSTAB_TARGET_PATH`
-//! target is written outright and alone. Read that function's docs before
-//! changing anything here; it is where `docs/SPEC.md` §7's "every save writes
-//! `/etc/fstab`" is actually implemented - and, since T36, where a save first
-//! asks whether the real `/etc/fstab` changed outside Rustab since the session
-//! last synced with it, refusing to overwrite such a change until the user has
-//! seen it and said so ([`save_document_with`], [`target::ExternalChangeGuard`]).
+//! The genuinely interesting logic is [`save_document_with`] ("which save
+//! path do I take"): three cases, all ending in the same
+//! [`writer::write_document`] call, some via a `pkexec` re-exec (see
+//! [`crate::privileged`]) - the default target's save writes the real
+//! `/etc/fstab` and mirrors into the working draft, while an explicit
+//! `RUSTAB_TARGET_PATH` target is written outright and alone. Read that
+//! function's docs before changing anything here; it's where
+//! `docs/SPEC.md` §7's "every save writes `/etc/fstab`" is implemented,
+//! and where a save first checks whether the real file changed outside
+//! Rustab since the session last synced with it
+//! ([`target::ExternalChangeGuard`]).
 //!
-//! The second interesting decision - "whose backups am I looking at" - is
-//! [`backup_target_path`], added by T35 to close the gap T34 left open. Every
-//! backup command ([`list_backups`], [`read_backup`], [`restore_backup`]'s
-//! `backup_path` resolution, [`delete_backup`], [`create_backup`],
-//! [`open_backup_location`]) now routes through it rather than using
-//! `target.path`, so for a default launch the Backups panel describes the
-//! backups of the file a save actually writes - the real `/etc/fstab` - and
-//! not the working draft's own directory. [`delete_backup_with`] and
-//! [`create_backup_with`] dispatch on [`backups_are_elevated`] accordingly,
-//! which is the same `is_real || source == SandboxDefault` shape
-//! [`save_document_with`] encodes and the frontend calls `writes_real_file`
-//! (`docs/UI_DESIGN.md` §2): creating or unlinking a root-owned file in
-//! `/etc/` needs the same single `pkexec` re-exec a save needs.
+//! The second decision, "whose backups am I looking at", is
+//! [`backup_target_path`]. Every backup command routes through it rather
+//! than `target.path`, so for a default launch the Backups panel
+//! describes the backups of the file a save actually writes - the real
+//! `/etc/fstab` - not the draft's own directory.
+//! [`delete_backup_with`]/[`create_backup_with`] dispatch on
+//! [`backups_are_elevated`] accordingly (the same `is_real || source ==
+//! SandboxDefault` shape [`save_document_with`] uses): creating or
+//! unlinking a root-owned file in `/etc/` needs the same `pkexec` re-exec
+//! a save needs. Reading a backup needs no escalation either way, since
+//! `/etc/fstab` and its backups are world-readable.
 //!
-//! Reading a backup, by contrast, needs no escalation at all in either case:
-//! `/etc/fstab` and the backups beside it are world-readable, which is the
-//! same reason [`list_entries`] and [`list_backups`] already work against the
-//! real target unprivileged.
+//! ## Where the real file's manual backups live
 //!
-//! ## T39: *where* the real file's manual backups live
+//! A third, layered decision: a process that can't enumerate `/etc/` (a
+//! Flatpak sandbox, which sees only the runtime's `/etc`) keeps the real
+//! `/etc/fstab`'s manually managed backups in a per-user fallback
+//! directory instead (see [`crate::backup_location`]).
+//! [`backup_target_path`] points every backup command at a mirror file in
+//! that directory, redirecting all of them with no change to the
+//! functions doing the work, and [`backups_are_elevated`] then answers
+//! `false`, since that directory needs no `pkexec`.
 //!
-//! The third decision, layered on top of the second: a process that cannot
-//! **enumerate** `/etc/` - a Flatpak sandbox, where the `/etc` it sees is the
-//! runtime's, because Flatpak reserves that path space and honours no
-//! `--filesystem=` grant under it - keeps the real `/etc/fstab`'s **manually
-//! managed** backups in a per-user fallback directory instead (see
-//! [`crate::backup_location`]). [`backup_target_path`] points every backup
-//! command at a mirror file inside that directory in that case, which
-//! redirects all of them with no change to the functions that do the work, and
-//! [`backups_are_elevated`] then answers `false`, because that directory
-//! belongs to the user and needs no `pkexec` at all.
-//!
-//! Nothing about *writing* changes: [`save_document_with`] and everything
-//! under it are untouched, so a save still writes the real `/etc/fstab`
-//! through the elevated helper and still leaves its automatic backup beside it
-//! in `/etc/`. The accepted consequence - those automatic backups are not
-//! visible in a fallback-mode [`list_backups`] - is spelled out in
-//! [`crate::backup_location`]'s module docs and surfaced to the user through
+//! Nothing about *writing* changes: a save still writes the real
+//! `/etc/fstab` through the elevated helper and leaves its automatic
+//! backup beside it in `/etc/`. Those automatic backups just aren't
+//! visible in a fallback-mode [`list_backups`] - spelled out in
+//! [`crate::backup_location`]'s docs and surfaced via
 //! [`TargetInfoDto::real_target_backup_fallback_dir`].
 //!
-//! ## T40: *how* the real file is read, and how the elevated helper is started
+//! ## How the real file is read, and how the elevated helper starts
 //!
-//! Orthogonal to all three decisions above, and the reason the Flatpak build
-//! works at all: inside a sandbox neither the real `/etc/fstab` nor a
-//! `pkexec`'d child of this process can be reached by the obvious means. Every
-//! read of the real file in this module therefore goes through an injected
-//! [`crate::host::RealFileReader`] - production passes
-//! [`crate::host::real_file_reader`], which crosses the sandbox boundary with
-//! `flatpak-spawn --host` when there is one to cross, and the tests pass
-//! [`crate::host::DirectFs`] or a double. The three functions that read it -
-//! [`resync_external_change_with`], [`save_document_with`]'s courtesy
-//! external-change check, and [`refresh_backup_mirror`] (the one write-side
-//! reader: it copies the real file onto the fallback mirror before a manual
-//! backup) - take the reader as a parameter for exactly the reason
-//! `real_fstab` is one: `cargo test` must never read the machine's own
-//! `/etc/fstab`, and now also must never spawn `flatpak-spawn`. The elevated
-//! write path's own change is in [`crate::privileged`] and [`crate::host`];
-//! nothing in this module's dispatch moved.
+//! Orthogonal to the above, and the reason the Flatpak build works at
+//! all: inside a sandbox, neither the real `/etc/fstab` nor a `pkexec`'d
+//! child can be reached by the obvious means. Every read of the real
+//! file here goes through an injected [`crate::host::RealFileReader`] -
+//! production uses [`crate::host::real_file_reader`] (crossing the
+//! sandbox boundary with `flatpak-spawn --host` when needed), tests pass
+//! [`crate::host::DirectFs`] or a double. The functions that read it
+//! ([`resync_external_change_with`], [`save_document_with`]'s courtesy
+//! check, [`refresh_backup_mirror`]) take the reader as a parameter so
+//! `cargo test` never reads the machine's own `/etc/fstab` or spawns
+//! `flatpak-spawn`. The elevated write path's own change lives in
+//! [`crate::privileged`] and [`crate::host`]; this module's dispatch is unaffected.
 //!
 //! ## Why every command is `#[tauri::command(async)]`
 //!
-//! Several of these do blocking work: `lsblk`, `findmnt`, file I/O, and in
-//! the `/etc/fstab` case a `pkexec` call that blocks until the user has typed
-//! a password. A plain synchronous Tauri command runs on the main thread,
-//! which would freeze the window for the duration. `(async)` makes Tauri run
-//! these synchronous functions on its thread pool instead, which keeps them
-//! ordinary blocking Rust functions - directly callable from the unit tests
-//! below, with no runtime to set up and no `AppHandle` to fake.
+//! Several do blocking work: `lsblk`, `findmnt`, file I/O, and a `pkexec`
+//! call that blocks on a password. `(async)` makes Tauri run these
+//! ordinary blocking functions on its thread pool instead of the main
+//! thread, which also keeps them directly callable from unit tests with
+//! no runtime or `AppHandle` to fake.
 //!
-//! ## Why the argument-taking commands add `rename_all = "snake_case"`
+//! ## Why argument-taking commands add `rename_all = "snake_case"`
 //!
-//! Tauri renames command *arguments* to camelCase on the IPC boundary by
-//! default, while serde leaves the DTO *fields* inside them in snake_case.
-//! That mix would mean a frontend sending `{"backupPath": ..., }` whose
-//! nested objects use `{"mount_point": ...}` - one spelling rule per nesting
-//! level, which is exactly the kind of detail an integration task gets wrong
-//! once and then debugs for an hour. Pinning the argument case to snake_case
-//! makes the whole payload, at every level, snake_case.
+//! Tauri renames command *arguments* to camelCase by default, while
+//! serde leaves DTO *fields* inside them snake_case. That mix would mean
+//! one spelling rule per nesting level; pinning the argument case to
+//! snake_case keeps the whole payload consistent.
 
 use crate::backup_location::{self, BackupLocation};
 use crate::backups;
@@ -201,22 +181,20 @@ pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
 /// real `/etc/fstab`'s *current* content, without writing to `/etc/fstab`
 /// itself.
 ///
-/// This is T37's "Reload and re-sync" action inside `ExternalChangeDialog`
-/// (`docs/UI_DESIGN.md` §12, `docs/API_CONTRACT.md` §3.15): when a `save` or
-/// `restore_backup` has just been refused with `kind: "external_change"`
-/// (T36), the user can ask Rustab to adopt the real file's current content as
-/// its new baseline - without discarding their pending edits (the frontend's
-/// `candidate`, which this command never touches) and without writing
-/// anything to `/etc/fstab`. It reuses [`target::sync_sandbox_after_save`]
-/// unchanged - the same primitive a successful save already calls to publish
-/// fresh bytes onto the draft and the marker, atomically, as one event
-/// ("Rustab now knows this is reality") - from a new, explicit,
-/// user-initiated entry point rather than only from a successful write.
+/// The "Reload and re-sync" action inside `ExternalChangeDialog`
+/// (`docs/UI_DESIGN.md` §12, `docs/API_CONTRACT.md` §3.15): when a `save`
+/// or `restore_backup` has just been refused with `kind:
+/// "external_change"`, the user can ask Rustab to adopt the real file's
+/// current content as its new baseline, without discarding pending edits
+/// (the frontend's `candidate`, never touched here) or writing to
+/// `/etc/fstab`. Reuses [`target::sync_sandbox_after_save`] - the same
+/// primitive a successful save calls - from a new, explicit,
+/// user-initiated entry point.
 ///
-/// See [`resync_external_change_with`] for the full behaviour, including the
-/// fail-closed guard this command needs because, unlike every other reader in
-/// this module, it *writes* a file (the local draft) as a side effect of a
-/// read of a different one (the real `/etc/fstab`).
+/// See [`resync_external_change_with`] for the full behavior, including
+/// the fail-closed guard this command needs since, unlike every other
+/// reader here, it *writes* a file (the draft) as a side effect of
+/// reading a different one (the real `/etc/fstab`).
 ///
 /// # Errors
 ///
@@ -261,27 +239,25 @@ pub fn render_candidate(candidate: DocumentDto) -> String {
 
 /// Saves `candidate`, atomically.
 ///
-/// Since T34 (`docs/SPEC.md` §7) "where" depends on how the active target was
+/// Per `docs/SPEC.md` §7, "where" depends on how the active target was
 /// chosen, not on whether it happens to be the real file:
 ///
-/// - Default launch (no `RUSTAB_TARGET_PATH`): writes the real `/etc/fstab`
-///   through a single elevated re-exec that performs the whole operation as
-///   root, then best-effort updates the local working draft to match. The
-///   elevated write is what succeeds or fails; a draft that could not be
-///   updated is reported in `draft_sync_warning` on an otherwise successful
-///   outcome.
-/// - `RUSTAB_TARGET_PATH` set: writes that path and only that path -
+/// - Default launch: writes the real `/etc/fstab` through a single
+///   elevated re-exec, then best-effort updates the local draft to
+///   match. The elevated write is what succeeds or fails; a draft that
+///   couldn't be updated is reported in `draft_sync_warning` on an
+///   otherwise successful outcome.
+/// - `RUSTAB_TARGET_PATH` set: writes that path and only that path,
 ///   in-process, or elevated if the path is `/etc/fstab` itself.
 ///
-/// Every case runs the same [`writer::write_document`]. See
+/// Every case runs the same [`writer::write_document`]; see
 /// [`save_document_with`] for the full reasoning.
 ///
-/// `allow_external_change` is the T36 "write anyway" signal, and the frontend
-/// always passes it explicitly: `false` on the normal path, `true` only after
-/// the user has been shown the diff of an external change to the real
-/// `/etc/fstab` and asked for the write regardless. It is layered *on top of*
-/// the existing real-target confirmation, never a replacement for it - see
-/// [`save_document_with`].
+/// `allow_external_change` is the "write anyway" signal, which the
+/// frontend always passes explicitly: `false` normally, `true` only
+/// after the user has seen the diff of an external change and asked for
+/// the write regardless. Layered on top of the real-target confirmation,
+/// never a replacement for it.
 ///
 /// # Errors
 ///
@@ -305,30 +281,26 @@ pub fn save(
     )
 }
 
-/// Lists the backups of the file this session's saves write, newest first -
-/// the real `/etc/fstab`'s for a default launch, since T35 (see
-/// [`backup_target_path`]), and the named path's own for an explicit
+/// Lists the backups of the file this session's saves write, newest
+/// first - the real `/etc/fstab`'s for a default launch (see
+/// [`backup_target_path`]), the named path's own for an explicit
 /// `RUSTAB_TARGET_PATH`.
 ///
-/// Needs no privilege escalation either way: `/etc/` and the backups in it are
-/// world-readable, the same reason [`list_entries`] can read the real target
-/// unprompted.
+/// Needs no privilege escalation either way, since `/etc/` and the
+/// backups in it are world-readable.
 ///
-/// Since T39, a session that cannot enumerate `/etc/` lists the real file's
-/// backups from the fallback directory instead ([`crate::backup_location`]) -
-/// and therefore does **not** list the automatic backups each save leaves
-/// beside `/etc/fstab`, which such a process cannot enumerate. Those backups
-/// are, since T40, confirmed to be getting written (the elevated writer runs
-/// on the host); they are simply invisible from here. The frontend says so,
-/// out of [`TargetInfoDto::real_target_backup_fallback_dir`]; see that field
-/// and `docs/API_CONTRACT.md` §3.6.
+/// A session that can't enumerate `/etc/` (a Flatpak sandbox) lists the
+/// real file's backups from the fallback directory instead
+/// ([`crate::backup_location`]), so it does **not** list the automatic
+/// backups each save leaves beside `/etc/fstab` - those are confirmed to
+/// still be written by the elevated writer, just invisible from here. The
+/// frontend says so via [`TargetInfoDto::real_target_backup_fallback_dir`].
 ///
-/// This is also the one backup operation T40 could *not* move back into
-/// `/etc/` for a sandboxed session, and the reason the other two stayed with
-/// it: it is unprivileged by design and calls
-/// [`writer::list_backups`] in-process, where the `/etc` it would enumerate is
-/// the runtime's. See [`crate::backup_location`]'s module docs for the full
-/// decision.
+/// This is also the one backup operation that stayed unprivileged-only
+/// rather than moving into `/etc/` for a sandboxed session: it calls
+/// [`writer::list_backups`] in-process, where the `/etc` it would
+/// enumerate is the runtime's. See [`crate::backup_location`]'s docs for
+/// the full decision.
 ///
 /// # Errors
 ///
@@ -347,38 +319,30 @@ pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
 
 /// Restores a previously taken backup onto the active target.
 ///
-/// `backup_path` must be one of the paths [`list_backups`] returned for the
-/// *current* target; anything else is refused before being used as a path at
-/// all (see [`crate::backups`]).
+/// `backup_path` must be one of the paths [`list_backups`] returned for
+/// the *current* target; anything else is refused before being used as a
+/// path at all (see [`crate::backups`]).
 ///
-/// A restore is **not** a privileged copy and not a shortcut: the backup's
-/// text is parsed into a document and then goes through the very same
-/// [`save_document`] a normal save uses, so it is validated, backed up (the
-/// content being replaced is itself backed up first), written to a temp file,
-/// `fsync`ed, renamed, verified - and elevated exactly once wherever a normal
-/// save would be. Restoring a broken backup is therefore refused for the same
-/// reasons saving broken content is.
+/// Not a privileged copy or a shortcut: the backup's text is parsed into
+/// a document and goes through the very same [`save_document`] a normal
+/// save uses - validated, backed up, written, `fsync`ed, renamed,
+/// verified, elevated exactly once wherever a normal save would be.
+/// Restoring a broken backup is refused for the same reasons saving
+/// broken content is.
 ///
-/// Because that delegation is the *only* write this command performs, it
-/// inherits T34's dual write with no write code of its own: on a default
-/// launch, restoring a backup writes the real `/etc/fstab` and then mirrors it
-/// into the working draft, exactly as a save does (asserted in this module's
-/// tests). T35 did not change that half at all - [`save_document_with`] is
-/// untouched - but it did change the *other* half: `backup_path` is now
-/// resolved against [`backup_target_path`]'s list, so on a default launch the
-/// backup being restored is one of the real `/etc/fstab`'s, which is the only
-/// list [`list_backups`] offers the user in that case. Before T35 the two
-/// disagreed: the resolution looked in the draft's directory while the write
-/// went to `/etc/fstab`.
+/// Because that delegation is the only write this command performs, it
+/// inherits the dual write with no write code of its own: on a default
+/// launch, restoring writes the real `/etc/fstab` and mirrors it into
+/// the working draft, exactly as a save does. `backup_path` resolves
+/// against [`backup_target_path`]'s list, so on a default launch the
+/// backup being restored is always one of the real `/etc/fstab`'s - the
+/// same list [`list_backups`] offers the user.
 ///
 /// # Errors
 ///
-/// T36 is inherited the same way the dual write is: a restore is a save, so
-/// an external change to the real `/etc/fstab` blocks it exactly as it blocks
-/// [`save`], and `allow_external_change` means the same thing here - `false`
-/// on the normal path, `true` only after the user has seen the diff and asked
-/// for the restore anyway (asserted in this module's tests for *both*
-/// commands, not just for `save`).
+/// A restore is a save, so an external change to the real `/etc/fstab`
+/// blocks it exactly as it blocks [`save`], and `allow_external_change`
+/// means the same thing here.
 ///
 /// # Errors
 ///
@@ -405,19 +369,13 @@ pub fn restore_backup(
 
 /// Returns a backup's raw text, for the backup-diff view.
 ///
-/// `backup_path` must be one of the paths [`list_backups`] returned for the
-/// *current* target, and is resolved exactly the way [`restore_backup`]
-/// resolves it - against [`backup_target_path`]'s backup list, and matched
-/// against that real list before it is ever used as a path (see
-/// [`crate::backups`]). Since T35 that means the real `/etc/fstab`'s backups
-/// for a default launch, so the backup-diff view diffs a restore point of the
-/// file a save writes against what [`list_entries`] shows.
+/// `backup_path` must be one of the paths [`list_backups`] returned for
+/// the current target, resolved against [`backup_target_path`]'s backup
+/// list exactly as [`restore_backup`] resolves it (see [`crate::backups`]).
 ///
-/// Writes nothing and needs no privilege escalation for either target kind:
-/// `/etc/fstab` and the backups beside it are world-readable, so an
-/// unprivileged read suffices - the same reason [`list_entries`] can read the
-/// real target without a password prompt. Pair the returned text with
-/// [`list_entries`]'s `text` to diff a restore point against what is live now.
+/// Writes nothing and needs no privilege escalation, since `/etc/fstab`
+/// and its backups are world-readable. Pair the returned text with
+/// [`list_entries`]'s `text` to diff a restore point against what's live now.
 ///
 /// # Errors
 ///
@@ -439,25 +397,18 @@ pub fn read_backup(backup_path: String) -> Result<String, CommandErrorDto> {
 
 /// Deletes one of the active target's backups.
 ///
-/// `backup_path` must be one of the paths [`list_backups`] returned for the
-/// *current* target. Only ever a backup file: the active target itself is
-/// never one of its own backups, so it can never be the file removed here
+/// `backup_path` must be one of the paths [`list_backups`] returned for
+/// the current target. Only ever a backup file, never the target itself
 /// (asserted by [`crate::privileged`]'s and this module's tests).
 ///
-/// Dispatches on [`backups_are_elevated`] exactly like [`save`] and
-/// [`restore_backup`] dispatch on `source` (T35): an explicit, non-real
-/// `RUSTAB_TARGET_PATH`'s backups live in a user-owned directory and are
-/// removed in-process, while the real `/etc/fstab`'s backups - which is what a
-/// *default* launch's backups are too - live in root-owned `/etc/` and are
-/// removed by a single elevated re-exec (see [`crate::privileged`]). Unlike a
-/// save, this never opens, renames or writes the target file - which is why it
-/// rejects with a [`DeleteBackupErrorDto`] rather than a [`WriteErrorDto`]:
-/// there is no `target_unchanged` question to answer.
-///
-/// T39 adds one case where the real file's backups are *not* elevated: when
-/// they live in the fallback directory rather than in `/etc/`, that directory
-/// is the user's own, so the unlink happens in-process with no prompt (see
-/// [`backups_are_elevated`]).
+/// Dispatches on [`backups_are_elevated`] like [`save`]/[`restore_backup`]
+/// dispatch on `source`: an explicit, non-real target's backups live in
+/// a user-owned directory and are removed in-process, while the real
+/// `/etc/fstab`'s backups live in root-owned `/etc/` and are removed by
+/// a single elevated re-exec - unless they live in the fallback
+/// directory instead, which is the user's own and needs no prompt. This
+/// never opens, renames, or writes the target file, which is why it
+/// rejects with [`DeleteBackupErrorDto`] rather than [`WriteErrorDto`].
 ///
 /// # Errors
 ///
@@ -475,33 +426,23 @@ pub fn delete_backup(backup_path: String) -> Result<(), DeleteBackupErrorDto> {
 
 /// Creates a backup of the active target right now, without changing it.
 ///
-/// The explicit counterpart of the backup a [`save`] takes on its own: it
-/// copies the target's *current* content to a new **manual** backup beside it
-/// and returns that backup as a [`BackupInfoDto`] - the same row shape
-/// [`list_backups`] produces, so the frontend can prepend it or simply
-/// re-list. A manual backup is exempt from the retention bound that prunes
-/// automatic ones (`fstab_core::writer::MAX_BACKUPS`); only an explicit
-/// [`delete_backup`] ever removes it.
+/// The explicit counterpart of the backup a [`save`] takes automatically:
+/// copies the target's current content to a new manual backup and
+/// returns it as a [`BackupInfoDto`], the same row shape [`list_backups`]
+/// produces. A manual backup is exempt from the retention bound that
+/// prunes automatic ones; only an explicit [`delete_backup`] removes it.
 ///
-/// Takes no arguments: like every other command here, *which* file it acts on
-/// is resolved server-side and never supplied by the frontend - since T35 that
-/// is [`backup_target_path`], so a default launch backs up the real
-/// `/etc/fstab` (the file its saves write), not the working draft. Dispatches
-/// on [`backups_are_elevated`] exactly like [`delete_backup`] does: an
-/// explicit, non-real override is copied in-process, while `/etc/fstab` goes
-/// through a single elevated re-exec, because its backups have to be created
-/// in root-owned `/etc/`.
+/// Which file it acts on is resolved server-side via
+/// [`backup_target_path`], so a default launch backs up the real
+/// `/etc/fstab`, not the working draft. Dispatches on
+/// [`backups_are_elevated`] like [`delete_backup`]: an explicit, non-real
+/// override is copied in-process, while `/etc/fstab` goes through a
+/// single elevated re-exec - unless a session can't manage files in
+/// `/etc/`, in which case it copies into the fallback directory
+/// in-process instead (see [`create_backup_with`], [`crate::backup_location`]).
 ///
-/// Since T39, a session that cannot manage files in `/etc/` copies the real
-/// file's *current* content into the fallback directory instead, in-process
-/// and with no prompt - see [`create_backup_with`] for the mirror refresh that
-/// keeps "current" honest, and [`crate::backup_location`] for why only the
-/// manual backups move.
-///
-/// This never opens, renames or writes the target file; it only reads it.
-/// That is why it rejects with a [`CreateBackupErrorDto`] rather than a
-/// [`WriteErrorDto`], for the same reason [`delete_backup`] does: there is no
-/// `target_unchanged` question to answer.
+/// Never opens, renames, or writes the target file, only reads it - why
+/// it rejects with [`CreateBackupErrorDto`] rather than [`WriteErrorDto`].
 ///
 /// # Errors
 ///
@@ -534,20 +475,15 @@ pub fn discover_devices() -> DeviceDiscoveryDto {
 /// manager, via `xdg-open`.
 ///
 /// A target's own directory is also where its backups live (see
-/// [`crate::backups`]'s module docs), so this is the one button the Backups
-/// panel needs to let the user browse the backup files directly. Which
-/// directory that is follows [`backup_target_path`], not the resolved target:
-/// since T35 a default launch opens `/etc/`, where the backups
-/// [`list_backups`] just listed actually are, rather than the working draft's
-/// own directory, which holds none of them. By the same rule, since T39 a
-/// session whose real-file backups are in the fallback directory opens *that*
-/// directory: it is still "where the rows on screen are".
+/// [`crate::backups`]'s module docs), so this is the one button the
+/// Backups panel needs. Which directory that is follows
+/// [`backup_target_path`], not the resolved target: a default launch
+/// opens `/etc/`, where [`list_backups`] actually found them, or the
+/// fallback directory when that's where the rows on screen came from.
 ///
-/// **No privilege escalation, for either target kind.** `/etc/` is
-/// world-readable and world-executable, which is the same reasoning
-/// [`read_backup`] already documents for reading a backup's content -
-/// listing a directory needs strictly less access than reading a file inside
-/// it.
+/// No privilege escalation needed: `/etc/` is world-readable and
+/// world-executable, and listing a directory needs strictly less access
+/// than reading a file inside it (see [`read_backup`]).
 ///
 /// # Errors
 ///
@@ -566,27 +502,16 @@ pub fn open_backup_location() -> Result<(), CommandErrorDto> {
 
 /// `open_external_link(link) -> null` (API_CONTRACT.md §3.13). Opens one
 /// of this app's five known external links (used by the About dialog) via
-/// `xdg-open` - the GitHub repo and Sponsors links in the host's default web
-/// browser, the `Email` link's `mailto:` URI in the host's default mail
-/// client (`xdg-open` dispatches by URI scheme, so no separate code path is
-/// needed for that case).
+/// `xdg-open` - GitHub/Sponsors links in the default browser, the
+/// `Email` link's `mailto:` URI in the default mail client.
 ///
-/// Deliberately takes a closed enum, not a raw URL string: the URLs/URIs
-/// this command will ever open are a fixed, hardcoded set baked into
-/// [`ExternalLinkDto::url`], never anything the frontend supplies -
-/// applying this project's minimal-dispatch-surface philosophy (compare
-/// `privileged.rs`'s own module doc) to a non-privileged case: there is no
-/// argument surface here for a caller to redirect this command at an
-/// arbitrary URL. This is also why the About dialog's email line goes
-/// through this command rather than a plain `<a href="mailto:...">` - an
-/// in-webview anchor navigation to a non-`http(s)` scheme is not guaranteed
-/// to be handled by the host webview at all (WebKitGTK shows "The URL can't
-/// be shown" for `mailto:` rather than falling back to the OS's own
-/// scheme handler), so this command's `xdg-open` dispatch is the only
-/// reliable way to reach the user's mail client from inside the app.
+/// Takes a closed enum, not a raw URL string: the set is fixed, baked
+/// into [`ExternalLinkDto::url`], so there's no argument surface for a
+/// caller to redirect this at an arbitrary URL. This also avoids a plain
+/// `<a href="mailto:...">`, since WebKitGTK shows "The URL can't be
+/// shown" for `mailto:` instead of falling back to the OS's scheme handler.
 ///
-/// **No privilege escalation.** Opening a browser or mail client needs no
-/// elevated access, same reasoning as [`open_backup_location`].
+/// No privilege escalation needed, same reasoning as [`open_backup_location`].
 ///
 /// # Errors
 ///
@@ -601,32 +526,20 @@ pub fn open_external_link(link: ExternalLinkDto) -> Result<(), CommandErrorDto> 
 /// an arbitrary frontend-supplied path in the host file manager, via
 /// `xdg-open`.
 ///
-/// `path` is the project's **second** explicit exception to "no command
-/// accepts a target path" (`docs/API_CONTRACT.md` §2; the first is
-/// [`restore_backup`]'s `backup_path`). It is a different *kind* of
-/// exception, not a weakening of the same one: this command is read-only (it
-/// only launches a file-manager process pointed at a path, the same thing
-/// [`open_backup_location`] already does for a path it resolves itself) and
-/// needs no privilege escalation, so there is no write or privileged read for
-/// a compromised frontend to redirect. The path itself is also never a
-/// secret or something the backend validates on the user's behalf - it is
-/// the Source/Mount point text already visible in the table the user is
-/// looking at, either typed by them or picked via the directory-picker
-/// button - so a malicious frontend gains nothing here it could not already
-/// get by opening that same path in a terminal with Rustab's own
-/// unprivileged access. See `docs/API_CONTRACT.md` §2 for the full
-/// reasoning.
+/// `path` is this project's second explicit exception to "no command
+/// accepts a target path" (the first is [`restore_backup`]'s
+/// `backup_path`), but a different kind: this command is read-only and
+/// needs no privilege escalation, so there's no write or privileged read
+/// to redirect. The path is also never a secret - it's the Source/Mount
+/// point text already visible in the table - so a malicious frontend
+/// gains nothing it couldn't already get by opening that path itself
+/// with Rustab's own unprivileged access (see `docs/API_CONTRACT.md` §2).
 ///
-/// `path` is decoded via [`fstab_core::model::decode_escaped_whitespace`]
-/// first: `fstab_core`'s model deliberately stores a mount point/source path
-/// exactly as written, octal escapes (`\040` for a space, etc.) and all -
-/// see `crates/fstab-core/src/model.rs`'s "Escaped-whitespace policy" - so
-/// the text this command receives can contain a literal `\040` where the
-/// real path on disk has a space. `xdg-open` has no idea about fstab's
-/// escape convention, so without decoding first it looks for a file that
-/// does not exist instead of the one the user actually meant. The same
-/// decode is applied in `fstab_core::validate`'s mount-point-exists check,
-/// for the identical reason.
+/// Decoded via [`fstab_core::model::decode_escaped_whitespace`] first,
+/// since the model stores a mount point/source exactly as written -
+/// octal escapes and all - so without decoding, `xdg-open` would look
+/// for a literal `\040` instead of the space the real path has (same
+/// reason `fstab_core::validate`'s mount-point-exists check decodes too).
 ///
 /// # Errors
 ///
@@ -646,8 +559,7 @@ pub fn open_path_in_file_manager(path: String) -> Result<(), CommandErrorDto> {
 /// below takes.
 ///
 /// A one-line accessor for [`target::REAL_FSTAB_PATH`] rather than the
-/// constant inlined six times, so there is exactly one expression to look at
-/// when asking "what does production pass here".
+/// constant inlined six times.
 fn real_fstab() -> &'static Path {
     Path::new(target::REAL_FSTAB_PATH)
 }
@@ -655,50 +567,30 @@ fn real_fstab() -> &'static Path {
 /// Which file's backups a backup command acts on - the **backup-owning**
 /// target, which is not always the resolved one.
 ///
-/// This is T35's whole decision, in one `match`, and it deliberately mirrors
-/// [`save_document_with`]'s dispatch rather than inventing a second rule:
+/// One `match`, mirroring [`save_document_with`]'s dispatch:
 ///
-/// - [`TargetSource::SandboxDefault`] (the default, unconfigured launch) -
-///   `real_fstab`. A save of this target writes the real `/etc/fstab` and so
-///   leaves its automatic backups beside it; the Backups panel has to describe
-///   *that* file, because the entire purpose the repo owner wants backups for
-///   is "if I brick the system I can restore the real fstab from a rescue CD"
-///   (`PROJECT_PLAN.md` §T35). A backup of the working draft could not serve
-///   that at all, and before T35 that is exactly what this surface offered.
-/// - [`TargetSource::Environment`] - `target.path`, the one file the user
-///   named, whether or not it happens to be `/etc/fstab`. Same reasoning as
-///   case 2/3 of [`save_document_with`]: an explicit override means "this
-///   path, outright" for everything, so its backups are its own.
+/// - [`TargetSource::SandboxDefault`] - `real_fstab`. A save of this
+///   target writes the real `/etc/fstab` and leaves its automatic
+///   backups beside it, so the Backups panel has to describe that file -
+///   the whole point of backups is restoring the real fstab from a
+///   rescue environment, which a backup of the working draft couldn't serve.
+/// - [`TargetSource::Environment`] - `target.path`, whether or not it
+///   happens to be `/etc/fstab`: an explicit override means "this path,
+///   outright", so its backups are its own.
 ///
-/// ## Why the real path is an argument and not read from the constant here
+/// The real path is a parameter, not read from the constant, since a
+/// backup operation genuinely reads the backup-owning file's directory -
+/// production passes [`real_fstab`], tests pass a temp file, so the code
+/// under test is the shipped code, and `cargo test` never touches the
+/// machine's real `/etc/fstab`.
 ///
-/// Unlike a save's elevated write - whose path is only ever *recorded* by the
-/// test stand-in, never touched (see [`save_document_with`]) - a backup
-/// operation genuinely reads the backup-owning file's directory, and the
-/// elevated branch is handed that same path. A test for the default-launch
-/// case therefore needs a stand-in for `/etc/fstab` that it may really create
-/// backups beside, which is what this parameter is for: production passes
-/// [`real_fstab`], the tests pass a temp file, and the code under test is the
-/// shipped code rather than a re-implementation of it. It is the same
-/// injectable-collaborator seam as the `elevate` parameters, for the same
-/// reason - `cargo test` must never read, write or even list the machine's own
-/// `/etc/fstab`.
-///
-/// ## T39: the same decision, plus "and in which directory"
-///
-/// Since T39 this function answers the backup-owning question in two steps.
-/// The first is the T35 `match` above, unchanged, and is still the whole
-/// answer whenever the real file's backups are colocated. The second applies
-/// only when they are not ([`backup_fallback_dir`]): the path returned is then
-/// the **mirror file** inside the fallback directory
-/// ([`backup_location::mirror_path`]), not the real file.
-///
-/// That one substitution is what redirects the entire backup surface, because
-/// every function underneath derives "the backup directory" from "the target
-/// file's own parent directory" - so pointing them at a file inside the
-/// fallback directory makes all of them work there, with no change to a single
-/// signature in [`backups`] or [`fstab_core::writer`] (see
-/// [`crate::backup_location::mirror_path`]).
+/// This two-step answer also decides *which directory*: the `match`
+/// above is the whole answer when the real file's backups are colocated;
+/// when they aren't ([`backup_fallback_dir`]), the path returned is the
+/// **mirror file** inside the fallback directory instead. That one
+/// substitution redirects the entire backup surface, since every
+/// function underneath derives "the backup directory" from "the target
+/// file's own parent directory".
 fn backup_target_path(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -710,14 +602,13 @@ fn backup_target_path(
     }
 }
 
-/// The backup-owning path as it is when the real file's backups live beside
-/// it: the T35 answer, and still the production answer on every launch that is
-/// not sandboxed away from `/etc/`.
+/// The backup-owning path when the real file's backups live beside it -
+/// still the production answer on every launch not sandboxed away from `/etc/`.
 ///
 /// Split out from [`backup_target_path`] because two callers need exactly
-/// this, and must not get the fallback substitution: [`backup_target_path`]
-/// itself (as the colocated branch) and [`refresh_backup_mirror`], which has
-/// to know the file the mirror is a *copy of*.
+/// this without the fallback substitution: [`backup_target_path`] itself
+/// (the colocated branch) and [`refresh_backup_mirror`], which needs to
+/// know the file the mirror is a copy of.
 fn colocated_backup_target_path(target: &ActiveTarget, real_fstab: &Path) -> PathBuf {
     match target.source {
         TargetSource::SandboxDefault => real_fstab.to_path_buf(),
@@ -725,23 +616,16 @@ fn colocated_backup_target_path(target: &ActiveTarget, real_fstab: &Path) -> Pat
     }
 }
 
-/// The directory this session's backups are kept in **instead of** beside the
-/// file they belong to, or `None` when they are kept beside it after all.
+/// The directory this session's backups are kept in **instead of** beside
+/// the file they belong to, or `None` when they're kept beside it after all.
 ///
-/// `Some(dir)` requires *both* halves to hold, and this is the only place
-/// either is asked:
-///
-/// 1. the backups in question are the real `/etc/fstab`'s
-///    ([`backups_belong_to_the_real_fstab`]), and
-/// 2. this process cannot manage files in that file's own directory
-///    ([`BackupLocation::fallback_dir`]).
-///
-/// Order matters, and `&&`-style short-circuiting is the point: an explicit
-/// `RUSTAB_TARGET_PATH` naming some other, user-owned file fails the first
-/// half and so **never consults `location` at all**. Its backups are its own,
-/// in its own directory, exactly as before T39 - whatever this process can or
-/// cannot do with `/etc/` has nothing to do with them (asserted by
-/// `an_explicit_override_never_consults_the_backup_location`).
+/// `Some(dir)` requires both: the backups in question are the real
+/// `/etc/fstab`'s ([`backups_belong_to_the_real_fstab`]), and this
+/// process can't manage files in that directory
+/// ([`BackupLocation::fallback_dir`]). Short-circuiting matters: an
+/// explicit `RUSTAB_TARGET_PATH` naming some other, user-owned file
+/// fails the first half and never consults `location` at all - its
+/// backups are its own, regardless of what this process can do with `/etc/`.
 fn backup_fallback_dir<'a>(
     target: &ActiveTarget,
     location: &'a BackupLocation,
@@ -753,41 +637,34 @@ fn backup_fallback_dir<'a>(
     }
 }
 
-/// Whether this session's backups are the real `/etc/fstab`'s - `true` for a
-/// default launch (whose saves write that file) and for an explicit
-/// `RUSTAB_TARGET_PATH=/etc/fstab`, `false` only for an explicit override
-/// naming some other file.
+/// Whether this session's backups are the real `/etc/fstab`'s - `true`
+/// for a default launch or an explicit `RUSTAB_TARGET_PATH=/etc/fstab`,
+/// `false` only for an explicit override naming some other file.
 ///
-/// The T35 predicate, named for what it *is* rather than for what it used to
-/// imply. Before T39 "these are the real file's backups" and "mutating them
-/// needs `pkexec`" were the same sentence, so one function answered both;
-/// they are now two questions, because in fallback mode the real file's
-/// backups live in a user-owned directory and need no elevation at all. This
-/// is the first; [`backups_are_elevated`] is the second, and is defined in
-/// terms of this one so the two cannot drift.
+/// Named for what it *is*, not for what it used to imply: "these are the
+/// real file's backups" and "mutating them needs `pkexec`" used to be
+/// the same sentence, but in fallback mode the real file's backups need
+/// no elevation. This is the first question; [`backups_are_elevated`] is
+/// the second, defined in terms of this one so they can't drift.
 fn backups_belong_to_the_real_fstab(target: &ActiveTarget) -> bool {
     target.is_real || target.source == TargetSource::SandboxDefault
 }
 
-/// Refreshes the fallback directory's mirror file from the file it mirrors, so
-/// that a backup taken from it is a copy of the real `/etc/fstab` **as of
-/// now**.
+/// Refreshes the fallback directory's mirror file from the file it
+/// mirrors, so a backup taken from it is a copy of the real `/etc/fstab`
+/// as of now.
 ///
-/// A no-op - not even a read - in colocated mode and for a non-real target,
-/// where there is no mirror to keep fresh.
-///
-/// Called by [`create_backup_with`] and deliberately by nothing else:
-/// `list_backups` and `delete_backup` only enumerate or remove files that are
-/// already in that directory, so a fresh mirror would cost them a read and a
-/// write of the whole file for no effect on their result.
+/// A no-op in colocated mode or for a non-real target, where there's no
+/// mirror to keep fresh. Called only by [`create_backup_with`]:
+/// `list_backups`/`delete_backup` only act on files already in the
+/// directory, so a fresh mirror would cost them a read-write of the
+/// whole file for no effect.
 ///
 /// # Errors
 ///
 /// The underlying [`io::Error`] from [`backup_location::refresh_mirror`],
-/// including [`io::ErrorKind::NotFound`] when the file being mirrored does not
-/// exist - which the caller turns into "there is nothing to back up yet",
-/// exactly the answer `fstab_core::writer::create_backup` gives for a missing
-/// target of its own.
+/// including [`io::ErrorKind::NotFound`] when the mirrored file doesn't
+/// exist, which the caller turns into "nothing to back up yet".
 fn refresh_backup_mirror(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -804,15 +681,13 @@ fn refresh_backup_mirror(
     }
 }
 
-/// The [`TargetInfoDto`] for `target` in this session - the one place that
-/// builds it, so every command that returns target info reports the same
-/// thing.
+/// The [`TargetInfoDto`] for `target` in this session - the one place
+/// that builds it, so every command reports the same thing.
 ///
-/// Exists because the DTO's T39 field cannot be derived from an
-/// [`ActiveTarget`] alone: it is [`backup_fallback_dir`]'s answer, rendered
-/// for display, which is what makes the notice the user sees and the directory
-/// the backup commands actually act on one answer rather than two that could
-/// disagree.
+/// The DTO's fallback-directory field can't be derived from an
+/// [`ActiveTarget`] alone; it's [`backup_fallback_dir`]'s answer,
+/// rendered for display, so the notice shown and the directory the
+/// backup commands act on are one answer, not two that could disagree.
 fn describe_target(target: &ActiveTarget, location: &BackupLocation) -> TargetInfoDto {
     TargetInfoDto::describe(target, backup_fallback_dir(target, location))
 }
@@ -849,13 +724,12 @@ fn backups_are_elevated(target: &ActiveTarget, location: &BackupLocation) -> boo
     backups_belong_to_the_real_fstab(target) && backup_fallback_dir(target, location).is_none()
 }
 
-/// The body of [`list_backups`], with the target, the real-file path and the
-/// real file's backup location passed in (see [`backup_target_path`] for why
-/// the latter two are parameters).
+/// The body of [`list_backups`], with the target, real-file path, and
+/// backup location passed in (see [`backup_target_path`]).
 ///
-/// Deliberately does **not** refresh the fallback directory's mirror file:
-/// listing enumerates files that are already there, and the mirror is not one
-/// of them (see [`refresh_backup_mirror`]).
+/// Doesn't refresh the fallback directory's mirror file: listing
+/// enumerates files already there, and the mirror isn't one of them
+/// (see [`refresh_backup_mirror`]).
 fn list_backups_for(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -865,44 +739,30 @@ fn list_backups_for(
         .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::ListBackups, err.to_string()))
 }
 
-/// The body of [`resync_external_change`], with the real-file path passed in
-/// (see [`backup_target_path`]/[`save_document_with`] for why: `cargo test`
-/// must never read the machine's own `/etc/fstab`, so production passes
-/// [`real_fstab`] and the tests pass a temp file).
+/// The body of [`resync_external_change`], with the real-file path
+/// passed in (production passes [`real_fstab`], tests pass a temp file).
 ///
 /// **Fails closed - touching neither the draft nor the marker - unless
-/// `target.source == TargetSource::SandboxDefault`.** In normal operation this
-/// command is only ever called while the frontend's `ExternalChangeDialog` is
-/// showing, which per T36 only happens for that one dispatch case, but the
-/// guard is load-bearing on its own, not merely defensive dead code: without
-/// it, this command would read the real `/etc/fstab` and overwrite *any*
-/// resolved target's draft with it, which for an explicit
-/// `RUSTAB_TARGET_PATH` test target - a file that is not a mirror of
-/// `/etc/fstab` at all - would be a genuine data-safety bug, not a cosmetic
-/// one. Nothing is read or written when this guard fires.
+/// `target.source == TargetSource::SandboxDefault`.** This guard is
+/// load-bearing, not defensive dead code: without it, this command would
+/// overwrite *any* resolved target's draft with the real `/etc/fstab`,
+/// which for an explicit `RUSTAB_TARGET_PATH` test target would be a
+/// genuine data-safety bug.
 ///
-/// Otherwise, reads `real_fstab`'s current bytes:
+/// Otherwise, reads `real_fstab`'s current bytes: missing is not an
+/// error (synced to empty, like [`list_entries`]'s missing-target
+/// handling), non-UTF-8 bytes are refused outright (same reason as
+/// [`list_entries`]), any other read error is
+/// [`CommandErrorKindDto::ReadTarget`].
 ///
-/// - Missing (`io::ErrorKind::NotFound`) is not an error - the same
-///   `exists: false`, empty-text handling [`list_entries`] already gives a
-///   missing target, which here means the draft and marker are synced to
-///   empty too.
-/// - Non-UTF-8 bytes are refused outright, touching nothing, for the same
-///   reason [`list_entries`] refuses them for its own target: loading them
-///   here could only write mangled content back over a file that was fine.
-/// - Any other read error is [`CommandErrorKindDto::ReadTarget`].
+/// On success (missing file included), the result is published onto the
+/// draft and its marker atomically with
+/// [`target::sync_sandbox_after_save`] - the same primitive a successful
+/// save uses. A failure there is [`CommandErrorKindDto::Resync`], same
+/// kind as the fail-closed guard above, different message.
 ///
-/// On a successful read (missing file included), the result is published
-/// onto the working draft and its last-known-real marker, atomically, with
-/// [`target::sync_sandbox_after_save`] - the exact primitive a successful
-/// save already uses. An `io::Error` from that call is
-/// [`CommandErrorKindDto::Resync`], distinct from the fail-closed guard above
-/// only in the message, not the kind: the frontend treats both identically
-/// (`PROJECT_PLAN.md` §T37).
-///
-/// The returned [`DocumentViewDto`] is a direct construction from `text`, not
-/// a second read-back: the draft *now holds* exactly this text, by
-/// construction of the call just made.
+/// The returned [`DocumentViewDto`] is built directly from `text`, not a
+/// second read-back, since the draft now holds exactly this text.
 fn resync_external_change_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -922,9 +782,8 @@ fn resync_external_change_with(
 
     let (exists, text) = match real_reader.read(real_fstab) {
         Ok(bytes) => {
-            // Deliberately *not* `from_utf8_lossy` - see `list_entries`, whose
-            // reasoning applies identically here: a lossy load would publish
-            // mangled content onto the draft and the marker both.
+            // Not `from_utf8_lossy` - same reasoning as `list_entries`: a
+            // lossy load would publish mangled content onto the draft and marker.
             let text = String::from_utf8(bytes).map_err(|err| {
                 CommandErrorDto::new(
                     CommandErrorKindDto::NotUtf8,
@@ -961,11 +820,8 @@ fn resync_external_change_with(
 
     let document = parser::parse(&text);
     Ok(DocumentViewDto {
-        // The same target info `list_entries` reports, built the same way, so
-        // the view this command returns cannot describe the session
-        // differently from the view the one before it did - `location` is a
-        // parameter purely so that this stays true (it plays no part in the
-        // re-sync itself, which never touches a backup).
+        // Same target info `list_entries` reports, built the same way, so this
+        // view can't describe the session differently from the one before it.
         target: describe_target(target, location),
         exists,
         text,
@@ -974,26 +830,18 @@ fn resync_external_change_with(
     })
 }
 
-/// The body of [`restore_backup`], with the real-file path and the elevated
-/// half of the save injectable.
+/// The body of [`restore_backup`], with the real-file path and the
+/// elevated half of the save injectable.
 ///
-/// Two steps, and T35 only changed the first of them:
-///
-/// 1. Resolve `backup_path` against [`backup_target_path`]'s backup list -
-///    since T35 the real `/etc/fstab`'s, for a default launch, which is the
-///    only list [`list_backups`] offers in that case.
-/// 2. Hand the backup's parsed text to [`save_document_with`], unchanged. That
-///    is where the dual write lives, so a restore still inherits it with no
-///    write code of its own - and, since T36, inherits the external-change
-///    check in the same way, from the same place, for free. `real_fstab` and
-///    `allow_external_change` are passed straight through for that reason.
-///
-/// T39 changed only the first step again, and only for the real file in
-/// fallback mode: the backup is then resolved against the fallback directory's
-/// list, because that is the list [`list_backups`] offered. **Step 2 is
-/// untouched** - restoring still writes the real `/etc/fstab` through the same
-/// single elevated call, since where a backup is *stored* says nothing about
-/// where restoring it has to write.
+/// Two steps: resolve `backup_path` against [`backup_target_path`]'s
+/// backup list (the real `/etc/fstab`'s, for a default launch, or the
+/// fallback directory's list when that's what [`list_backups`] offered),
+/// then hand the backup's parsed text to [`save_document_with`]
+/// unchanged - that's where the dual write and the external-change check
+/// live, so a restore inherits both with no write code of its own. Where
+/// a backup is *stored* says nothing about where restoring it writes:
+/// step two still writes the real `/etc/fstab` through the same single
+/// elevated call.
 fn restore_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1009,11 +857,8 @@ fn restore_backup_with(
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
     let owner = backup_target_path(target, real_fstab, location);
 
-    // Both failure modes - "the list could not be read" and "the requested
-    // path is not in it" - are reported as `InvalidBackup`: from the
-    // frontend's point of view they are the same situation (this backup
-    // cannot be used, and nothing was written), and the message says which
-    // one it was.
+    // Both "list unreadable" and "path not in it" report as `InvalidBackup`:
+    // same frontend situation (unusable, nothing written), message says which.
     let backup = backups::resolve_requested(&owner, backup_path).map_err(|err| {
         WriteErrorDto::new(
             WriteErrorKindDto::InvalidBackup,
@@ -1046,16 +891,15 @@ fn restore_backup_with(
 
 /// The one dispatch point between the save paths.
 ///
-/// Every branch ends in [`writer::write_document`] - the in-process branch
-/// calls it directly, the elevated branch calls it inside a root process that
-/// does nothing else (see [`crate::privileged`]). There is deliberately no
-/// path that writes a *target* without going through `write_document`.
+/// Every branch ends in [`writer::write_document`] - the in-process
+/// branch calls it directly, the elevated branch calls it inside a root
+/// process that does nothing else (see [`crate::privileged`]). No path
+/// writes a target without going through `write_document`.
 ///
 /// Takes the already-resolved [`ActiveTarget`] rather than resolving it
-/// itself so the tests can point a save at a temp file without mutating
-/// process-wide environment variables (which would race with every other
-/// test in the binary). `real_fstab` is a parameter for the same reason it is
-/// one on [`backup_target_path`] - see [`save_document_with`].
+/// itself, so tests can point a save at a temp file without mutating
+/// process-wide environment variables. `real_fstab` is a parameter for
+/// the same reason as on [`backup_target_path`].
 fn save_document(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1073,101 +917,68 @@ fn save_document(
     )
 }
 
-/// [`save_document`], with the elevated half injectable - and, since T34, the
-/// place the whole "a save always writes the real `/etc/fstab`" decision
-/// lives (`docs/SPEC.md` §7, `docs/API_CONTRACT.md` §3.5).
+/// [`save_document`], with the elevated half injectable - the place the
+/// whole "a save always writes the real `/etc/fstab`" decision lives
+/// (`docs/SPEC.md` §7, `docs/API_CONTRACT.md` §3.5).
 ///
-/// The seam exists for one reason: the dispatch decisions ("the default
-/// target's save always escalates", "an explicit non-real override never
-/// does") have to be *asserted*, and asserting them against the production
-/// `elevate` would mean a unit test that launches `pkexec` and waits on an
-/// authentication prompt. The tests therefore pass a recording stand-in; the
-/// production path is a one-line delegation that cannot diverge.
+/// The seam exists so the dispatch decisions can be *asserted* without a
+/// unit test launching `pkexec` and waiting on a password prompt: tests
+/// pass a recording stand-in, production a one-line delegation that
+/// can't diverge.
 ///
-/// ## The three cases, and why they are keyed on `source` and not `is_real`
+/// ## The three cases, keyed on `source`, not `is_real`
 ///
-/// 1. **[`TargetSource::SandboxDefault`]** - the unconfigured launch, which
-///    is how Rustab is normally used. The save goes to the real
-///    [`target::REAL_FSTAB_PATH`] through `elevate`, and that call's result
-///    is *the* result of the save. `target.path` (the working draft) is then
-///    best-effort updated to match, together with the marker that stops the
-///    next launch from reading this very save as external drift (see
-///    [`target::sync_sandbox_after_save`]).
-///
-///    Note what is passed to `elevate`: the hardcoded real path, never
-///    `target.path`. The resolved draft path is not a thing this branch ever
-///    elevates a write to - it is written in-process, unprivileged, where it
-///    lives in the user's own data directory.
+/// 1. **[`TargetSource::SandboxDefault`]** - the normal, unconfigured
+///    launch. The save goes to the real [`target::REAL_FSTAB_PATH`]
+///    through `elevate` (never `target.path`, which is written
+///    separately, in-process, unprivileged), and that result is *the*
+///    result of the save. `target.path` (the draft) is then best-effort
+///    updated to match, along with the marker that stops the next
+///    launch from reading this save as external drift.
 /// 2. **[`TargetSource::Environment`] naming some other file** - the
-///    dev/test escape hatch, and the only way to run Rustab without it
-///    writing `/etc/fstab`. Byte-for-byte the pre-T34 behaviour: one
-///    in-process write of `target.path`, no escalation, no mirroring, no
-///    marker. `cargo test` and CI depend on this branch existing.
-/// 3. **[`TargetSource::Environment`] naming `/etc/fstab` itself** (so
-///    `target.is_real`, literally or through a symlink) - one elevated write
-///    of `target.path`, and, deliberately, **no draft mirror and no marker
-///    update**.
+///    dev/test escape hatch and the only way to run Rustab without
+///    writing `/etc/fstab`: one in-process write, no escalation, no
+///    mirroring, no marker.
+/// 3. **[`TargetSource::Environment`] naming `/etc/fstab` itself** - one
+///    elevated write of `target.path`, deliberately with no draft mirror
+///    and no marker update.
 ///
-/// Case 3 was a genuinely open question, so here is the reasoning rather
-/// than just the choice. Both `README.md`'s Safety Notes ("Setting
-/// `RUSTAB_TARGET_PATH` to anything other than `/etc/fstab` makes that path
-/// the target outright, with no dual-write ... involved") and
-/// `CONTRIBUTING.md` ("the T34 dual-write behavior only applies to the
-/// default, unscoped-launch sandbox/real pair, not to an explicit override")
-/// describe the dual write as a property of the *default pair*, not of the
-/// real file. Reading it that way makes `RUSTAB_TARGET_PATH` mean exactly one
-/// thing for every value it can take - "this path, outright" - instead of
-/// "this path, outright, unless it happens to be `/etc/fstab`, in which case
-/// also something else". The alternative (mirror this case too) would be
-/// harmless in the write it performs but would mean an explicit override
-/// silently writing a *second* file the user never named.
+/// Case 3's reasoning: the dual write is documented as a property of the
+/// *default pair*, not of the real file, so `RUSTAB_TARGET_PATH` means
+/// exactly one thing for every value - "this path, outright" - rather
+/// than a special case for `/etc/fstab`. Consequence: a later default
+/// launch will see `/etc/fstab` differing from its marker and refresh
+/// the draft, which is correct - the file really did change under it,
+/// via a run that wasn't keeping the draft in sync.
 ///
-/// The one consequence worth knowing: because this case does not move the
-/// marker, a later default launch sees `/etc/fstab` differing from what it
-/// last recorded and refreshes the draft. That is correct - from the default
-/// session's point of view the file *did* change under it, by a run that was
-/// not keeping its draft in sync - and it is the same answer Rustab gives for
-/// an edit made with any other tool.
+/// ## The external-change check, and why only case 1 has one
 ///
-/// ## The external-change check (T36), and why only case 1 has one
-///
-/// Case 1 compares what Rustab last knew the real `/etc/fstab` to hold (its
-/// marker) against what that file holds *now*, right before elevating, and
-/// refuses the write if they differ
+/// Case 1 compares the marker against what the real file holds *now*,
+/// right before elevating, and refuses the write if they differ
 /// ([`target::ExternalChangeGuard`], [`WriteErrorKindDto::ExternalChange`]).
-/// `allow_external_change` is the user's explicit "I have seen the diff, write
-/// anyway" answer, which skips the comparison for this one call; a
-/// "write anyway" that succeeds is in every other respect an ordinary save,
-/// mirror and marker included, because it goes through the same code below.
+/// `allow_external_change` skips that comparison for this one call; a
+/// "write anyway" that succeeds is otherwise an ordinary save, mirror
+/// and marker included.
 ///
-/// **The check here is a courtesy, not the safety net.** It exists to avoid
-/// asking for a password for a write that the elevated side is going to
-/// refuse. The binding check is the identical comparison performed *inside*
-/// the elevated process immediately before `write_document`
-/// (`crate::privileged::handle_write`), because `pkexec` blocks on a human
-/// typing a password and the file can change during exactly that wait. This is
-/// deliberately the same relationship `privileged::save_elevated` already has
-/// between its pre-prompt `validate::validate` call and the authoritative
-/// validation inside `write_document`: delete either pre-check and no
-/// guarantee is weakened, only a pointless password prompt is reintroduced.
+/// This check is a courtesy, not the safety net - it avoids a password
+/// prompt for a write the elevated side will refuse anyway. The binding
+/// check is the identical comparison performed inside the elevated
+/// process immediately before `write_document`
+/// (`crate::privileged::handle_write`), since `pkexec`'s password wait
+/// leaves a window for the file to change. The same relationship
+/// `privileged::save_elevated` has between its pre-prompt `validate`
+/// call and the authoritative validation inside `write_document`.
 ///
-/// Case 2 needs no check (nothing else is writing a scratch file, and it keeps
-/// no marker), and case 3 deliberately keeps none either - it has no marker to
-/// compare against, so it passes [`target::ExternalChangeGuard::unchecked`]
-/// and behaves exactly as it did before T36. That leaves an explicit
-/// `RUSTAB_TARGET_PATH=/etc/fstab` with the same theoretical race, which is a
-/// known, recorded gap rather than an oversight (`PROJECT_PLAN.md` §T36).
+/// Case 2 needs no check (no marker kept); case 3 keeps none either (no
+/// marker to compare against, so it passes
+/// [`target::ExternalChangeGuard::unchecked`]), leaving an explicit
+/// `RUSTAB_TARGET_PATH=/etc/fstab` with a known, recorded race.
 ///
-/// ## Why `real_fstab` is a parameter
-///
-/// Before T36 this branch could hardcode [`target::REAL_FSTAB_PATH`], because
-/// the path was only ever *handed* to `elevate` - which the tests replace with
-/// a recording stand-in that touches nothing. The external-change check
-/// genuinely **reads** that file, so it needs the same injectable seam
-/// [`backup_target_path`] already has, for the identical reason: `cargo test`
-/// must never read the machine's own `/etc/fstab`. Production passes
-/// [`real_fstab`] at both call sites ([`save`] and [`restore_backup`], via
-/// [`save_document`] and [`restore_backup_with`]); the tests pass a temp file.
+/// `real_fstab` is a parameter because the external-change check
+/// genuinely *reads* that file, unlike the path merely handed to
+/// `elevate` - so it needs the same injectable seam as
+/// [`backup_target_path`], for the same reason: `cargo test` must never
+/// read the machine's own `/etc/fstab`.
 fn save_document_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1184,10 +995,8 @@ fn save_document_with(
         TargetSource::SandboxDefault => {
             let guard =
                 target::ExternalChangeGuard::from_marker(&target.path, allow_external_change);
-            // The courtesy half of T36 (see this function's docs): refuse
-            // before the password prompt, not instead of the elevated side's
-            // own check. Nothing has been opened for writing here, which is
-            // why the error can promise `target_unchanged`.
+            // The courtesy check (see this function's docs). Nothing has been
+            // opened for writing here, so the error can promise `target_unchanged`.
             if let Some(change) = guard.detect_with(real_fstab, real_reader) {
                 return Err(WriteErrorDto::external_change(
                     real_fstab,
@@ -1216,8 +1025,7 @@ fn save_document_with(
             }
             Ok(outcome)
         }
-        // No marker exists for an explicit override, so there is nothing to
-        // compare and no check happens here - see this function's docs.
+        // No marker for an explicit override, so nothing to compare here.
         TargetSource::Environment if target.is_real => elevate(
             &target.path,
             candidate,
@@ -1229,13 +1037,8 @@ fn save_document_with(
     }
 }
 
-/// The body of [`read_backup`], with the target and the real-file path passed
-/// in.
-///
-/// Split out for the same reason [`save_document`] is: the tests can point it
-/// at a temp file without mutating the process-wide environment that
-/// [`target::active_target`] reads. See [`backup_target_path`] for why
-/// `real_fstab` is a parameter.
+/// The body of [`read_backup`], with the target and the real-file path
+/// passed in, for the same reason as [`save_document`].
 fn read_backup_of(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1247,9 +1050,8 @@ fn read_backup_of(
         .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::InvalidBackup, err.to_string()))?;
 
     backups::read_text(&backup).map_err(|err| {
-        // `read_text`'s own `InvalidData` is the not-valid-UTF-8 case, which
-        // already has a kind of its own that the frontend handles for the
-        // target; reusing it keeps one meaning per kind.
+        // `InvalidData` is the not-valid-UTF-8 case, already a kind of its
+        // own the frontend handles for the target; reuse it here too.
         let kind = if err.kind() == io::ErrorKind::InvalidData {
             CommandErrorKindDto::NotUtf8
         } else {
@@ -1273,14 +1075,10 @@ fn open_backup_location_of(
 }
 
 /// [`open_backup_location_of`], with the actual launch of a GUI program
-/// injectable.
-///
-/// The seam exists for the same structural reason [`save_document_with`]'s
-/// does: a unit test has to be able to assert *which* directory this command
-/// would open without truly spawning a file manager window - there is no way
-/// to do that in CI, which has no display and no file manager installed at
-/// all. The production path is a one-line delegation to
-/// [`open_in_file_manager`] that cannot diverge from what ships.
+/// injectable, so a unit test can assert *which* directory this command
+/// would open without spawning a file manager window (impossible in CI,
+/// which has no display). Production delegates to
+/// [`open_in_file_manager`] in one line, which can't diverge.
 fn open_backup_location_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1385,40 +1183,23 @@ fn delete_backup_from(
 /// The one dispatch point between the two backup-deletion paths, with the
 /// elevated half injectable.
 ///
-/// Mirrors [`save_document_with`] exactly, and for the same reason: the
-/// dispatch decision ("the real `/etc/fstab`'s backups are never unlinked by
-/// this process") has to be *asserted*, and asserting it against the
-/// production `privileged::delete_backup_elevated` would mean a unit test that
-/// launches `pkexec` and waits on an authentication prompt.
+/// Mirrors [`save_document_with`], for the same reason: the dispatch
+/// decision ("the real `/etc/fstab`'s backups are never unlinked by this
+/// process") has to be asserted without a unit test launching `pkexec`.
 ///
-/// `backup_path` is resolved before the dispatch, in **both** branches. For
-/// the elevated branch that is only a courtesy - it means a path that cannot
-/// work is refused without making the user authenticate first, the same
-/// courtesy [`privileged::save_elevated`]'s pre-validation provides. The
-/// authoritative check is the elevated process's own
-/// [`backups::resolve_requested`] call, which does not trust this one (see
-/// [`crate::privileged`]).
+/// `backup_path` is resolved before dispatch in both branches. For the
+/// elevated branch that's only a courtesy, refusing a path that can't
+/// work before the password prompt - the authoritative check is the
+/// elevated process's own [`backups::resolve_requested`] call, which
+/// doesn't trust this one (see [`crate::privileged`]).
 ///
-/// ## T35: the T34 gap this function recorded is now closed
-///
-/// T34 left this function (and [`create_backup_with`], [`list_backups`],
-/// [`read_backup`] and [`open_backup_location`]) keyed on raw `target.is_real`
-/// and acting on `target.path`, while [`save_document_with`] had already moved
-/// to [`ActiveTarget::source`]. On a default launch that meant the backup
-/// surface described a *different file* than the one a save writes: the save's
-/// own automatic backups landed beside `/etc/fstab` where nothing listed them,
-/// while the Backups panel offered restore points of the working draft.
-///
-/// T35 resolved the question that gap was waiting on - the repo owner's reason
-/// for wanting backups at all is "a real copy of the real fstab I can restore
-/// from a rescue CD" (`PROJECT_PLAN.md` §T35), which a backup of the draft
-/// cannot serve. So the backup-owning path is now [`backup_target_path`] and
-/// the dispatch is now [`backups_are_elevated`]: on a default launch this
-/// unlinks one of the real `/etc/fstab`'s backups, through the elevated helper,
-/// because those files live in root-owned `/etc/`. The frontend side of the
-/// same decision is `BackupDeleteConfirmDialog`'s `writes_real_file` gate, so
-/// the newly privileged delete is still behind the explicit checkbox T34
-/// requires for every real-touching action (`docs/UI_DESIGN.md` §2).
+/// The backup-owning path is [`backup_target_path`] and the dispatch is
+/// [`backups_are_elevated`]: on a default launch this unlinks one of the
+/// real `/etc/fstab`'s backups through the elevated helper, since those
+/// files live in root-owned `/etc/`. The frontend side of the same
+/// decision is `BackupDeleteConfirmDialog`'s `writes_real_file` gate, so
+/// the privileged delete is still behind the explicit checkbox required
+/// for every real-touching action (`docs/UI_DESIGN.md` §2).
 fn delete_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1466,46 +1247,31 @@ fn create_backup_of(
 /// The one dispatch point between the two backup-creation paths, with the
 /// elevated half injectable.
 ///
-/// Mirrors [`save_document_with`] and [`delete_backup_with`] exactly, and for
-/// the same reason: the dispatch decision ("the real `/etc/fstab` is never
-/// copied by this process") has to be *asserted*, and asserting it against the
-/// production [`privileged::create_backup_elevated`] would mean a unit test
-/// that launches `pkexec` and waits on an authentication prompt.
+/// Mirrors [`save_document_with`]/[`delete_backup_with`], for the same
+/// reason: the dispatch decision ("the real `/etc/fstab` is never copied
+/// by this process") has to be asserted without a unit test launching `pkexec`.
 ///
-/// Which file is copied is [`backup_target_path`], not the resolved target:
-/// since T35 a default launch backs up the real `/etc/fstab` - the file its
-/// saves write, and the one the user actually wants a rescue-CD-restorable
-/// copy of - rather than the working draft. The dispatch follows from that and
-/// is [`backups_are_elevated`], the same predicate [`delete_backup_with`]
-/// uses: creating a new file in root-owned `/etc/` needs the elevated helper,
-/// while an explicit override naming a user-owned file is copied in-process.
-/// Before T35 both halves were keyed on raw `target.is_real` and
-/// `target.path`; see [`delete_backup_with`]'s own T35 note for the full
-/// reasoning, which applies identically here.
+/// Which file is copied is [`backup_target_path`], not the resolved
+/// target, so a default launch backs up the real `/etc/fstab` rather
+/// than the working draft. Dispatch follows the same
+/// [`backups_are_elevated`] predicate [`delete_backup_with`] uses.
 ///
-/// Both branches end in the same `fstab_core::writer::create_backup` - the
-/// in-process branch calls it directly, the elevated branch calls it inside a
-/// root process that does nothing else. Neither branch is given a path to
-/// write to: `create_backup` derives the backup's name from the target it was
-/// handed.
+/// Both branches end in the same `fstab_core::writer::create_backup` -
+/// in-process directly, or elevated inside a root process that does
+/// nothing else - and neither is given a path to write to; the backup's
+/// name comes from the target it was handed.
 ///
 /// The resulting path is turned back into a [`BackupInfoDto`] by
-/// [`backups::describe_one`], the same helper [`backups::list`] builds its
-/// rows with, so a freshly created backup is described exactly the way the
-/// next `list_backups` will describe it - including its `is_manual` flag,
-/// which is read back from the naming scheme rather than assumed here.
-///
-/// ## T39: the one operation that needs a fresh mirror
+/// [`backups::describe_one`], the same helper [`backups::list`] uses, so
+/// a freshly created backup is described exactly as the next
+/// `list_backups` will describe it.
 ///
 /// In fallback mode `owner` is the mirror file rather than the real
-/// `/etc/fstab`, so this is the one backup operation that has to *write*
-/// before it reads: [`refresh_backup_mirror`] copies the real file's current
-/// bytes onto the mirror first, and only then is the mirror copied to a
-/// backup. The result is therefore a snapshot of `/etc/fstab` as of the moment
-/// the user pressed the button, which is the only thing that would make this
-/// button honest. The dispatch below then takes the in-process branch (see
-/// [`backups_are_elevated`]), because the fallback directory is the user's
-/// own - the elevated helper is neither needed nor asked for.
+/// `/etc/fstab`, so this is the one backup operation that writes before
+/// it reads: [`refresh_backup_mirror`] copies the real file's current
+/// bytes onto the mirror first, so the result is a snapshot as of the
+/// moment the user pressed the button. The dispatch below then takes
+/// the in-process branch, since the fallback directory is the user's own.
 fn create_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -4027,27 +3793,20 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
     }
 
-    /// T34's obligation (f) plus T35's half of the same command, asserted
-    /// together through the production [`restore_backup_with`] rather than a
-    /// hand-rolled re-enactment of its body.
+    /// Asserts, through the production [`restore_backup_with`], that
+    /// backup resolution and the dual write agree on which file is real:
     ///
-    /// Both halves matter and they used to disagree:
+    /// - **Resolution:** `backup_path` resolves against the *real file's*
+    ///   backup list, the only list `list_backups` offers a default
+    ///   launch - the draft has a different backup, asserted refused below.
+    /// - **Write:** the restore delegates to [`save_document_with`] with
+    ///   no write code of its own, so it inherits the dual write: one
+    ///   elevated write of the real `/etc/fstab`, then the draft mirrored
+    ///   to match, marker included.
     ///
-    /// - **T35 (resolution):** `backup_path` is resolved against the *real
-    ///   file's* backup list, which is the only list `list_backups` offers a
-    ///   default launch. The backup restored here exists only beside the real
-    ///   stand-in; the draft has a different one, asserted refused below.
-    /// - **T34 (write):** the restore itself has no write code - it delegates
-    ///   to [`save_document_with`] - so it inherits the dual write: one
-    ///   elevated write of the real `/etc/fstab`, then the draft mirrored to
-    ///   match, marker included.
-    ///
-    /// The elevate seam is injected, so this neither launches `pkexec` nor
-    /// touches the machine's own `/etc/fstab`; since T36 the real file's path
-    /// is the injected `real_fstab` argument on both halves (the backup
-    /// resolution *and* the write), so the elevated call is aimed at the
-    /// stand-in here - production's own call site passes
-    /// [`target::REAL_FSTAB_PATH`] (see [`restore_backup`]).
+    /// The elevate seam is injected, so this neither launches `pkexec`
+    /// nor touches the machine's own `/etc/fstab`; production's own call
+    /// site passes [`target::REAL_FSTAB_PATH`] (see [`restore_backup`]).
     #[test]
     fn restoring_a_backup_resolves_against_the_real_fstab_and_inherits_the_dual_write() {
         let dir = TempDir::new("restore-dual-write");

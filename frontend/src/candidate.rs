@@ -1,35 +1,31 @@
-//! The in-memory "candidate document" - T11's central state design.
+//! The in-memory "candidate document" - the app's central editing state.
 //!
 //! `AppShell` owns one `CandidateDocument`, seeded from `list_entries`'s
-//! `DocumentDto` on load. Every staged add/edit/delete mutates it directly
-//! in memory; nothing here ever calls a write command (`save` is T12's
-//! job). `EntriesTable` renders from it, `EntryDetailDrawer` stages into
-//! it, and `validate_candidate` is called against its full
-//! `to_document()` so duplicate-mount-point-style checks see the whole
-//! file, not just the one entry being edited.
+//! `DocumentDto` on load. Every staged add/edit/delete mutates it
+//! directly in memory; nothing here calls a write command. `EntriesTable`
+//! renders from it, `EntryDetailDrawer` stages into it, and
+//! `validate_candidate` is called against its full `to_document()` so
+//! duplicate-mount-point-style checks see the whole file.
 //!
-//! Each line remembers the index it had in the *original* `list_entries`
-//! response (`original_index`), or `None` if it was added this session.
-//! That is deliberately enough information for T12 to compute the
-//! Added/Modified/Removed grouping its diff view needs - by comparing each
-//! candidate line's `original_index`/content against the original
-//! document's lines - without this task having to build that comparison
-//! itself:
+//! Each line remembers the index it had in the original `list_entries`
+//! response (`original_index`), or `None` if added this session - enough
+//! to compute the Added/Modified/Removed grouping the diff view needs by
+//! comparing each candidate line's `original_index`/content against the
+//! original document's lines:
 //! - `original_index: None` → Added.
 //! - `original_index: Some(i)` and `line != original.lines[i]` → Modified.
 //! - an original index present in `original.lines` but absent from every
 //!   candidate line's `original_index` → Removed.
 //!
-//! That content-only comparison is position-blind, which T40's entry
-//! reordering made insufficient on its own: a pure swap changes no line's
-//! content at its own `original_index`. [`CandidateDocument::
-//! position_changes`] adds the missing positional half (`docs/UI_DESIGN.md`
-//! §13.7), and is the one shared implementation both `pending_count` and
-//! `diff.rs` use for it.
+//! That content-only comparison is position-blind, which entry reordering
+//! makes insufficient on its own: a pure swap changes no line's content
+//! at its own `original_index`.
+//! [`CandidateDocument::position_changes`] adds the missing positional
+//! half (`docs/UI_DESIGN.md` §13.7), shared by `pending_count` and `diff.rs`.
 //!
-//! Comments and blank lines round-trip untouched (never surfaced as table
-//! rows, never dropped - `docs/UI_DESIGN.md` §3) because they are seeded
-//! the same way as entry/malformed lines and nothing in this task's UI
+//! Comments and blank lines round-trip untouched (never surfaced as
+//! table rows, never dropped - `docs/UI_DESIGN.md` §3), since they're
+//! seeded the same way as entry/malformed lines and nothing in the UI
 //! offers a way to touch them.
 
 use crate::dto::{DocumentDto, EntryDto, LineDto};
@@ -44,12 +40,11 @@ fn is_row(line: &LineDto) -> bool {
 /// Where the two lines involved in a [`CandidateDocument::stage_move`]
 /// actually ended up (`docs/UI_DESIGN.md` §13.4 step 3).
 ///
-/// T40's `stage_move` was a bare `Vec::swap`, so a caller could assume the
-/// line at `from` landed at `to` and vice versa. Once each entry can carry
-/// an attached comment block of its own length (§13.4), that assumption is
-/// wrong whenever the two blocks differ in length - so the computation that
-/// already has to rearrange the lines reports its own answer rather than
-/// leaving a caller to re-derive it.
+/// `stage_move` isn't a bare `Vec::swap`: since each entry can carry an
+/// attached comment block of its own length, the line at `from` doesn't
+/// necessarily land at `to` and vice versa whenever the two blocks differ
+/// in length - so the computation that rearranges the lines reports its
+/// own answer rather than leaving a caller to re-derive it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoveOutcome {
     /// New index of the line that was at `from`.
@@ -143,7 +138,7 @@ impl CandidateDocument {
     }
 
     /// Renders the candidate back to a `DocumentDto`, in its current
-    /// order - used by T12's `save` and `render_candidate` calls.
+    /// order - used by `save` and `render_candidate` calls.
     pub fn to_document(&self) -> DocumentDto {
         DocumentDto {
             lines: self.lines.iter().map(|cl| cl.line.clone()).collect(),
@@ -198,38 +193,30 @@ impl CandidateDocument {
     /// row-kind line at `row_index` - the lines that move *with* it
     /// (`docs/UI_DESIGN.md` §13.4). `0` means it has none.
     ///
-    /// An ordinary `#` comment written above an entry is the common fstab
-    /// convention for describing that entry, so it must travel with the
-    /// entry when it moves; T40 wrongly left every comment behind. (As of
-    /// T43, the backend parser itself absorbs any ordinary comment block
-    /// sitting directly above an `Entry` line into that entry's own
-    /// `description` field - and a same-line trailing comment is absorbed
-    /// into `trailing_comment` the same way - so neither ever reaches the
-    /// frontend as a standalone `LineDto::Comment` to begin with, and
-    /// neither is involved here at all. This walk only ever sees comment
-    /// blocks the backend did *not* absorb: ones above a `Malformed` line
-    /// (the backend's rule is scoped to `Entry` lines only) or a block at
-    /// true end-of-file with nothing below it.)
+    /// Note: the backend parser already absorbs any ordinary comment
+    /// block directly above an `Entry` line into that entry's own
+    /// `description` field (and a same-line trailing comment into
+    /// `trailing_comment`), so neither ever reaches the frontend as a
+    /// standalone `LineDto::Comment`. This walk only ever sees comment
+    /// blocks the backend didn't absorb: ones above a `Malformed` line,
+    /// or a block at true end-of-file with nothing below it.
     ///
-    /// The backward walk, exactly as §13.4 specifies it:
+    /// The backward walk:
     ///
-    /// 1. Skip any number of consecutive `Blank` lines immediately above
-    ///    `row_index`. Blank lines alone never break attachment.
-    /// 2. If the first non-blank line reached is not a `Comment` (a
-    ///    row-kind line, or the start of the document), there is no
-    ///    attached block - return `0`.
-    /// 3. Otherwise keep walking back *without* skipping blanks, while the
-    ///    lines stay strictly contiguous `Comment`s; a `Blank`, a row-kind
-    ///    line or the start of the document ends the run. The attached
-    ///    block is everything from there down to (but excluding)
-    ///    `row_index` itself - i.e. the comment run *and* any blank lines
-    ///    step 1 skipped, so that the block plus its row is one contiguous
-    ///    span that can be relocated as a unit.
+    /// 1. Skip any consecutive `Blank` lines immediately above
+    ///    `row_index` - blanks alone never break attachment.
+    /// 2. If the first non-blank line reached isn't a `Comment`, there's
+    ///    no attached block - return `0`.
+    /// 3. Otherwise keep walking back without skipping blanks, while the
+    ///    lines stay strictly contiguous `Comment`s. The attached block
+    ///    is everything from there down to (excluding) `row_index`
+    ///    itself - the comment run plus any blanks step 1 skipped, so
+    ///    the block plus its row is one contiguous span that moves as a unit.
     ///
-    /// A second, separate comment block further back is never reached (the
-    /// walk stops at the nearer one), and a comment block at true
-    /// end-of-file is never visited by any walk at all - both stay
-    /// freestanding and pinned in place, exactly as T40 had them.
+    /// A second, separate comment block further back is never reached
+    /// (the walk stops at the nearer one), and a block at true
+    /// end-of-file is never visited at all - both stay freestanding and
+    /// pinned in place.
     pub fn attached_block_len(&self, row_index: usize) -> usize {
         if row_index >= self.lines.len() {
             return 0;
@@ -260,28 +247,20 @@ impl CandidateDocument {
     /// moving together with its own attached comment block
     /// (`docs/UI_DESIGN.md` §13.4).
     ///
-    /// A no-op (`None`, document untouched) if either index is out of range
-    /// or `from == to` - the same defensive contract shape as
-    /// `stage_delete`. Otherwise the whole range from the upper line's
-    /// block start through the lower line inclusive is rewritten as the
-    /// lower line's full span, the unchanged freestanding middle, then the
-    /// upper line's full span. That range's length is unchanged, so nothing
-    /// outside it shifts by even one index.
+    /// A no-op (`None`) if either index is out of range or `from == to`.
+    /// Otherwise the whole range from the upper line's block start
+    /// through the lower line inclusive is rewritten as the lower line's
+    /// full span, the unchanged freestanding middle, then the upper
+    /// line's full span - same length, so nothing outside it shifts.
     ///
-    /// This does **not** re-derive "the nearest row-kind neighbor" itself:
-    /// the caller (`EntriesTable`) already knows both indices from its own
-    /// `rows()`-derived render order, so exactly one place in the codebase
-    /// decides adjacency. Freestanding comment/blank lines - ones no
-    /// entry's attachment walk claims - never travel with either entry:
-    /// they stay in the middle, in their original order, and keep their
-    /// exact index whenever the two spans are the same length (the common
-    /// case). When the spans differ in length the middle necessarily
-    /// shifts by that difference, since the whole range is rewritten in
-    /// place and the middle still sits between the two spans.
+    /// Doesn't re-derive "the nearest row-kind neighbor" itself: the
+    /// caller (`EntriesTable`) already knows both indices from its own
+    /// render order. Freestanding comment/blank lines stay in the
+    /// middle, keeping their exact index when the two spans are the same
+    /// length; when the spans differ, the middle shifts by that difference.
     ///
-    /// Returns the *actual* new indices of the two lines, via
-    /// [`resolve_moved_indices`]; they are not simply `to`/`from` once the
-    /// two attached blocks differ in length.
+    /// Returns the actual new indices via [`resolve_moved_indices`], not
+    /// simply `to`/`from` once the two attached blocks differ in length.
     pub fn stage_move(&mut self, from: usize, to: usize) -> Option<MoveOutcome> {
         if from >= self.lines.len() || to >= self.lines.len() || from == to {
             return None;
@@ -290,19 +269,16 @@ impl CandidateDocument {
         let upper = from.min(to);
         let lower = from.max(to);
         let upper_len = self.attached_block_len(upper);
-        // The lower line's block can never reach across the upper line when
-        // both are row-kind lines (the walk stops at a row-kind line), but
-        // clamp anyway so a non-row index from a future caller can't make
-        // the two spans overlap.
+        // Clamped so a non-row index from a future caller can't make the
+        // two spans overlap (row-kind spans never reach this far anyway).
         let lower_len = self.attached_block_len(lower).min(lower - upper - 1);
 
         let range_start = upper - upper_len;
         let mut rearranged: Vec<CandidateLine> = Vec::with_capacity(lower - range_start + 1);
-        // Lower's full span, then the untouched freestanding middle, then
-        // upper's full span (§13.4 steps 1-2).
+        // Lower's full span, then the untouched middle, then upper's full span.
         rearranged.extend_from_slice(&self.lines[lower - lower_len..=lower]);
         rearranged.extend_from_slice(&self.lines[upper + 1..lower - lower_len]);
-        rearranged.extend_from_slice(&self.lines[range_start..=upper]);
+        rearranged.extend_from_slice(&self.lines[range_start..=upper]); // upper's full span
         self.lines.splice(range_start..=lower, rearranged);
 
         let (new_upper, new_lower) = resolve_moved_indices(upper, upper_len, lower, lower_len);
@@ -317,24 +293,22 @@ impl CandidateDocument {
         })
     }
 
-    /// Every still-present row-kind line whose position changed relative to
-    /// `original` (`docs/UI_DESIGN.md` §13.7).
+    /// Every still-present row-kind line whose position changed relative
+    /// to `original` (`docs/UI_DESIGN.md` §13.7).
     ///
-    /// This is the single shared implementation behind both
+    /// The single shared implementation behind both
     /// [`Self::pending_count`]'s reorder contribution and `diff.rs`'s
-    /// `Reordered` group - §13.7 makes "both call sites use the *same*
-    /// logic" a hard requirement, so neither computes ranks for itself.
+    /// `Reordered` group, so neither computes ranks for itself.
     ///
-    /// The algorithm compares final state to original state directly (not a
-    /// log of individual moves), so it is correct for any combination of
-    /// moves, edits, additions and deletions made in any order:
+    /// Compares final state to original state directly (not a log of
+    /// individual moves), so it's correct for any combination of moves,
+    /// edits, additions, and deletions in any order:
     ///
-    /// 1. The comparable set is every row-kind candidate line that still
-    ///    carries an `original_index` pointing at a row-kind original line
-    ///    (so deletions drop out, and additions - which have no original
-    ///    rank to compare against - never enter it).
-    /// 2. Rank that set twice, 0-based: once in original-document order,
-    ///    once in current-candidate order.
+    /// 1. The comparable set is every row-kind candidate line still
+    ///    carrying an `original_index` pointing at a row-kind original
+    ///    line (deletions drop out, additions never enter it).
+    /// 2. Rank that set twice, 0-based: once in original order, once in
+    ///    current order.
     /// 3. Any line whose two ranks differ changed position.
     pub fn position_changes(&self, original: &DocumentDto) -> Vec<PositionChange> {
         // Step 1: the comparable set, in current candidate order. Pairs are

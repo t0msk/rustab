@@ -1,115 +1,74 @@
 //! `EntriesTable` - main entry list (§3), rows are `EntryRow` (parsed) or
 //! `UnparsedEntryRow` (malformed). Renders from the app's in-memory
-//! candidate document (see `crate::candidate`) rather than mock data (T11).
+//! candidate document (see `crate::candidate`).
 //!
-//! **Row expansion (T32):** clicking anywhere on an `EntryRow`'s own `<tr>`
-//! toggles an inline detail panel showing every one of that entry's fields,
-//! untruncated - the deliberate replacement for the fact that there was
-//! previously no way to see an entry's description without opening its
-//! drawer. Expansion state is a `HashSet<usize>` of expanded
-//! `candidate_index` values owned by `EntriesTable` itself, so any number of
-//! rows can be open at once (not an accordion). `UnparsedEntryRow` is not
-//! affected - it already shows its full raw text untruncated.
+//! **Row expansion:** clicking anywhere on an `EntryRow`'s own `<tr>`
+//! toggles an inline detail panel showing every field, untruncated.
+//! Expansion state is a `HashSet<usize>` of expanded `candidate_index`
+//! values owned by `EntriesTable`, so any number of rows can be open at
+//! once. `UnparsedEntryRow` isn't affected - it already shows its full
+//! raw text.
 //!
-//! **Reordering (T40, revised by T41 - `docs/UI_DESIGN.md` §13):** every
-//! row carries Move up/Move down buttons that emit `on_move((from, to))`
-//! with two *candidate-document* indices. This component resolves `to`
-//! itself from the adjacent entry in its own `rows` list, so exactly one
-//! place decides adjacency (§13.4), and it mirrors the move onto its own
-//! `expanded` set at the same time, because that set is keyed by position,
-//! not by entry identity (§13.8).
+//! **Reordering** (`docs/UI_DESIGN.md` §13): every row carries Move
+//! up/down buttons emitting `on_move((from, to))` with two
+//! candidate-document indices. This component resolves `to` itself from
+//! the adjacent entry in its own `rows` list, so exactly one place
+//! decides adjacency (§13.4), and mirrors the move onto its own
+//! `expanded` set, since that set is keyed by position, not identity
+//! (§13.8). An entry moves together with its attached comment block, so
+//! the two entries don't simply trade indices once their blocks differ
+//! in length - this predicts where each one lands with the same
+//! `resolve_moved_indices` `stage_move` uses, fed by `attached_block_len`.
 //!
-//! An entry moves together with its attached comment block (§13.4), so the
-//! two entries do not simply trade indices once their blocks differ in
-//! length - this component predicts where each one really lands with the
-//! same `resolve_moved_indices` `stage_move` uses, fed by the
-//! `attached_block_len` prop.
-//!
-//! **Drag-and-drop (T48, revised by T52 - §13.11)** is layered on top of
-//! that, additively: a row's own `<tr>` *is* the grab surface, and its
-//! `pointerdown`/`pointermove`/`pointerup` gesture commits *the very same*
+//! **Drag-and-drop** (§13.11) is layered on top, additively: a row's own
+//! `<tr>` is the grab surface, and its pointer gesture commits the same
 //! `on_move((from, to))` calls a Move-button click makes - one adjacent
-//! step per row boundary the pointer crosses, and **at most one emission
-//! per pointer event**. That last rule is not a style preference:
-//! `AppShell`'s handler reads a `UseStateHandle` snapshot of the candidate
-//! document and calls `.set()`, so a second `emit` in the same JS callback
-//! would stage onto the pre-`.set()` document and the two steps would not
-//! compose. A fast drag that outruns one step per event simply catches up
-//! on the next one.
+//! step per row boundary crossed, at most one emission per pointer
+//! event (required because `AppShell`'s handler reads a snapshot and
+//! calls `.set()`, so a second `emit` in the same callback would stage
+//! onto the pre-`.set()` document and the steps wouldn't compose).
 //!
-//! **Click vs. drag (T52).** T48 started this gesture from a dedicated
-//! grip handle purely to keep it off the row's own T32 expand click; the
-//! repo owner's own live feedback replaced that with a whole-row grab, so
-//! the two gestures now share one `pointerdown` on one element and are
-//! told apart by pointer *travel* rather than by hit target:
+//! **Click vs. drag.** Both gestures share one `pointerdown` on the same
+//! element and are told apart by pointer travel, not hit target:
 //!
-//! - A press only starts a *pending* gesture ([`PendingGesture`]: pointer
-//!   id, row position, origin x/y, plus pointer capture). Nothing is
-//!   measured, no state that renders is touched, and no default is
-//!   prevented - so a press that never travels stays, as far as the
-//!   browser is concerned, the same plain click it was before this
-//!   feature existed, and T32's `on_toggle` runs byte-for-byte unchanged.
-//! - Once a `pointermove` clears [`crossed_drag_threshold`]'s
-//!   [`DRAG_THRESHOLD_PX`] of travel (Euclidean, both axes, measured from
-//!   the *original* `pointerdown` position so the geometry below sees the
-//!   gesture's true start, not the point it was reclassified at), the
-//!   pending gesture is promoted: rows are measured, the layout freezes,
-//!   and a real [`DragState`] exists.
+//! - A press only starts a *pending* gesture ([`PendingGesture`]): no
+//!   measuring, no rendered state touched, no default prevented, so an
+//!   untraveled press stays a plain click and `on_toggle` runs unchanged.
+//! - Once [`crossed_drag_threshold`]'s [`DRAG_THRESHOLD_PX`] is cleared
+//!   (measured from the original `pointerdown` position), the gesture
+//!   is promoted: rows are measured, the layout freezes, a real
+//!   [`DragState`] exists.
 //! - Promotion also raises a "this press became a drag" flag that
-//!   `on_toggle` checks and clears. That flag is deliberately a plain
-//!   shared cell (`use_mut_ref`), **not** a `use_state`: the browser
-//!   synthesises `click` right after `pointerup` for the same
-//!   interaction, with no guarantee that Yew's scheduler has re-rendered
-//!   with a cleared `DragState` in between, so a render-scoped snapshot
-//!   cannot be trusted to answer "was this press a drag?". The flag lives
-//!   outside the render cycle and is read synchronously, which makes the
-//!   suppression structural rather than a timing hope.
-//! - Descendants that own their own pointer behaviour
-//!   ([`NO_DRAG_SELECTOR`] - every `button`, and `UnparsedEntryRow`'s
-//!   raw-line `<pre>`, whose text selection is the only way to copy that
-//!   line) bail out at the top of the handler, before any capture, state
-//!   change or `prevent_default`, so their native behaviour is left
-//!   completely untouched instead of being fought with `stop_propagation`
-//!   after the fact.
-//! - A non-excluded press also blocks text selection document-wide
-//!   ([`set_body_user_select_none`]) right there in the `pointerdown`
-//!   handler, and `on_drag_end` clears it again - both synchronously,
-//!   deliberately *not* through the `use_effect_with` below, which still
-//!   owns `cursor: grabbing` and is now only an idempotent backstop for
-//!   `user-select`. This fixes a race T48 shipped with: an effect keyed on
-//!   `drag.is_some()` cannot apply the style until Yew has processed a
-//!   state update and re-rendered, while the browser's native "press, then
-//!   move, so select text" behaviour waits for nothing - so a drag visibly
-//!   highlighted row text on its way past. The handler, by contrast, runs
-//!   to completion before any later native event of the same input stream
-//!   is dispatched, leaving no window to race against. Note what is *not*
-//!   used here: `prevent_default()` on `pointerdown` would also suppress
-//!   selection, but per the Pointer Events spec it suppresses that
-//!   interaction's compatibility mouse events too - plausibly including
-//!   the very `click` this whole two-phase design exists to preserve - so
-//!   the CSS route is taken instead, being orthogonal to `click`
-//!   synthesis rather than merely assumed to be safe.
+//!   `on_toggle` checks and clears - a plain shared cell (`use_mut_ref`),
+//!   not `use_state`, since the browser's synthesized `click` after
+//!   `pointerup` isn't guaranteed to see a re-rendered `DragState` in
+//!   between. The flag lives outside the render cycle and is read
+//!   synchronously, making the suppression structural.
+//! - Elements with their own pointer behavior ([`NO_DRAG_SELECTOR`]:
+//!   every button, and `UnparsedEntryRow`'s raw-line `<pre>` for text
+//!   selection) bail out before any capture or state change, leaving
+//!   their native behavior untouched.
+//! - A non-excluded press also blocks document-wide text selection
+//!   ([`set_body_user_select_none`]) synchronously in the `pointerdown`
+//!   handler (not via `use_effect_with`, which can't apply in time to
+//!   beat the browser's native "press, move, select text" behavior).
+//!   `prevent_default()` isn't used here, since per the Pointer Events
+//!   spec it would also suppress the interaction's compatibility mouse
+//!   events - including the very `click` this design preserves.
 //!
 //! **Why the drag renders rows out of document order.** A move changes
-//! only the *contents* of this table's rows, never their count or their
-//! keys' order (rows are keyed by `candidate_index`, rendered ascending, so
-//! Yew's keyed diff sees `[0, 1, ..., N-1]` before and after and never
-//! physically moves a `<tr>`). Nothing in the DOM changes position, so
-//! there is nothing for a CSS `transition: transform` to animate - a
-//! "just add a transition" drag would silently produce zero motion. The fix
-//! is to freeze the layout for the duration of the gesture: while a drag is
-//! in progress this component renders the rows in the order they had at
-//! `pointerdown` (each keyed by the `candidate_index` it had *then* - an
-//! ephemeral, gesture-scoped `key=` identity, nothing more) and expresses
-//! the committed order purely as a `translateY` per row. Each row's DOM
-//! node therefore keeps its own entry for the whole gesture, and every
-//! committed step changes those `translateY` *values*, which is precisely
-//! what a CSS transform transition animates. On `pointerup` the frozen
-//! order and the transforms are dropped together; the document order they
-//! were standing in for is already live, so nothing moves on screen.
+//! only row *contents*, never the keys' order (keyed by
+//! `candidate_index`, rendered ascending), so nothing in the DOM
+//! actually moves for a CSS transform transition to animate. The fix:
+//! while dragging, this component renders rows in their `pointerdown`-time
+//! order (keyed by an ephemeral, gesture-scoped `candidate_index`) and
+//! expresses the committed order purely as a `translateY` per row, which
+//! a transform transition can animate. On `pointerup` the frozen order
+//! and transforms drop together, since the real document order is
+//! already live underneath.
 //!
 //! Nothing here introduces an app-level per-entry identity: `expanded`,
-//! `on_move` and `candidate_index` keep their exact position-based
+//! `on_move`, and `candidate_index` keep their exact position-based
 //! meaning, and the frozen keys live and die with one gesture.
 
 use std::cell::RefCell;
@@ -253,27 +212,22 @@ fn move_button(
 /// Mirrors a `from`/`to` move onto the set of expanded candidate indices
 /// (`docs/UI_DESIGN.md` §13.8).
 ///
-/// `expanded` is keyed by *position*, not by entry identity, so without
-/// this an expanded row would stay open over whichever entry moved into
-/// its slot instead of following the entry the user actually expanded.
+/// `expanded` is keyed by position, not entry identity, so without this
+/// an expanded row would stay open over whichever entry moved into its
+/// slot instead of following the entry the user actually expanded.
 ///
-/// T40 did this as a plain membership swap between `from` and `to`, which
-/// is wrong once each entry moves together with an attached comment block
-/// of its own length (§13.4): the entry at `from` does not, in general,
-/// end up at `to`. Rather than route the real answer back from `AppShell`
-/// (there is no such channel, and inventing one would be a far bigger
-/// change than this needs), this predicts it synchronously at click time
-/// with the very same [`resolve_moved_indices`] `stage_move` runs
-/// internally, fed by the `attached_block_len` prop computed from the same
-/// document this table is currently showing - so the prediction agreeing
-/// with the staged result is a guarantee, not a coincidence.
+/// Not a plain membership swap between `from` and `to`: since each entry
+/// moves together with an attached comment block of its own length
+/// (§13.4), the entry at `from` doesn't generally end up at `to`. This
+/// predicts the real landing spot synchronously at click time with the
+/// same [`resolve_moved_indices`] `stage_move` runs internally, fed by
+/// the `attached_block_len` prop computed from the same document this
+/// table is showing - so the prediction matching the staged result is
+/// guaranteed, not coincidental.
 ///
-/// Only `from`/`to` need remapping: `to` is always the *adjacent row* in
-/// the render order, so no other row-kind line sits between them, and
+/// Only `from`/`to` need remapping: `to` is always the adjacent row in
+/// render order, so no other row-kind line sits between them, and
 /// comment/blank lines are never in `expanded` to begin with.
-///
-/// With two equal-length blocks (including the usual none/none case) this
-/// reduces exactly to T40's swap.
 fn remap_expanded(
     expanded: &HashSet<usize>,
     from: usize,
@@ -306,8 +260,7 @@ fn remap_expanded(
 }
 
 /// One adjacent reorder step, in render-order terms - the only kind of
-/// move either a Move button or a drag ever performs (T40 §13.8, T48
-/// §13.11).
+/// move either a Move button or a drag ever performs (§13.8, §13.11).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     Up,
@@ -356,8 +309,8 @@ struct DragState {
     keys: Vec<usize>,
 }
 
-/// A press on a row that has not (yet) been reclassified as a drag (T52,
-/// §13.11) - everything the promotion needs, and nothing more.
+/// A press on a row that has not (yet) been reclassified as a drag
+/// (§13.11) - everything the promotion needs, and nothing more.
 ///
 /// Deliberately held in a `use_mut_ref` rather than a `use_state`: a
 /// pending gesture has no visual effect at all, so promoting it is the
@@ -382,13 +335,11 @@ struct PendingGesture {
 /// The candidate index one adjacent step away from `row_position` in this
 /// table's own render order, or `None` at that boundary.
 ///
-/// Deliberately the single place both paths resolve a move's `to` index:
-/// the Move buttons call it to build their click handlers, and a drag's
-/// committed step calls it with the dragged row's current render position,
-/// so a drag provably cannot produce a different `(from, to)` pair than
-/// the equivalent click (§13.12 item 4). It keeps `on_move`'s contract
-/// exactly as T40 wrote it - "`EntriesTable` resolves `to` itself from the
-/// adjacent element of `rows`" - for both.
+/// The single place both paths resolve a move's `to` index: the Move
+/// buttons call it to build their click handlers, and a drag's committed
+/// step calls it with the dragged row's current render position, so a
+/// drag provably can't produce a different `(from, to)` pair than the
+/// equivalent click (§13.12 item 4).
 fn neighbor_target(candidate_indices: &[usize], row_position: usize, step: Step) -> Option<usize> {
     match step {
         Step::Up => can_move_up(row_position).then(|| candidate_indices[row_position - 1]),
@@ -507,33 +458,27 @@ fn drag_offsets(
 /// How much of the neighbouring row a drag has to cover before its step
 /// commits, as a fraction of that neighbour's own height.
 ///
-/// Deliberately *more* than half. The two directions' thresholds are
-/// mirror images of each other, so a plain 50% rule is exactly
-/// self-reversing: the instant a step commits, the pointer is standing
-/// precisely on the threshold for stepping straight back, and the rows
-/// would then swap back and forth on every single pointer event without
-/// the user moving at all. The 15 percentage points above half are the
-/// resulting dead zone - about 13px for this table's 44px rows - i.e.
-/// pointer travel the user has to deliberately undo before a committed
-/// step reverses. Kept well below 100% so that the last row remains
-/// reachable even for a dragged row much taller than the ones it passes
-/// (see [`clamp_drag_offset`], which stops it at the table's own edge).
+/// Deliberately more than half: a plain 50% rule is exactly
+/// self-reversing (the instant a step commits, the pointer sits right on
+/// the threshold for stepping back, so rows would swap back and forth
+/// with no further movement). The 15 points above half create a dead
+/// zone - about 13px for this table's 44px rows - of travel the user
+/// must undo before a step reverses. Kept well below 100% so the last
+/// row stays reachable even for a dragged row much taller than the ones
+/// it passes (see [`clamp_drag_offset`]).
 const STEP_THRESHOLD: f64 = 0.65;
 
-/// Whether this pointer position has crossed the next row boundary, and in
-/// which direction (§13.12 item 1).
+/// Whether this pointer position has crossed the next row boundary, and
+/// in which direction (§13.12 item 1).
 ///
-/// The threshold is [`STEP_THRESHOLD`] of the *neighbour's* height, taken
-/// from the dragged row's own resting top edge, which keeps the step
-/// honest for the mixed row heights this table actually has (a tall
-/// `UnparsedEntryRow`, an expanded row).
+/// The threshold is [`STEP_THRESHOLD`] of the neighbour's own height,
+/// taken from the dragged row's resting top edge, which keeps the step
+/// honest for mixed row heights (a tall `UnparsedEntryRow`, an expanded row).
 ///
-/// Returns **at most one** step, by construction - no loop, nothing
-/// accumulated - which is the whole of §13.11's "never more than one
-/// `on_move` emission per pointer event" rule: a pointer that jumped
-/// several boundaries in one event takes one step now and the rest on the
-/// following events, by which time `AppShell` has re-rendered this table
-/// with the staged document (§13.12 item 3).
+/// Returns at most one step, by construction (no loop, nothing
+/// accumulated) - a pointer that jumped several boundaries in one event
+/// takes one step now and the rest on later events, by which time
+/// `AppShell` has re-rendered with the staged document (§13.12 item 3).
 fn plan_step(
     metrics: &[RowMetrics],
     start: usize,
@@ -734,41 +679,26 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // panics with "Hooks are called conditionally".
     let expanded: UseStateHandle<HashSet<usize>> = use_state(HashSet::new);
     let drag: UseStateHandle<Option<DragState>> = use_state(|| None);
-    // The two halves of T52's click-vs-drag disambiguation, both held
-    // outside Yew's render cycle on purpose (module docs):
-    //
-    // * `pending_gesture` - a press that may or may not become a drag.
-    //   Nothing about it renders, so it has no business triggering one;
-    //   and because it does not, the layout it is promoted against is
-    //   still exactly the layout it was pressed on.
-    // * `drag_promoted` - "the press that is ending right now became a
-    //   drag, so swallow the `click` the browser is about to synthesise
-    //   from it." `click` is dispatched synchronously after `pointerup`,
-    //   before any re-render is guaranteed, so `on_toggle` cannot answer
-    //   this from a render-scoped snapshot of `drag` and reads this cell
-    //   synchronously instead.
-    //
-    // One of each per table, not per row: only one pointer gesture can be
-    // in flight at a time (the pointer is captured, and non-primary
-    // pointers are ignored), and a per-row-per-render cell would be a
-    // *different* allocation by the time the synthetic `click` arrives -
-    // several renders happen between promotion and `pointerup` - which is
-    // precisely the identity the suppression depends on.
+    // The two halves of click-vs-drag disambiguation, held outside Yew's
+    // render cycle (module docs): `pending_gesture` is a press that may or
+    // may not become a drag, rendering nothing so promotion sees the
+    // layout it was pressed on; `drag_promoted` tells `on_toggle` to
+    // swallow the synthetic `click` after a promoted press, read
+    // synchronously since `click` can't wait for a guaranteed re-render.
+    // One of each per table, not per row, since only one gesture can be
+    // in flight (pointer capture, non-primary pointers ignored).
     let pending_gesture: Rc<RefCell<Option<PendingGesture>>> = use_mut_ref(|| None);
     let drag_promoted: Rc<RefCell<bool>> = use_mut_ref(|| false);
 
-    // The grabbing cursor has to be document-level for the gesture's
-    // duration (§13.11), or it flickers back to the default as the pointer
-    // crosses other rows - and it has to be an *inline* style on `<body>`,
-    // because `styles/input.css` sets `body { cursor: default }` outside
-    // any cascade layer, which outranks every utility class. Running it as
-    // an effect (rather than setting/clearing it in the pointer handlers)
-    // means the cleanup also covers an unmount mid-gesture.
+    // The grabbing cursor must be document-level for the gesture's duration
+    // (or it flickers back to default crossing other rows) and an inline
+    // style on `<body>` (since `styles/input.css` sets `body { cursor:
+    // default }` outside any cascade layer, outranking utility classes).
+    // Running it as an effect means cleanup also covers an unmount mid-gesture.
     //
-    // `user-select` is still written here too, but is no longer *owned*
-    // here: the pointer handlers apply and clear it synchronously (T52's
-    // text-selection fix - see the module docs), and this effect is only
-    // an idempotent backstop plus the unmount-mid-gesture cleanup path.
+    // `user-select` is also written here, but no longer owned here: the
+    // pointer handlers apply/clear it synchronously (see module docs),
+    // and this effect is just an idempotent backstop plus unmount cleanup.
     {
         let dragging = drag.is_some();
         use_effect_with(dragging, move |dragging: &bool| {

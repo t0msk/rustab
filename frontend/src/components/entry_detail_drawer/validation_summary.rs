@@ -1,9 +1,6 @@
 //! `ValidationSummary` - drawer-top aggregate error banner (§5).
 //!
-//! Renders nothing when there are no errors. Like `ValidationMessage`, real
-//! validation results arrive in T11 - this task only needs the rendering
-//! logic to exist and to correctly hide itself when the error list is
-//! empty (which it always is in this task's static mock form).
+//! Renders nothing when there are no errors.
 
 use yew::prelude::*;
 
