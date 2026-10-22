@@ -1,21 +1,15 @@
-//! Thin Tauri IPC bindings for the commands this app uses:
-//! `get_target_info`, `list_entries`, `validate_candidate`,
-//! `discover_devices` (T11), plus `render_candidate`, `save`,
-//! `list_backups` and `restore_backup` (T12), plus `read_backup` and
-//! `delete_backup` (T20), plus `create_backup` (T21.1), plus
-//! `open_backup_location` (T25), plus `open_external_link` (T26), plus
-//! `pick_directory`, plus `open_path_in_file_manager` (T32), plus
-//! `resync_external_change` (T37). See `docs/API_CONTRACT.md` for the exact
-//! contract.
+//! Thin Tauri IPC bindings for the commands this app uses: `get_target_info`,
+//! `list_entries`, `validate_candidate`, `discover_devices`,
+//! `render_candidate`, `save`, `list_backups`, `restore_backup`,
+//! `read_backup`, `delete_backup`, `create_backup`, `open_backup_location`,
+//! `open_external_link`, `pick_directory`, `open_path_in_file_manager`,
+//! `resync_external_change`. See `docs/API_CONTRACT.md` for the exact contract.
 //!
-//! This binds directly to `window.__TAURI_INTERNALS__.invoke` rather than
-//! the `@tauri-apps/api` JS package: the frontend has no npm/JS bundling
-//! step (see `frontend/Trunk.toml` - Node is only a dev-time Tailwind CSS
-//! generator, never bundled). `__TAURI_INTERNALS__.invoke` is the same
-//! underlying function the JS package itself calls, and it is always
-//! injected by Tauri's core runtime into the webview regardless of the
-//! `app.withGlobalTauri` config flag (which only controls whether the
-//! friendlier `window.__TAURI__` wrapper is *also* injected).
+//! Binds directly to `window.__TAURI_INTERNALS__.invoke` rather than the
+//! `@tauri-apps/api` JS package, since the frontend has no npm/JS
+//! bundling step. `__TAURI_INTERNALS__.invoke` is the same underlying
+//! function the JS package calls, and is always injected by Tauri's core
+//! runtime regardless of the `app.withGlobalTauri` config flag.
 
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::prelude::*;
@@ -192,12 +186,11 @@ struct SaveArgs<'a> {
 /// WriteOutcomeDto` (API_CONTRACT.md §3.5). The only write path in the
 /// application.
 ///
-/// `allow_external_change` is T36's "write anyway" signal: send `false` on
-/// the normal path, and `true` only to repeat a call that has just rejected
-/// with `kind: "external_change"`, after the user has been shown the diff
-/// (`ExternalChangeDialog`) and asked for the write regardless. It is
-/// layered on top of the existing real-target confirmation, never a
-/// replacement for it.
+/// `allow_external_change` is the "write anyway" signal: send `false` on
+/// the normal path, `true` only to repeat a call that just rejected with
+/// `kind: "external_change"`, after the user has seen the diff
+/// (`ExternalChangeDialog`) and asked for the write regardless. Layered
+/// on top of the real-target confirmation, never a replacement for it.
 pub async fn save(
     candidate: &DocumentDto,
     allow_external_change: bool,
