@@ -1,15 +1,14 @@
 //! `BackupPanel` - backup list view (§7), rows are `BackupListItem`.
-//! Renders from the real `list_backups` result (T12); `AppShell` owns the
+//! Renders from the real `list_backups` result; `AppShell` owns the
 //! fetch, this component is purely presentational.
 //!
-//! **Fallback notice (T39, `docs/UI_DESIGN.md` §7):** when
+//! **Fallback notice** (`docs/UI_DESIGN.md` §7): when
 //! `TargetInfoDto.real_target_backup_fallback_dir` is `Some`, this panel
 //! shows a persistent banner above the list (or empty state) rather than
-//! only in a tooltip, because the fact it states is something a user needs
-//! to be able to find *in a rescue scenario*, not just on first notice. The
-//! banner's exact wording is built by [`fallback_notice_text`], a plain
-//! function kept separate from the `html!` so its content can be unit
-//! tested without a DOM.
+//! only a tooltip, since the fact it states needs to be findable in a
+//! rescue scenario, not just on first notice. The banner's wording is
+//! built by [`fallback_notice_text`], kept separate from the `html!` so
+//! it can be unit tested without a DOM.
 //!
 //! T40 note: the banner's second fact - that each save's automatic backup is
 //! still written beside the real `/etc/fstab` - was in doubt for exactly as

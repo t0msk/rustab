@@ -1,4 +1,4 @@
-//! `ExternalChangeDialog` - T36's warning/diff modal for a `save`/
+//! `ExternalChangeDialog` - warning/diff modal for a `save`/
 //! `restore_backup` call that rejected with `kind: "external_change"`
 //! (`docs/API_CONTRACT.md` §8): `/etc/fstab` changed outside Rustab since
 //! this session last synced with it, so nothing was written.

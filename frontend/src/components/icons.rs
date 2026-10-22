@@ -1,13 +1,11 @@
 //! Small reusable inline-SVG icon components, replacing ad hoc Unicode
-//! glyphs (`✎`, `🗑`) across the app so icon rendering is consistent across
-//! platforms/fonts instead of depending on whatever glyphs the system font
-//! happens to ship - the same reasoning `AboutDialog`'s own inline-SVG
-//! icons were built on (T26).
+//! glyphs (`✎`, `🗑`) so icon rendering is consistent across
+//! platforms/fonts instead of depending on the system font's glyphs -
+//! same reasoning `AboutDialog`'s own inline-SVG icons use.
 //!
-//! Deliberately not an icon-library dependency (`yew-lucide` and similar
-//! were considered): this app only ever needs a handful of icons, so a
-//! whole icon-set crate would be unused-icon bloat in the compiled wasm
-//! bundle for no benefit a few hand-copied `<path>`s don't already give.
+//! Not an icon-library dependency (`yew-lucide` and similar were
+//! considered): this app only ever needs a handful of icons, so a whole
+//! icon-set crate would be unused-icon bloat in the compiled wasm bundle.
 //! The path data below is copied from Lucide (https://lucide.dev, ISC
 //! license - permissive, explicitly allows this), picked for its
 //! consistent, modern stroke-based style; nothing here pulls in Lucide as

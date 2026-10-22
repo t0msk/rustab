@@ -1,11 +1,11 @@
 //! `StatusToast` - transient success/warning/error notification.
 //!
-//! A self-contained, presentational shell: given a message and severity it
-//! renders the toast. `AppShell` (T12) triggers it on a successful `save`/
-//! `restore_backup`, auto-dismissing it after a few seconds; a *failed*
-//! save/restore shows its error inside the still-open modal instead
-//! (`docs/UI_DESIGN.md` §6 point 4), which is why `ToastKind::Error` is
-//! still unused.
+//! A self-contained, presentational shell: given a message and severity
+//! it renders the toast. `AppShell` triggers it on a successful
+//! `save`/`restore_backup`, auto-dismissing it after a few seconds; a
+//! failed save/restore shows its error inside the still-open modal
+//! instead (`docs/UI_DESIGN.md` §6 point 4), which is why
+//! `ToastKind::Error` is still unused.
 
 use yew::prelude::*;
 

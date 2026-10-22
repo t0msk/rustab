@@ -6,20 +6,18 @@
 //! the one state that is *not* calm (`RealFile`) deliberately stands out
 //! from the other two.
 //!
-//! Since T34 this distinguishes three states, not two (`docs/SPEC.md` §7,
-//! `src-tauri/src/commands.rs::save_document_with`): a save from a default,
-//! unconfigured launch writes the real `/etc/fstab` too, even though the
-//! file being *edited* is the local working draft. T35 (per the repo
-//! owner's own call, recorded in `PROJECT_PLAN.md`) reverted that state's
-//! ambient treatment back to calm: this banner reports *what you are
-//! currently looking at* (a local draft, nothing written yet), not *what
-//! a future save will do*. The Review Changes and backup-delete/restore
-//! confirmation dialogs already carry an explicit checkbox at the one
-//! moment a real write is actually about to happen
+//! Distinguishes three states, not two (`docs/SPEC.md` §7,
+//! `src-tauri/src/commands.rs::save_document_with`): a save from a
+//! default, unconfigured launch writes the real `/etc/fstab` too, even
+//! though the file being *edited* is the local working draft. This
+//! banner reports what you're currently looking at (a local draft,
+//! nothing written yet), not what a future save will do - that
+//! ambient-calm treatment is deliberate. The Review Changes and
+//! backup-delete/restore confirmation dialogs already carry an explicit
+//! checkbox at the one moment a real write is actually about to happen
 //! (`crate::components::real_target_confirm_checkbox::confirm_disabled`,
-//! gated on the same `writes_real_file` predicate) - duplicating that as a
-//! second, permanent, high-alarm ambient banner would just be noise, not
-//! an extra safety signal.
+//! gated on the same `writes_real_file` predicate) - duplicating that as
+//! a second, permanent, high-alarm ambient banner would just be noise.
 
 use yew::prelude::*;
 
