@@ -46,6 +46,12 @@ node_modules/
 # Env files (see CONTRIBUTING.md for the .env.example convention)
 .env
 
+# Convenience symlink to wherever this machine's downstream packaging repo
+# clones (Flathub, AUR, Debian/PPA...) actually live on disk - created by
+# packaging/sync.sh, per-machine by nature (RUSTAB_PACKAGING_ROOT), never
+# meant to be tracked.
+/packaging/clones
+
 # Local-only, not part of the public repo (by the maintainer's own choice):
 # CLAUDE.md carries project instructions for AI coding assistants, and
 # PROJECT_PLAN.md is the maintainer's private orchestration log for their

@@ -1,62 +1,39 @@
 //! Structural and semantic validation of candidate fstab documents - see `docs/SPEC.md` §5, §6.
 //!
-//! This module implements the two validation steps described in
-//! `docs/SPEC.md` §6 ("Atomicity") step 1 and step 2:
+//! Implements the two validation steps from `docs/SPEC.md` §6 ("Atomicity"):
 //!
 //! 1. **Structural validation** (`structural_findings`): cheap, in-memory
-//!    checks of a [`Document`]'s [`crate::model::FstabEntry`] lines -
-//!    non-empty `fs_type`, duplicate mount points, malformed-looking
-//!    `UUID=`/`PARTUUID=` values, and a couple of advisory checks (mount
-//!    point missing on disk, visible [`Line::Malformed`] lines).
-//! 2. **Semantic validation** (`semantic_findings`): an external check
-//!    equivalent to `findmnt --verify --tab-file <path>`, run against a
-//!    temporary rendering of the candidate document - never against the
-//!    real target file.
+//!    checks of a [`Document`]'s entries - non-empty `fs_type`, duplicate
+//!    mount points, malformed-looking `UUID=`/`PARTUUID=` values, plus
+//!    advisory checks (mount point missing on disk, visible
+//!    [`Line::Malformed`] lines).
+//! 2. **Semantic validation** (`semantic_findings`): equivalent to
+//!    `findmnt --verify --tab-file <path>`, run against a temporary
+//!    rendering of the candidate - never the real target file.
 //!
-//! [`validate`] runs both and returns a [`ValidationReport`] distinguishing
+//! [`validate`] runs both and returns a [`ValidationReport`], separating
 //! blocking [`Severity::Error`] findings from advisory [`Severity::Warning`]
-//! findings. A caller (e.g. the future atomic writer, T6) should check
-//! [`ValidationReport::has_errors`] (or the equivalent [`ValidationReport::is_ok`])
-//! before writing anything to disk, and may still want to surface warnings
-//! to the user even when there are no errors.
+//! ones. Callers should check [`ValidationReport::has_errors`] (or
+//! [`ValidationReport::is_ok`]) before writing to disk.
 //!
-//! ## Design note: no `target_path` parameter
-//!
-//! An earlier sketch of this module's API included a `target_path: &Path`
-//! parameter on [`validate`]. It was dropped: every check this module
-//! performs is self-contained within the candidate [`Document`] (structural
-//! checks) or operates against a throwaway temporary file (the semantic
-//! check) - none of them need to know what file the candidate would
-//! eventually be written to. Keeping that parameter would mean either
-//! leaving it unused (which `-D warnings` would reject) or inventing a use
-//! for it that doesn't serve any check actually required by
-//! `docs/SPEC.md` §5/§6. If a future check genuinely needs the target path
-//! (e.g. comparing against the file currently on disk), add the parameter
-//! then.
+//! `validate` takes no `target_path`: every check is self-contained within
+//! the candidate [`Document`] or a throwaway temp file - none need to know
+//! the eventual destination.
 //!
 //! ## `findmnt` I/O-vs-pure-logic separation
 //!
-//! Following the same pattern `discovery.rs` uses for `lsblk`
-//! (`run_lsblk` vs. `parse_lsblk_json`), the `findmnt` semantic check is
-//! split into:
+//! Like `discovery.rs`'s `lsblk` split, the semantic check is divided into
+//! `run_findmnt_verify` (the actual I/O: render, write to a temp file via
+//! [`std::env::temp_dir`], shell out to `findmnt --verify`) and
+//! `interpret_findmnt_result` (a pure function from `io::Result<FindmntRunResult>`
+//! to `Finding`s, which unit tests exercise directly, including the
+//! "findmnt unavailable" case via a synthetic `io::Error`).
 //!
-//! - `run_findmnt_verify`: the actual I/O - renders the candidate
-//!   document, writes it to a fresh temp file (via [`std::env::temp_dir`]),
-//!   and shells out to `findmnt --verify --tab-file <temp path>`.
-//! - `interpret_findmnt_result`: a pure function that maps an
-//!   `io::Result<FindmntRunResult>` to zero or more [`Finding`]s, with no
-//!   process invocation of its own. This is what unit tests exercise
-//!   directly (including the "findmnt unavailable" degraded-mode case, via
-//!   a synthetic `Err(io::Error::from(ErrorKind::NotFound))`) without
-//!   needing to actually uninstall `findmnt` from the test machine.
-//!
-//! Per `docs/SPEC.md` §6 step 2 and the explicit instruction to never
-//! silently skip-and-claim-success, any failure to even run `findmnt`
-//! (missing binary, or any other I/O error attempting to launch it) is
-//! surfaced as a non-blocking [`Severity::Warning`] finding that says
-//! verification ran in degraded mode - it is deliberately not silent and
-//! deliberately not a hard error (an environment without `findmnt`
-//! installed should still be able to save a structurally valid fstab).
+//! Per SPEC §6 step 2, a failure to even run `findmnt` (missing binary or
+//! other I/O error) is surfaced as a non-blocking [`Severity::Warning`]
+//! saying verification ran in degraded mode - never silent, never a hard
+//! error, since an environment without `findmnt` should still be able to
+//! save a structurally valid fstab.
 
 use crate::model::{Document, Line, SourceId};
 use std::collections::HashMap;
@@ -85,18 +62,15 @@ pub enum Severity {
     Warning,
 }
 
-/// Which of an entry's fields a [`Finding`] is about, when it is about
-/// exactly one.
+/// Which of an entry's fields a [`Finding`] is about, when it's about
+/// exactly one. A domain concept, not a UI one - a GUI maps each variant to
+/// whichever widget shows that field.
 ///
-/// This is a domain concept - one of the fields of a
-/// [`crate::model::FstabEntry`] line - not a UI concept; a GUI consuming
-/// this is free to map each variant onto whichever input widget shows that
-/// field. [`Finding::field`] being `None` does not mean "unknown"; it means
-/// the finding is not about exactly one field/line at all - either it spans
-/// multiple lines (e.g. a mount point shared by two entries), or it isn't
-/// about a parsed entry in the first place (e.g. a [`Line::Malformed`]
-/// line), or it is about one identifiable line but names no field of it
-/// (a `findmnt --verify` diagnostic - see [`findmnt_detail_line_findings`]).
+/// [`Finding::field`] being `None` doesn't mean "unknown"; it means the
+/// finding isn't about exactly one field - it spans multiple lines (e.g. a
+/// shared mount point), isn't about a parsed entry (e.g.
+/// [`Line::Malformed`]), or names no field of an otherwise identifiable
+/// line (a `findmnt --verify` diagnostic - see [`findmnt_detail_line_findings`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingField {
     /// The entry's mount point (second fstab field).
@@ -105,25 +79,19 @@ pub enum FindingField {
     Source,
     /// The entry's filesystem type (third fstab field).
     FsType,
-    /// The entry's human-readable description - not one of the six fstab
-    /// fields itself, but the comment line (or lines) rustab attaches to the
-    /// entry (see [`crate::model::FstabEntry::description`]).
+    /// The entry's human-readable description (see
+    /// [`crate::model::FstabEntry::description`]), not one of the six fstab
+    /// fields.
     ///
-    /// No check in this module currently produces this variant: T43 deleted
-    /// the only one that did (a description had to be a single line back when
-    /// it was written as exactly one comment line; it no longer does). The
-    /// variant itself is deliberately kept - it is part of a wire-locked
-    /// enum, spelled `"description"`, documented in `docs/API_CONTRACT.md`
-    /// §7, and a future description-specific check should reuse it rather
-    /// than re-adding it. `fstab-core` is a library crate, so a `pub` variant
-    /// nothing constructs is not a `dead_code` hazard.
+    /// No current check produces this variant, but it's kept because it's
+    /// part of a wire-locked enum (spelled `"description"`, see
+    /// `docs/API_CONTRACT.md` §7) - a future description-specific check
+    /// should reuse it rather than add a new one.
     Description,
-    /// The entry's trailing inline comment - the free-form text appended
-    /// after the entry's six fstab fields on the same physical line,
-    /// following a `#` (see [`crate::model::FstabEntry::trailing_comment`]).
-    /// Distinct from [`Self::Description`], which is a separate comment
-    /// line (or lines) placed *above* the entry rather than appended after
-    /// it. Produced by [`trailing_comment_contains_newline_findings`].
+    /// The entry's trailing inline comment, appended after the six fields
+    /// on the same line (see [`crate::model::FstabEntry::trailing_comment`]).
+    /// Distinct from [`Self::Description`], a comment block placed *above*
+    /// the entry. Produced by [`trailing_comment_contains_newline_findings`].
     TrailingComment,
 }
 
@@ -138,30 +106,20 @@ pub struct Finding {
     /// directly to a user (e.g. in the GUI's inline validation feedback, per
     /// `docs/SPEC.md` §9).
     pub message: String,
-    /// Which single field of an entry this finding is about, if any. See
-    /// [`FindingField`]'s doc comment for exactly what `None` means here -
-    /// it is not "unknown", it is "not applicable to a single field".
+    /// Which single field of an entry this finding is about, if any - see
+    /// [`FindingField`] for what `None` means here.
     pub field: Option<FindingField>,
-    /// The 0-based index, into the validated [`Document`]'s `lines`, of the
-    /// single line this finding is about, if any. This reuses the project's
-    /// existing convention that a line's identity is simply its index in
-    /// the lines array (already documented on `LineDto` in both DTO
-    /// crates) rather than inventing a new identity scheme - a caller that
-    /// knows which `Document`/`DocumentDto` was validated can use this
-    /// index to look the exact line back up.
+    /// The 0-based index into the validated [`Document`]'s `lines`, if this
+    /// finding is about a single line. Matches `LineDto`'s identity
+    /// convention in the DTO crates, so a caller can look the line back up.
     ///
-    /// Usually set exactly when [`Self::field`] is set (both or neither) -
-    /// with two exceptions, both of which set `line_index` alone. A
-    /// [`Line::Malformed`] line is one: it is a single, identifiable line,
-    /// so `line_index` is set for it, while `field` stays `None` because it
-    /// was never a parsed entry with fields to localize to in the first
-    /// place. A `findmnt --verify` diagnostic attributed to one entry (see
-    /// [`findmnt_detail_line_findings`]) is the other: `findmnt` names the
-    /// mount point its complaint is about, which is enough to identify the
-    /// line, but not which of that entry's fields is at fault. A consumer
-    /// must therefore treat `line_index: Some, field: None` as "about this
-    /// whole line, not one field of it" - not assume the pairing always
-    /// holds.
+    /// Usually set together with [`Self::field`] (both or neither), with
+    /// two exceptions that set `line_index` alone: a [`Line::Malformed`]
+    /// line (identifiable, but never had fields to localize to), and a
+    /// `findmnt --verify` diagnostic attributed to one entry (identifies
+    /// the line via its mount point, but not which field is at fault). So
+    /// `line_index: Some, field: None` means "about this whole line", not
+    /// an invariant violation.
     pub line_index: Option<usize>,
 }
 
@@ -200,9 +158,8 @@ impl Finding {
         }
     }
 
-    /// Constructs an advisory [`Severity::Warning`] finding localized to a
-    /// single field of a single line - see [`FindingField`] and
-    /// [`Self::line_index`] for what the two extra parameters mean.
+    /// Constructs an advisory [`Severity::Warning`] localized to one field
+    /// of one line.
     fn warning_at(message: impl Into<String>, field: FindingField, line_index: usize) -> Self {
         Finding {
             severity: Severity::Warning,
@@ -212,10 +169,8 @@ impl Finding {
         }
     }
 
-    /// Constructs an advisory [`Severity::Warning`] finding localized to a
-    /// single *line* without naming one of its [`FindingField`]s - see
-    /// [`Self::line_index`]'s doc comment for why `line_index` is set here
-    /// while `field` stays `None`.
+    /// Constructs an advisory [`Severity::Warning`] localized to a line but
+    /// no specific field (see [`Self::line_index`]).
     fn warning_at_line(message: impl Into<String>, line_index: usize) -> Self {
         Finding {
             severity: Severity::Warning,
@@ -225,12 +180,9 @@ impl Finding {
         }
     }
 
-    /// Constructs a blocking [`Severity::Error`] finding localized to a
-    /// single *line* without naming one of its [`FindingField`]s - the
-    /// [`Severity::Error`] counterpart of [`Self::warning_at_line`], used by
-    /// [`findmnt_detail_line_findings`] for a `findmnt --verify` `[E]`
-    /// diagnostic that could be attributed to exactly one entry but names no
-    /// specific fstab field.
+    /// The [`Severity::Error`] counterpart of [`Self::warning_at_line`],
+    /// used by [`findmnt_detail_line_findings`] for `findmnt --verify`
+    /// `[E]` diagnostics attributed to one entry but no specific field.
     fn error_at_line(message: impl Into<String>, line_index: usize) -> Self {
         Finding {
             severity: Severity::Error,
@@ -242,9 +194,7 @@ impl Finding {
 }
 
 /// The outcome of validating a candidate [`Document`]: every [`Finding`]
-/// produced by structural and semantic validation, in no particular order
-/// across the two categories (structural findings are pushed first, then
-/// semantic ones).
+/// from structural and semantic validation (structural first, then semantic).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValidationReport {
     /// All findings from this validation run, both blocking and advisory.
@@ -252,32 +202,25 @@ pub struct ValidationReport {
 }
 
 impl ValidationReport {
-    /// Returns `true` if any finding in this report is a blocking
-    /// [`Severity::Error`]. A caller performing a save (e.g. the atomic
-    /// writer in T6) must treat `true` here as "abort before touching
-    /// disk", per `docs/SPEC.md` §6 step 1-2.
+    /// `true` if any finding is a blocking [`Severity::Error`] - callers
+    /// must abort the save before touching disk when this is `true`.
     pub fn has_errors(&self) -> bool {
         self.findings.iter().any(|f| f.severity == Severity::Error)
     }
 
-    /// Returns `true` if this report contains no blocking errors (it may
-    /// still contain advisory warnings). The logical complement of
-    /// [`Self::has_errors`], provided as the trivially-checkable "is it safe
-    /// to proceed" predicate a caller wants.
+    /// `true` if there are no blocking errors (there may still be warnings).
     pub fn is_ok(&self) -> bool {
         !self.has_errors()
     }
 
-    /// Returns an iterator over just the blocking [`Severity::Error`]
-    /// findings.
+    /// Iterator over just the blocking [`Severity::Error`] findings.
     pub fn errors(&self) -> impl Iterator<Item = &Finding> {
         self.findings
             .iter()
             .filter(|f| f.severity == Severity::Error)
     }
 
-    /// Returns an iterator over just the advisory [`Severity::Warning`]
-    /// findings.
+    /// Iterator over just the advisory [`Severity::Warning`] findings.
     pub fn warnings(&self) -> impl Iterator<Item = &Finding> {
         self.findings
             .iter()
@@ -285,18 +228,14 @@ impl ValidationReport {
     }
 }
 
-/// Validates a candidate fstab [`Document`], running both structural checks
-/// (see the module-level docs) and a semantic check equivalent to
-/// `findmnt --verify --tab-file <path>` against a temporary rendering of
-/// `doc`.
+/// Validates a candidate fstab [`Document`]: structural checks (see module
+/// docs) plus a semantic check equivalent to `findmnt --verify --tab-file
+/// <path>` against a temporary rendering of `doc`.
 ///
-/// This never touches any real target file: the semantic check writes `doc`
-/// (via its [`std::fmt::Display`] / canonical serializer) to a throwaway
-/// temp file under [`std::env::temp_dir`] and points `findmnt` at that temp
-/// path only. Never panics; if `findmnt` itself cannot be run at all (not on
-/// `$PATH`, or any other I/O error attempting to launch it), that is
-/// reported as an advisory [`Severity::Warning`] finding rather than
-/// silently treated as a pass.
+/// Never touches the real target file - `doc` is written to a throwaway
+/// temp file under [`std::env::temp_dir`] and `findmnt` points at that.
+/// Never panics; if `findmnt` can't be run at all, that's an advisory
+/// [`Severity::Warning`], not a silent pass.
 pub fn validate(doc: &Document) -> ValidationReport {
     let mut findings = structural_findings(doc);
     findings.extend(semantic_findings(doc));
@@ -324,23 +263,15 @@ fn structural_findings(doc: &Document) -> Vec<Finding> {
 }
 
 /// Surfaces any [`Line::Malformed`] lines in `doc` as advisory warnings.
-/// Per `docs/SPEC.md` §5, a malformed line must be preserved (the parser
-/// already guarantees that) and surfaced to the user rather than silently
-/// skipped - but it is non-blocking here: a document containing a malformed
-/// line the parser could not understand is not, by itself, a reason to
-/// refuse to save the *rest* of the file (the parser's `Display` impl
-/// re-renders malformed lines verbatim, so nothing is lost either way).
+/// Non-blocking: a malformed line the parser couldn't understand isn't by
+/// itself a reason to refuse saving the rest of the file (it round-trips
+/// verbatim either way).
 ///
-/// Tagged with [`Finding::line_index`] (via [`Finding::warning_at_line`]) so
-/// a consumer - the GUI's per-entry drawer, specifically - can scope this
-/// finding to the one line it is actually about, same as every other
-/// line-specific finding. It was originally left completely untagged
-/// (T21.3), which meant it read as "document-level" to that scoping and
-/// surfaced inside *every* entry's add/edit drawer regardless of which line
-/// was open - confusing in exactly the way a direct user report already
-/// got the cross-entry-warning case fixed for (`docs/UI_DESIGN.md` §5).
-/// There is still no [`FindingField`] for it (a malformed line was never a
-/// parsed entry with fields to localize to), so `field` stays `None`.
+/// Tagged with [`Finding::line_index`] so the GUI's per-entry drawer can
+/// scope the finding to the one line it's about, rather than surfacing it
+/// in every entry's drawer regardless of which is open (see
+/// `docs/UI_DESIGN.md` §5). No [`FindingField`] applies, since a malformed
+/// line was never a parsed entry.
 fn malformed_line_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
@@ -360,13 +291,10 @@ fn malformed_line_findings(doc: &Document) -> Vec<Finding> {
 
 /// Flags any [`FstabEntry`] whose `fs_type` is empty as a blocking error.
 ///
-/// The parser (`parser.rs`) already requires at least four whitespace fields
-/// to produce an [`Line::Entry`] at all, and an empty *token* between two
-/// runs of whitespace cannot occur from `str::split_whitespace`, so this
-/// should be unreachable via normal parsing. It is checked anyway as a
-/// second line of defense against entries constructed directly via the
-/// `fstab-core` API (e.g. by a future GUI add/edit form) bypassing the
-/// parser entirely.
+/// Unreachable via normal parsing (`parser.rs` requires 4+ fields, and
+/// `str::split_whitespace` can't yield an empty token), but checked anyway
+/// as a second line of defense against entries built directly via the
+/// `fstab-core` API, bypassing the parser.
 fn empty_fs_type_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
@@ -391,16 +319,10 @@ fn empty_fs_type_findings(doc: &Document) -> Vec<Finding> {
 /// Flags any [`crate::model::FstabEntry`] whose `trailing_comment` contains
 /// an embedded newline (`\n` or `\r`) as a blocking error.
 ///
-/// A trailing comment parsed from a real file can never contain one (the
-/// source text was already split on newlines before any field reached this
-/// code, and `trailing_comment` is only ever the text after the first `#` on
-/// that one physical line) - this exists as a second line of defense against
-/// an `EntryDto` constructed directly via the Tauri IPC boundary, bypassing
-/// the text parser entirely, the same reasoning [`empty_fs_type_findings`]
-/// above documents for its own analogous case. If such a value ever reached
-/// the writer, it would split one physical fstab line into two, corrupting
-/// the file - the second half would be misparsed as a [`Line::Malformed`]
-/// line or a bogus new entry on the next load.
+/// Can't happen from real parsing (same reasoning as
+/// [`empty_fs_type_findings`]); this guards against an `EntryDto` built
+/// directly via the Tauri IPC boundary. Such a value reaching the writer
+/// would split one physical line into two, corrupting the file.
 fn trailing_comment_contains_newline_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
@@ -431,9 +353,8 @@ fn trailing_comment_contains_newline_findings(doc: &Document) -> Vec<Finding> {
 }
 
 /// Flags mount points shared by two or more entries as a blocking error,
-/// except for the literal `none` mount point (see [`SWAP_NONE_MOUNT_POINT`]),
-/// which multiple swap entries legitimately share since they have no real
-/// mount point to collide on.
+/// except the literal `none` mount point (see [`SWAP_NONE_MOUNT_POINT`]),
+/// which swap entries legitimately share.
 fn duplicate_mount_point_findings(doc: &Document) -> Vec<Finding> {
     let mut seen: HashMap<&str, u32> = HashMap::new();
     for entry in doc.entries() {
@@ -454,19 +375,15 @@ fn duplicate_mount_point_findings(doc: &Document) -> Vec<Finding> {
         .collect()
 }
 
-/// Flags [`SourceId::Uuid`] and [`SourceId::PartUuid`] values that don't look
-/// like a canonical UUID (the standard 8-4-4-4-12 hex-with-hyphens textual
-/// form, e.g. `11111111-2222-3333-4444-555555555555`) as a blocking error.
+/// Flags [`SourceId::Uuid`] and [`SourceId::PartUuid`] values that don't
+/// look like a canonical UUID (8-4-4-4-12 hex-with-hyphens, e.g.
+/// `11111111-2222-3333-4444-555555555555`) as a blocking error.
 ///
-/// Deliberately lenient: this only checks the overall shape (hyphen
-/// positions and hex digits), not that the UUID identifies any real device,
-/// and it accepts both upper- and lower-case hex digits (`blkid`/`lsblk`
-/// report lower-case, but fstab files edited by hand sometimes contain
-/// upper-case). It does not attempt to validate the UUID version/variant
-/// bits (RFC 9562 §4-5) - `/etc/fstab` has never required a *version-correct*
-/// UUID, only a filesystem UUID in the conventional textual shape, so being
-/// stricter than that would risk rejecting valid-but-uncommon real-world
-/// values this crate has no way to double-check against actual hardware.
+/// Deliberately lenient: only checks shape (hyphen positions, hex digits,
+/// case-insensitive), not that the UUID identifies a real device or has
+/// valid version/variant bits (RFC 9562 §4-5) - fstab itself doesn't
+/// require that, and being stricter risks rejecting valid-but-uncommon
+/// real values.
 fn malformed_uuid_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
@@ -476,15 +393,10 @@ fn malformed_uuid_findings(doc: &Document) -> Vec<Finding> {
             _ => None,
         })
         .filter_map(|(idx, entry)| match &entry.source {
-            // `UUID=` accepts a second, shorter shape beyond the canonical
-            // 36-char form: `blkid`/the kernel report a FAT/exFAT
-            // filesystem's volume serial number as an 8-4 hex pair (e.g.
-            // `CAF7-75BB`), and a real `/etc/fstab` referencing a FAT/EFI
-            // system partition this way is common and valid - rejecting it
-            // was a real false positive, not overcaution. `PARTUUID=`
-            // (always a GPT/MBR partition-table GUID, never a filesystem
-            // volume ID) is deliberately not given the same allowance here;
-            // no report has shown a real short PARTUUID shape in the wild.
+            // `UUID=` also accepts the shorter FAT/exFAT volume-serial shape
+            // (e.g. `CAF7-75BB`), common for EFI system partitions.
+            // `PARTUUID=` (a GPT/MBR GUID, never a volume ID) gets no such
+            // allowance.
             SourceId::Uuid(value)
                 if !looks_like_uuid(value) && !looks_like_fat_volume_id(value) =>
             {
@@ -516,10 +428,8 @@ fn malformed_uuid_findings(doc: &Document) -> Vec<Finding> {
         .collect()
 }
 
-/// Returns `true` if `value` has the canonical UUID textual shape: 32 hex
-/// digits grouped `8-4-4-4-12` and separated by literal hyphens at exactly
-/// those positions, case-insensitively. See [`malformed_uuid_findings`] for
-/// why this check is intentionally no stricter than that.
+/// Returns `true` if `value` has the canonical UUID shape: 32 hex digits
+/// grouped `8-4-4-4-12` with hyphens at exactly those positions, case-insensitively.
 fn looks_like_uuid(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
@@ -538,14 +448,10 @@ fn looks_like_uuid(value: &str) -> bool {
     true
 }
 
-/// Returns `true` if `value` has the shape `blkid`/the kernel use for a
-/// FAT/exFAT filesystem's volume serial number: exactly 4 hex digits, a
-/// literal hyphen, then exactly 4 more hex digits (e.g. `CAF7-75BB`),
-/// case-insensitively. Unlike [`looks_like_uuid`], this is a real,
-/// commonly-seen alternate `UUID=` shape - FAT-family filesystems (vfat,
-/// the typical ESP filesystem) have no 128-bit UUID to report, only this
-/// 32-bit volume ID, and `/etc/fstab` entries referencing one this way are
-/// valid and unremarkable, not a malformed value.
+/// Returns `true` if `value` is a FAT/exFAT volume serial number: 4 hex
+/// digits, a hyphen, 4 more hex digits (e.g. `CAF7-75BB`),
+/// case-insensitively. FAT-family filesystems have no 128-bit UUID, only
+/// this 32-bit volume ID, so it's a valid alternate `UUID=` shape.
 fn looks_like_fat_volume_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 9 {
@@ -557,19 +463,13 @@ fn looks_like_fat_volume_id(value: &str) -> bool {
 }
 
 /// Advisory check: flags a mount point that doesn't currently exist on disk.
-/// Non-blocking per `docs/SPEC.md` §9 - a mount point legitimately may not
-/// exist yet at validation time (e.g. provisioning a fresh `/mnt/newdrive`
-/// directory before first boot), so this is a [`Severity::Warning`], not a
-/// [`Severity::Error`].
+/// A [`Severity::Warning`] per `docs/SPEC.md` §9, since a mount point may
+/// legitimately not exist yet (e.g. provisioning before first boot).
 ///
-/// Skipped entirely for the literal `none` mount point (swap entries have no
-/// real mount point to check). `mount_point` is decoded via
-/// [`crate::model::decode_escaped_whitespace`] before the existence check -
-/// the model stores it raw (octal escapes and all, per `docs/SPEC.md`'s
-/// escaped-whitespace policy), but a literal `\040` in that text would never
-/// match the real on-disk path, which has an actual space. The *finding*
-/// still reports the raw, as-stored text, so it reads like the rest of the
-/// document and like something the user can find by eye.
+/// Skipped for the literal `none` mount point. Decoded via
+/// [`crate::model::decode_escaped_whitespace`] before the existence check,
+/// since the raw (possibly `\040`-escaped) text would never match a real
+/// on-disk path - but the finding itself reports the raw text, as stored.
 fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
     doc.lines
         .iter()
@@ -602,81 +502,53 @@ fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
 /// The result of successfully running `findmnt --verify --tab-file`
 /// (regardless of whether `findmnt` itself reported the file as valid) -
 /// i.e. the process launched and ran to completion. Deliberately a small,
-/// synthesizable struct (rather than the raw [`std::process::Output`]) so
-/// [`interpret_findmnt_result`] can be unit-tested with hand-built values,
-/// without needing a real child process.
+/// synthesizable struct (rather than raw [`std::process::Output`]) so
+/// [`interpret_findmnt_result`] can be unit-tested with hand-built values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FindmntRunResult {
-    /// `true` if `findmnt --verify` exited with status 0 (no errors).
+    /// `true` if `findmnt --verify` exited with status 0.
     success: bool,
-    /// `findmnt`'s stdout followed by its stderr (if non-empty), concatenated
-    /// so a caller gets whatever diagnostic text `findmnt` produced either
-    /// way; `findmnt --verify` is documented to report problems on stdout,
-    /// but stderr is included too so nothing is silently dropped.
+    /// `findmnt`'s stdout followed by stderr, concatenated so nothing is
+    /// dropped even though `--verify` documents stdout as the usual place
+    /// for problems.
     combined_output: String,
 }
 
-/// Runs structural checks are not repeated here; this performs only the
-/// semantic (`findmnt --verify`) half of validation and returns its
-/// [`Finding`]s.
+/// Runs only the semantic (`findmnt --verify`) half of validation -
+/// structural checks happen separately - and returns its [`Finding`]s.
 fn semantic_findings(doc: &Document) -> Vec<Finding> {
     let rendered = doc.to_string();
     let result = run_findmnt_verify(&rendered);
     interpret_findmnt_result(doc, &result)
 }
 
-/// Pure decision logic: given the result of attempting to run
-/// `findmnt --verify --tab-file` (see [`run_findmnt_verify`]), decides what
-/// [`Finding`]s to report. Contains no process invocation or file I/O of its
-/// own, which is what makes it directly unit-testable (including the
-/// "findmnt unavailable" degraded-mode path, via a synthetic
-/// `Err(io::Error::from(io::ErrorKind::NotFound))`) without needing to
-/// actually uninstall `findmnt`.
+/// Pure decision logic over the result of [`run_findmnt_verify`] - no
+/// process invocation or I/O, so it's directly unit-testable (including
+/// the "findmnt unavailable" path, via a synthetic `io::Error`).
 ///
-/// - `Err(_)` (the binary could not be launched at all, for any reason -
-///   not on `$PATH`, or some other I/O error) → one [`Severity::Warning`]
-///   finding stating that semantic verification ran in degraded mode
-///   (structural checks only), never silently treated as success, per
-///   `docs/SPEC.md` §6.
+/// - `Err(_)` (binary couldn't be launched) → a [`Severity::Warning`]
+///   saying verification ran in degraded mode, never silently a pass.
 /// - `Ok(run)` with `run.success == true` → no findings.
-/// - `Ok(run)` with `run.success == false` → first, the preferred path:
-///   `findmnt`'s output is grouped by mount point, so
-///   [`parse_findmnt_detail`] tries to decompose it into one diagnostic per
-///   mount point, and [`findmnt_detail_line_findings`] tries to attribute
-///   each of those to exactly one [`Line::Entry`] of `doc`. When *both*
-///   succeed (every line of `findmnt`'s output was recognized, and every
-///   mount point it named resolved to exactly one entry), the result is one
-///   per-line [`Finding`] per diagnostic, carrying the real
-///   [`Finding::line_index`] of the entry it is about and the severity of
-///   its own `[E]`/`[W]` marker - and no whole-output dump at all. That is
-///   what lets a GUI put each complaint on the row/drawer it belongs to
-///   instead of showing one unscoped blob on every entry.
+/// - `Ok(run)` with `run.success == false` → preferred path first:
+///   [`parse_findmnt_detail`] decomposes the output into one diagnostic
+///   per mount point, and [`findmnt_detail_line_findings`] tries to
+///   attribute each to exactly one entry. When both succeed, the result is
+///   one per-line [`Finding`] per diagnostic (so a GUI can put each
+///   complaint on its own row/drawer), and no whole-output dump.
 ///
-///   If anything about the output is unexpected, or any mount point is
-///   ambiguous (matches zero, or two or more entries), the whole result
-///   falls back - all-or-nothing, never partially attributed - to the
-///   original behavior below, which is the safety net and deliberately
-///   unchanged: `findmnt --verify` prints a
-///   final summary line shaped like
-///   `"<N> parse error(s), <M> error(s), <K> warning(s)"` and exits
-///   non-zero whenever `N > 0` *or* `M > 0` - i.e. it conflates "a line
-///   could not be parsed" (`N`; `findmnt` itself logs `parse error at line
-///   X -- ignored` and keeps analyzing the rest of the file, so this is not
-///   fatal) with "the file parsed fine but has a real mount/boot-reachability
-///   problem" (`M`). [`parse_findmnt_summary`] extracts `N`/`M`/`K` from that
-///   line so the two cases are not conflated here:
-///     - If the summary line parses and `M == 0` (regardless of `N`, and
-///       regardless of the non-zero exit code that `N > 0` alone causes),
-///       this is a non-blocking [`Severity::Warning`] - findmnt did not
-///       find any real semantic problem.
-///     - If the summary line parses and `M > 0`, this is still a blocking
-///       [`Severity::Error`], and the finding still includes `findmnt`'s own
-///       output text.
-///     - If the summary line cannot be found/parsed at all (output shape
-///       `findmnt` produced does not match what this function expects),
-///       this falls back to the original conservative behavior - a
-///       blocking [`Severity::Error`] - rather than ever silently treating
-///       an unrecognized failure as a pass.
+///   If anything is unrecognized, or a mount point is ambiguous, the whole
+///   result falls back - all-or-nothing - to a summary-line check:
+///   `findmnt --verify` prints `"<N> parse error(s), <M> error(s), <K>
+///   warning(s)"` and exits non-zero whenever `N > 0` *or* `M > 0`,
+///   conflating "a line couldn't be parsed" (`N`, non-fatal to findmnt
+///   itself) with "a real mount/boot problem" (`M`).
+///   [`parse_findmnt_summary`] separates them:
+///     - Summary parses, `M == 0` → non-blocking [`Severity::Warning`]
+///       regardless of `N` or the non-zero exit code.
+///     - Summary parses, `M > 0` → blocking [`Severity::Error`], with
+///       findmnt's own output included.
+///     - Summary can't be found/parsed → blocking [`Severity::Error`] as a
+///       conservative fallback, never silently a pass.
 fn interpret_findmnt_result(doc: &Document, result: &io::Result<FindmntRunResult>) -> Vec<Finding> {
     match result {
         Err(err) => vec![Finding::warning(format!(
@@ -687,13 +559,9 @@ fn interpret_findmnt_result(doc: &Document, result: &io::Result<FindmntRunResult
         ))],
         Ok(run) if run.success => Vec::new(),
         Ok(run) => {
-            // Preferred path: decompose findmnt's output into per-entry
-            // findings. Both halves have to agree before anything is
-            // reported this way - an unrecognized output shape, or a mount
-            // point that cannot be pinned to exactly one entry, drops the
-            // whole result through to the unchanged fallback below rather
-            // than reporting a partially-attributed (and therefore
-            // possibly incomplete) set of findings.
+            // Preferred path: decompose into per-entry findings. Both halves
+            // must agree, or the whole result falls through to the summary
+            // check below rather than reporting a partial attribution.
             let (detail_lines, had_unrecognized_content) =
                 parse_findmnt_detail(&run.combined_output);
             if !had_unrecognized_content {
@@ -732,40 +600,33 @@ fn interpret_findmnt_result(doc: &Document, result: &io::Result<FindmntRunResult
 }
 
 /// One `[E]`/`[W]` diagnostic line from `findmnt --verify`'s output,
-/// together with the mount point of the block it appeared under (see
+/// with the mount point of the block it appeared under (see
 /// [`parse_findmnt_detail`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FindmntDetailLine {
-    /// The mount-point text from the block header this diagnostic appeared
-    /// under, verbatim as `findmnt` printed it - which is verbatim as the
-    /// candidate document contained it, since the candidate was rendered
-    /// via [`Document`]'s `Display` impl before being handed to `findmnt`.
+    /// The mount-point text from the block header, verbatim as `findmnt`
+    /// printed it (which matches the candidate document's own text).
     mount_point: String,
-    /// [`Severity::Error`] for a `[E]` marker, [`Severity::Warning`] for a
-    /// `[W]` one. Taken from this line's own marker, never re-derived from
-    /// the summary line's aggregate counts.
+    /// [`Severity::Error`] for `[E]`, [`Severity::Warning`] for `[W]` -
+    /// taken from this line's own marker, not the summary's counts.
     severity: Severity,
-    /// The diagnostic text after the marker, e.g. `"unreachable on boot
-    /// required target: No such file or directory"`.
+    /// The diagnostic text after the marker.
     message: String,
 }
 
 /// The exact indentation `findmnt --verify` puts before each `[E]`/`[W]`
-/// diagnostic line (confirmed against util-linux 2.42.2). Matched exactly,
-/// not as "some whitespace": a different indentation is something this
-/// parser has not seen and must not guess about.
+/// line (confirmed against util-linux 2.42.2). Matched exactly - a
+/// different indentation means an output shape this parser hasn't seen.
 const FINDMNT_DETAIL_INDENT: &str = "   ";
 
-/// Decomposes `findmnt --verify`'s combined stdout+stderr text into one
-/// [`FindmntDetailLine`] per `[E]`/`[W]` diagnostic, returning them along
-/// with a `had_unrecognized_content` flag that is `true` if *anything* in
-/// `text` could not be cleanly explained.
+/// Decomposes `findmnt --verify`'s combined stdout+stderr into one
+/// [`FindmntDetailLine`] per `[E]`/`[W]` diagnostic, plus a
+/// `had_unrecognized_content` flag for anything that didn't fit the
+/// expected shape.
 ///
-/// `findmnt --verify` groups its diagnostics by mount point: an unindented
-/// line holding the mount-point text verbatim, followed by one or more
-/// lines of [`FINDMNT_DETAIL_INDENT`] + `[E] `/`[W] ` + message. Real
-/// captured output (util-linux 2.42.2), as
-/// [`run_findmnt_verify`] assembles it (stdout, then stderr):
+/// Diagnostics are grouped by mount point: an unindented header line, then
+/// one or more [`FINDMNT_DETAIL_INDENT`] + `[E] `/`[W] ` + message lines.
+/// Real output (util-linux 2.42.2):
 ///
 /// ```text
 /// /mnt/unreachable
@@ -777,20 +638,11 @@ const FINDMNT_DETAIL_INDENT: &str = "   ";
 /// 1 parse error, 2 errors, 0 warnings
 /// ```
 ///
-/// Everything else this recognizes is deliberately *discarded* rather than
-/// surfaced:
-///
-/// - Blank lines, which carry no information. A blank line also closes any
-///   block currently open, since real output never separates a header from
-///   its own diagnostics.
-/// - The summary line (via [`parse_findmnt_summary_line`]); its counts are
-///   aggregates of the per-line diagnostics, so reporting them too would
-///   just repeat what the per-line findings already say.
-/// - A `findmnt: <path>: parse error at line N -- ignored` stderr line.
-///   This one is pure duplication: a line `findmnt` could not parse is
-///   already reported by [`malformed_line_findings`], which has that line's
-///   own correct `line_index` - and the path in it is the throwaway temp
-///   file, which means nothing to a user.
+/// Discarded rather than surfaced: blank lines (which also close the
+/// current block); the summary line (its counts just aggregate the
+/// per-line diagnostics); and `findmnt: <path>: parse error at line N --
+/// ignored` (duplicates [`malformed_line_findings`], and its path is the
+/// throwaway temp file anyway).
 ///
 /// The flag is set to `true` for anything else at all: an unknown line
 /// shape, a `[E]`/`[W]` line with no block header open above it, or a
@@ -855,10 +707,8 @@ fn parse_findmnt_detail(text: &str) -> (Vec<FindmntDetailLine>, bool) {
 }
 
 /// Recognizes one indented `findmnt --verify` diagnostic line, returning
-/// its severity and the message after the marker. Requires exactly
-/// [`FINDMNT_DETAIL_INDENT`] followed by exactly `"[E] "` or `"[W] "` -
-/// anything else (other indentation, an unknown marker letter) is not
-/// recognized, so the caller treats it as unexplained content.
+/// its severity and message. Requires exactly [`FINDMNT_DETAIL_INDENT`]
+/// followed by `"[E] "` or `"[W] "`; anything else is unrecognized.
 fn parse_findmnt_detail_message_line(line: &str) -> Option<(Severity, &str)> {
     let rest = line.strip_prefix(FINDMNT_DETAIL_INDENT)?;
     if let Some(message) = rest.strip_prefix("[E] ") {
@@ -869,8 +719,8 @@ fn parse_findmnt_detail_message_line(line: &str) -> Option<(Severity, &str)> {
 }
 
 /// Returns `true` for `findmnt`'s own `findmnt: <path>: parse error at line
-/// N -- ignored` stderr line. See [`parse_findmnt_detail`] for why this line
-/// is recognized only in order to discard it.
+/// N -- ignored` stderr line, recognized only to discard it (see
+/// [`parse_findmnt_detail`]).
 fn is_findmnt_parse_error_line(line: &str) -> bool {
     let line = line.trim_end();
     line.starts_with("findmnt: ")
@@ -878,37 +728,28 @@ fn is_findmnt_parse_error_line(line: &str) -> bool {
         && line.ends_with(" -- ignored")
 }
 
-/// Returns `true` if `line` could be a `findmnt --verify` block header, i.e.
-/// an fstab mount-point text printed on its own line.
+/// Returns `true` if `line` could be a `findmnt --verify` block header -
+/// an fstab mount-point text on its own line.
 ///
-/// A mount point is a single whitespace-free token: the fstab format splits
-/// its fields on whitespace, and a mount point containing a space carries it
-/// as an octal escape (`\040`) which this crate deliberately stores and
-/// renders raw (see `docs/SPEC.md`). So "contains no whitespace at all" both
-/// matches every real header and rejects `findmnt`'s prose lines (its own
-/// `findmnt: ...` messages, the summary line, and any future wording), which
-/// is what keeps an unrecognized line from being mistaken for a header.
+/// A mount point is always one whitespace-free token (a space is carried
+/// as `\040`, never a literal space), so "no whitespace at all" matches
+/// every real header while rejecting findmnt's prose lines.
 fn looks_like_findmnt_mount_point_header(line: &str) -> bool {
     !line.is_empty() && !line.chars().any(char::is_whitespace)
 }
 
 /// Resolves [`FindmntDetailLine`]s against `doc`, returning one per-line
-/// [`Finding`] per diagnostic - or `None` if any single one of them cannot
-/// be attributed to exactly one entry.
+/// [`Finding`] per diagnostic, or `None` if any one can't be attributed to
+/// exactly one entry.
 ///
-/// Matching is plain string equality against [`crate::model::FstabEntry::mount_point`]
-/// as stored (raw, octal escapes and all), the same way
-/// [`mount_point_missing_findings`] matches: `findmnt` was given this very
-/// document rendered by its own serializer, so the header text it echoes
-/// back is byte-identical to what the model holds.
+/// Matching is plain string equality against `mount_point` as stored
+/// (raw) - safe because `findmnt` was given this same document rendered
+/// by its own serializer.
 ///
-/// `None` is all-or-nothing on purpose. A mount point that matches *no*
-/// entry means this function and `findmnt` disagree about the document,
-/// and one that matches *two or more* (e.g. the `none` several swap entries
-/// share) means there is no single right line to blame. Either way, guessing
-/// risks pinning a real problem to the wrong row - worse than the honest
-/// unscoped fallback - and a *partial* result risks dropping a diagnostic
-/// entirely, so neither is attempted.
+/// `None` is all-or-nothing: a mount point matching zero entries means
+/// this function and `findmnt` disagree, and one matching two or more
+/// (e.g. shared `none`) has no single line to blame. Guessing either way
+/// risks a wrong attribution, worse than the unscoped fallback.
 fn findmnt_detail_line_findings(
     doc: &Document,
     lines: &[FindmntDetailLine],
@@ -931,10 +772,7 @@ fn findmnt_detail_line_findings(
             return None;
         }
 
-        // The message is prefixed with its source so a user reading it on
-        // its own row knows this is `findmnt`'s verdict, not rustab's own
-        // wording - the fallback whole-output findings say so explicitly,
-        // and these must not lose that attribution by being shorter.
+        // Prefixed so the reader knows this is findmnt's verdict, not rustab's.
         let message = format!("findmnt --verify: {}", detail.message);
         findings.push(match detail.severity {
             Severity::Error => Finding::error_at_line(message, line_index),
@@ -945,50 +783,36 @@ fn findmnt_detail_line_findings(
     Some(findings)
 }
 
-/// The three counts `findmnt --verify` reports in its final summary line
-/// (see [`parse_findmnt_summary`]).
+/// The three counts `findmnt --verify` reports in its summary line (see
+/// [`parse_findmnt_summary`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FindmntSummary {
-    /// `N`: lines `findmnt` could not parse at all (logged as `parse error
-    /// at line X -- ignored` and otherwise non-fatal).
+    /// `N`: unparseable lines (non-fatal to findmnt itself).
     parse_errors: u32,
-    /// `M`: real semantic/mount/boot-reachability problems found in lines
-    /// that did parse successfully.
+    /// `M`: real semantic/mount/boot-reachability problems.
     errors: u32,
-    /// `K`: advisory warnings (e.g. a boot-required source that is merely
-    /// unreachable right now, downgraded from an error by `noauto`).
+    /// `K`: advisory warnings.
     #[allow(dead_code)] // part of the parsed shape; not currently read by any caller.
     warnings: u32,
 }
 
-/// Parses `findmnt --verify`'s final summary line out of its combined
-/// stdout+stderr text, tolerating both the singular ("1 error") and plural
-/// ("2 errors", and also "0 errors") wording `findmnt` uses for each of the
-/// three counts, and either "parse error(s)" or plain "error(s)" for the
-/// respective counts.
+/// Parses `findmnt --verify`'s summary line from combined stdout+stderr,
+/// tolerating singular/plural wording for each count (`"1 error"` vs.
+/// `"2 errors"`) and "parse error(s)" vs. plain "error(s)".
 ///
-/// Confirmed against real `findmnt` (util-linux 2.42.2) output such as:
-/// - `"1 parse error, 2 errors, 0 warnings"`
-/// - `"1 parse error, 0 errors, 2 warnings"`
-/// - `"0 parse errors, 0 errors, 2 warnings"`
-/// - `"0 parse errors, 1 error, 0 warnings"`
+/// Confirmed against real output (util-linux 2.42.2), e.g.
+/// `"1 parse error, 2 errors, 0 warnings"`.
 ///
-/// Returns `None` if no line in `text` matches the expected
-/// `"<N> parse error(s), <M> error(s), <K> warning(s)"` shape at all (e.g. a
-/// future `findmnt` version changes the wording) - callers must treat `None`
-/// conservatively (today's "non-zero exit = Error" behavior), never as a
-/// free pass, since this function has no way to tell the two cases apart
-/// once the shape is unrecognized.
+/// Returns `None` if no line matches the expected shape (e.g. a future
+/// findmnt changes the wording) - callers must treat `None` conservatively
+/// (today's "non-zero exit = Error"), never as a free pass.
 fn parse_findmnt_summary(text: &str) -> Option<FindmntSummary> {
     text.lines().find_map(parse_findmnt_summary_line)
 }
 
-/// Parses a single line as `findmnt --verify`'s summary line, returning
-/// `None` if it is not one. Factored out of [`parse_findmnt_summary`] (which
-/// is just this applied across every line of the output) so
-/// [`parse_findmnt_detail`] can use the identical test when classifying a
-/// line, rather than keeping a second copy of the summary-line shape that
-/// could drift from this one.
+/// Parses a single line as `findmnt --verify`'s summary line, or `None`.
+/// Factored out of [`parse_findmnt_summary`] so [`parse_findmnt_detail`]
+/// can reuse the identical test rather than keep a second copy.
 fn parse_findmnt_summary_line(line: &str) -> Option<FindmntSummary> {
     let fields: Vec<&str> = line.trim().split(", ").collect();
     let [parse_field, error_field, warning_field] = fields.as_slice() else {
@@ -1019,20 +843,17 @@ fn parse_count_field(field: &str, singular: &str, plural: &str) -> Option<u32> {
     }
 }
 
-/// Monotonically increasing counter used to keep temp-file names produced by
-/// concurrent calls (e.g. parallel test threads within the same process)
-/// from colliding, since [`std::process::id`] alone is constant for the
-/// whole process lifetime.
+/// Keeps temp-file names from concurrent calls (e.g. parallel test
+/// threads) from colliding, since [`std::process::id`] alone is constant
+/// for the whole process lifetime.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Writes `rendered` (the candidate document's canonical serialized text) to
-/// a fresh file under [`std::env::temp_dir`] and returns its path.
+/// Writes `rendered` to a fresh file under [`std::env::temp_dir`] and
+/// returns its path.
 ///
-/// This is only used for the read-only `findmnt --verify` check, which does
-/// not need same-filesystem rename atomicity - unlike the final write in a
-/// future atomic-writer task (T6), which must use a temp file in the same
-/// directory as the real target for `rename(2)` to be atomic. Verification
-/// never touches the real target file at all.
+/// Only used for the read-only `findmnt --verify` check, which doesn't
+/// need same-filesystem rename atomicity like `writer.rs`'s real save
+/// does. Verification never touches the real target file.
 fn write_candidate_to_temp_file(rendered: &str) -> io::Result<PathBuf> {
     let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
@@ -1045,17 +866,12 @@ fn write_candidate_to_temp_file(rendered: &str) -> io::Result<PathBuf> {
 }
 
 /// Runs `findmnt --verify --tab-file <temp path>` against a fresh temp-file
-/// rendering of `rendered`, and returns the outcome as a [`FindmntRunResult`].
+/// rendering of `rendered`.
 ///
-/// Returns `Err` if the temp file could not be written, or if the `findmnt`
-/// binary could not be launched at all (not installed / not on `$PATH`, or
-/// any other `std::process::Command::output` failure) - both cases are
-/// treated identically by [`interpret_findmnt_result`] as "verification
-/// unavailable", since this function has no way to run the real check
-/// either way. The temp file is removed afterwards on a best-effort basis
-/// (its absence or removal failure is not itself reported as an error, since
-/// it is a throwaway file under the OS temp directory, not a correctness
-/// concern).
+/// Returns `Err` if the temp file couldn't be written or `findmnt` couldn't
+/// be launched - both treated identically by [`interpret_findmnt_result`]
+/// as "verification unavailable". The temp file is removed afterwards on a
+/// best-effort basis; removal failure isn't reported as an error.
 fn run_findmnt_verify(rendered: &str) -> io::Result<FindmntRunResult> {
     let temp_path = write_candidate_to_temp_file(rendered)?;
 
@@ -1647,14 +1463,11 @@ mod tests {
             .contains("unreachable on boot required source"));
     }
 
-    // --- Semantic: parse-error (N) vs real-error (M) summary-line split (T5b) ---
+    // --- Semantic: parse-error (N) vs real-error (M) summary-line split ---
 
-    /// Real `findmnt` (util-linux 2.42.2) output, captured by hand to confirm
-    /// the exact summary-line shape before writing the parser against it -
-    /// see this module's "T5b" fix. `findmnt --verify --tab-file t.fstab`
-    /// against a two-line file (one unparseable line, one entry with
-    /// `UUID=deadbeef-...` and `defaults`, i.e. auto-mounted and
-    /// unreachable, a real error):
+    /// Real `findmnt --verify` output (util-linux 2.42.2) against a two-line
+    /// file (one unparseable line, one auto-mounted entry with a dead
+    /// `UUID=`, a real error):
     /// ```text
     /// findmnt: t.fstab: parse error at line 1 -- ignored
     ///
@@ -1663,9 +1476,8 @@ mod tests {
     ///    [E] unreachable on boot required target: No such file or directory
     ///    [E] unreachable on boot required source: UUID=deadbeef-0000-0000-0000-000000000000
     /// ```
-    /// exit code 1. The same file but with `noauto` instead of `defaults`
-    /// (so the unreachable source is merely a warning, not a real error)
-    /// produces `"1 parse error, 0 errors, 2 warnings"`, still exit code 1.
+    /// With `noauto` instead (merely a warning), the summary line is
+    /// `"1 parse error, 0 errors, 2 warnings"` instead.
     #[test]
     fn parse_findmnt_summary_handles_real_findmnt_output_shapes() {
         assert_eq!(
@@ -1771,14 +1583,11 @@ mod tests {
 
     // --- Semantic: per-line decomposition of findmnt's detail output ---
 
-    /// Real `findmnt --verify` output for a document with one unparseable
-    /// line, one `noauto` entry with a nonexistent UUID (two `[W]`s), and
-    /// one auto-mounted entry with a nonexistent UUID (two `[E]`s), in the
-    /// order [`run_findmnt_verify`] assembles it: stdout (the detail
-    /// blocks), a blank separator, then stderr (the parse-error line, a
-    /// blank line, and the summary line). Captured by hand against
-    /// util-linux 2.42.2, with stdout/stderr redirected to separate files to
-    /// confirm which stream each part comes from.
+    /// Real `findmnt --verify` output (util-linux 2.42.2) for a document
+    /// with one unparseable line, a `noauto` entry with a dead UUID
+    /// (`[W]`), and an auto-mounted entry with a dead UUID (`[E]`), in
+    /// [`run_findmnt_verify`]'s assembly order: stdout, blank separator,
+    /// then stderr.
     fn real_two_block_findmnt_output() -> String {
         "/mnt/data\n\
          \u{20}\u{20}\u{20}[W] unreachable target: No such file or directory\n\
@@ -1793,10 +1602,9 @@ mod tests {
             .to_string()
     }
 
-    /// A document matching [`real_two_block_findmnt_output`]: the two
-    /// entries it names, deliberately *not* at indices 0 and 1 (a malformed
-    /// line precedes them and a blank line separates them) so a correct
-    /// `line_index` cannot pass by coincidence.
+    /// A document matching [`real_two_block_findmnt_output`], with the two
+    /// entries deliberately not at indices 0/1 so a correct `line_index`
+    /// can't pass by coincidence.
     fn doc_for_real_two_block_output() -> Document {
         Document::from_lines(vec![
             Line::Malformed("this line is garbage and cannot be parsed".to_string()),
@@ -2106,15 +1914,9 @@ mod tests {
 
     #[test]
     fn validate_reports_no_errors_for_a_valid_document() {
-        // `noauto` keeps `findmnt --verify` from treating these fake,
-        // nonexistent UUIDs as boot-required-but-unreachable *errors* (it
-        // downgrades that to warnings for non-auto-mounted entries) - see
-        // the module docs for why the semantic check is exercised against
-        // real `findmnt` here rather than only via `interpret_findmnt_result`.
-        // This keeps the test meaningful (it exercises the real `findmnt`
-        // binary when available) while remaining correct regardless of
-        // whether `findmnt` happens to be installed on the machine running
-        // the test: unavailable-findmnt degrades to a warning, not an error.
+        // `noauto` keeps findmnt from treating these fake UUIDs as errors
+        // (downgraded to warnings). Correct either way findmnt is installed:
+        // unavailable findmnt degrades to a warning, not an error.
         let doc = Document::from_lines(vec![
             Line::Comment(" synthetic valid fstab for validator tests".to_string()),
             Line::Entry(FstabEntry::new(
@@ -2209,9 +2011,9 @@ mod tests {
             .any(|f| f.message.contains("does not currently exist on disk")));
     }
 
-    /// `true` if `findmnt` is actually runnable on this machine. Mirrors the
-    /// identically-named helper in `writer.rs`'s test module (not reused
-    /// across modules since both are private `#[cfg(test)]` items).
+    /// `true` if `findmnt` is actually runnable on this machine. Mirrors
+    /// `writer.rs`'s identically-named test helper (not shared, since both
+    /// are private `#[cfg(test)]` items).
     fn is_findmnt_available() -> bool {
         Command::new("findmnt")
             .arg("--version")
@@ -2219,17 +2021,10 @@ mod tests {
             .is_ok_and(|out| out.status.success())
     }
 
-    /// Regression test for T5b: a document with one [`Line::Malformed`] line
-    /// *and* an otherwise fully-resolvable entry that `findmnt --verify`
-    /// would, at most, warn about (not error on) - `noauto` on a
-    /// nonexistent-but-well-formed UUID, the same pattern `writer.rs`'s own
-    /// tests use to avoid tripping a real `findmnt` error. Before the T5b
-    /// fix, `findmnt --verify`'s non-zero exit (caused solely by the
-    /// malformed line being an unparseable `N > 0`, not a real `M > 0`
-    /// error) was mapped unconditionally to a blocking [`Severity::Error`],
-    /// making this document permanently unsavable - contradicting
-    /// `docs/SPEC.md` §5's requirement that a malformed line be tolerated as
-    /// a visible warning, not treated as fatal.
+    /// A [`Line::Malformed`] line alongside an otherwise valid entry
+    /// (`noauto` on a nonexistent-but-well-formed UUID) must not be a
+    /// blocking error - the malformed line's unparseable `N > 0` must not
+    /// get conflated with a real `M > 0` semantic error.
     #[test]
     fn malformed_line_alongside_an_otherwise_valid_entry_is_not_a_blocking_error() {
         let doc = Document::from_lines(vec![
@@ -2256,21 +2051,9 @@ mod tests {
             .warnings()
             .any(|f| f.message.contains("could not be understood")));
         if is_findmnt_available() {
-            // Confirm the fix is actually being exercised against real
-            // findmnt here, not just passing because findmnt happens to be
-            // unavailable (which would degrade to a warning regardless).
-            //
-            // This originally looked for findmnt's own "parse error"
-            // wording in a document-level warning. Per-line decomposition
-            // deliberately removed that: real findmnt reports this document
-            // as `1 parse error, 0 errors, 2 warnings` with both warnings
-            // attributable to the one entry, so the result is now two
-            // per-line warnings and *no* whole-output dump - and findmnt's
-            // parse-error line is dropped as pure duplication of the
-            // malformed-line warning asserted just above, which already
-            // carries that line's own correct `line_index`. The equivalent
-            // (in fact stricter) evidence that real findmnt ran is
-            // therefore its per-entry verdict, tagged to the entry's line.
+            // Real findmnt reports this as `1 parse error, 0 errors, 2
+            // warnings`; per-line decomposition turns that into a per-entry
+            // warning tagged to the entry's line, with no whole-output dump.
             assert!(
                 report.warnings().any(|f| f.line_index == Some(1)
                     && f.field.is_none()
@@ -2287,13 +2070,9 @@ mod tests {
         }
     }
 
-    /// Companion regression test: the malformed line alone must not mask a
-    /// *real* semantic error findmnt finds elsewhere in the same document
-    /// (`M > 0`) - that must still be a blocking [`Severity::Error`],
-    /// confirming T5b only changes the `M == 0` case. Skipped when `findmnt`
-    /// is unavailable, since without it this check degrades to a
-    /// non-blocking warning regardless (covered by this module's other
-    /// degraded-mode tests).
+    /// A malformed line must not mask a real semantic error (`M > 0`)
+    /// elsewhere in the document - that's still a blocking error. Skipped
+    /// without `findmnt` (degrades to a warning, covered elsewhere).
     #[test]
     fn malformed_line_does_not_mask_a_real_semantic_error_elsewhere() {
         if !is_findmnt_available() {

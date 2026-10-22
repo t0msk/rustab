@@ -1,44 +1,28 @@
 //! Block-device / UUID / LABEL discovery helpers - see `docs/SPEC.md` §8.
 //!
-//! ## Which system tool(s) this module shells out to, and why
+//! ## Why `lsblk` alone
 //!
-//! This module shells out to `lsblk` only (`lsblk -J -O`), not `blkid` or
-//! `findmnt`. `lsblk -O` ("all columns") already reports the
-//! `PATH`/`UUID`/`LABEL`/`PARTUUID`/`PARTLABEL`/`FSTYPE` columns - on modern
-//! util-linux these columns are themselves sourced from the same udev/blkid
-//! metadata `blkid` would report - so a second shell-out to `blkid` and a
-//! manual cross-reference by device path would duplicate data `lsblk`
-//! already gives us in one process invocation and one parse, for no
-//! additional information. `lsblk -J` emits a single JSON document
-//! describing the whole device tree (whole disks as top-level entries,
-//! partitions nested under a `children` array), which this module flattens
-//! into one `Vec<DeviceInfo>`.
+//! `lsblk -J -O` ("all columns") already reports `PATH`/`UUID`/`LABEL`/
+//! `PARTUUID`/`PARTLABEL`/`FSTYPE` from the same udev/blkid metadata
+//! `blkid` would report, so shelling out to `blkid` too would just
+//! duplicate data for no gain. `lsblk -J` emits one JSON tree (whole disks
+//! at top level, partitions nested under `children`), which this module
+//! flattens into a `Vec<DeviceInfo>`.
 //!
-//! `findmnt` is intentionally not used here: `lsblk -O` already includes
-//! `mountpoint`/`mountpoints` columns, and SPEC §8's ask is a device/UUID/
-//! LABEL *picker*, not a live mount-state view (that belongs to §6's
-//! `findmnt --verify` semantic-validation step, a different concern that
-//! lives in `validate.rs`). If a future task needs richer live-mount-state
-//! info than `lsblk` reports, that's a reason to add a dedicated
-//! `findmnt`-based helper then, not a reason to add one speculatively now.
+//! `findmnt` is not used here either: SPEC §8 wants a device/UUID/LABEL
+//! *picker*, not live mount state (that's §6's `findmnt --verify` step, in
+//! `validate.rs`).
 //!
-//! ## Soft-failure contract (critical, per SPEC §8)
+//! ## Soft-failure contract (per SPEC §8)
 //!
-//! `lsblk` may be entirely absent (minimal/sandboxed systems), may exit
-//! non-zero, or may print something this module's parser doesn't
-//! recognize. None of those cases may panic or propagate a hard error that
-//! blocks the rest of the app: [`discover_devices`] always returns a
-//! [`DiscoveryResult`] by value, never a `Result`/`Option`, which makes
-//! "just unwrap it" structurally the only thing a caller can do - there is
-//! no error variant to forget to handle. [`DiscoveryResult::lsblk_available`]
-//! is the caller's signal for whether `devices` reflects "the tool ran and
-//! reported however many devices it reported" (including legitimately
-//! zero) or "the tool itself could not be run at all" (binary missing or
-//! non-zero exit); callers should fall back to manual text entry for the
-//! source field in the latter case, per SPEC §8. A successful run that
-//! produces JSON this module fails to parse is treated as "available, zero
-//! devices" rather than "unavailable", since the tool did run - see
-//! [`parse_lsblk_json`].
+//! `lsblk` may be missing, exit non-zero, or print something unparseable.
+//! None of that may panic or hard-error: [`discover_devices`] always
+//! returns a [`DiscoveryResult`] by value, never `Result`/`Option`.
+//! [`DiscoveryResult::lsblk_available`] tells the caller whether `devices`
+//! reflects a real run (including legitimately zero devices) or the tool
+//! not running at all; callers fall back to manual text entry in the
+//! latter case. Unparseable JSON from a successful run counts as
+//! "available, zero devices" - see [`parse_lsblk_json`].
 
 use std::io;
 use std::process::Command;
@@ -49,75 +33,54 @@ use serde_json::Value;
 /// device-identifier fields fstab entries can reference as a source.
 ///
 /// Every field besides `path` is `Option` because `lsblk` legitimately
-/// reports `null` for most of these on many devices (e.g. an unformatted
-/// partition has no `fs_type`; a whole-disk entry usually has no `uuid` or
-/// `label` of its own, only its partitions do). A `None` here means "lsblk
-/// reported no value for this device", not "unknown due to a parse error" -
-/// parse errors on the whole `lsblk` invocation are modeled at the
-/// [`DiscoveryResult`] level instead, not per-field.
+/// reports `null` for most of these (e.g. an unformatted partition has no
+/// `fs_type`; a whole-disk entry usually has no `uuid`/`label` of its own).
+/// `None` means "lsblk reported no value", not "parse error" - invocation
+/// failures are modeled at the [`DiscoveryResult`] level, not per-field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// The device's path, e.g. `/dev/sda1`. Taken from `lsblk`'s `path`
-    /// column when present; falls back to `/dev/<name>` (built from the
-    /// `name` column) if `path` itself was `null`, since every block device
-    /// `lsblk` knows about does live under `/dev`.
+    /// The device's path, e.g. `/dev/sda1`. Falls back to `/dev/<name>` if
+    /// `lsblk`'s `path` column was `null`.
     pub path: String,
-    /// The filesystem UUID (`lsblk`'s `uuid` column), matching what an
-    /// fstab `UUID=` source would reference.
+    /// Filesystem UUID (`lsblk`'s `uuid` column) - what fstab's `UUID=` references.
     pub uuid: Option<String>,
-    /// The filesystem label (`lsblk`'s `label` column), matching what an
-    /// fstab `LABEL=` source would reference.
+    /// Filesystem label (`lsblk`'s `label` column) - what fstab's `LABEL=` references.
     pub label: Option<String>,
-    /// The partition-table UUID (`lsblk`'s `partuuid` column), matching
-    /// what an fstab `PARTUUID=` source would reference. Distinct from
-    /// `uuid`: this identifies the partition table entry, not the
-    /// filesystem inside it.
+    /// Partition-table UUID (`lsblk`'s `partuuid` column) - distinct from
+    /// `uuid`, which identifies the filesystem rather than the partition entry.
     pub partuuid: Option<String>,
-    /// The partition label (`lsblk`'s `partlabel` column), matching what an
-    /// fstab `PARTLABEL=` source would reference. Distinct from `label`:
-    /// this is the GPT partition name, not the filesystem label.
+    /// Partition label (`lsblk`'s `partlabel` column) - the GPT partition
+    /// name, distinct from the filesystem `label`.
     pub partlabel: Option<String>,
-    /// The filesystem type (`lsblk`'s `fstype` column), e.g. `ext4`,
-    /// `vfat`, `swap`, `crypto_LUKS`. `None` if the device has no
-    /// filesystem `lsblk` recognizes (e.g. an empty whole-disk entry that
-    /// is purely a partition-table container).
+    /// Filesystem type (`lsblk`'s `fstype` column), e.g. `ext4`, `vfat`,
+    /// `swap`. `None` for devices with no filesystem `lsblk` recognizes.
     pub fs_type: Option<String>,
 }
 
 /// The outcome of a device-discovery attempt (see [`discover_devices`]).
 ///
-/// Deliberately not a `Result<Vec<DeviceInfo>, E>`: there is no error
-/// variant for a caller to match on and no way to `?`-propagate a discovery
-/// failure into a hard error, by construction. A caller can always use
-/// `devices` directly; `lsblk_available` is purely an optional UI hint
-/// (e.g. "device picker unavailable, use manual text entry") rather than
-/// something that must be checked before `devices` can be trusted.
+/// Not a `Result<Vec<DeviceInfo>, E>` - there's no error variant to match
+/// on or propagate. `devices` is always usable directly; `lsblk_available`
+/// is just a UI hint for whether to fall back to manual text entry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoveryResult {
-    /// The devices discovered, in the order `lsblk` reported them
-    /// (top-level block devices followed by their partitions). Empty if
-    /// `lsblk` is unavailable, failed, produced unparseable output, or
-    /// (legitimately) if the system has no block devices `lsblk` can see.
+    /// Devices discovered, in `lsblk`'s order (disks then their
+    /// partitions). Empty if `lsblk` is unavailable, failed, produced
+    /// unparseable output, or the system legitimately has none.
     pub devices: Vec<DeviceInfo>,
-    /// `true` if the `lsblk` invocation itself ran and exited successfully
-    /// (regardless of how many devices, if any, were parsed out of its
-    /// output). `false` if the `lsblk` binary could not be launched at all
-    /// (not installed / not on `PATH`) or it exited with a non-zero status.
-    /// Callers should treat `false` as "the device picker has no data
-    /// source on this system" and fall back to manual text entry, per
-    /// SPEC §8 - not as an error to surface loudly.
+    /// `true` if `lsblk` ran and exited successfully, regardless of how
+    /// many devices were parsed. `false` if the binary couldn't be
+    /// launched or exited non-zero - callers fall back to manual text
+    /// entry per SPEC §8, not treat it as an error to surface loudly.
     pub lsblk_available: bool,
 }
 
-/// Runs `lsblk -J -O` and returns its raw stdout as a `String`.
+/// Runs `lsblk -J -O` and returns its raw stdout.
 ///
-/// Returns `Err` if the binary could not be launched (e.g. not installed)
-/// or if it exited with a non-zero status; the `io::Error` in the latter
-/// case carries the exit status in its message, not `lsblk`'s stderr
-/// output, since this crate has no logging dependency to report it through.
-/// Kept separate from [`parse_lsblk_json`] specifically so the pure parsing
-/// logic can be unit-tested with canned input, without the test suite
-/// needing `lsblk` installed or needing to touch real hardware.
+/// Returns `Err` if the binary couldn't be launched or exited non-zero (the
+/// `io::Error` message carries the exit status, not stderr). Kept separate
+/// from [`parse_lsblk_json`] so the parsing logic can be unit-tested with
+/// canned input, without `lsblk` installed.
 fn run_lsblk() -> io::Result<String> {
     let output = Command::new("lsblk").args(["-J", "-O"]).output()?;
     if !output.status.success() {
@@ -132,13 +95,11 @@ fn run_lsblk() -> io::Result<String> {
 /// Parses the JSON text produced by `lsblk -J -O` into a flat list of
 /// [`DeviceInfo`], recursing into each device's `children` (partitions).
 ///
-/// This is a pure function with no I/O, so tests can feed it synthetic
-/// sample strings directly. Never panics: invalid JSON, a JSON value that
-/// isn't the expected object shape, or a missing/non-array `blockdevices`
-/// field all simply yield an empty `Vec`, matching this module's
-/// soft-failure contract (see the module-level docs) - this function has no
-/// way to report *why* parsing failed, by design, since "fall back to
-/// manual entry" is the same caller action regardless of the reason.
+/// Pure function, no I/O. Never panics: invalid JSON, an unexpected shape,
+/// or a missing/non-array `blockdevices` field all yield an empty `Vec`
+/// (see the module's soft-failure contract) - there's no way to report
+/// *why* parsing failed, since "fall back to manual entry" is the same
+/// caller action regardless.
 pub fn parse_lsblk_json(raw: &str) -> Vec<DeviceInfo> {
     let root: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -156,10 +117,9 @@ pub fn parse_lsblk_json(raw: &str) -> Vec<DeviceInfo> {
     devices
 }
 
-/// Converts one `lsblk` device JSON object into a [`DeviceInfo`] (pushing it
-/// onto `out`) and recurses into its `children` array, if any, so partitions
-/// nested under a whole-disk entry are flattened into the same list as their
-/// parent.
+/// Converts one `lsblk` device JSON object into a [`DeviceInfo`] (pushed
+/// onto `out`) and recurses into its `children`, flattening partitions into
+/// the same list as their parent disk.
 fn flatten_device(device: &Value, out: &mut Vec<DeviceInfo>) {
     if let Some(info) = device_info_from_json(device) {
         out.push(info);
@@ -172,11 +132,9 @@ fn flatten_device(device: &Value, out: &mut Vec<DeviceInfo>) {
     }
 }
 
-/// Builds a single [`DeviceInfo`] from one `lsblk` device JSON object.
-/// Returns `None` if `device` isn't a JSON object, or if it has neither a
-/// usable `path` nor a `name` field to derive a path from - such an entry
-/// carries no identifying information at all and would be useless to a
-/// device picker.
+/// Builds a [`DeviceInfo`] from one `lsblk` device JSON object. Returns
+/// `None` if `device` isn't an object, or has neither `path` nor `name` to
+/// derive one from.
 fn device_info_from_json(device: &Value) -> Option<DeviceInfo> {
     let obj = device.as_object()?;
 
@@ -194,9 +152,7 @@ fn device_info_from_json(device: &Value) -> Option<DeviceInfo> {
 }
 
 /// Extracts a non-empty string from an optional JSON value, treating both
-/// JSON `null` and an empty string as "absent" - `lsblk` uses `null` for
-/// most unset columns but has historically emitted empty strings for some,
-/// and this module does not need to distinguish the two.
+/// `null` and `""` as absent (`lsblk` has used both for unset columns).
 fn non_empty_string(value: Option<&Value>) -> Option<String> {
     let s = value?.as_str()?;
     if s.is_empty() {
@@ -206,14 +162,11 @@ fn non_empty_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// Discovers block devices available on this system by shelling out to
-/// `lsblk` (see the module-level docs for why `lsblk` alone is sufficient).
+/// Discovers block devices on this system via `lsblk` (see module docs for
+/// why `lsblk` alone is sufficient).
 ///
-/// Never panics and never returns an error type the caller must handle -
-/// see [`DiscoveryResult`]'s docs for how soft failure is modeled. Intended
-/// to be called from a `#[tauri::command]` wrapper in a later task so the
-/// GUI can offer a device picker when adding/editing an entry's source,
-/// falling back to manual text entry when `lsblk_available` is `false`.
+/// Never panics and never returns an error the caller must handle - see
+/// [`DiscoveryResult`] for how soft failure is modeled.
 pub fn discover_devices() -> DiscoveryResult {
     match run_lsblk() {
         Ok(raw) => DiscoveryResult {
@@ -231,11 +184,8 @@ pub fn discover_devices() -> DiscoveryResult {
 mod tests {
     use super::*;
 
-    /// A synthetic (invented, not copied from any real machine) `lsblk -J
-    /// -O` sample: one whole disk with no filesystem of its own and two
-    /// partitions nested under it, plus a second whole disk that is itself
-    /// a filesystem (no partition table), covering the common shapes a
-    /// device picker needs to handle.
+    /// Synthetic `lsblk -J -O` sample: one disk with two partitions, plus a
+    /// second disk that's itself a filesystem (no partition table).
     const SAMPLE_LSBLK_JSON: &str = r#"
     {
        "blockdevices": [
@@ -374,11 +324,8 @@ mod tests {
 
     #[test]
     fn discover_devices_never_panics_and_is_internally_consistent() {
-        // This exercises the real `run_lsblk()` path. It deliberately makes
-        // no assertion about whether `lsblk` is installed in the CI/test
-        // environment (per SPEC §8, that must never be a hard dependency)
-        // - only that the function returns normally and that an
-        // unavailable tool is reported together with an empty device list.
+        // Doesn't assume lsblk is installed in CI - only that an unavailable
+        // tool is reported together with an empty device list.
         let result = discover_devices();
         if !result.lsblk_available {
             assert!(result.devices.is_empty());

@@ -22,17 +22,14 @@ fn read_fixture(name: &str) -> String {
 /// nodes and paths - are fake placeholders invented for testing only**, and
 /// none of them describes any real machine.
 ///
-/// That disclosure used to live in a two-line `#rustab synthetic fixture: ...`
-/// header comment at the top of each file. T43 moved it here: since any
-/// ordinary comment directly above an entry is now that entry's description,
-/// such a header would be absorbed into the *first* entry's description (see
-/// `parser.rs`'s "Description block absorption"), which is both wrong and
-/// would stop the fixtures being byte-for-byte fixed points. The disclosure
-/// belongs in test code, where it has no file-structural consequences.
+/// This disclosure lives here rather than as a header comment in each
+/// fixture file, since an ordinary comment directly above an entry is now
+/// that entry's description (see `parser.rs`'s "Description block
+/// absorption") - a header there would be wrongly absorbed and break the
+/// byte-for-byte fixed-point assertions below.
 ///
-/// Each fixture is written in the parser's canonical shape: an entry's
-/// comment block sits directly above it, with blank lines only *between*
-/// those blocks, which is what makes the byte-for-byte assertions below hold.
+/// Each fixture is written in the parser's canonical shape: a comment
+/// block sits directly above its entry, with blank lines only between blocks.
 const FIXTURE_NAMES: &[&str] = &[
     "uuid_label_partuuid_partlabel.fstab",
     "bind_swap_systemd_escaped.fstab",
@@ -88,17 +85,13 @@ fn malformed_fixture_line_is_preserved_not_dropped() {
         .any(|line| matches!(line, Line::Malformed(raw) if raw == "/dev/fake1")));
 }
 
-/// Loading a multi-entry document, editing exactly one entry in place, and
-/// re-serializing must leave every *other* physical line byte-identical to the
-/// original - proving comment/blank-line/other-entry preservation
-/// independent of whitespace-canonicalization concerns.
+/// Editing exactly one entry in a multi-entry document and re-serializing
+/// must leave every *other* physical line byte-identical to the original.
 ///
-/// The changed line is located by content rather than by index: an entry's
-/// description lines are absorbed into the entry itself, so a `Document`'s
-/// `lines` index is no longer the same thing as a physical line number (the
-/// xfs entry here is `lines[4]` but physical line 7). Comparing the two texts
-/// line by line and demanding exactly one difference is both stricter and
-/// independent of that mapping.
+/// The changed line is located by content, not index: description
+/// absorption means a `Document`'s `lines` index isn't the same as a
+/// physical line number (the xfs entry here is `lines[4]` but physical
+/// line 7).
 #[test]
 fn editing_one_entry_leaves_every_other_line_byte_identical() {
     let original = read_fixture("uuid_label_partuuid_partlabel.fstab");

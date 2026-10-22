@@ -1,12 +1,52 @@
 //! `BackupPanel` - backup list view (§7), rows are `BackupListItem`.
-//! Renders from the real `list_backups` result (T12); `AppShell` owns the
+//! Renders from the real `list_backups` result; `AppShell` owns the
 //! fetch, this component is purely presentational.
+//!
+//! **Fallback notice** (`docs/UI_DESIGN.md` §7): when
+//! `TargetInfoDto.real_target_backup_fallback_dir` is `Some`, this panel
+//! shows a persistent banner above the list (or empty state) rather than
+//! only a tooltip, since the fact it states needs to be findable in a
+//! rescue scenario, not just on first notice. The banner's wording is
+//! built by [`fallback_notice_text`], kept separate from the `html!` so
+//! it can be unit tested without a DOM.
+//!
+//! T40 note: the banner's second fact - that each save's automatic backup is
+//! still written beside the real `/etc/fstab` - was in doubt for exactly as
+//! long as it took to find out *why* a sandboxed save could not reach that
+//! file (the elevated helper was being started with a bare `pkexec`, which
+//! changes a process's UID but not its mount namespace, so it stayed inside
+//! the sandbox). The backend now starts it with `flatpak-spawn --host pkexec`,
+//! which makes it a real host root process, so the statement is true and
+//! verified rather than assumed. The wording is unchanged apart from saying
+//! "can't list the contents of /etc/" instead of "can't manage files in
+//! /etc/", which is the accurate description of what a sandboxed session
+//! cannot do: it *can* have `/etc/fstab` written for it, it just cannot
+//! enumerate the directory.
 
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
 
 use crate::components::empty_state::EmptyState;
 use crate::dto::BackupInfoDto;
+
+/// The fallback-notice banner's text, or `None` when there is nothing to
+/// show (`fallback_dir` is `None` - the ordinary, colocated case). Kept as
+/// a plain function, separate from `BackupPanel`'s `html!`, so its content
+/// is unit-testable without rendering a DOM (`docs/API_CONTRACT.md` §6
+/// documents the two facts this must state).
+pub fn fallback_notice_text(fallback_dir: Option<&str>) -> Option<String> {
+    fallback_dir.map(|dir| {
+        format!(
+            "Backups you create here are being kept in {dir}, not beside the real \
+             /etc/fstab, because this sandboxed install can't list the contents of \
+             /etc/. Automatic backups taken during ordinary \
+             saves are still written beside the real /etc/fstab and are not shown in this \
+             list, but they are not lost: they're recoverable from a rescue environment \
+             (e.g. booting a live/rescue disk), just not visible or manageable from inside \
+             this app."
+        )
+    })
+}
 
 /// Formats a backup's `created_unix_secs` into `(relative, iso)` strings
 /// for `BackupListItem`'s display text + hover tooltip
@@ -50,47 +90,64 @@ pub struct BackupPanelProps {
     pub on_restore: Callback<usize>,
     pub on_view_diff: Callback<usize>,
     pub on_delete: Callback<usize>,
+    /// `TargetInfoDto.real_target_backup_fallback_dir` (API_CONTRACT.md §6),
+    /// threaded down unchanged. `Some(dir)` shows the fallback notice above
+    /// the list/empty-state regardless of whether `backups` is empty -
+    /// the fact applies to the whole panel, not to any particular row.
+    pub backup_fallback_dir: Option<AttrValue>,
 }
 
 #[function_component(BackupPanel)]
 pub fn backup_panel(props: &BackupPanelProps) -> Html {
+    let notice = fallback_notice_text(props.backup_fallback_dir.as_deref());
+
     html! {
-        <div class="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
-            if props.backups.is_empty() {
-                <EmptyState
-                    icon="🗄"
-                    title="No backups yet"
-                    description={Some(AttrValue::from(
-                        "No backups yet - one will be created automatically the first time you save."
-                    ))}
-                />
-            } else {
-                <ul class="divide-y divide-slate-200 dark:divide-slate-700">
-                    { for props.backups.iter().enumerate().map(|(idx, backup)| {
-                        let on_restore = {
-                            let cb = props.on_restore.clone();
-                            Callback::from(move |_: MouseEvent| cb.emit(idx))
-                        };
-                        let on_view_diff = {
-                            let cb = props.on_view_diff.clone();
-                            Callback::from(move |_: MouseEvent| cb.emit(idx))
-                        };
-                        let on_delete = {
-                            let cb = props.on_delete.clone();
-                            Callback::from(move |_: MouseEvent| cb.emit(idx))
-                        };
-                        html! {
-                            <BackupListItem
-                                key={idx}
-                                backup={backup.clone()}
-                                on_restore={on_restore}
-                                on_view_diff={on_view_diff}
-                                on_delete={on_delete}
-                            />
-                        }
-                    }) }
-                </ul>
+        <div class="space-y-4">
+            if let Some(notice) = notice {
+                <div
+                    class="flex items-start gap-2 rounded-md border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 text-amber-900 dark:text-amber-200 px-4 py-3 text-sm"
+                    role="status"
+                >
+                    <p>{ notice }</p>
+                </div>
             }
+            <div class="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
+                if props.backups.is_empty() {
+                    <EmptyState
+                        icon="🗄"
+                        title="No backups yet"
+                        description={Some(AttrValue::from(
+                            "No backups yet - one will be created automatically the first time you save."
+                        ))}
+                    />
+                } else {
+                    <ul class="divide-y divide-slate-200 dark:divide-slate-700">
+                        { for props.backups.iter().enumerate().map(|(idx, backup)| {
+                            let on_restore = {
+                                let cb = props.on_restore.clone();
+                                Callback::from(move |_: MouseEvent| cb.emit(idx))
+                            };
+                            let on_view_diff = {
+                                let cb = props.on_view_diff.clone();
+                                Callback::from(move |_: MouseEvent| cb.emit(idx))
+                            };
+                            let on_delete = {
+                                let cb = props.on_delete.clone();
+                                Callback::from(move |_: MouseEvent| cb.emit(idx))
+                            };
+                            html! {
+                                <BackupListItem
+                                    key={idx}
+                                    backup={backup.clone()}
+                                    on_restore={on_restore}
+                                    on_view_diff={on_view_diff}
+                                    on_delete={on_delete}
+                                />
+                            }
+                        }) }
+                    </ul>
+                }
+            </div>
         </div>
     }
 }
@@ -155,5 +212,41 @@ pub fn backup_list_item(props: &BackupListItemProps) -> Html {
                 </button>
             </div>
         </li>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_fallback_dir_means_no_notice() {
+        assert_eq!(fallback_notice_text(None), None);
+    }
+
+    #[test]
+    fn a_fallback_dir_produces_a_notice_stating_both_required_facts() {
+        let dir = "/home/u/.local/share/rustab/etc-fstab-backups";
+        let notice = fallback_notice_text(Some(dir)).expect("Some(dir) must produce a notice");
+
+        // (a) backups created from this panel land in the given directory,
+        // not beside /etc/fstab.
+        assert!(notice.contains(dir));
+        assert!(notice.contains("/etc/fstab"));
+
+        // (b) automatic backups from ordinary saves are still beside the
+        // real file, not shown here, not lost, recoverable from a rescue
+        // environment.
+        assert!(notice.contains("not shown in this list"));
+        assert!(notice.to_lowercase().contains("not lost"));
+        assert!(notice.to_lowercase().contains("rescue"));
+    }
+
+    #[test]
+    fn a_different_fallback_dir_is_reflected_verbatim() {
+        // Guards against the message hard-coding a path rather than using
+        // the one it was given.
+        let notice = fallback_notice_text(Some("/some/other/path")).unwrap();
+        assert!(notice.contains("/some/other/path"));
     }
 }

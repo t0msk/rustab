@@ -1,46 +1,34 @@
-//! The serializable types that cross the Tauri command boundary - the frozen
-//! contract documented in `docs/API_CONTRACT.md`.
+//! The serializable types that cross the Tauri command boundary - the
+//! frozen contract documented in `docs/API_CONTRACT.md`.
 //!
 //! ## Why hand-written DTOs instead of `Serialize` on `fstab-core`'s types
 //!
-//! It would have been fewer lines to add `#[derive(Serialize, Deserialize)]`
-//! to [`fstab_core::model`]'s types and send them straight to the frontend.
-//! This module exists instead, and `fstab-core` was left completely
-//! untouched, for three reasons:
+//! Three reasons `fstab-core`'s types aren't sent to the frontend directly:
 //!
 //! 1. **The wire format stops being an accident of the Rust types.** The
-//!    frontend (`frontend/`, a separate Yew/wasm crate that deliberately does
-//!    *not* depend on `fstab-core`) has to mirror these shapes by hand. A
-//!    derived format would silently change shape the day someone renames a
-//!    field or reorders an enum variant in the domain model; here, the wire
-//!    format can only change by editing this file, next to the doc comment
-//!    that says what the frontend expects.
-//! 2. **The frontend wants a flatter shape than the model.**
-//!    [`fstab_core::model::SourceId`] is an eight-variant enum whose payload
-//!    is only meaningful together with the variant; the UI wants a
-//!    `{kind, value}` pair it can drive a dropdown and a text field from
-//!    (`docs/UI_DESIGN.md` §4). Same for options, which the UI edits as
-//!    `{key, value}` rows.
-//! 3. **No new dependency in the safety-critical crate.** `fstab-core` is the
-//!    crate holding the atomic-write guarantee; it currently depends only on
-//!    `serde_json`. Adding `serde` + derive macros there to serve a GUI
-//!    concern is the wrong direction of dependency.
+//!    frontend is a separate Yew/wasm crate that mirrors these shapes by
+//!    hand and deliberately doesn't depend on `fstab-core`; a derived
+//!    format would silently change shape on a model rename or reorder.
+//! 2. **The frontend wants a flatter shape.**
+//!    [`fstab_core::model::SourceId`]'s eight variants become a
+//!    `{kind, value}` pair the UI can drive a dropdown and text field
+//!    from (`docs/UI_DESIGN.md` §4); same for options as `{key, value}` rows.
+//! 3. **No new dependency in the safety-critical crate.** `fstab-core`
+//!    only depends on `serde_json`; adding `serde` derive macros there to
+//!    serve a GUI concern is the wrong direction.
 //!
 //! ## Losslessness
 //!
-//! Every conversion in this module is lossless and total in both directions:
-//! `Document -> DocumentDto -> Document` reproduces the original document
-//! exactly (asserted by `round_trips_*` tests below, including against the
-//! committed fixtures in `tests/fixtures/`). That matters because a save
-//! sends a `DocumentDto` back and a lossy round trip would mean the file
-//! written is not the file the user was shown.
+//! Every conversion here is lossless and total in both directions:
+//! `Document -> DocumentDto -> Document` reproduces the original exactly
+//! (asserted by `round_trips_*` tests, including against the fixtures in
+//! `tests/fixtures/`) - a save sends a `DocumentDto` back, and a lossy
+//! round trip would mean the file written isn't the file shown.
 //!
-//! `DocumentDto -> Document` is infallible *by construction*: the only values
-//! that could be rejected (an unknown `kind` string, a negative or
-//! out-of-range `dump`/`pass`) cannot be represented in the DTO at all, so
-//! they are rejected by serde at the Tauri boundary before any of this code
-//! runs. See `docs/API_CONTRACT.md` ("Argument validation") for what the
-//! frontend sees when that happens.
+//! `DocumentDto -> Document` is infallible by construction: the only
+//! values that could be rejected (unknown `kind`, out-of-range
+//! `dump`/`pass`) can't be represented in the DTO at all, so serde
+//! rejects them at the boundary before this code runs.
 
 use fstab_core::discovery::{DeviceInfo, DiscoveryResult};
 use fstab_core::model::{Document, FstabEntry, FstabOption, Line, Options, SourceId};
@@ -53,16 +41,12 @@ use std::path::Path;
 
 /// Renders a path for the wire.
 ///
-/// Paths cross the boundary as plain strings. A path that is not valid UTF-8
-/// is rendered lossily (U+FFFD replacement characters) rather than failing the
-/// whole command: the frontend's job with these strings is to display them,
-/// and the only commands that take a path *back*
-/// ([`crate::commands::restore_backup`], [`crate::commands::read_backup`] and
-/// [`crate::commands::delete_backup`]) do not trust the string they are given -
-/// each matches it against the real backup list, so a mangled path fails
-/// closed with "not a backup of the active target" instead of reading,
-/// writing or deleting somewhere unintended. See `docs/API_CONTRACT.md`
-/// ("Non-UTF-8 paths").
+/// Paths cross the boundary as plain strings. A non-UTF-8 path is
+/// rendered lossily (U+FFFD) rather than failing the command - the
+/// frontend's job with these strings is to display them, and the
+/// commands that take a path back never trust it directly, matching it
+/// against the real backup list instead (see `docs/API_CONTRACT.md`
+/// "Non-UTF-8 paths").
 fn path_to_wire(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -96,10 +80,44 @@ pub struct TargetInfoDto {
     pub is_real: bool,
     /// Where the path came from, so the UI can explain itself.
     pub source: TargetSourceDto,
+    /// The directory this session's backups of the **real `/etc/fstab`**
+    /// are kept in instead of beside the file itself, or `None` if they're
+    /// beside it after all.
+    ///
+    /// `Some(dir)` only when both hold: this session's backups are the
+    /// real `/etc/fstab`'s (`source == "sandbox_default"`, or
+    /// `is_real == true` via an explicit `RUSTAB_TARGET_PATH=/etc/fstab`),
+    /// **and** this process can't manage files in `/etc/` (typically a
+    /// Flatpak sandbox, which sees a different `/etc` than the host's).
+    /// `None` in every other case, including any `environment` target
+    /// that isn't `/etc/fstab` itself.
+    ///
+    /// When `Some(dir)`: backups created explicitly land in `dir` with no
+    /// password prompt, while each save's automatic backup still lands
+    /// beside the real `/etc/fstab` via the elevated writer but is **not
+    /// listed**, since this process can't enumerate that directory - not
+    /// lost, just not shown or managed in-app (`docs/UI_DESIGN.md` §7).
+    ///
+    /// A display path, never sent back: backup-path-taking commands
+    /// always match against the real backup list regardless.
+    pub real_target_backup_fallback_dir: Option<String>,
 }
 
-impl From<&crate::target::ActiveTarget> for TargetInfoDto {
-    fn from(target: &crate::target::ActiveTarget) -> Self {
+impl TargetInfoDto {
+    /// Describes `target` for the frontend, with the fallback backup
+    /// directory this session is using for the real `/etc/fstab`'s
+    /// backups (`None` if none - see
+    /// [`TargetInfoDto::real_target_backup_fallback_dir`]).
+    ///
+    /// Takes that directory as a parameter rather than deriving it from
+    /// `target`, since it's a property of *this process's* access to
+    /// `/etc/`, not of the resolved [`crate::target::ActiveTarget`]
+    /// itself. `crate::commands::describe_target` computes the answer for
+    /// every caller.
+    pub(crate) fn describe(
+        target: &crate::target::ActiveTarget,
+        backup_fallback_dir: Option<&Path>,
+    ) -> Self {
         TargetInfoDto {
             path: path_to_wire(&target.path),
             is_real: target.is_real,
@@ -107,6 +125,7 @@ impl From<&crate::target::ActiveTarget> for TargetInfoDto {
                 crate::target::TargetSource::Environment => TargetSourceDto::Environment,
                 crate::target::TargetSource::SandboxDefault => TargetSourceDto::SandboxDefault,
             },
+            real_target_backup_fallback_dir: backup_fallback_dir.map(path_to_wire),
         }
     }
 }
@@ -241,24 +260,15 @@ pub struct EntryDto {
     /// An optional human-readable note about what this entry is *for*, or
     /// `null` if there is none.
     ///
-    /// Distinct from [`Self::trailing_comment`] - two different mechanisms,
-    /// stored separately. A trailing comment is inline, on the entry's *own*
-    /// physical line, after the six fields; a description instead round-trips
-    /// to and from the ordinary `#` comment line(s) directly *above* the
-    /// entry, with no marker of any kind - adjacency alone decides it. See
-    /// [`fstab_core::model::FstabEntry::description`] and `fstab-core`'s
-    /// `parser.rs` for the exact absorption and serialization rules; they are
-    /// not restated here.
+    /// Distinct from [`Self::trailing_comment`]: a trailing comment is
+    /// inline on the entry's own line, while a description round-trips
+    /// to/from the ordinary `#` comment line(s) directly above the entry,
+    /// with no marker - adjacency alone decides it (see
+    /// [`fstab_core::model::FstabEntry::description`]).
     ///
-    /// **May be multi-line.** The value carries one `\n` per comment line,
-    /// with no trailing newline and no `\r`, and is written back out as one
-    /// comment line per `\n`-separated piece. A UI editing this field should
-    /// use a multi-line input.
-    ///
-    /// Normalized on the way in: see [`From<EntryDto> for FstabEntry`] below,
-    /// which is where a value arriving over IPC has its line endings folded
-    /// to `\n` and is held to the same "empty-after-trim is not a
-    /// description" standard as one arriving via the text parser.
+    /// May be multi-line, one `\n` per comment line, no trailing newline
+    /// or `\r`. Normalized on the way in by
+    /// [`From<EntryDto> for FstabEntry`] below.
     pub description: Option<String>,
 }
 
@@ -292,25 +302,14 @@ impl From<EntryDto> for FstabEntry {
             dump: dto.dump,
             pass: dto.pass,
             trailing_comment: dto.trailing_comment,
-            // The one normalization this module performs, and deliberately so.
-            // `fstab_core::model` does no normalization itself and documents
-            // that an empty or whitespace-only description is turned into
-            // `None` "by whoever constructs the entry"; for anything arriving
-            // from the frontend, this IPC boundary is that place. The parser
-            // already enforces the same rule on text read from a file (a
-            // comment block whose text is empty after trimming is not
-            // absorbed at all), so a description typed into the UI and one
-            // read from disk are held to the same standard - otherwise a
-            // whitespace-only value from the UI would be stored, then written
-            // out as a bare `#` line, and silently vanish on the next parse.
-            //
-            // Line endings are folded to `\n` *first*. A description is now
-            // genuinely multi-line, and `\n` is the only separator the model
-            // and the serializer understand (one comment line per piece); a
-            // stray `\r` would otherwise end up inside a comment line's text
-            // and be written into the file. A browser `<textarea>`'s `.value`
-            // is already LF-only per the HTML spec, but an IPC boundary is
-            // exactly the place not to assume what the other side sent.
+            // This IPC boundary is where a description arriving from the
+            // frontend gets the same "empty-after-trim is not a description"
+            // normalization the model documents (and the text parser already
+            // enforces) - otherwise a whitespace-only UI value would be
+            // written out as a bare `#` line and vanish on the next parse.
+            // Line endings fold to `\n` first, the only separator the model
+            // understands, since a stray `\r` would otherwise land in a
+            // comment line's text.
             description: dto
                 .description
                 .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"))
@@ -565,25 +564,16 @@ pub struct WriteOutcomeDto {
     /// helper itself cannot know how it was launched, so it always emits
     /// `false` (see [`crate::privileged`]).
     pub elevated: bool,
-    /// The one **non-fatal warning** a successful save can carry (T34): the
-    /// real `/etc/fstab` was written, but the local working draft beside it
-    /// could not be updated to match. `null` whenever there is nothing to
-    /// say, which is every save that did not mirror into a draft at all (an
-    /// explicit `RUSTAB_TARGET_PATH` target - see
-    /// `crate::commands::save_document_with`) and every one whose mirror
-    /// succeeded.
+    /// The one non-fatal warning a successful save can carry: the real
+    /// `/etc/fstab` was written, but the local working draft beside it
+    /// couldn't be updated to match. `null` whenever there's nothing to
+    /// say - a save with no draft to mirror into, or one whose mirror succeeded.
     ///
-    /// Deliberately **not** folded into `notes`: `notes` are deviations in
-    /// how the file just written was written, all of which are "the file is
-    /// fine, here is a detail". This one is about a *different* file than the
-    /// one the save was about, and it is the only thing in this struct the UI
-    /// should raise as a warning rather than describe. Deliberately not an
-    /// error either - the write that mattered succeeded, and the next launch
-    /// repairs the draft on its own (`crate::target`).
-    ///
-    /// Carries a ready-to-show message rather than a flag plus a path,
-    /// because the interesting part is the underlying I/O failure, which only
-    /// the backend has.
+    /// Not folded into `notes`, since `notes` describe deviations in how
+    /// the file just written was written ("the file is fine, here's a
+    /// detail"), while this is about a different file and should be
+    /// raised as a warning. Not an error either - the write that mattered
+    /// succeeded, and the next launch repairs the draft on its own.
     #[serde(default)]
     pub draft_sync_warning: Option<String>,
 }
@@ -664,15 +654,13 @@ pub enum WriteErrorKindDto {
     /// A bug or a protocol violation between the two halves of the elevated
     /// write.
     Internal,
-    /// The real `/etc/fstab` changed outside Rustab since this session last
-    /// synced with it, so the write was **refused before it started** (T36).
+    /// The real `/etc/fstab` changed outside Rustab since this session
+    /// last synced with it, so the write was refused before it started.
     ///
-    /// Not a failure of the write and not an I/O problem: nothing was
-    /// attempted, `target_unchanged` is always `true`, and the two file bodies
-    /// needed to show the user *what* changed are attached as
-    /// an `external_change` object. The user's two ways forward
-    /// are to cancel, or to repeat the call with `allow_external_change: true`
-    /// after seeing the diff.
+    /// Not a failure and not an I/O problem: nothing was attempted,
+    /// `target_unchanged` is always `true`, and the diff is attached as
+    /// an `external_change` object. The user cancels, or repeats the call
+    /// with `allow_external_change: true` after seeing it.
     ExternalChange,
 }
 
@@ -697,35 +685,23 @@ pub struct WriteErrorDto {
     /// For [`WriteErrorKindDto::Verify`], the backup holding the pre-save
     /// content, if one was made.
     pub backup: Option<String>,
-    /// For [`WriteErrorKindDto::ExternalChange`], the two file bodies the UI
-    /// diffs. `null` for every other kind - exactly like `report`, which is
-    /// the same shape of kind-specific optional payload.
+    /// For [`WriteErrorKindDto::ExternalChange`], the two file bodies the
+    /// UI diffs. `null` for every other kind, same shape as `report`.
     ///
-    /// Optional on the wire for the same reason
-    /// [`WriteOutcomeDto::draft_sync_warning`] is: it is an additive field,
-    /// and a response produced without it still deserializes.
-    ///
-    /// ## Why it is boxed
-    ///
-    /// `Box` is invisible on the wire (serde serializes straight through it);
-    /// it is here because [`WriteErrorDto`] is the error half of *every*
-    /// write-side `Result` in the crate, and two inline `String`s would push
-    /// that type past `clippy::result_large_err`'s threshold - i.e. would make
-    /// every `save`/`restore_backup` return move 160 bytes of mostly-`None`
-    /// instead of 120. One pointer keeps the common (non-`ExternalChange`)
-    /// path cheap while the uncommon one pays for the content it carries.
+    /// Boxed (invisible on the wire) since [`WriteErrorDto`] is the error
+    /// half of every write-side `Result`, and two inline `String`s would
+    /// push it past `clippy::result_large_err`'s threshold - one pointer
+    /// keeps the common path cheap while the rare one pays for its own content.
     #[serde(default)]
     pub external_change: Option<Box<ExternalChangeDto>>,
 }
 
-/// The two file bodies a [`WriteErrorKindDto::ExternalChange`] carries, so the
-/// frontend can show *what* changed outside Rustab before the user decides
-/// (T36).
+/// The two file bodies a [`WriteErrorKindDto::ExternalChange`] carries, so
+/// the frontend can show what changed outside Rustab before the user decides.
 ///
-/// One nested object rather than two sibling fields on [`WriteErrorDto`] so
-/// the pair cannot be half-present: there is no meaningful state in which the
-/// UI has one side of a diff and not the other, and this makes that
-/// unrepresentable rather than merely documented.
+/// One nested object rather than two sibling fields, so the pair can't be
+/// half-present - there's no meaningful state with one side of a diff and not
+/// the other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalChangeDto {
     /// What Rustab last knew the real `/etc/fstab` to hold - the **old** side
@@ -763,19 +739,16 @@ impl WriteErrorDto {
         self
     }
 
-    /// The one T36 outcome: `target` changed outside Rustab, so the write was
-    /// refused before it began.
+    /// `target` changed outside Rustab, so the write was refused before
+    /// it began.
     ///
-    /// Built here, in one place, rather than at each detection site, because
-    /// the check happens **twice** - once as a courtesy before the `pkexec`
-    /// prompt (`crate::commands::save_document_with`) and once
-    /// authoritatively inside the elevated process
-    /// (`crate::privileged::handle_write`) - and the frontend must not be able
-    /// to tell which of the two refused the write: it is the same situation,
-    /// with the same two ways forward.
+    /// Built here, in one place, since the check happens twice - a
+    /// courtesy before the `pkexec` prompt, and authoritatively inside
+    /// the elevated process - and the frontend must not be able to tell
+    /// which of the two refused the write.
     ///
-    /// `target_unchanged` is unconditionally `true`: nothing was opened for
-    /// writing, no backup was taken, no temp file was created.
+    /// `target_unchanged` is unconditionally `true`: nothing was opened
+    /// for writing, no backup taken, no temp file created.
     pub fn external_change(target: &Path, last_known: &str, current: &str) -> Self {
         WriteErrorDto {
             external_change: Some(Box::new(ExternalChangeDto {
@@ -1268,6 +1241,7 @@ mod tests {
                 path: "/p".to_string(),
                 is_real: false,
                 source: TargetSourceDto::SandboxDefault,
+                real_target_backup_fallback_dir: None,
             },
             exists: true,
             text: "# hi\n".to_string(),
@@ -1278,7 +1252,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&view).expect("serialize"),
-            r##"{"target":{"path":"/p","is_real":false,"source":"sandbox_default"},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}"##
+            r##"{"target":{"path":"/p","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null},"exists":true,"text":"# hi\n","document":{"lines":[{"kind":"blank"}]},"has_malformed_lines":false}"##
         );
 
         let report = ValidationReportDto {
@@ -1842,21 +1816,63 @@ mod tests {
 
     #[test]
     fn target_info_reports_the_source_it_was_resolved_from() {
-        let sandbox = TargetInfoDto::from(&ActiveTarget {
-            path: PathBuf::from("/home/u/.local/share/rustab/fstab.sandbox"),
-            is_real: false,
-            source: TargetSource::SandboxDefault,
-        });
+        let sandbox = TargetInfoDto::describe(
+            &ActiveTarget {
+                path: PathBuf::from("/home/u/.local/share/rustab/fstab.sandbox"),
+                is_real: false,
+                source: TargetSource::SandboxDefault,
+            },
+            None,
+        );
         assert_eq!(sandbox.source, TargetSourceDto::SandboxDefault);
         assert!(!sandbox.is_real);
 
-        let explicit = TargetInfoDto::from(&ActiveTarget {
-            path: PathBuf::from("/etc/fstab"),
-            is_real: true,
-            source: TargetSource::Environment,
-        });
+        let explicit = TargetInfoDto::describe(
+            &ActiveTarget {
+                path: PathBuf::from("/etc/fstab"),
+                is_real: true,
+                source: TargetSource::Environment,
+            },
+            None,
+        );
         assert_eq!(explicit.source, TargetSourceDto::Environment);
         assert!(explicit.is_real);
+    }
+
+    /// The T39 field, both ways round, including its exact wire spelling: the
+    /// frontend builds a visible notice out of it, so the name and the `null`
+    /// case are as load-bearing as the path itself.
+    ///
+    /// *Which* target gets a fallback directory is `crate::commands`'s
+    /// decision (`backup_fallback_dir`, asserted there); this layer's job is
+    /// only to carry the answer across the boundary unchanged.
+    #[test]
+    fn target_info_carries_the_real_target_backup_fallback_dir_verbatim() {
+        let default_launch = ActiveTarget {
+            path: PathBuf::from("/home/u/.local/share/rustab/fstab.draft"),
+            is_real: false,
+            source: TargetSource::SandboxDefault,
+        };
+
+        let colocated = TargetInfoDto::describe(&default_launch, None);
+        assert_eq!(colocated.real_target_backup_fallback_dir, None);
+        assert_eq!(
+            serde_json::to_string(&colocated).expect("serialize"),
+            r##"{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null}"##
+        );
+
+        let fallback = TargetInfoDto::describe(
+            &default_launch,
+            Some(Path::new("/home/u/.local/share/rustab/etc-fstab-backups")),
+        );
+        assert_eq!(
+            fallback.real_target_backup_fallback_dir.as_deref(),
+            Some("/home/u/.local/share/rustab/etc-fstab-backups")
+        );
+        assert_eq!(
+            serde_json::to_string(&fallback).expect("serialize"),
+            r##"{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":"/home/u/.local/share/rustab/etc-fstab-backups"}"##
+        );
     }
 
     /// The single most consequential field in this module.

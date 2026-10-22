@@ -1,247 +1,135 @@
 //! Text-to-`Document` parser and round-trip serializer - see `docs/SPEC.md` §5.
 //!
-//! This module owns the only two operations that convert between fstab text
-//! and the [`crate::model`] types: [`parse`] (text → [`Document`]) and the
-//! [`fmt::Display`] implementation on [`Document`] (`Document` → text).
+//! The two operations that convert between fstab text and [`crate::model`]:
+//! [`parse`] (text → [`Document`]) and `Document`'s [`fmt::Display`] impl
+//! (`Document` → text).
 //!
 //! ## Parsing contract
 //!
-//! [`parse`] **never panics and never fails**: it always returns a
-//! [`Document`], even for completely garbage input. Any line that cannot be
-//! understood as a valid entry, comment, or blank line becomes a
-//! [`Line::Malformed`] carrying the original line text verbatim, per
-//! `docs/SPEC.md` §5 ("surface malformed lines ... rather than crashing or
-//! silently corrupting the rest of the file"). A fallible `Result`-returning
-//! signature was deliberately rejected: there is no input for which this
-//! parser needs to report a hard error rather than a degraded-but-preserved
-//! line, and a `Result<Document, _>` would invite callers to `?`-propagate
-//! away a document that should instead be shown to the user with malformed
-//! lines flagged (see [`Document::has_malformed_lines`]).
+//! [`parse`] never panics and never fails - it always returns a [`Document`].
+//! A line that can't be understood as an entry, comment, or blank line
+//! becomes [`Line::Malformed`], verbatim, per `docs/SPEC.md` §5. No
+//! `Result` return type: there's no input this parser needs to hard-error
+//! on rather than degrade-and-preserve (see [`Document::has_malformed_lines`]).
 //!
-//! Per the escaped-whitespace policy documented in [`crate::model`], this
-//! parser never decodes `\040`/`\011`-style octal escapes - raw field text is
-//! captured exactly as written. Field splitting itself is whitespace-based
-//! (consecutive runs of spaces/tabs are delimiters); this is safe with
-//! respect to escape sequences without any special-casing because an escape
-//! sequence's raw text (`\`, then octal digits) never itself contains a
-//! literal whitespace byte - only the *decoded* character would, and we
-//! never decode. So naive `str::split_whitespace` cannot split in the middle
-//! of a `\NNN` sequence.
+//! Per [`crate::model`]'s escaped-whitespace policy, `\040`/`\011`-style
+//! octal escapes are never decoded - fields are split on whitespace, which
+//! is safe because an escape's raw text (`\` + octal digits) never itself
+//! contains a literal whitespace byte.
 //!
 //! ### Description block absorption
 //!
-//! On top of per-line classification, [`parse`] performs one post-processing
-//! pass that "absorbs" an entry's optional [`FstabEntry::description`] - a
-//! human-readable note stored in the file as the ordinary comment line (or
-//! lines) sitting directly above the entry it describes (see that field's docs
-//! for how it differs from [`FstabEntry::trailing_comment`], which is an
-//! inline comment on the entry's *own* line and is handled by the per-line
-//! splitting rule below).
+//! [`parse`] also folds an entry's [`FstabEntry::description`] out of the
+//! ordinary `#` comment line(s) directly above it (see that field's docs
+//! for how it differs from [`FstabEntry::trailing_comment`], an inline
+//! comment on the entry's own line, handled separately below). No marker
+//! is involved - any comment adjacent to an entry, by position alone, is
+//! its description.
 //!
-//! **No special marker is involved.** Any ordinary `#` comment adjacent to an
-//! entry in the sense defined below is that entry's description. This
-//! deliberately replaced an earlier `# // <text>` marker convention, and with
-//! it that convention's "an unmarked comment is inert and is never absorbed"
-//! invariant: that guarantee is gone on purpose, so a comment line's own text
-//! no longer has any bearing on whether it is absorbed - only its position
-//! does.
+//! Walking upward from a [`Line::Entry`]:
 //!
-//! Walking upward from a [`Line::Entry`] to find its attached block:
+//! 1. Skip at most one immediately-preceding [`Line::Blank`] - a pure
+//!    separator, never part of the description, never absorbed.
+//! 2. From there, keep walking up across a contiguous run of
+//!    [`Line::Comment`]/[`Line::Blank`] lines (in any mixture) until hitting
+//!    an entry, a [`Line::Malformed`], or start of file. A comment line
+//!    doesn't stop the walk, so blank-separated comment blocks merge into one.
+//! 3. If the run has zero comment lines (or they're all empty/whitespace),
+//!    nothing is touched - absorption only ever rewrites a span it actually
+//!    extracts text from.
+//! 4. Otherwise the description is the run's comment-line texts only, each
+//!    trimmed and joined with `\n` (so it may be multi-line). The run's
+//!    blank lines contribute nothing to the value and are never inside the
+//!    re-rendered block, but they aren't deleted either - they survive as
+//!    their own [`Line::Blank`]s, ending up directly above the block.
 //!
-//! 1. Skip **exactly one** immediately-preceding [`Line::Blank`], if present.
-//!    That blank is a pure separator: it belongs to neither neighbor, is never
-//!    part of the description, and is never absorbed - it survives as its own
-//!    literal [`Line::Blank`] at its original relative position. If the line
-//!    directly above the entry is not blank, there is nothing to skip.
-//! 2. From there, keep walking upward across a contiguous run of
-//!    [`Line::Comment`] and [`Line::Blank`] lines, in any mixture, until
-//!    hitting a [`Line::Entry`], a [`Line::Malformed`], or the start of the
-//!    file. That whole run is the entry's attached block. Note that a comment
-//!    line does **not** stop the walk: two comment blocks separated only by
-//!    blanks are one single run, and merge into one description.
-//! 3. If the run contains **zero** comment lines, the entry has no
-//!    description and - importantly - **nothing in that span is touched**.
-//!    Absorption only ever rewrites a span it actually extracts a description
-//!    from; a span that yields nothing is left exactly as it was (so, e.g.,
-//!    two blank lines between two entries stay two blank lines). This keeps
-//!    absorption-with-something-to-show-for-it the one and only way the
-//!    number of [`Line`]s can shrink.
-//! 4. Otherwise the description is the run's **comment-line texts only**, in
-//!    original top-to-bottom order, each trimmed, joined with `\n` - so a
-//!    description may legitimately be multi-line. The run's [`Line::Blank`]
-//!    lines contribute **nothing to the value**: they are pure formatting
-//!    noise inside the block, and the re-rendered description block never
-//!    contains a blank line (see the serialization contract below). They are
-//!    not *deleted from the file*, though - only the run's comment lines stop
-//!    being [`Line`]s of their own. Each blank in the run survives as its own
-//!    literal [`Line::Blank`], keeping its relative order, which - because
-//!    the description block is re-rendered hugging its entry - means the
-//!    run's blanks end up directly above that block.
+//! Keeping the run's blanks (step 4) rather than deleting them is what
+//! makes absorption idempotent, as `docs/SPEC.md` §5/§6 and this crate's
+//! fixed-point tests require: re-parsing this parser's own output must
+//! reproduce the same document. Deleting them instead would re-flow a
+//! separator blank into the run on each save, shrinking the file one blank
+//! at a time forever.
 //!
-//! One deliberate guard on step 4: if every comment line in the run is empty
-//! or whitespace-only (a run of bare `#` lines), the joined text carries no
-//! information, so step 3's "nothing is touched" outcome applies instead.
-//! Otherwise those lines would be absorbed into a description that
-//! [`crate::model`] documents as never being stored (empty/whitespace-only is
-//! normalized to `None`), and would then vanish from the file on the next
-//! save.
+//! Two consequences: the rule only fires from a [`Line::Entry`] - a comment
+//! block above a [`Line::Malformed`] line, or trailing one with no entry
+//! below it, is never absorbed, and a malformed line shields everything
+//! above it. And byte-for-byte round-tripping only holds for the shape real
+//! fstabs use (comment block hugging its entry, optionally blank-separated
+//! from whatever's above) - a blank line *inside* a comment run re-flows
+//! above the block on the first save, then is stable.
 //!
-//! ### Why the run's blank lines are kept as blank lines
-//!
-//! Step 4 keeping each blank in the run is not a softening of "blanks are not
-//! part of the description" - the value and the rendered block really do
-//! contain no blanks. It is what makes absorption **idempotent**, which
-//! `docs/SPEC.md` §5/§6 and this crate's own fixed-point tests require:
-//! re-parsing this parser's own output must reproduce the same document, and
-//! saving twice must not keep changing the file.
-//!
-//! Deleting the run's blanks outright fails that, and the counterexample is
-//! the plan's own `/boot` case. Given `entry, blank, comment, blank, blank,
-//! entry`, step 1 skips the last blank and the run is `blank, comment,
-//! blank`. If those two blanks were deleted, the first save would emit
-//! `entry, blank, comment, entry` (the one skipped separator, then the block).
-//! Re-parsing *that* finds a comment directly above the entry, so step 1 skips
-//! nothing, the run becomes `blank, comment` - and the surviving separator
-//! blank is deleted by the second save. Blank lines would keep disappearing,
-//! one save at a time, with nothing to show for it; the number of physical
-//! lines would shrink on a save that changed nothing. Keeping the run's
-//! blanks converges immediately instead: the first save is already a fixed
-//! point, and the physical line count never changes just because a document
-//! was parsed and written back.
-//!
-//! Two further consequences worth stating plainly, both of which follow from
-//! the rules above rather than from any extra special-casing:
-//!
-//! - The rule is scoped to [`Line::Entry`] lines. A comment block above a
-//!   [`Line::Malformed`] line, or one at the end of the file with no entry
-//!   below it at all, is never absorbed and stays an ordinary
-//!   [`Line::Comment`] run. A [`Line::Malformed`] line also *stops* an
-//!   upward walk, so it shields everything above it from the entry below it.
-//! - Byte-for-byte round-tripping holds for the shape real fstab files use -
-//!   an entry's comment block directly above it, optionally separated from
-//!   whatever is above by blank lines - because the block is re-rendered in
-//!   place. It does *not* hold when a blank line sits *between* two comment
-//!   lines of one run, or between a run's comments and the entry: such a
-//!   blank is in the run, so it comes back above the block rather than inside
-//!   it. That is a one-time re-flow on the first save, and the result is a
-//!   fixed point.
-//!
-//! Absorption is the one and only reason the number of [`Line`]s in a parsed
-//! [`Document`] can be smaller than the number of physical lines in the input;
-//! the absorbed comment text is not lost, it is re-emitted as its own comment
-//! line (or lines) by the serializer (see below), so the number of *physical*
-//! lines is unchanged by a parse-and-write-back.
+//! Absorption is the only way a parsed [`Document`] can have fewer [`Line`]s
+//! than the input has physical lines; the serializer re-emits the absorbed
+//! text as comment lines, so physical line count survives a save.
 //!
 //! ## Serialization contract
 //!
-//! [`fmt::Display`] for [`Document`] renders each line back to text, one
-//! line per [`Line`], each terminated with `\n` (including the last line):
+//! [`fmt::Display`] for [`Document`] renders one line per [`Line`], each `\n`-terminated:
 //!
-//! - [`Line::Blank`] → an empty line.
-//! - [`Line::Comment(text)`](Line::Comment) → `#` followed by `text` verbatim.
-//! - [`Line::Malformed(raw)`](Line::Malformed) → `raw` verbatim, unchanged.
-//! - [`Line::Entry`] → the six fields joined by a single ASCII space, in
-//!   field order (source, mount point, fs type, options, dump, pass),
-//!   followed by ` #` and the trailing comment text if present. The source
-//!   field is reconstructed with its `KEY=` prefix re-added (e.g.
-//!   [`SourceId::Uuid`] serializes as `UUID=<value>`); the options field
-//!   reuses [`Options`]'s own `Display` impl (comma-joined). If the entry has
-//!   a [`FstabEntry::description`], it is written first, as its own block of
-//!   physical lines directly above the entry: the description is split on
-//!   `\n` and each piece is trimmed and written as `# <piece>` (or a bare `#`
-//!   for an empty piece, with no trailing space). The block is contiguous -
-//!   no blank line is ever inserted inside it, nor between its last line and
-//!   the entry's own fields line. This is the inverse of the absorption rule
-//!   above, so a description read from a file is written back byte-identically
-//!   as long as its comment lines were already canonical (`# ` then the text,
-//!   with the block hugging the entry). An entry with no description renders
-//!   exactly as it did before descriptions existed.
+//! - [`Line::Blank`] → empty line.
+//! - [`Line::Comment(text)`](Line::Comment) → `#` + `text` verbatim.
+//! - [`Line::Malformed(raw)`](Line::Malformed) → `raw` verbatim.
+//! - [`Line::Entry`] → the six fields joined by single spaces (source,
+//!   mount point, fs type, options, dump, pass), then ` #` + trailing
+//!   comment if present. The source's `KEY=` prefix is re-added; options
+//!   reuse [`Options`]'s `Display`. A [`FstabEntry::description`] is
+//!   written first as its own contiguous comment block directly above the
+//!   entry (`# <piece>` per `\n`-separated piece, trimmed; bare `#` for an
+//!   empty piece) - the inverse of absorption.
 //!
-//! This is a deliberately **canonical** rendering: it normalizes whatever
-//! original inter-field whitespace a line had down to single spaces. Per the
-//! module-level task brief, byte-for-byte round-tripping
-//! (`parse(text).to_string() == text`) is therefore only guaranteed for text
-//! that was already in this canonical form (single-space-separated fields,
-//! no leading whitespace before comments, entries with all six fields
-//! present, a trailing newline at end of file) - which is exactly the shape
-//! this crate's own fixtures are written in. Non-canonical input (e.g. real
-//! hand-edited fstabs with tab-aligned columns) still parses correctly and
-//! still reaches a *stable fixed point*
-//! (`parse(serialize(parse(text))) == parse(text)`, and
-//! `serialize(parse(serialize(parse(text)))) == serialize(parse(text))`),
-//! it just won't be byte-identical to the original on the very first pass.
+//! This rendering is canonical: it normalizes inter-field whitespace to
+//! single spaces. So `parse(text).to_string() == text` only holds for text
+//! already in that canonical form (this crate's own fixtures). Non-canonical
+//! input (e.g. tab-aligned real-world fstabs) still parses correctly and
+//! reaches a stable fixed point after one round trip
+//! (`parse(serialize(parse(text))) == parse(text)`), just not byte-identical
+//! to the original on the first pass.
 
 use crate::model::{Document, FstabEntry, FstabOption, Line, Options, SourceId};
 use std::fmt;
 
 /// Parses fstab-style text into a [`Document`].
 ///
-/// Always succeeds and never panics - see the module-level "Parsing
-/// contract" docs. Each input line (split on `\n`, with any trailing `\r`
-/// from CRLF input tolerated by [`str::lines`]) is first classified into
-/// exactly one [`Line`], in original order. The single exception to "one
-/// input line, one output line" is description-block absorption (see
-/// [`absorb_description_comments`] and the module docs): the ordinary comment
-/// line(s) directly above an entry are folded into that entry's
-/// [`FstabEntry::description`] and so do not occupy [`Line`]s of their own.
+/// Always succeeds, never panics - see the module's "Parsing contract".
+/// Each line (split on `\n`; [`str::lines`] tolerates CRLF) is classified
+/// into exactly one [`Line`], except for description-block absorption (see
+/// [`absorb_description_comments`]), which folds a comment block above an
+/// entry into its [`FstabEntry::description`] instead of its own `Line`s.
 ///
 /// Classification per line:
-/// - Whitespace-only (or empty) → [`Line::Blank`].
-/// - Starts with `#` after optional leading whitespace → [`Line::Comment`],
-///   storing everything after that `#` verbatim.
-/// - Otherwise, an attempt is made to parse it as an [`FstabEntry`] (see
-///   below); on failure, the entire original line text is preserved as
+/// - Whitespace-only/empty → [`Line::Blank`].
+/// - Starts with `#` (after optional leading whitespace) → [`Line::Comment`].
+/// - Otherwise parsed as an [`FstabEntry`]; on failure, preserved as
 ///   [`Line::Malformed`].
 ///
-/// Entry parsing: the line is first split at the first `#` that begins a
-/// new whitespace-delimited token (i.e. is preceded by whitespace or is the
-/// first character) - everything from there to end-of-line becomes
-/// [`FstabEntry::trailing_comment`] (minus the `#` itself), and everything
-/// before it is split on whitespace into fields. At least four fields
-/// (source, mount point, fs type, options) are required; fewer than that
-/// makes the whole line [`Line::Malformed`] (this is what covers the
-/// `docs/SPEC.md` §5 "bare source with nothing else" case). The optional
-/// trailing `dump`/`pass` fields are handled as follows:
-/// - Both absent (exactly 4 fields before any comment) → both default to
-///   `0`, per fstab convention for files that omit them entirely.
-/// - Only `dump` present (5 fields) → `dump` is parsed from field 5, `pass`
-///   defaults to `0`.
-/// - Both present (6 fields) → both are parsed from fields 5 and 6.
-/// - More than 6 fields, or a present dump/pass field that fails to parse
-///   as `u32` → the whole line is [`Line::Malformed`] rather than silently
-///   coercing or dropping data, per the explicit instruction to never
-///   silently coerce an invalid integer field.
+/// Entry parsing: split at the first `#` that starts a new token (preceded
+/// by whitespace or at line start) → that becomes
+/// [`FstabEntry::trailing_comment`]; everything before it splits on
+/// whitespace into fields. At least 4 fields (source, mount point, fs type,
+/// options) are required, else [`Line::Malformed`] (covers SPEC §5's "bare
+/// source" case). Trailing `dump`/`pass`: both default to `0` if absent (4
+/// fields), `pass` defaults to `0` if only `dump` is given (5 fields), both
+/// parsed if both given (6 fields). More than 6 fields, or a dump/pass that
+/// fails to parse as `u32`, makes the whole line [`Line::Malformed`] rather
+/// than silently coercing or dropping data.
 pub fn parse(text: &str) -> Document {
     let classified: Vec<Line> = text.lines().map(parse_line).collect();
     Document::from_lines(absorb_description_comments(classified))
 }
 
-/// Post-processes a freshly-classified line list, folding each
-/// [`Line::Entry`]'s attached comment block into its
-/// [`FstabEntry::description`] and removing that block's *comment* lines from
-/// the output (the block's blank lines stay, per step 4 of the rule).
-/// Implements exactly the four-step upward walk documented in the module's
-/// "Description block absorption" section; that section, not this comment, is
-/// the normative description of the rule.
+/// Implements the four-step upward walk from the module's "Description
+/// block absorption" docs (the normative description of the rule, not this
+/// comment): folds each entry's attached comment block into its
+/// [`FstabEntry::description`], removing the block's comment lines from the
+/// output while leaving its blank lines in place.
 ///
-/// Two-phase by design, so that every decision is made against *original*
-/// indices and the outcome cannot depend on evaluation order: phase 1 walks
-/// upward from each entry and records (a) which indices that entry absorbs and
-/// (b) the description text it absorbs them into; phase 2 rebuilds the vector
-/// by filtering out the absorbed indices and attaching each description to its
-/// entry.
+/// Two-phase so every decision is made against original indices regardless
+/// of evaluation order: phase 1 walks upward from each entry, recording
+/// which indices it absorbs and into what description; phase 2 rebuilds the
+/// vector, filtering absorbed indices and attaching descriptions.
 ///
-/// Idempotence (required by this crate's fixed-point tests) is a property of
-/// the pair (this function, [`fmt::Display`] for [`Document`]), and is argued
-/// in the module docs' "Why the run's blank lines are kept as blank lines"
-/// section. In short: the serializer re-renders the run's comment lines
-/// canonically, hugging the entry, and leaves the run's blanks above them, so
-/// a second walk over that output finds the same run and the same description.
-///
-/// The recorded spans provably never overlap: an entry's walk stops at the
-/// first [`Line::Entry`]/[`Line::Malformed`] above it, so a span lies strictly
-/// between its own entry and the nearest row-kind line above it, and the one
-/// blank line step 1 may skip is excluded from the span by construction.
+/// Spans never overlap: each walk stops at the nearest entry/malformed line
+/// above it, and the one blank step 1 may skip is excluded by construction.
 fn absorb_description_comments(lines: Vec<Line>) -> Vec<Line> {
     // Phase 1: decide, by original index alone, which lines are absorbed and
     // what description each entry ends up with.
@@ -369,9 +257,7 @@ fn try_parse_entry(raw: &str) -> Option<Line> {
         dump,
         pass,
         trailing_comment,
-        // A description never comes from the entry's own line; it is
-        // attached afterwards by `absorb_description_comments` if a comment
-        // block is attached to this entry.
+        // Attached afterwards by `absorb_description_comments`, if any.
         description: None,
     }))
 }
@@ -421,8 +307,7 @@ fn parse_source(token: &str) -> SourceId {
     if token.starts_with('/') {
         return SourceId::Path(token.to_string());
     }
-    // `host:/path`-style nfs addresses: a colon with a non-empty, slash-free
-    // host part before it.
+    // `host:/path`-style nfs: colon with a non-empty, slash-free host before it.
     if let Some(colon_idx) = token.find(':') {
         let host = &token[..colon_idx];
         if !host.is_empty() && !host.contains('/') {
@@ -433,11 +318,9 @@ fn parse_source(token: &str) -> SourceId {
 }
 
 /// Splits a comma-separated options field into an [`Options`] list,
-/// preserving order. Each comma-delimited chunk becomes [`FstabOption::Flag`]
-/// if it has no `=`, or [`FstabOption::KeyValue`] split at the first `=`
-/// otherwise (so a value may itself contain `=`, e.g. in some
-/// `credentials=`-style paths). Empty chunks (from a stray double comma)
-/// are silently skipped rather than producing a malformed empty option.
+/// preserving order. Each chunk becomes [`FstabOption::Flag`] (no `=`) or
+/// [`FstabOption::KeyValue`] split at the first `=` (so a value may itself
+/// contain `=`). Empty chunks (stray double comma) are skipped.
 fn parse_options(field: &str) -> Options {
     let mut opts = Vec::new();
     for chunk in field.split(',') {
@@ -454,9 +337,8 @@ fn parse_options(field: &str) -> Options {
     Options::from_vec(opts)
 }
 
-/// Reconstructs a source field's full original text, including its `KEY=`
-/// prefix where applicable (the model stores the prefix and payload
-/// separately; this is the inverse of [`parse_source`]).
+/// Reconstructs a source field's full text, re-adding its `KEY=` prefix -
+/// the inverse of [`parse_source`].
 fn source_field_text(source: &SourceId) -> String {
     match source {
         SourceId::Path(s) | SourceId::Network(s) | SourceId::Other(s) => s.clone(),
@@ -469,9 +351,8 @@ fn source_field_text(source: &SourceId) -> String {
 }
 
 impl fmt::Display for Document {
-    /// Renders the document back to fstab text. See the module-level
-    /// "Serialization contract" docs for the exact per-`Line` rendering
-    /// rules and the scope of the byte-for-byte round-trip guarantee.
+    /// Renders the document back to fstab text - see the module's
+    /// "Serialization contract" docs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for line in &self.lines {
             match line {
@@ -479,13 +360,8 @@ impl fmt::Display for Document {
                 Line::Comment(text) => writeln!(f, "#{text}")?,
                 Line::Malformed(raw) => writeln!(f, "{raw}")?,
                 Line::Entry(entry) => {
-                    // A description is rendered as a contiguous block of
-                    // ordinary comment lines directly above the entry it
-                    // belongs to - the inverse of
-                    // `absorb_description_comments`. One comment line per
-                    // `\n`-separated piece, each trimmed; an empty piece
-                    // renders as a bare `#` rather than `"# "`, so a
-                    // re-parse sees the same empty piece back.
+                    // Inverse of `absorb_description_comments`: one comment
+                    // line per `\n`-piece, trimmed; empty piece -> bare `#`.
                     if let Some(description) = &entry.description {
                         for piece in description.split('\n') {
                             let text = piece.trim();
@@ -718,10 +594,8 @@ mod tests {
         assert_eq!(doc.to_string(), text);
     }
 
-    /// The one shape that re-flows on the first save: a blank line *between*
-    /// an entry's comment block and the entry is inside the absorbed run, so
-    /// it comes back above the re-rendered block instead of inside it. No
-    /// line is gained or lost, and the result is a fixed point.
+    /// A blank between a comment block and its entry is inside the absorbed
+    /// run, so it re-flows above the block instead of inside it - once.
     #[test]
     fn a_blank_between_a_comment_and_its_entry_reflows_once_then_is_stable() {
         let text = "# header\n\nUUID=aaaa / ext4 defaults 0 1\n";
@@ -794,8 +668,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_comment_directly_above_an_entry_is_its_description() {
-        // The whole point of T43: no marker of any kind is involved, and the
-        // comment line stops being a `Line` of its own.
+        // No marker involved: the comment line stops being its own `Line`.
         let doc = parse("# a plain note\nUUID=aaaa /mnt/a ext4 defaults 0 2\n");
 
         assert_eq!(doc.lines.len(), 1, "lines: {:?}", doc.lines);
@@ -834,10 +707,8 @@ mod tests {
         assert_eq!(doc.to_string(), text);
     }
 
-    /// A comment line does not stop the upward walk, so two comment blocks
-    /// separated only by a blank line above one entry are one single run and
-    /// merge into one description, with the internal blank dropped. This is
-    /// lines 15/17 of the plan's worked example in isolation.
+    /// A comment line doesn't stop the upward walk, so two blocks separated
+    /// by a blank merge into one run, one description.
     #[test]
     fn two_comment_blocks_separated_by_a_blank_line_merge_into_one_description() {
         let doc = parse(
@@ -862,9 +733,7 @@ mod tests {
         );
     }
 
-    /// Step 1 of the rule: exactly one blank line directly above an entry is
-    /// a pure separator. Here the run above it has no comments at all, so by
-    /// step 3 nothing whatsoever is touched - the blanks stay blanks.
+    /// A run with zero comments yields nothing, so step 3 touches nothing.
     #[test]
     fn a_run_with_zero_comments_is_left_completely_untouched() {
         let text = "UUID=aaaa /mnt/a ext4 defaults 0 2\n\
@@ -880,12 +749,8 @@ mod tests {
         assert_eq!(doc.to_string(), text);
     }
 
-    /// The other resolved sub-case: when a description *is* found, the one
-    /// blank line step 1 skipped survives as its own `Line::Blank`, at its
-    /// original relative position - which, with the run's comments absorbed,
-    /// means above the re-rendered description block, never between the block
-    /// and the entry. The run's own blanks survive the same way (see the
-    /// module docs on idempotence), so no line is lost.
+    /// When a description is found, the separator blank step 1 skipped
+    /// survives above the re-rendered block, never between it and the entry.
     #[test]
     fn the_skipped_separator_blank_survives_when_a_description_is_found() {
         // The plan's `/boot` case: entry, blank, comment, blank, blank, entry.
@@ -922,8 +787,8 @@ mod tests {
         assert_eq!(twice.to_string(), serialized);
     }
 
-    /// A comment block with no entry below it at all is freestanding: the
-    /// rule only ever walks upward *from an entry*.
+    /// A comment block with no entry below it is freestanding - the rule
+    /// only walks upward from an entry.
     #[test]
     fn a_comment_block_at_end_of_file_stays_a_freestanding_comment() {
         let text = "UUID=aaaa /mnt/a ext4 defaults 0 2\n\
@@ -942,9 +807,8 @@ mod tests {
         assert_eq!(doc.to_string(), text);
     }
 
-    /// A malformed line stops the upward walk, so it shields the comment
-    /// block above it from the entry below it. That block stays freestanding,
-    /// byte-unchanged.
+    /// A malformed line stops the walk, shielding the comment block above
+    /// it from the entry below.
     #[test]
     fn a_malformed_line_shields_the_comment_block_above_it() {
         let text = "#this note describes the broken line below it\n\
@@ -966,10 +830,8 @@ mod tests {
         assert_eq!(doc.to_string(), text);
     }
 
-    /// A run whose comment lines are all empty carries no information, so the
-    /// step-3 "nothing is touched" outcome applies rather than storing an
-    /// empty description (which `model.rs` documents as never stored) and
-    /// losing those lines on the next save.
+    /// An all-empty comment run carries no information, so step 3 applies
+    /// instead of storing (and later losing) an empty description.
     #[test]
     fn a_run_of_empty_comment_lines_is_not_absorbed() {
         let text = "#\n#   \nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
@@ -980,8 +842,8 @@ mod tests {
         assert_eq!(doc.to_string(), text);
     }
 
-    /// An empty line *inside* an otherwise non-empty block is content: it is
-    /// kept as an empty piece of the value and re-emitted as a bare `#`.
+    /// An empty comment line inside a non-empty block is content, kept as
+    /// an empty piece and re-emitted as a bare `#`.
     #[test]
     fn an_empty_comment_line_inside_a_block_is_kept_as_an_empty_piece() {
         let text = "# first\n#\n# third\nUUID=aaaa /mnt/a ext4 defaults 0 2\n";
@@ -1024,11 +886,8 @@ mod tests {
         assert_eq!(twice.to_string(), serialized_once);
     }
 
-    /// A commented-out fstab line directly above an entry *is* now that
-    /// entry's description - there is no text-based carve-out left (the old
-    /// `//server/share`-versus-marker collision class is gone with the marker
-    /// itself). What still matters is that its text survives verbatim through
-    /// a round trip, which the trimmed-and-re-emitted block gives us.
+    /// A commented-out fstab line above an entry is that entry's
+    /// description like any other comment, surviving round-trip verbatim.
     #[test]
     fn a_commented_out_cifs_line_above_an_entry_becomes_its_description_verbatim() {
         let original = "# //nas/media /mnt/media cifs guest,noauto 0 0\n\
@@ -1042,9 +901,7 @@ mod tests {
         assert_eq!(doc.to_string(), original);
     }
 
-    /// The plan's worked example, verbatim, as the rule's test oracle: every
-    /// entry's expected description is spelled out in `docs`/PROJECT_PLAN.md
-    /// §T43 and reproduced here exactly.
+    /// A larger worked example exercising the full absorption rule at once.
     #[test]
     fn the_worked_example_from_the_plan_maps_to_the_expected_descriptions() {
         let text = "\

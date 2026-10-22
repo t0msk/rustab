@@ -83,6 +83,11 @@ pub struct TargetInfoDto {
     pub path: String,
     pub is_real: bool,
     pub source: TargetSource,
+    /// `Some(<directory>)` only when this session's backups are the real
+    /// `/etc/fstab`'s *and* this process can't manage files in `/etc/`
+    /// (in practice: Flatpak); `None` in every other case. Always present
+    /// on the wire (`null`, never omitted) - see `docs/API_CONTRACT.md` §6.
+    pub real_target_backup_fallback_dir: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,18 +194,17 @@ pub struct WriteErrorDto {
     pub report: Option<ValidationReportDto>,
     pub path: Option<String>,
     pub backup: Option<String>,
-    /// For `kind == "external_change"` (T36): the two file bodies the UI
-    /// diffs to show the user what changed outside Rustab before deciding.
-    /// `None` for every other kind - additive on the wire, so a response
-    /// produced without it (or by a pre-T36 backend) still deserializes.
+    /// For `kind == "external_change"`: the two file bodies the UI diffs
+    /// to show what changed outside Rustab before deciding. `None` for
+    /// every other kind - additive on the wire, so an older response
+    /// without it still deserializes.
     #[serde(default)]
     pub external_change: Option<ExternalChangeDto>,
 }
 
-/// `ExternalChangeDto` (§8, T36): the two file bodies a
-/// `kind: "external_change"` `WriteErrorDto` carries, so the UI can show
-/// *what* changed outside Rustab before the user decides whether to write
-/// anyway.
+/// `ExternalChangeDto` (§8): the two file bodies a `kind:
+/// "external_change"` `WriteErrorDto` carries, so the UI can show what
+/// changed outside Rustab before the user decides whether to write anyway.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExternalChangeDto {
     /// What Rustab last knew the real `/etc/fstab` to hold - the **old**

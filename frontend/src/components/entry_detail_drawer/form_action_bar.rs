@@ -1,11 +1,10 @@
 //! `FormActionBar` - Cancel/Verify/Save buttons inside the drawer (§4),
 //! sticky at the bottom. `save_disabled` mirrors §5's "real disabled
-//! element, not just a styling warning" requirement; this task doesn't wire
-//! real validation so it is always enabled by default, driven by a prop so
-//! T11 can disable it once real validation errors exist. `Verify`, between
-//! Cancel and Save, triggers an immediate, non-debounced `validate_candidate`
-//! re-check (distinct from the existing debounced background check) and
-//! confirms the result via a toast; it is hidden entirely when `on_verify`
+//! element, not just a styling warning" requirement, driven by whether
+//! real validation errors exist. `Verify`, between Cancel and Save,
+//! triggers an immediate, non-debounced `validate_candidate` re-check
+//! (distinct from the existing debounced background check) and confirms
+//! the result via a toast; it is hidden entirely when `on_verify`
 //! is `None` (raw-text edit mode has no structured document to validate).
 
 use yew::prelude::*;

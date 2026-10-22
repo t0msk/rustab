@@ -1,8 +1,7 @@
 //! `LoadingSpinner` - inline loading indicator used inside buttons/panels
-//! while a write/restore operation is in flight (T12,
-//! `docs/UI_DESIGN.md` §6/§7): dropped into `DiffView`'s and
-//! `BackupRestoreConfirmDialog`'s confirm buttons while `save`/
-//! `restore_backup` is pending.
+//! while a write/restore operation is in flight (`docs/UI_DESIGN.md`
+//! §6/§7): dropped into `DiffView`'s and `BackupRestoreConfirmDialog`'s
+//! confirm buttons while `save`/`restore_backup` is pending.
 
 use yew::prelude::*;
 
