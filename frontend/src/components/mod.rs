@@ -1,5 +1,5 @@
-//! Component tree for the Rustab UI shell (T10). See
-//! `docs/UI_DESIGN.md` §9 for the full component inventory this maps to.
+//! Component tree for the Rustab UI shell. See `docs/UI_DESIGN.md` §9
+//! for the full component inventory this maps to.
 
 pub mod about_dialog;
 pub mod app_shell;

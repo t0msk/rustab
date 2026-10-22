@@ -1,7 +1,7 @@
 //! `DescriptionField` - free-text input for an entry's optional
 //! human-readable description (§4 item 4), round-tripped to/from one or
 //! more ordinary `#` comment lines directly above the entry
-//! (`docs/API_CONTRACT.md` §5). The value is genuinely multi-line now (T43):
+//! (`docs/API_CONTRACT.md` §5). The value is genuinely multi-line:
 //! embedded `\n` is a normal, expected shape, not something this field
 //! guards against.
 

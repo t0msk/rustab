@@ -1,5 +1,5 @@
-//! `AboutDialog` - static, read-only "About Rustab" overlay (T26),
-//! triggered by `HeaderBar`'s always-visible "About" button.
+//! `AboutDialog` - static, read-only "About Rustab" overlay, triggered
+//! by `HeaderBar`'s always-visible "About" button.
 //!
 //! Reuses `BackupDiffView`'s exact modal shell (backdrop `onclick` dismiss,
 //! inner `stop_propagation`, `role="dialog"` `aria-modal="true"`): this
