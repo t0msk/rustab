@@ -1,150 +1,88 @@
 //! Atomic write/backup/rename logic - see `docs/SPEC.md` §6.
 //!
-//! This module implements the single most important safety requirement in the
-//! project (`docs/SPEC.md` §2.1): a save of an fstab-style file is
-//! **all-or-nothing**. The target file always contains either its complete
-//! old content or its complete new content - never a truncated, partially
-//! written, or interleaved mixture of the two - no matter where a failure
-//! (I/O error, full disk, permission error, process death) occurs.
+//! Implements the project's core safety requirement (`docs/SPEC.md` §2.1):
+//! a save is **all-or-nothing**. The target always ends up with either its
+//! complete old content or its complete new content, never a mixture,
+//! regardless of where a failure (I/O error, full disk, process death) occurs.
 //!
 //! [`write_document`] is the primary entry point ([`create_backup`] is the
-//! other one, and is described further down - it shares this module's backup
-//! machinery but never touches the target file). It performs, in exactly this
-//! order:
+//! other, sharing this module's backup machinery but never touching the
+//! target). In order:
 //!
-//! 1. **Validate in memory.** [`crate::validate::validate`] runs both the
-//!    structural checks and the `findmnt --verify` semantic check against the
-//!    candidate [`Document`]. If it reports any blocking error, this function
-//!    returns [`WriteError::Validation`] **before performing a single write
-//!    syscall**: nothing on disk has been touched, created, or even opened
-//!    for writing at that point.
-//! 2. **Resolve the effective target.** If `target` is a symlink (a
-//!    legitimate configuration - e.g. `/etc/fstab` symlinked into an
-//!    etckeeper//`nix`-managed tree), it is resolved and the write is applied
-//!    to the link's destination. Replacing the symlink itself with a regular
-//!    file would both discard the user's configuration and leave the real
-//!    file holding stale content - which, for `/etc/fstab`, is exactly the
-//!    "machine fails to boot" class of outcome §2.1 forbids.
-//! 3. **Back up.** If the effective target exists, it is copied to
-//!    `<target>.rustab-backup.<secs>.<nanos>` in the same directory and the
-//!    copy is `fsync`ed, *before* anything else touches the target or its
-//!    directory. Then retention is enforced: at most [`MAX_BACKUPS`]
-//!    *automatic* backups are kept for that target and the oldest are deleted
-//!    beyond that bound (see "the two kinds of backup" below). If the target
-//!    does not exist (first-ever save) the whole step is skipped - there is
-//!    nothing to back up.
-//! 4. **Write a temp file in the same directory** as the target, named
+//! 1. **Validate in memory** via [`crate::validate::validate`]. A blocking
+//!    error returns [`WriteError::Validation`] before any write syscall.
+//! 2. **Resolve the effective target.** A symlinked target (e.g.
+//!    etckeeper/nix-managed `/etc/fstab`) is followed, and the write
+//!    applies to its destination - replacing the symlink itself would
+//!    leave the real file holding stale content.
+//! 3. **Back up.** If the effective target exists, copy it to
+//!    `<target>.rustab-backup.<secs>.<nanos>` and `fsync` the copy before
+//!    anything else touches the target, then prune to [`MAX_BACKUPS`]
+//!    *automatic* backups (see "two kinds of backup" below). Skipped on a
+//!    first-ever save (nothing to back up).
+//! 4. **Write a temp file** in the target's own directory, named
 //!    `.<target-file-name>.rustab.tmp.<pid>`.
-//! 5. **`fsync` the temp file, `fsync` the directory, `rename` onto the
-//!    target**, then `fsync` the directory once more.
-//! 6. **Re-read and verify** the target byte-for-byte against the bytes that
-//!    were intended; a mismatch is a hard [`WriteError::Verify`], never a
-//!    warning.
-//! 7. **Clean up the temp file on every failure path** between steps 4 and 5
-//!    on a best-effort basis, never letting a cleanup failure mask the
-//!    original error.
+//! 5. **`fsync` temp → `fsync` directory → `rename` onto target → `fsync`
+//!    directory again.**
+//! 6. **Re-read and verify** the target byte-for-byte; a mismatch is a
+//!    hard [`WriteError::Verify`], never just a warning.
+//! 7. **Clean up the temp file** on every failure path between steps 4-5,
+//!    best-effort, never masking the original error.
 //!
 //! ## Why the ordering is what it is
 //!
-//! **Why the temp file must live in the target's own directory.**
-//! `rename(2)` is only atomic within a single filesystem. A temp file under
-//! `/tmp` (frequently a separate `tmpfs`) could not be `rename`d onto
-//! `/etc/fstab` at all (`EXDEV`), and working around that with a
-//! copy-then-truncate would reintroduce exactly the partial-write window this
-//! module exists to eliminate. Hence: same directory, always. (The read-only
-//! `findmnt --verify` check in [`crate::validate`] does use a throwaway
-//! `/tmp` file - that is fine precisely because it never renames anything
-//! onto a real target.)
+//! - **Temp file in the target's own directory**: `rename(2)` is only
+//!   atomic within one filesystem - a `/tmp` temp file could hit `EXDEV`,
+//!   and copy-then-truncate would reopen the partial-write window this
+//!   module exists to close. (The read-only `findmnt --verify` check does
+//!   use a throwaway `/tmp` file, fine since it never renames onto a real target.)
+//! - **`fsync` the temp file before the rename**: otherwise a crash could
+//!   leave the target name pointing at an inode whose data was never
+//!   written - a renamed but empty/garbage file.
+//! - **The directory is `fsync`ed twice**: the pre-rename `fsync` makes
+//!   the temp file's directory entry durable before the rename; a
+//!   directory `fsync` only covers changes made *before* it, so making
+//!   the rename itself durable needs a second `fsync` after.
+//! - **Backup first, and `fsync`ed**: taking it before the temp write
+//!   means a backup failure aborts with the target untouched. Without an
+//!   `fsync`, a crash right after a successful rename could leave the new
+//!   content durable and the backup gone - the one state with no way back.
+//! - **Target mode/owner carried over**: a brand-new temp-file inode
+//!   doesn't inherit them, and the process umask default could silently
+//!   turn `0644 root:root /etc/fstab` into `0600`, breaking unprivileged
+//!   readers. The temp file is created `0600`, then `fchmod`/`fchown`ed to
+//!   match the old target. A failed `fchown` is a non-fatal note, not an
+//!   abort - refusing to save over an ownership mismatch is worse than
+//!   saving with the writing user's ownership.
 //!
-//! **Why `fsync` the temp file before the rename.** `rename` makes the new
-//! content visible under the target's name immediately. If the file's *data*
-//! were still only in the page cache at that moment, a crash could leave the
-//! target name pointing at an inode whose data blocks were never written -
-//! i.e. a visibly-renamed but silently-empty or garbage `/etc/fstab`. Syncing
-//! the data first means the rename can only ever publish fully-durable
-//! content.
+//! ## The two kinds of backup
 //!
-//! **Why the directory is `fsync`ed twice.** `docs/SPEC.md` §6 step 4
-//! prescribes `fsync(temp) → fsync(dir) → rename`. The pre-rename directory
-//! `fsync` persists the temp file's own directory entry, so the rename cannot
-//! be applied to a name that does not durably exist yet. But a directory
-//! `fsync` only persists directory changes made *before* it - so making the
-//! *rename itself* durable requires a second `fsync` of the directory
-//! **after** the rename. The spec's step-4 wording conflates the two; this
-//! module does both rather than picking one, since the pre-rename `fsync` is
-//! what the spec literally asks for and the post-rename `fsync` is what
-//! actually guarantees the swap survives a power loss. Neither can weaken the
-//! other.
-//!
-//! **Why the backup is taken first, and `fsync`ed.** The backup exists so the
-//! user always has a restore path (`docs/SPEC.md` §6 step 5, §9). Taking it
-//! before the temp file is written means a failure to create it aborts the
-//! save with the target still fully intact and nothing else on disk changed.
-//! `fs::copy` alone leaves the backup in the page cache, so a crash shortly
-//! after a successful rename could leave the *new* content durable and the
-//! backup gone - the one state in which the user has no way back. `fsync`ing
-//! the backup copy closes that window.
-//!
-//! **Why the target's mode and owner are carried over.** The temp file is a
-//! brand-new inode, so it does not inherit the target's permissions. Letting
-//! it keep the process umask's default would mean a save could silently turn
-//! a `0644 root:root /etc/fstab` into a `0600` file, breaking every
-//! unprivileged tool that reads it (`findmnt`, `lsblk`, `systemd-fstab-generator`
-//! runs as root, but `mount` invoked by a user does not). The temp file is
-//! therefore created `0600` (never briefly *more* permissive than the file it
-//! will replace), then `fchmod`ed to the previous target's mode and
-//! `fchown`ed to its uid/gid. A failed `fchown` is reported as a non-fatal
-//! note rather than aborting the save, since the common cases (same owner, or
-//! running as root) cannot fail and refusing to save a file whose owner
-//! happens to be someone else would be worse than saving it with the writing
-//! user's ownership.
-//!
-//! ## The two kinds of backup, and why pruning only counts one of them
-//!
-//! A backup is either **automatic** (the side effect of a save, step 3 above)
-//! or **manual** (the user explicitly asked for a snapshot right now, via
-//! [`create_backup`]). Which one a backup is lives in its file name and
-//! nowhere else:
+//! **Automatic** (a save's side effect, step 3) vs. **manual** (the user
+//! explicitly snapshotting now, via [`create_backup`]) - distinguished
+//! only by file name:
 //!
 //! - automatic: `<target-file-name>.rustab-backup.<secs>.<nanos>`
 //! - manual: `<target-file-name>.rustab-backup.<secs>.<nanos>.manual`
 //!
-//! That is exactly one new optional trailing literal suffix on the scheme
-//! that already existed; [`backup_name_of`] accepts those two shapes and
-//! nothing else, so every near miss the strict parser rejected before is still
-//! rejected (that is what keeps [`prune_backups`] from ever touching a file it
-//! did not create - see its docs).
+//! [`backup_name_of`] accepts only these two shapes, so [`prune_backups`]
+//! never touches a file it didn't create. The file name is the only
+//! record of which kind a backup is (no sidecar/database, consistent with
+//! `src-tauri/src/backups.rs` treating the name as identity).
 //!
-//! The file name is the only record because the project already treats "the
-//! name, in the target's own directory, *is* the identity" as load-bearing
-//! (see `src-tauri/src/backups.rs`). A sidecar file or a database would be a
-//! second place that has to agree with the filesystem, and keeping those two
-//! in agreement across crashes is precisely the class of problem this module
-//! exists to avoid - for no benefit, since the name can carry the one bit.
-//!
-//! **Manual backups are exempt from pruning.** [`prune_backups`] counts and
-//! deletes among *automatic* backups only: [`MAX_BACKUPS`] bounds how many
-//! automatic backups a target keeps, and a manual backup neither occupies one
-//! of those slots nor is ever deleted to free one, however many of either kind
-//! exist. The point of "snapshot this now" is "keep it regardless of what I do
-//! next", so letting a later flurry of saves silently evict it would defeat
-//! the feature; the exemption also protects the inverse case, where several
-//! manual snapshots would otherwise push a user's entire automatic safety net
-//! out of the window. The only thing that ever removes a manual backup is the
-//! user deleting it explicitly (`delete_backup` in `src-tauri`), which is
-//! deliberately indifferent to the kind.
+//! **Manual backups are exempt from pruning**: [`MAX_BACKUPS`] bounds only
+//! automatic backups, so a manual snapshot is never evicted by later saves,
+//! and manual snapshots never push automatic ones out either. Only
+//! explicit user deletion (`delete_backup` in `src-tauri`) removes a
+//! manual backup.
 //!
 //! ## Testability seam
 //!
-//! All of the above runs through a small crate-private `FileSystemOps`
-//! trait whose production implementation (`RealFs`) is a direct,
-//! one-method-per-syscall wrapper over `std::fs`. Unit tests use a
-//! *delegating spy*: it
-//! performs every operation for real against a temp directory and replaces
-//! exactly one operation with an injected `io::Error`. Failure-injection
-//! tests therefore assert "the original target file is byte-for-byte
-//! untouched" against a real file on a real filesystem, not against an
-//! in-memory model that could itself be wrong.
+//! Everything above runs through a crate-private `FileSystemOps` trait;
+//! the production impl (`RealFs`) wraps `std::fs` one syscall at a time.
+//! Unit tests use a delegating spy that performs every operation for real
+//! against a temp directory and replaces exactly one with an injected
+//! `io::Error`, so failure-injection tests assert "the target is
+//! byte-for-byte untouched" against a real file, not an in-memory model.
 
 use crate::model::Document;
 use crate::validate::{self, Finding, ValidationReport};
@@ -159,12 +97,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How many **automatic** timestamped backups are kept per target file.
 ///
-/// After each successful backup, *automatic* backups belonging to the same
-/// target beyond this bound are deleted oldest-first, so backups never grow
-/// without limit (`docs/SPEC.md` §6 step 5). Manual backups are exempt: they
-/// are neither counted against this bound nor deleted to honour it (see the
-/// module docs and [`prune_backups`]). Tune here; nothing else encodes this
-/// number.
+/// After each backup, automatic backups beyond this bound are deleted
+/// oldest-first (`docs/SPEC.md` §6 step 5). Manual backups are exempt (see
+/// module docs and [`prune_backups`]). Tune here; nothing else encodes this.
 pub const MAX_BACKUPS: usize = 10;
 
 /// The fixed infix separating a target's file name from a backup's timestamp,
@@ -225,14 +160,13 @@ impl fmt::Display for FsyncStage {
     }
 }
 
-/// Everything that can go wrong in [`write_document`], with one variant per
-/// distinguishable failure point so a caller (the Tauri command layer, T8)
-/// can tell the user precisely what happened and whether the target changed.
+/// Everything that can go wrong in [`write_document`], one variant per
+/// failure point, so a caller (the Tauri command layer) can tell the user
+/// precisely what happened and whether the target changed.
 ///
-/// With the sole exception of [`WriteError::Verify`] and
-/// [`FsyncStage::DirectoryAfterRename`] - both of which can only occur
-/// *after* the atomic rename already succeeded - every variant guarantees
-/// that the target file still holds its original content, byte for byte.
+/// Except [`WriteError::Verify`] and [`FsyncStage::DirectoryAfterRename`]
+/// (both only possible after the rename already succeeded), every variant
+/// guarantees the target still holds its original content, byte for byte.
 #[derive(Debug)]
 pub enum WriteError {
     /// The candidate document failed structural or semantic validation
@@ -469,35 +403,24 @@ pub struct WriteOutcome {
 /// Atomically replaces `target` with the serialized form of `candidate`,
 /// following `docs/SPEC.md` §6 exactly.
 ///
-/// **The guarantee.** This function never leaves the target file partially
-/// written. On any failure prior to the atomic `rename` - validation,
-/// backup, temp-file write, permission application, or either pre-rename
-/// `fsync` - the original file is left byte-for-byte untouched and no
-/// partially written data is ever visible under its name. The target
-/// therefore always holds either its complete previous content or the
-/// complete new content. After a successful rename the new content is
-/// re-read and compared byte-for-byte with what was written; a mismatch is
-/// returned as [`WriteError::Verify`], never as a silent warning.
+/// **The guarantee.** Never leaves the target partially written. Any
+/// failure before the atomic `rename` leaves the original byte-for-byte
+/// untouched; after a successful rename, the new content is re-read and
+/// compared byte-for-byte, and a mismatch is [`WriteError::Verify`], never
+/// a silent warning.
 ///
-/// If `target` does not exist it is created (no backup is attempted, since
-/// there is nothing to back up). If it exists, a timestamped backup of the
-/// previous content is made first and at most [`MAX_BACKUPS`] backups are
-/// kept. If `target` is a symlink, the write is applied to its destination
-/// rather than replacing the link.
+/// A non-existent `target` is created with no backup attempt. An existing
+/// one is backed up first, keeping at most [`MAX_BACKUPS`]. A symlinked
+/// `target` is written through to its destination.
 ///
-/// Privilege escalation is explicitly out of scope: this function assumes it
-/// already has whatever permissions it needs on `target` and makes no
-/// assumption about how it got them, so it behaves identically whether
-/// called directly against a sandbox file or from inside an elevated helper
-/// writing the real `/etc/fstab`.
+/// Privilege escalation is out of scope: this assumes it already has
+/// whatever permissions it needs on `target`, so it behaves identically
+/// called directly or from inside an elevated helper.
 ///
 /// # Errors
 ///
-/// Returns a [`WriteError`] variant identifying the exact failure point; see
-/// that type for which variants imply the target was left untouched (all of
-/// them except [`WriteError::Verify`], [`WriteError::ReadBack`] and
-/// [`WriteError::Fsync`] with [`FsyncStage::DirectoryAfterRename`], which can
-/// only occur after the swap already succeeded).
+/// Returns a [`WriteError`] identifying the exact failure point; see that
+/// type for which variants leave the target untouched.
 pub fn write_document(target: &Path, candidate: &Document) -> Result<WriteOutcome, WriteError> {
     write_document_with(target, candidate, &RealFs)
 }
@@ -505,11 +428,8 @@ pub fn write_document(target: &Path, candidate: &Document) -> Result<WriteOutcom
 /// One backup of a target, as [`list_backups`] reports it.
 ///
 /// Carries the kind alongside the path on purpose: this module owns the
-/// naming scheme, so it is also the only place that can say what a given name
-/// *means*. A caller that wanted to know "was this one manual?" from the path
-/// alone would have to re-implement the grammar - and the moment two parsers
-/// exist, they can disagree about which files are backups at all, which is the
-/// disagreement [`prune_backups`]'s safety rests on not happening.
+/// naming scheme, so a caller never has to re-implement (and risk
+/// disagreeing with) the "was this manual?" grammar itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupEntry {
     /// Full path to the backup file, in the target's own directory.
@@ -523,21 +443,16 @@ pub struct BackupEntry {
 /// Lists the backups this module has created for `target`, oldest first,
 /// automatic and manual alike.
 ///
-/// Only files whose names match the exact
-/// `<target-file-name>.rustab-backup.<10-digit secs>.<9-digit nanos>` scheme -
-/// optionally followed by the literal `.manual` - in the target's own
-/// directory are returned, so unrelated files - including a user's own
-/// `fstab.bak` or a backup belonging to a *different* target in the same
-/// directory - are never reported (and, by the same token, never pruned).
-/// Exposed so a restore UI does not have to re-implement, and risk disagreeing
-/// with, this naming scheme; [`BackupEntry::manual`] is part of that same
-/// answer rather than something a caller is expected to derive itself.
+/// Only files matching the exact
+/// `<target-file-name>.rustab-backup.<10-digit secs>.<9-digit nanos>`
+/// scheme (optionally + `.manual`) in the target's own directory are
+/// returned - unrelated files (a user's own `fstab.bak`, or a different
+/// target's backup in the same directory) are never reported or pruned.
 ///
 /// # Errors
 ///
-/// Returns the underlying [`io::Error`] if the target's directory cannot be
-/// read. A `target` with no final file-name component yields an empty list
-/// rather than an error, since no backup could ever belong to it.
+/// Returns the underlying [`io::Error`] if the target's directory can't
+/// be read. A `target` with no file-name component yields an empty list.
 pub fn list_backups(target: &Path) -> io::Result<Vec<BackupEntry>> {
     let Some(file_name) = target.file_name() else {
         return Ok(Vec::new());
@@ -559,10 +474,9 @@ pub fn list_backups(target: &Path) -> io::Result<Vec<BackupEntry>> {
 
 /// What a successful [`create_backup`] did.
 ///
-/// Shaped like [`WriteOutcome`] minus everything that only makes sense for a
-/// save: there is no `validation_warnings` (nothing was validated, because
-/// nothing is being written) and `backup` is not an `Option` (a run that
-/// created no backup is an `Err`, never a quiet success).
+/// Shaped like [`WriteOutcome`] minus what only makes sense for a save: no
+/// `validation_warnings` (nothing was written), and `backup` isn't an
+/// `Option` (a run that creates no backup is an `Err`, not a quiet success).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateBackupOutcome {
     /// The file that was backed up. Differs from the `target` argument only
@@ -589,17 +503,14 @@ pub struct CreateBackupOutcome {
 
 /// Everything that can go wrong in [`create_backup`].
 ///
-/// Deliberately *not* [`WriteError`]: this operation never opens, renames or
-/// writes the target, so most of that type's variants are unreachable here and
-/// its central "did the target change?" question has no meaning. Every variant
-/// below leaves the target file byte-for-byte untouched - there is no variant
-/// that does not, because nothing in this operation can touch it.
+/// Deliberately not [`WriteError`]: this never opens, renames, or writes
+/// the target, so "did the target change?" has no meaning here - every
+/// variant leaves the target byte-for-byte untouched.
 #[derive(Debug)]
 pub enum CreateBackupError {
-    /// The target path cannot be backed up for a structural reason: it has no
-    /// final file-name component, it is a directory, or it is a symlink that
-    /// could not be resolved. The same check [`write_document`] applies, via
-    /// the same code.
+    /// The target path cannot be backed up for a structural reason: no
+    /// final file-name component, it's a directory, or an unresolvable
+    /// symlink. The same check [`write_document`] applies, via the same code.
     InvalidTarget {
         /// The path as given to [`create_backup`].
         path: PathBuf,
@@ -607,21 +518,17 @@ pub enum CreateBackupError {
         reason: String,
     },
 
-    /// There is nothing on disk at the target yet, so there is nothing to copy
-    /// (a first-ever-save state). Its own variant rather than a silent no-op
-    /// or a generic I/O error: the caller asked to take a snapshot *now*, and
-    /// quietly reporting success for a snapshot that does not exist would be
-    /// the one answer the user cannot act on.
+    /// Nothing exists at the target yet. Its own variant rather than a
+    /// silent no-op, since quietly reporting success for a snapshot that
+    /// doesn't exist is the one answer the user can't act on.
     TargetMissing {
         /// The resolved target that does not exist.
         path: PathBuf,
     },
 
-    /// Inspecting the target, reserving a backup name, copying the target to
-    /// it, or `fsync`ing that copy failed. Nothing else was attempted; pruning
-    /// old automatic backups is deliberately not part of this variant, for the
-    /// same reason it is not part of [`WriteError::Backup`] - see
-    /// [`CreateBackupOutcome::notes`].
+    /// Inspecting the target, reserving a backup name, copying it, or
+    /// `fsync`ing the copy failed. Pruning old automatic backups isn't
+    /// part of this variant (see [`CreateBackupOutcome::notes`]).
     Backup {
         /// The path being inspected or written when the failure occurred.
         path: PathBuf,
@@ -674,15 +581,11 @@ impl std::error::Error for CreateBackupError {
 /// temp file is created, nothing is renamed, nothing is validated, and
 /// [`write_document`] is not called - the target file is only ever *read*.
 ///
-/// The backup it creates is exempt from [`MAX_BACKUPS`] pruning for as long as
-/// it exists; see the module docs for why that is the right policy and
-/// [`prune_backups`] for how it is enforced.
+/// The backup it creates is exempt from [`MAX_BACKUPS`] pruning (see the
+/// module docs).
 ///
-/// Privilege escalation is out of scope here for the same reason it is for
-/// [`write_document`]: this function assumes it already has whatever
-/// permissions it needs and behaves identically whether it is called directly
-/// against a sandbox file or from inside an elevated helper acting on the real
-/// `/etc/fstab`.
+/// Privilege escalation is out of scope, for the same reason as
+/// [`write_document`].
 ///
 /// # Errors
 ///
@@ -701,8 +604,8 @@ pub fn create_backup(target: &Path) -> Result<CreateBackupOutcome, CreateBackupE
 /// The [`FileSystemOps`]-generic implementation behind [`write_document`].
 ///
 /// Crate-private: production callers get the concrete, `std::fs`-backed
-/// [`write_document`], and the generic parameter exists only so unit tests
-/// can inject an I/O failure at one specific syscall.
+/// [`write_document`]; the generic parameter lets unit tests inject an
+/// I/O failure at one specific syscall.
 fn write_document_with<F: FileSystemOps>(
     target: &Path,
     candidate: &Document,
@@ -797,18 +700,13 @@ fn write_document_with<F: FileSystemOps>(
 }
 
 /// The [`FileSystemOps`]-generic implementation behind [`create_backup`].
+/// Crate-private, for the same reason as [`write_document_with`].
 ///
-/// Crate-private for the same reason [`write_document_with`] is: production
-/// callers get the concrete, `std::fs`-backed [`create_backup`], and the
-/// generic parameter exists only so unit tests can inject an I/O failure at
-/// one specific syscall.
-///
-/// Every step here is shared code with the save path - the same
-/// [`resolve_target`], the same [`take_backup`], the same [`prune_backups`] -
-/// so the two can never disagree about which file is the target, what a backup
-/// is called, or which backups are excess. What is *not* shared is everything
-/// after the copy: this function has no temp file, no rename and no read-back,
-/// because it never writes the target.
+/// Shares [`resolve_target`], [`take_backup`], and [`prune_backups`] with
+/// the save path, so the two can never disagree about the target, backup
+/// naming, or which backups are excess. Not shared: everything after the
+/// copy - no temp file, no rename, no read-back, since this never writes
+/// the target.
 fn create_backup_with<F: FileSystemOps>(
     target: &Path,
     fsops: &F,
@@ -1003,11 +901,9 @@ struct BackupFailure {
 
 /// Determines the file that will actually be acted on and stats it.
 ///
-/// Returns the effective target path together with its current [`FileStat`],
-/// or `None` for a target that does not exist yet. A symlinked target is
-/// resolved to its destination (see the module docs for why); a directory, or
-/// a symlink that cannot be resolved (e.g. a dangling one), is rejected as
-/// [`TargetFailure::Invalid`].
+/// Returns the effective target path and its [`FileStat`], or `None` if it
+/// doesn't exist yet. A symlinked target resolves to its destination; a
+/// directory or dangling symlink is rejected as [`TargetFailure::Invalid`].
 fn resolve_target<F: FileSystemOps>(
     target: &Path,
     fsops: &F,
@@ -1028,9 +924,6 @@ fn resolve_target<F: FileSystemOps>(
                     path: target.to_path_buf(),
                     reason: format!("it is a symlink that could not be resolved ({source})"),
                 })?;
-            // Worded for both entry points: a save writes through the link, a
-            // manual backup copies through it, and in both cases the fact the
-            // user needs is *which file was actually acted on*.
             notes.push(format!(
                 "{} is a symlink; it was followed through to {}, which is the file that was \
                  acted on",
@@ -1061,13 +954,9 @@ fn resolve_target<F: FileSystemOps>(
 /// Reserves a fresh backup name for `file_name` in `dir` and copies `source`
 /// into it durably, returning the backup's path.
 ///
-/// The single place a backup copy is ever made, by either entry point: the
-/// name reservation and the copy-then-`fsync` belong together (a reserved name
-/// that is never filled is a name another process could take), and the
-/// durability argument in the module docs has to hold for a manual snapshot
-/// exactly as it does for a save's automatic one.
-///
-/// `manual` picks which of the two recognized name shapes is reserved.
+/// The single place a backup copy is ever made, by either entry point - the
+/// durability argument in the module docs holds for a manual snapshot
+/// exactly as for an automatic one. `manual` picks which name shape is reserved.
 fn take_backup<F: FileSystemOps>(
     fsops: &F,
     source: &Path,
@@ -1098,10 +987,9 @@ fn containing_dir(path: &Path) -> PathBuf {
 /// Builds the same-directory temp file name for `file_name`:
 /// `.<file_name>.rustab.tmp.<pid>`.
 ///
-/// The pid keeps two concurrent Rustab processes (or an elevated helper and
-/// the app itself) from writing the same temp file. Built by concatenating
-/// [`OsString`]s rather than going through `str`, so a non-UTF-8 target file
-/// name is preserved exactly instead of being lossily mangled.
+/// The pid keeps concurrent processes (or an elevated helper and the app
+/// itself) from colliding. Built via [`OsString`] concatenation, not
+/// `str`, so a non-UTF-8 file name isn't lossily mangled.
 fn temp_file_name(file_name: &OsStr) -> OsString {
     let mut name = OsString::from(".");
     name.push(file_name);
@@ -1110,11 +998,8 @@ fn temp_file_name(file_name: &OsStr) -> OsString {
 }
 
 /// Everything a backup's file name encodes: when it was taken, and whether a
-/// user asked for it explicitly.
-///
-/// The parsed counterpart of [`backup_file_name`]; the two are inverses, and
-/// keeping them adjacent is the whole defence against the written and the
-/// recognized shapes drifting apart.
+/// user asked for it explicitly. The parsed counterpart of
+/// [`backup_file_name`] - kept adjacent so the two can't drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackupName {
     /// Whole seconds since the Unix epoch, from the name's first component.
@@ -1134,12 +1019,9 @@ impl BackupName {
 }
 
 /// Builds the backup file name for `file_name` at the given timestamp:
-/// `<file_name>.rustab-backup.<secs>.<nanos>`, both components zero-padded to
-/// a fixed width so names sort chronologically as text as well as numerically,
-/// plus a trailing [`MANUAL_SUFFIX`] when `manual` is set.
-///
-/// The suffix goes *after* the timestamp rather than before it precisely so
-/// the fixed-width chronological text sort is unaffected by a backup's kind.
+/// `<file_name>.rustab-backup.<secs>.<nanos>`, zero-padded so names sort
+/// chronologically as text too, plus a trailing [`MANUAL_SUFFIX`] when
+/// `manual` is set (after the timestamp, so the text sort is unaffected).
 fn backup_file_name(file_name: &OsStr, secs: u64, nanos: u32, manual: bool) -> OsString {
     let mut name = OsString::from(file_name);
     name.push(format!(
@@ -1153,23 +1035,17 @@ fn backup_file_name(file_name: &OsStr, secs: u64, nanos: u32, manual: bool) -> O
     name
 }
 
-/// Parses a directory entry name as a backup of `target_name`, returning what
-/// the name encodes, or `None` if it is not *exactly* a Rustab backup of that
-/// specific target.
+/// Parses a directory entry name as a backup of `target_name`, or `None`
+/// if it isn't *exactly* a Rustab backup of that target.
 ///
-/// Strict on purpose: this predicate is the only thing standing between
-/// [`prune_backups`] and a user's unrelated files, so anything that is not an
-/// exact `<target_name>.rustab-backup.<10 digits>.<9 digits>`, optionally
-/// followed by exactly `.manual` - a different target's backup, a hand-made
-/// `fstab.bak`, a backup name with any *other* extra suffix, a doubled or
-/// differently-cased `.manual`, or a non-numeric timestamp - must be rejected
-/// and left alone.
+/// Strict on purpose - this is the only thing standing between
+/// [`prune_backups`] and a user's unrelated files. Must reject anything
+/// that isn't an exact `<target_name>.rustab-backup.<10 digits>.<9
+/// digits>`, optionally + exactly `.manual`.
 ///
-/// The manual suffix is stripped *before* the timestamp is parsed, and the
-/// timestamp checks are unchanged, so adding the suffix widened the accepted
-/// set by exactly one shape and could not loosen any existing check: anything
-/// that was rejected for its timestamp is still rejected with or without the
-/// suffix (asserted by the strictness tests).
+/// The manual suffix is stripped before the timestamp is parsed, so
+/// adding it widened the accepted set by exactly one shape without
+/// loosening the timestamp check.
 fn backup_name_of(name: &OsStr, target_name: &OsStr) -> Option<BackupName> {
     let rest = name.as_bytes().strip_prefix(target_name.as_bytes())?;
     let rest = rest.strip_prefix(BACKUP_INFIX.as_bytes())?;
@@ -1218,10 +1094,9 @@ fn sorted_backups(
 /// Picks an unused timestamped backup path in `dir` for `file_name`, of the
 /// kind `manual` selects.
 ///
-/// Retries with a fresh timestamp if the name is somehow already taken, so a
-/// backup never silently overwrites an older one. Failing to find a free name
-/// is reported as a [`BackupFailure`], which aborts the operation with the
-/// target untouched - the safe direction to fail in.
+/// Retries with a fresh timestamp on a collision, so a backup never
+/// silently overwrites an older one. Running out of attempts aborts the
+/// operation via [`BackupFailure`] with the target untouched.
 fn reserve_backup_path<F: FileSystemOps>(
     fsops: &F,
     dir: &Path,
@@ -1254,19 +1129,12 @@ fn reserve_backup_path<F: FileSystemOps>(
 /// Deletes **automatic** backups of `file_name` in `dir` beyond
 /// [`MAX_BACKUPS`], oldest first, recording what it deleted in `pruned`.
 ///
-/// Manual backups are invisible to this function in both directions: they are
-/// not counted when deciding how many automatic backups are excess, and they
-/// are never deleted to make room. See the module docs for why that is the
-/// policy; the short version is that a user-requested snapshot must not be
-/// evicted by unrelated later saves, and manual snapshots must not be able to
-/// evict the automatic safety net either.
+/// Manual backups are invisible here in both directions: not counted as
+/// excess, and never deleted to make room (see module docs).
 ///
-/// Deliberately infallible: pruning happens *after* the new backup exists and
-/// *before* the swap, and a stale extra backup is harmless, so neither an
-/// unreadable directory nor an undeletable old backup is allowed to abort an
-/// operation that is otherwise safe to perform. Such failures are not silent
-/// either - each one is recorded in `notes` and surfaced via
-/// [`WriteOutcome::notes`] or [`CreateBackupOutcome::notes`].
+/// Deliberately infallible: a stale extra backup is harmless, so neither
+/// an unreadable directory nor an undeletable old backup aborts an
+/// otherwise-safe operation. Failures are still recorded in `notes`.
 fn prune_backups<F: FileSystemOps>(
     fsops: &F,
     dir: &Path,
@@ -1326,9 +1194,8 @@ fn unix_timestamp_parts() -> (u64, u32) {
 /// symlink and a directory apart from a regular file, and to carry the
 /// previous target's identity onto its replacement.
 ///
-/// A hand-rollable struct rather than [`fs::Metadata`] specifically so the
-/// test spy can synthesize one - `fs::Metadata` cannot be constructed outside
-/// `std`.
+/// A hand-rolled struct rather than [`fs::Metadata`], since the test spy
+/// needs to synthesize one and `fs::Metadata` can't be built outside `std`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStat {
     /// Whether the path itself is a symlink (i.e. from an `lstat`, not a
@@ -1346,18 +1213,15 @@ struct FileStat {
 
 /// The individual filesystem operations [`write_document_with`] performs.
 ///
-/// This exists purely as a failure-injection seam: it is a thin, mechanical
-/// wrapper over the syscalls involved, with no policy of its own, so that the
-/// production path ([`RealFs`]) stays auditable as plain `std::fs` code while
-/// tests can replace exactly one operation with an error. Every method maps
-/// to one syscall (or, for [`Self::create_and_write`] and
-/// [`Self::copy_durably`], one obvious pair).
+/// A failure-injection seam: a thin, policy-free wrapper over the
+/// syscalls, so the production path ([`RealFs`]) stays auditable as plain
+/// `std::fs` code while tests can replace exactly one operation with an
+/// error. Every method maps to one syscall (or one obvious pair, for
+/// [`Self::create_and_write`]/[`Self::copy_durably`]).
 trait FileSystemOps {
-    /// An open, writable handle to a file created by
-    /// [`Self::create_and_write`]. Operations that must act on the open file
-    /// description - `fchmod`, `fchown`, `fsync` - take this rather than a
-    /// path, so they provably affect the file that was just written and not
-    /// whatever a path might point at by then.
+    /// A handle from [`Self::create_and_write`]. Operations on the open
+    /// file description (`fchmod`/`fchown`/`fsync`) take this rather than
+    /// a path, so they provably affect the file just written.
     type File;
 
     /// `lstat`: metadata for `path` itself, not following a final symlink.
@@ -1569,12 +1433,11 @@ mod tests {
         Read,
     }
 
-    /// A delegating spy: every operation is performed for real against the
-    /// filesystem, except one chosen operation (optionally its *n*-th
-    /// occurrence) which fails with an injected `io::Error`. It also records
-    /// the exact sequence of operations, so the spec-mandated
-    /// write/fsync/fsync/rename ordering can be asserted rather than
-    /// eyeballed.
+    /// A delegating spy: every operation runs for real against the
+    /// filesystem, except one chosen operation (optionally its nth
+    /// occurrence) which fails with an injected `io::Error`. Also records
+    /// the operation sequence, so the spec-mandated write/fsync/fsync/rename
+    /// ordering can be asserted rather than eyeballed.
     struct SpyFs {
         inner: RealFs,
         fail_on: Option<Op>,
