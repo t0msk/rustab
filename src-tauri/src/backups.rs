@@ -2,54 +2,43 @@
 //! frontend-supplied backup path against that list.
 //!
 //! Every function here takes the file whose backups are wanted as a `&Path`
-//! parameter and has no opinion about which file that should be. Since T35
-//! that is deliberately *not* always the resolved [`crate::target`]: the
-//! commands pass the **backup-owning** path
-//! (`crate::commands`'s `backup_target_path`), which for a default launch is
-//! the real `/etc/fstab` rather than the working draft. Read "the target"
-//! below as "the file whose backups these are".
+//! parameter, with no opinion on which file that is - not always the
+//! resolved [`crate::target`], since commands pass the **backup-owning**
+//! path (`crate::commands`'s `backup_target_path`), which for a default
+//! launch is the real `/etc/fstab` rather than the working draft.
 //!
 //! ## Why a frontend-supplied path is safe here
 //!
-//! Every other command refuses to accept a path at all, precisely so a buggy
-//! or compromised UI cannot redirect a read or a write (see
-//! [`crate::target`]). `restore_backup`, `read_backup` and `delete_backup`
-//! are the only exceptions, and they are safe for a structural reason rather
-//! than a careful-string-checking reason: the path they are given is never
-//! used as a path until it has been found in the list
-//! [`fstab_core::writer::list_backups`] reports for *the backup-owning file
-//! this session is working on*.
-//! That list is built by `fstab-core` from the backup naming scheme it owns,
-//! and only from the target's own directory. So `/etc/shadow`,
-//! `../../etc/fstab`, a backup of a *different* target sitting in the same
-//! directory, and a name that merely resembles the scheme (wrong timestamp
-//! width, a non-numeric timestamp, an extra suffix) all fail closed with
+//! Every other command refuses to accept a path at all, so a buggy or
+//! compromised UI can't redirect a read or write (see [`crate::target`]).
+//! `restore_backup`, `read_backup`, and `delete_backup` are the exceptions,
+//! safe for a structural reason: the path is never used until it's found
+//! in the list [`fstab_core::writer::list_backups`] reports for the
+//! backup-owning file this session is working on. That list comes from
+//! `fstab-core`'s own naming scheme, scoped to the target's own directory -
+//! so `/etc/shadow`, `../../etc/fstab`, another target's backup in the
+//! same directory, or a near-miss name all fail closed with
 //! [`BackupError::NotABackupOfTarget`].
 //!
-//! What this does *not* claim - deliberately - is that the file was created
-//! by this installation: a file in the target's directory whose name matches
-//! the scheme exactly counts as a backup of that target, because in that
-//! directory the name *is* the identity. That costs nothing, because creating
-//! such a file next to `/etc/fstab` already requires the write access that
-//! would let someone edit `/etc/fstab` directly, and a restore still goes
-//! through validation, a fresh backup and the atomic write like any other
-//! save. Both halves of this rule are asserted by the tests below.
+//! This doesn't claim the file was created by this installation - a file
+//! whose name matches the scheme exactly counts as a backup, since in that
+//! directory the name *is* the identity. That costs nothing: creating such
+//! a file next to `/etc/fstab` already requires write access that would
+//! let someone edit `/etc/fstab` directly, and a restore still goes
+//! through validation and an atomic write like any other save.
 //!
-//! Matching is by identity, not by string equality alone, so an equivalent
-//! spelling of the same file (a symlinked directory, a `./` prefix) still
-//! resolves - but to the canonical path from the list, which is what is then
-//! read.
+//! Matching is by identity, not string equality, so an equivalent spelling
+//! of the same file (a symlinked directory, a `./` prefix) still resolves,
+//! to the canonical path from the list.
 //!
 //! ## Called on both sides of the privilege boundary
 //!
 //! [`resolve_requested`] is also called *inside* the elevated process, by
-//! [`crate::privileged`]'s backup-deletion handler, against the backup list of
-//! the target that process has already verified it is allowed to manage. The
-//! unprivileged side resolving first is only a courtesy (fail without a
-//! password prompt for a path that cannot work); the elevated side's own call
-//! is the one that decides, because nothing the unprivileged side claims is
-//! trusted there. Both calls run this same function, so the two can never
-//! disagree about what counts as a backup.
+//! [`crate::privileged`]'s backup-deletion handler, against the backup
+//! list of the target it has already verified it may manage. The
+//! unprivileged side resolving first is just a courtesy; the elevated
+//! side's own call is what actually decides, since nothing the
+//! unprivileged side claims is trusted there.
 
 use crate::dto::BackupInfoDto;
 use fstab_core::writer;
@@ -108,18 +97,15 @@ impl std::error::Error for BackupError {
     }
 }
 
-/// Lists `target`'s backups, **newest first**, with the metadata the restore
-/// panel displays (`docs/UI_DESIGN.md` §7).
+/// Lists `target`'s backups, **newest first**, with the metadata the
+/// restore panel displays (`docs/UI_DESIGN.md` §7).
 ///
-/// [`writer::list_backups`] returns them oldest first; this reverses that
-/// order because every consumer shows the most recent restore point at the
-/// top, and doing the flip once here keeps the frontend from having to know
-/// (or get wrong) which end is which. A backup that vanishes between the
-/// listing and the `stat` is skipped rather than failing the whole command.
+/// [`writer::list_backups`] returns them oldest first; reversed here once
+/// so the frontend doesn't need to know which end is which. A backup that
+/// vanishes between the listing and the `stat` is skipped, not failed.
 ///
-/// Both kinds are listed together, in one chronological order, each row
-/// carrying [`BackupInfoDto::is_manual`] - the kind is a label on a backup,
-/// not a separate list.
+/// Both kinds are listed together, each row carrying
+/// [`BackupInfoDto::is_manual`] - the kind is a label, not a separate list.
 ///
 /// # Errors
 ///
@@ -164,16 +150,15 @@ fn describe(target: &Path, backup: &Path, manual: bool) -> Option<BackupInfoDto>
     })
 }
 
-/// Describes a single backup of `target` that has *just* been created, for a
-/// caller that already knows its path (currently
+/// Describes a single backup of `target` that has *just* been created, for
+/// a caller that already knows its path (currently
 /// [`crate::commands::create_backup`]).
 ///
-/// Goes back through [`writer::list_backups`] rather than taking the caller's
-/// word for the kind, so the row handed to the frontend is built from the same
-/// source of truth as every row [`list`] produces - including when the backup
-/// was created inside the elevated helper, where this process never saw it
-/// being made. A path that is not (or is no longer) one of `target`'s backups
-/// yields `None`.
+/// Goes back through [`writer::list_backups`] rather than trusting the
+/// caller's own idea of the kind, so the row is built from the same source
+/// of truth as every row [`list`] produces, even when the backup was
+/// created inside the elevated helper. `None` if the path isn't (or is no
+/// longer) one of `target`'s backups.
 ///
 /// # Errors
 ///
@@ -256,16 +241,12 @@ pub fn read_text(backup: &Path) -> io::Result<String> {
     })
 }
 
-/// Reads a backup's modification time as whole seconds since the Unix epoch,
-/// or `None` if the platform cannot report it.
+/// Reads a backup's modification time as whole seconds since the Unix
+/// epoch, or `None` if the platform can't report it.
 ///
-/// The mtime is used as the "taken at" timestamp rather than re-deriving it
-/// from the `<secs>.<nanos>` suffix in the file name: that suffix's exact
-/// format is `fstab-core`'s private business (it owns both the writing and
-/// the matching of those names), and duplicating the parser here would create
-/// a second place that has to agree with it. `fs::copy` gives the backup a
-/// fresh mtime at the moment the backup is taken, so the two are equivalent
-/// in practice.
+/// Used as the "taken at" timestamp rather than re-parsing the file name's
+/// `<secs>.<nanos>` suffix, which is `fstab-core`'s private format - this
+/// avoids a second parser that would have to agree with it.
 fn modified_unix_secs(metadata: &fs::Metadata) -> Option<u64> {
     metadata
         .modified()
