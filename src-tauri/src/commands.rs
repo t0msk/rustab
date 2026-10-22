@@ -1183,40 +1183,23 @@ fn delete_backup_from(
 /// The one dispatch point between the two backup-deletion paths, with the
 /// elevated half injectable.
 ///
-/// Mirrors [`save_document_with`] exactly, and for the same reason: the
-/// dispatch decision ("the real `/etc/fstab`'s backups are never unlinked by
-/// this process") has to be *asserted*, and asserting it against the
-/// production `privileged::delete_backup_elevated` would mean a unit test that
-/// launches `pkexec` and waits on an authentication prompt.
+/// Mirrors [`save_document_with`], for the same reason: the dispatch
+/// decision ("the real `/etc/fstab`'s backups are never unlinked by this
+/// process") has to be asserted without a unit test launching `pkexec`.
 ///
-/// `backup_path` is resolved before the dispatch, in **both** branches. For
-/// the elevated branch that is only a courtesy - it means a path that cannot
-/// work is refused without making the user authenticate first, the same
-/// courtesy [`privileged::save_elevated`]'s pre-validation provides. The
-/// authoritative check is the elevated process's own
-/// [`backups::resolve_requested`] call, which does not trust this one (see
-/// [`crate::privileged`]).
+/// `backup_path` is resolved before dispatch in both branches. For the
+/// elevated branch that's only a courtesy, refusing a path that can't
+/// work before the password prompt - the authoritative check is the
+/// elevated process's own [`backups::resolve_requested`] call, which
+/// doesn't trust this one (see [`crate::privileged`]).
 ///
-/// ## T35: the T34 gap this function recorded is now closed
-///
-/// T34 left this function (and [`create_backup_with`], [`list_backups`],
-/// [`read_backup`] and [`open_backup_location`]) keyed on raw `target.is_real`
-/// and acting on `target.path`, while [`save_document_with`] had already moved
-/// to [`ActiveTarget::source`]. On a default launch that meant the backup
-/// surface described a *different file* than the one a save writes: the save's
-/// own automatic backups landed beside `/etc/fstab` where nothing listed them,
-/// while the Backups panel offered restore points of the working draft.
-///
-/// T35 resolved the question that gap was waiting on - the repo owner's reason
-/// for wanting backups at all is "a real copy of the real fstab I can restore
-/// from a rescue CD" (`PROJECT_PLAN.md` §T35), which a backup of the draft
-/// cannot serve. So the backup-owning path is now [`backup_target_path`] and
-/// the dispatch is now [`backups_are_elevated`]: on a default launch this
-/// unlinks one of the real `/etc/fstab`'s backups, through the elevated helper,
-/// because those files live in root-owned `/etc/`. The frontend side of the
-/// same decision is `BackupDeleteConfirmDialog`'s `writes_real_file` gate, so
-/// the newly privileged delete is still behind the explicit checkbox T34
-/// requires for every real-touching action (`docs/UI_DESIGN.md` §2).
+/// The backup-owning path is [`backup_target_path`] and the dispatch is
+/// [`backups_are_elevated`]: on a default launch this unlinks one of the
+/// real `/etc/fstab`'s backups through the elevated helper, since those
+/// files live in root-owned `/etc/`. The frontend side of the same
+/// decision is `BackupDeleteConfirmDialog`'s `writes_real_file` gate, so
+/// the privileged delete is still behind the explicit checkbox required
+/// for every real-touching action (`docs/UI_DESIGN.md` §2).
 fn delete_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -1264,46 +1247,31 @@ fn create_backup_of(
 /// The one dispatch point between the two backup-creation paths, with the
 /// elevated half injectable.
 ///
-/// Mirrors [`save_document_with`] and [`delete_backup_with`] exactly, and for
-/// the same reason: the dispatch decision ("the real `/etc/fstab` is never
-/// copied by this process") has to be *asserted*, and asserting it against the
-/// production [`privileged::create_backup_elevated`] would mean a unit test
-/// that launches `pkexec` and waits on an authentication prompt.
+/// Mirrors [`save_document_with`]/[`delete_backup_with`], for the same
+/// reason: the dispatch decision ("the real `/etc/fstab` is never copied
+/// by this process") has to be asserted without a unit test launching `pkexec`.
 ///
-/// Which file is copied is [`backup_target_path`], not the resolved target:
-/// since T35 a default launch backs up the real `/etc/fstab` - the file its
-/// saves write, and the one the user actually wants a rescue-CD-restorable
-/// copy of - rather than the working draft. The dispatch follows from that and
-/// is [`backups_are_elevated`], the same predicate [`delete_backup_with`]
-/// uses: creating a new file in root-owned `/etc/` needs the elevated helper,
-/// while an explicit override naming a user-owned file is copied in-process.
-/// Before T35 both halves were keyed on raw `target.is_real` and
-/// `target.path`; see [`delete_backup_with`]'s own T35 note for the full
-/// reasoning, which applies identically here.
+/// Which file is copied is [`backup_target_path`], not the resolved
+/// target, so a default launch backs up the real `/etc/fstab` rather
+/// than the working draft. Dispatch follows the same
+/// [`backups_are_elevated`] predicate [`delete_backup_with`] uses.
 ///
-/// Both branches end in the same `fstab_core::writer::create_backup` - the
-/// in-process branch calls it directly, the elevated branch calls it inside a
-/// root process that does nothing else. Neither branch is given a path to
-/// write to: `create_backup` derives the backup's name from the target it was
-/// handed.
+/// Both branches end in the same `fstab_core::writer::create_backup` -
+/// in-process directly, or elevated inside a root process that does
+/// nothing else - and neither is given a path to write to; the backup's
+/// name comes from the target it was handed.
 ///
 /// The resulting path is turned back into a [`BackupInfoDto`] by
-/// [`backups::describe_one`], the same helper [`backups::list`] builds its
-/// rows with, so a freshly created backup is described exactly the way the
-/// next `list_backups` will describe it - including its `is_manual` flag,
-/// which is read back from the naming scheme rather than assumed here.
-///
-/// ## T39: the one operation that needs a fresh mirror
+/// [`backups::describe_one`], the same helper [`backups::list`] uses, so
+/// a freshly created backup is described exactly as the next
+/// `list_backups` will describe it.
 ///
 /// In fallback mode `owner` is the mirror file rather than the real
-/// `/etc/fstab`, so this is the one backup operation that has to *write*
-/// before it reads: [`refresh_backup_mirror`] copies the real file's current
-/// bytes onto the mirror first, and only then is the mirror copied to a
-/// backup. The result is therefore a snapshot of `/etc/fstab` as of the moment
-/// the user pressed the button, which is the only thing that would make this
-/// button honest. The dispatch below then takes the in-process branch (see
-/// [`backups_are_elevated`]), because the fallback directory is the user's
-/// own - the elevated helper is neither needed nor asked for.
+/// `/etc/fstab`, so this is the one backup operation that writes before
+/// it reads: [`refresh_backup_mirror`] copies the real file's current
+/// bytes onto the mirror first, so the result is a snapshot as of the
+/// moment the user pressed the button. The dispatch below then takes
+/// the in-process branch, since the fallback directory is the user's own.
 fn create_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -3825,27 +3793,20 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
     }
 
-    /// T34's obligation (f) plus T35's half of the same command, asserted
-    /// together through the production [`restore_backup_with`] rather than a
-    /// hand-rolled re-enactment of its body.
+    /// Asserts, through the production [`restore_backup_with`], that
+    /// backup resolution and the dual write agree on which file is real:
     ///
-    /// Both halves matter and they used to disagree:
+    /// - **Resolution:** `backup_path` resolves against the *real file's*
+    ///   backup list, the only list `list_backups` offers a default
+    ///   launch - the draft has a different backup, asserted refused below.
+    /// - **Write:** the restore delegates to [`save_document_with`] with
+    ///   no write code of its own, so it inherits the dual write: one
+    ///   elevated write of the real `/etc/fstab`, then the draft mirrored
+    ///   to match, marker included.
     ///
-    /// - **T35 (resolution):** `backup_path` is resolved against the *real
-    ///   file's* backup list, which is the only list `list_backups` offers a
-    ///   default launch. The backup restored here exists only beside the real
-    ///   stand-in; the draft has a different one, asserted refused below.
-    /// - **T34 (write):** the restore itself has no write code - it delegates
-    ///   to [`save_document_with`] - so it inherits the dual write: one
-    ///   elevated write of the real `/etc/fstab`, then the draft mirrored to
-    ///   match, marker included.
-    ///
-    /// The elevate seam is injected, so this neither launches `pkexec` nor
-    /// touches the machine's own `/etc/fstab`; since T36 the real file's path
-    /// is the injected `real_fstab` argument on both halves (the backup
-    /// resolution *and* the write), so the elevated call is aimed at the
-    /// stand-in here - production's own call site passes
-    /// [`target::REAL_FSTAB_PATH`] (see [`restore_backup`]).
+    /// The elevate seam is injected, so this neither launches `pkexec`
+    /// nor touches the machine's own `/etc/fstab`; production's own call
+    /// site passes [`target::REAL_FSTAB_PATH`] (see [`restore_backup`]).
     #[test]
     fn restoring_a_backup_resolves_against_the_real_fstab_and_inherits_the_dual_write() {
         let dir = TempDir::new("restore-dual-write");
