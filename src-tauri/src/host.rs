@@ -1,78 +1,59 @@
-//! Reaching the **real host** `/etc/` from inside a Flatpak sandbox - the one
-//! place that knows this process might not be looking at the machine it is
-//! running on (T40).
+//! Reaching the **real host** `/etc/` from inside a Flatpak sandbox - the
+//! one place that knows this process might not be looking at the machine
+//! it's running on.
 //!
-//! ## The problem, and the empirically confirmed answer
+//! ## The problem, and the confirmed answer
 //!
-//! Flatpak reserves the whole `/etc` path space. The `/etc` a sandboxed
-//! process sees is the runtime's own, and `--filesystem=/etc/fstab:rw` is
-//! **not** honoured at all - the sandbox refuses the grant outright
-//! (`F: Not sharing "/etc/fstab" with sandbox: Path "/etc" is reserved by
-//! Flatpak`, confirmed by running two throwaway diagnostic Flatpak apps).
-//! Nothing reaches the real file through it: not a read, not a write, and not
-//! a write made by an elevated child either, because `pkexec` changes the
-//! **UID** of a process, not its **mount namespace** - the elevated child
-//! inherits the sandbox it was started in and so sees the same synthetic
-//! `/etc`. T39's module docs in [`crate::backup_location`] assumed otherwise;
-//! that assumption is what this module corrects.
+//! Flatpak reserves the whole `/etc` path space: the `/etc` a sandboxed
+//! process sees is the runtime's, and `--filesystem=/etc/fstab:rw` is
+//! outright refused. A `pkexec` child inherits the same sandbox (`pkexec`
+//! changes UID, not mount namespace), so elevating alone doesn't help either.
 //!
 //! What does work, confirmed end-to-end with a manifest granting only
-//! `--talk-name=org.freedesktop.Flatpak` and no `--filesystem=` at all:
+//! `--talk-name=org.freedesktop.Flatpak`:
 //!
-//! - `flatpak-spawn --host cat /etc/fstab` prints the real host file verbatim;
-//! - `flatpak-spawn --host id` reports the real host user, which is the proof
-//!   that the spawned process is genuinely outside the sandbox's mount
-//!   namespace rather than merely outside its cgroup;
+//! - `flatpak-spawn --host cat /etc/fstab` prints the real host file;
+//! - `flatpak-spawn --host id` reports the real host user, proving the
+//!   spawned process is genuinely outside the sandbox's mount namespace;
 //! - `flatpak-spawn --host sh -c 'touch /etc/.test'` fails with
-//!   `Permission denied`, exactly as an unprivileged host process should;
+//!   `Permission denied`, as an unprivileged host process should;
 //! - `flatpak-spawn --host pkexec sh -c 'touch /etc/.test && rm -f /etc/.test'`
-//!   **succeeds** - genuine, unrestricted root access to the real `/etc/`.
+//!   succeeds - genuine root access to the real `/etc/`.
 //!
-//! `flatpak-spawn` is part of the `org.gnome.Platform`/`org.freedesktop.*`
-//! runtimes this app already builds against, so this is not a new runtime
-//! dependency. It is the standard mechanism Flatpak'd applications that have
-//! to touch host system files use, and it is what this module wraps.
+//! `flatpak-spawn` ships with the runtimes this app already builds
+//! against, so this is the standard mechanism, not a new dependency.
 //!
-//! ## What this module provides, and what it deliberately does not
+//! ## What this module provides, and what it doesn't
 //!
-//! Two things, and nothing else:
+//! 1. [`RealFileReader`] - an unprivileged read of a host path, injected
+//!    into every production call site that reads the real `/etc/fstab`
+//!    (`crate::target`'s draft refresh and change-detection,
+//!    [`crate::commands`]'s re-sync command, and
+//!    [`crate::backup_location::refresh_mirror`]). A one-method trait,
+//!    shaped like `fstab_core::writer`'s own `FileSystemOps` seam.
+//! 2. [`elevated_self_plan`] - how the elevated helper is spawned: under
+//!    Flatpak, `pkexec` must be invoked on the host
+//!    (`flatpak-spawn --host pkexec …`) and must name a **host** path for
+//!    this binary, since `std::env::current_exe()` inside the sandbox
+//!    yields `/app/bin/rustab`, which doesn't exist outside it.
 //!
-//! 1. [`RealFileReader`] - an **unprivileged read** of a host path, injected
-//!    into the three production call sites that read the real `/etc/fstab`
-//!    (`crate::target`'s draft refresh and [`crate::target::ExternalChangeGuard`]'s
-//!    check, [`crate::commands`]'s re-sync command, and
-//!    [`crate::backup_location::refresh_mirror`]). A one-method trait with a
-//!    production impl and a test double, deliberately in the shape
-//!    `fstab_core::writer`'s own `FileSystemOps` seam already established for
-//!    this codebase.
-//! 2. [`elevated_self_plan`] - *how* the elevated helper is spawned, which is
-//!    the only thing T40 changes in [`crate::privileged`]: under Flatpak the
-//!    `pkexec` call has to be made **on the host** (`flatpak-spawn --host
-//!    pkexec …`), and it has to name a **host** path for this binary, because
-//!    `std::env::current_exe()` inside the sandbox yields `/app/bin/rustab`,
-//!    a path that does not exist outside it.
+//! It doesn't hide the sandbox from the rest of the program: every
+//! function is explicit about which side of the boundary it acts on,
+//! every seam is injected rather than resolved globally, and nothing here
+//! ever writes a file - the single write path is still
+//! `fstab_core::writer::write_document`, run from exactly one elevated
+//! process (see [`crate::privileged`]).
 //!
-//! What it does *not* do is hide the sandbox from the rest of the program.
-//! Every function here is explicit about which side of the boundary it acts
-//! on, every seam is injected rather than resolved globally inside the code
-//! that uses it, and nothing in this module ever writes a file: the single
-//! write path in Rustab is still `fstab_core::writer::write_document`, called
-//! from exactly one elevated process (see [`crate::privileged`]).
+//! ## Why `cargo test` never touches any of this
 //!
-//! ## Why `cargo test` can never reach any of this
-//!
-//! The production reader is chosen by [`real_file_reader`], which is called
-//! only from the handful of production wrappers ([`crate::target::active_target`],
-//! the `#[tauri::command]` functions) that also fill in the real `/etc/fstab`
-//! path. Every testable core function takes its reader as a parameter and the
-//! tests pass [`DirectFs`] or a double of their own, exactly as
-//! `target::resolve` and `backup_location::detect` already take the paths they
-//! would otherwise have read from constants. The two pieces that genuinely
-//! have to spawn a process ([`HostSpawn::read`] and the elevated spawn) are
-//! split into a pure "what would be run" half ([`Spawn`], asserted literally
-//! by the tests below) and a pure "what did it mean" half
-//! ([`interpret_read_output`]), the same split
-//! `privileged::interpret_write_output` already uses for the elevated call.
+//! The production reader comes from [`real_file_reader`], called only
+//! from the production wrappers that also fill in the real path. Every
+//! testable core function takes its reader as a parameter, so tests pass
+//! [`DirectFs`] or their own double. The two pieces that genuinely spawn a
+//! process ([`HostSpawn::read`] and the elevated spawn) are split into a
+//! pure "what would be run" half ([`Spawn`], asserted literally by tests)
+//! and a pure "what did it mean" half ([`interpret_read_output`]), the
+//! same split `privileged::interpret_write_output` uses.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -81,30 +62,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The file whose existence means "this process is running inside a Flatpak
-/// sandbox", i.e. that the `/etc` it can see is the runtime's and not the
-/// host's.
+/// The file whose existence means "this process is running inside a
+/// Flatpak sandbox" - the `/etc` it sees is the runtime's, not the host's.
 ///
-/// Flatpak mounts this file into every sandbox it starts and documents it as
-/// the way an application detects that it is sandboxed; it is the same signal
-/// GLib's own containment check uses. Checked as a path rather than through
-/// the `FLATPAK_ID` environment variable because an environment variable can
-/// be unset, inherited or forged by whatever launched the process, while this
-/// mount is part of the sandbox itself.
+/// Flatpak mounts this into every sandbox as the documented way an app
+/// detects containment (the same signal GLib's own check uses). Checked
+/// as a path rather than `FLATPAK_ID`, since an env var can be unset,
+/// inherited, or forged, while this mount is part of the sandbox itself.
 ///
-/// Lives here rather than in [`crate::backup_location`] (where T39 first
-/// introduced it) because it is now the input to *two* unrelated decisions -
-/// "how do I read the real `/etc/fstab`?" and "where do this file's manual
-/// backups live?" - and a second copy of the string is a future disagreement
-/// waiting to happen. `backup_location` reads it from here.
+/// Lives here rather than in [`crate::backup_location`] since it's the
+/// input to two unrelated decisions ("how do I read the real
+/// `/etc/fstab`?" and "where do manual backups live?") - `backup_location`
+/// reads it from here rather than keeping a second copy.
 ///
-/// Note the one property that makes the whole T40 design hold together: the
-/// process `flatpak-spawn --host` starts is **outside** the sandbox, so it has
-/// no `/.flatpak-info`. The elevated helper therefore selects [`DirectFs`] on
-/// its own, with no flag and no argument to pass it, and
-/// `privileged::handle_write`'s own `fs::read` of the target is a read of the
-/// real host file - which is exactly what that check needs and why nothing in
-/// `privileged`'s elevated half had to change.
+/// The property that makes this whole design hold together: a process
+/// `flatpak-spawn --host` starts is outside the sandbox, so it has no
+/// `/.flatpak-info`. The elevated helper therefore selects [`DirectFs`] on
+/// its own, with no flag needed, and its `fs::read` of the target is
+/// already a read of the real host file.
 pub(crate) const SANDBOX_MARKER_PATH: &str = "/.flatpak-info";
 
 /// The binary that runs a command outside the sandbox, on the host.
@@ -136,59 +111,41 @@ const SH: &str = "sh";
 /// call failed. So the mapping has to be fail-safe, and the three candidate
 /// mechanisms are not equally good at that:
 ///
-/// - **Parse `cat`'s stderr** (`cat: /etc/fstab: No such file or directory`):
-///   locale-dependent and implementation-dependent. Rejected outright.
+/// - **Parse `cat`'s stderr**: locale- and implementation-dependent. Rejected.
 /// - **A preceding `flatpak-spawn --host test -e <path>` probe**: `test`
-///   exits 1 for "does not exist", but `flatpak-spawn` *itself* also exits 1
-///   when it cannot reach the portal at all (confirmed: a sandbox without
-///   `--talk-name=org.freedesktop.Flatpak` prints `Portal call failed` and
-///   fails). The two cases are indistinguishable from the exit code, which is
-///   precisely the confusion that must not happen - and it costs a second
-///   process per read.
+///   exits 1 for "does not exist", but `flatpak-spawn` itself also exits 1
+///   when it can't reach the portal at all - the two failures are
+///   indistinguishable from the exit code, and it costs a second process.
 /// - **This script**: the only way to see [`MISSING_EXIT`] is for a host
-///   shell to have run and found the path absent. `flatpak-spawn` failing,
-///   `sh` or `cat` missing, the portal being denied, a permission error, a
-///   signal - none of them can produce that number, so all of them land on
-///   "some other read error", which is the safe direction to be wrong in.
+///   shell to have run and found the path absent. Every other failure mode
+///   (missing binary, denied portal, permission error, signal) lands on
+///   "some other read error" instead - the safe direction to be wrong in.
 ///
-/// The path is passed as a positional argument (`$1`) and never interpolated
-/// into the script text, so there is no quoting or injection question to get
-/// wrong - even though in production the only path this is ever called with is
-/// the hardcoded [`crate::target::REAL_FSTAB_PATH`].
+/// The path is a positional argument (`$1`), never interpolated into the
+/// script text, so there's no quoting/injection question.
 const READ_SCRIPT: &str = r#"if [ -e "$1" ]; then exec cat -- "$1"; else exit 44; fi"#;
 
 /// The script [`host_path_exists`] runs on the host: succeed if the path is
-/// there, exit [`MISSING_EXIT`] if it is not.
+/// there, exit [`MISSING_EXIT`] if it isn't.
 ///
-/// A separate script from [`READ_SCRIPT`] rather than a `-e`-only mode of it,
-/// because the two answer different questions ("what does this file hold?" vs.
-/// "is this path there?") and the second one's whole value is that it cannot
-/// be confused with the first one's failure. Same positional-argument and
-/// sentinel conventions; see [`READ_SCRIPT`] for the reasoning behind both.
+/// A separate script from [`READ_SCRIPT`], not a `-e`-only mode of it, so
+/// "is this path there?" can never be confused with "what does it hold?".
 const EXISTS_SCRIPT: &str = r#"if [ -e "$1" ]; then exit 0; else exit 44; fi"#;
 
-/// The exit code [`READ_SCRIPT`] and [`EXISTS_SCRIPT`] use to say "that path
-/// does not exist on the host" - the only thing [`interpret_read_output`] ever
-/// maps to [`io::ErrorKind::NotFound`], and the only thing
-/// [`host_path_exists`] ever reports as a clean "no".
+/// The exit code [`READ_SCRIPT`]/[`EXISTS_SCRIPT`] use for "that path
+/// doesn't exist on the host" - the only code [`interpret_read_output`]
+/// maps to [`io::ErrorKind::NotFound`].
 ///
-/// Deliberately not 1 or 2 (which `sh`, `cat` and `flatpak-spawn` all use for
-/// their own failures) and well outside the 126/127/128+n range a shell uses
-/// for "could not execute" and "died on a signal". The number is duplicated
-/// literally inside both scripts because a shell script cannot interpolate a
-/// Rust constant; [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
+/// Not 1 or 2 (used by `sh`/`cat`/`flatpak-spawn` failures) and outside the
+/// 126/127/128+n shell-signal range. Duplicated literally in both scripts
+/// since a shell script can't interpolate a Rust constant;
+/// [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
 /// pins the three together.
 const MISSING_EXIT: i32 = 44;
 
 /// How much of a failed host command's stderr is quoted back in the
-/// `io::Error` it becomes.
-///
-/// The same bound, for the same reason, as `privileged`'s own
-/// `STDERR_EXCERPT_LIMIT`: enough to carry a portal error or a shell
-/// diagnostic into a bug report, not enough to paste a runaway program's whole
-/// output into a UI string. Kept as a separate constant rather than shared
-/// because the two modules' excerpts travel to different places and neither
-/// should silently change the other's.
+/// resulting `io::Error` - same bound and reason as `privileged`'s own
+/// `STDERR_EXCERPT_LIMIT`, kept separate since the two travel to different places.
 const STDERR_EXCERPT_LIMIT: usize = 500;
 
 /// Rustab's Flatpak application id - `tauri.conf.json`'s `identifier`.
@@ -227,19 +184,14 @@ const BIN_DIR: &str = "bin";
 /// Reads a file that lives on the **host**, whichever side of a sandbox
 /// boundary this process is on.
 ///
-/// One method, because one operation is all the real `/etc/fstab`'s readers
-/// need: every one of them wants the file's whole current content as bytes and
-/// nothing else (no metadata, no directory listing, no partial read). Shaped
-/// after `fstab_core::writer`'s `FileSystemOps` trait - a method per syscall,
-/// a production impl, a test double - because that is this codebase's
-/// established way of making filesystem-touching code testable, and a second
-/// convention for the same job would be worse than a slightly small trait.
+/// One method, since every real `/etc/fstab` reader wants only the whole
+/// current content as bytes - no metadata, no listing, no partial read.
+/// Shaped after `fstab_core::writer`'s `FileSystemOps` seam: a production
+/// impl plus a test double.
 ///
 /// Implementations must honour `fs::read`'s error contract:
-/// [`io::ErrorKind::NotFound`] **only** for a file that is genuinely not
-/// there, and some other kind for every other failure, including a failure of
-/// the transport itself. See [`READ_SCRIPT`] for why that distinction is
-/// load-bearing rather than tidy.
+/// [`io::ErrorKind::NotFound`] only for a file that's genuinely not there,
+/// some other kind for every other failure (see [`READ_SCRIPT`]).
 pub(crate) trait RealFileReader {
     /// Reads `path`'s full contents from the host.
     ///
@@ -269,13 +221,10 @@ impl RealFileReader for DirectFs {
 /// The reader for a process inside a Flatpak sandbox: one
 /// `flatpak-spawn --host` per read (see [`READ_SCRIPT`]).
 ///
-/// Stateless and uncached on purpose. Every caller of this reader is asking
-/// "what does the real `/etc/fstab` hold **right now**" - the draft refresh at
-/// startup, the external-change check immediately before a write, the mirror
-/// refresh immediately before a manual backup - and a cache is exactly the
-/// thing that would make those answers stale. There are at most a handful of
-/// these reads in a session, each of a file measured in kilobytes, so the
-/// process spawn is not worth optimizing away.
+/// Stateless and uncached on purpose - every caller wants to know what the
+/// real `/etc/fstab` holds *right now*, and a cache would make that stale.
+/// At most a handful of these reads happen per session, each of a
+/// kilobyte-sized file, so the process spawn isn't worth optimizing away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostSpawn;
 
@@ -334,15 +283,12 @@ fn reader_for(sandbox_marker: &Path) -> &'static dyn RealFileReader {
 /// What [`HostSpawn::read`] runs for `path`:
 /// `flatpak-spawn --host sh -c '<READ_SCRIPT>' sh <path>`.
 ///
-/// Pure, and asserted literally by
-/// [`tests::the_host_read_plan_is_a_flatpak_spawn_of_the_read_script`], so the
-/// exact command line is reviewable and regression-tested without a sandbox or
-/// a process.
+/// Pure, so the exact command line is reviewable and regression-tested
+/// without a sandbox (see
+/// [`tests::the_host_read_plan_is_a_flatpak_spawn_of_the_read_script`]).
 ///
-/// The second `sh` is the script's `$0`: `sh -c '<script>' <argv0> <argv1…>`
-/// is how a POSIX shell assigns positional parameters, so the path has to be
-/// the *second* operand to end up as `$1`. Getting this wrong would make the
-/// script test and `cat` an empty path, which is why it has a test of its own.
+/// The second `sh` is the script's `$0`: `sh -c '<script>' <argv0>
+/// <argv1…>` means the path must be the *second* operand to land in `$1`.
 fn read_plan(path: &Path) -> Spawn {
     Spawn {
         program: OsString::from(FLATPAK_SPAWN),
@@ -360,16 +306,13 @@ fn read_plan(path: &Path) -> Spawn {
 /// Turns a finished host read into the `io::Result` a `fs::read` caller
 /// expects.
 ///
-/// Pure, for the same reason `privileged::interpret_write_output` is: the
-/// interesting cases (a missing file, a denied portal, a signal) are
-/// classified by a function a unit test can call directly, so none of them
-/// needs a sandbox to be covered.
+/// Pure, like `privileged::interpret_write_output`: the interesting cases
+/// (missing file, denied portal, signal) are classified by a function a
+/// unit test can call directly, no sandbox needed.
 ///
-/// `stdout` is taken by value because the success path hands those exact bytes
-/// to the caller - there is no transformation, no trimming and no UTF-8
-/// assumption anywhere in this path, so a file whose content is not text
-/// survives a host read byte-for-byte, exactly as `fs::read` would have left
-/// it.
+/// `stdout` is taken by value and handed straight to the caller on
+/// success - no trimming, no UTF-8 assumption, so non-text content
+/// survives byte-for-byte, exactly as `fs::read` would leave it.
 fn interpret_read_output(
     path: &Path,
     code: Option<i32>,
@@ -403,11 +346,10 @@ fn interpret_read_output(
 /// A command to run, as the program plus the arguments it would be given -
 /// everything about a spawn except the spawning.
 ///
-/// Exists so that "which command does Rustab run to become root?" is a value a
-/// test can assert on and an error message can quote, rather than something
-/// only observable by actually running it. [`crate::privileged`]'s one
-/// remaining spawn site turns one of these into a `Command` and adds its own
-/// stdio configuration; nothing here has an opinion about pipes.
+/// Exists so "which command does Rustab run to become root?" is a value a
+/// test can assert on, rather than only observable by running it.
+/// [`crate::privileged`]'s one spawn site turns this into a `Command` and
+/// adds its own stdio configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spawn {
     /// The program to execute, resolved through `PATH` by the OS as usual.
@@ -428,10 +370,8 @@ impl Spawn {
 
 impl fmt::Display for Spawn {
     /// The command line, space-separated, for error messages and test
-    /// assertions. Lossy for non-UTF-8 arguments, which is acceptable for a
-    /// diagnostic string - and never reached in production, where every
-    /// argument is a hardcoded constant or an absolute path under
-    /// `/var/lib/flatpak`, `$HOME` or `/etc`.
+    /// assertions. Lossy for non-UTF-8 arguments (fine for a diagnostic
+    /// string; never reached in production).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.program.to_string_lossy())?;
         for arg in &self.args {
@@ -441,35 +381,26 @@ impl fmt::Display for Spawn {
     }
 }
 
-/// How this process re-executes itself as root with `flag`, on whichever side
-/// of a sandbox boundary it has to happen.
+/// How this process re-executes itself as root with `flag`, on whichever
+/// side of a sandbox boundary it has to happen.
 ///
-/// The production entry point for [`crate::privileged`]'s one spawn, and the
-/// only part of that module T40 changes. Two shapes:
+/// The production entry point for [`crate::privileged`]'s one spawn. Two shapes:
 ///
-/// - **not sandboxed**: `pkexec <current_exe> <flag>`, byte-for-byte what
-///   `privileged::run_elevated` did before T40;
+/// - **not sandboxed**: `pkexec <current_exe> <flag>`.
 /// - **sandboxed**: `flatpak-spawn --host pkexec <host path of this binary>
-///   <flag>`.
+///   <flag>` - `pkexec` alone would authorize root *inside* the sandbox
+///   (can't see the real `/etc/`); `flatpak-spawn --host` alone would reach
+///   the real `/etc/` unprivileged (can't write it). Both together are needed.
 ///
-/// Both halves of the sandboxed form are necessary and neither is sufficient:
-/// `pkexec` alone would authorize a root process *inside* the sandbox, which
-/// cannot see the real `/etc/` (`pkexec` changes UID, not mount namespace);
-/// `flatpak-spawn --host` alone would reach the real `/etc/` as an
-/// unprivileged user, which cannot write it. Confirmed empirically in both
-/// directions - see the module docs.
-///
-/// `current_exe()` is not usable in the sandboxed form: it resolves to
-/// `/app/bin/rustab`, which exists only inside the sandbox, so a host process
-/// handed that path would simply fail to execute. [`host_binary`] finds the
-/// path the same binary has *on the host* instead.
+/// `current_exe()` resolves to `/app/bin/rustab` inside the sandbox, which
+/// doesn't exist on the host, so [`host_binary`] finds the host path of
+/// the same binary instead.
 ///
 /// # Errors
 ///
-/// An [`io::Error`] if the path of the binary to run could not be determined:
+/// An [`io::Error`] if the binary's path couldn't be determined -
 /// `current_exe()`'s own error outside a sandbox, or [`host_binary`]'s
-/// "nowhere to be found" error inside one. In both cases nothing has been
-/// spawned and the caller has not acted.
+/// "nowhere to be found" error inside one. Nothing is spawned either way.
 pub(crate) fn elevated_self_plan(flag: &str) -> io::Result<Spawn> {
     elevated_self_plan_with(
         Path::new(SANDBOX_MARKER_PATH).exists(),
@@ -511,52 +442,36 @@ fn elevated_self_plan_with(
     }
 }
 
-/// This binary's path **on the host**, for a process running inside a Flatpak
-/// sandbox.
+/// This binary's path **on the host**, for a process running inside a
+/// Flatpak sandbox.
 ///
-/// Three candidates, in order, first one that exists **on the host** wins:
+/// Three candidates, in order, first one that exists on the host wins:
 ///
-/// 1. `<app-path from /.flatpak-info>/bin/rustab`. Flatpak writes the host
-///    path of this very app's `files` directory into the sandbox's own
-///    `/.flatpak-info` (`[Instance] app-path=…`, confirmed by reading that
-///    file inside a running Rustab sandbox), so this candidate is not a guess
-///    at all: it is the answer from the thing that built the sandbox, and it
-///    is correct for a user install, a system install, a custom
-///    `--installation=`, a non-default architecture and a non-`stable` branch
-///    alike. The sandbox's own `/app` *is* that directory, bind-mounted, so
-///    `<app-path>/bin/rustab` and the in-sandbox `/app/bin/rustab` are the
-///    same file.
+/// 1. `<app-path from /.flatpak-info>/bin/rustab` - Flatpak writes the
+///    host path of this app's `files` directory into the sandbox's own
+///    `/.flatpak-info` (`[Instance] app-path=…`), so this is correct for
+///    any install layout, architecture, or branch.
 /// 2. The user-install layout:
 ///    `$HOME/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab`.
-/// 3. The system-install layout, which is what a Flathub user who ran
-///    `flatpak install flathub dev.tomsk.Rustab` without `--user` has:
+/// 3. The system-install layout (`flatpak install` without `--user`):
 ///    `/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab`.
 ///
-/// 2 and 3 are kept even though 1 subsumes them in every case seen so far,
-/// because 1 depends on a key in a file this code does not own: if a future
-/// Flatpak version renames or drops `app-path`, the two layout guesses are
-/// still right for the overwhelming majority of installs.
+/// 2 and 3 are kept as fallbacks in case a future Flatpak version drops
+/// the `app-path` key that 1 depends on.
 ///
-/// ## Why `exists` has to be a *host-side* check, and is therefore fallible
+/// ## Why `exists` must be a host-side check
 ///
-/// This is the trap in the obvious implementation, and it is worth spelling
-/// out because `Path::exists()` looks like the right tool and is not: none of
-/// these three paths exists *as seen from inside the sandbox*. The app's own
-/// files are visible there only as `/app`, and `$HOME` is replaced by a
-/// per-app directory, so a plain `Path::exists()` would answer `false` for
-/// every candidate including the correct one, and this function would always
-/// report "no host-side executable found" on exactly the installs it is meant
-/// to work on. The predicate therefore asks the **host** (production passes
-/// [`host_path_exists`], which is one more `flatpak-spawn --host` call), and
-/// it returns `io::Result<bool>` rather than `bool` so that "the host says no"
-/// and "the host could not be asked" stay distinguishable - they need
-/// different error messages, and conflating them would blame a missing
-/// installation for what is really a missing permission.
+/// None of these three paths exists *as seen from inside the sandbox* -
+/// the app's own files are visible there only as `/app`, so a plain
+/// `Path::exists()` would answer `false` for every candidate, including
+/// the correct one. So the predicate asks the host instead (production
+/// passes [`host_path_exists`]), returning `io::Result<bool>` so "the
+/// host says no" and "the host couldn't be asked" stay distinguishable -
+/// they need different error messages.
 ///
-/// Nothing is *guessed past*: if the host says none of the three is there,
-/// this fails with a message naming all of them, because the alternative
-/// (handing `pkexec` a path that is not there) would surface as a bare
-/// authorization failure *after* the user had already typed their password.
+/// If the host says none of the three exists, this fails naming all of
+/// them, rather than handing `pkexec` a dead path that would surface as a
+/// bare authorization failure after the user already typed their password.
 ///
 /// # Errors
 ///
@@ -610,11 +525,10 @@ fn host_binary(
 
 /// Whether `path` exists **on the host**, asked by running one command there.
 ///
-/// Uses the same sentinel-exit-code shape as [`READ_SCRIPT`], for the same
-/// reason: `test -e` on its own exits 1 for "absent", and so does
-/// `flatpak-spawn` when the portal is unreachable, which would make a missing
-/// permission indistinguishable from a missing file. [`MISSING_EXIT`] can only
-/// come from a host shell that ran and found the path absent.
+/// Uses the same sentinel-exit-code shape as [`READ_SCRIPT`]: `test -e`
+/// alone exits 1 for "absent", as does `flatpak-spawn` when the portal is
+/// unreachable - [`MISSING_EXIT`] can only come from a host shell that ran
+/// and found the path absent, so the two stay distinguishable.
 ///
 /// # Errors
 ///
@@ -697,16 +611,13 @@ fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> V
     candidates
 }
 
-/// The `app-path` value in a `/.flatpak-info`'s text, or `None` if there is
-/// none.
+/// The `app-path` value in a `/.flatpak-info`'s text, or `None` if there
+/// is none.
 ///
-/// A deliberately minimal line scan rather than a real INI parse: this file
-/// has exactly one `app-path` key, in one section, written by Flatpak itself,
-/// and the only thing a section-aware parser would buy here is the ability to
-/// ignore an `app-path` in some *other* section - which does not exist. A
-/// value that is not an absolute path is ignored, so a malformed or
-/// unexpected file falls through to the layout candidates instead of producing
-/// a nonsense relative path.
+/// A deliberately minimal line scan, not a real INI parse: Flatpak writes
+/// exactly one `app-path` key, so section-awareness buys nothing here. A
+/// value that isn't an absolute path is ignored, falling through to the
+/// layout candidates instead of a nonsense relative path.
 fn app_path_in_sandbox_info(info: &str) -> Option<PathBuf> {
     let value = info
         .lines()
@@ -718,32 +629,23 @@ fn app_path_in_sandbox_info(info: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-/// This sandbox's own `/.flatpak-info` content, or `None` if it could not be
-/// read (which for a sandboxed process would be surprising, and is simply
-/// treated as "no `app-path` hint available" rather than as an error).
-///
-/// Read as UTF-8 text because the only key read from it is an absolute path
-/// written by Flatpak; a file that is not UTF-8 at all is not one this code can
-/// learn anything from.
+/// This sandbox's own `/.flatpak-info` content, or `None` if it couldn't
+/// be read (treated as "no `app-path` hint available", not an error).
 fn sandbox_info() -> Option<String> {
     fs::read_to_string(SANDBOX_MARKER_PATH).ok()
 }
 
-/// A [`RealFileReader`] double for the tests of *other* modules: it answers
-/// every read with one canned result and records the paths it was asked for.
+/// A [`RealFileReader`] double for the tests of *other* modules: answers
+/// every read with one canned result and records the paths asked for.
 ///
-/// Lives here, beside the trait, rather than being re-written inside each
-/// module's `mod tests`, because three modules need the same two things from
-/// it - "serve these bytes for a file that is **not** on this machine's disk"
-/// (which is what proves a read really goes through the seam rather than
-/// through `fs::read`) and "fail with exactly this `io::ErrorKind`" (which is
-/// what proves `NotFound` and "could not reach the host" are treated
-/// differently where that difference matters).
+/// Lives here, beside the trait, since several modules need the same two
+/// things from it: serving bytes for a file not on disk (proving a read
+/// goes through the seam, not `fs::read`), and failing with a specific
+/// `io::ErrorKind` (proving `NotFound` is treated differently where that matters).
 ///
-/// Deliberately path-insensitive: every caller of the seam reads exactly one
-/// file - the real `/etc/fstab` - so a per-path map would add bookkeeping
-/// without adding coverage. The recorded paths are still available so a test
-/// can assert *which* file was asked for.
+/// Deliberately path-insensitive, since every caller reads exactly one
+/// file (the real `/etc/fstab`); recorded paths are still available for
+/// asserting which file was asked for.
 #[cfg(test)]
 pub(crate) struct StubReader {
     /// What every [`RealFileReader::read`] call returns, cloned per call.
