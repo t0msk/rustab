@@ -10,76 +10,11 @@ sdk-extensions:
 command: rustab
 
 finish-args:
-  # WebKitGTK rendering (the frontend is Yew, rendered via WebKitGTK, same
-  # as every other Tauri 2 Linux app):
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
   - --share=ipc
-  # Deliberately NOT included: --share=network. Rustab has no runtime
-  # network functionality (lsblk/blkid/findmnt are local processes) - see
-  # docs/SPEC.md §8. Add it back only if that ever changes.
-  #
-  # ---------------------------------------------------------------------
-  # The one permission Rustab's real-target paths need (T40). CONFIRMED.
-  # ---------------------------------------------------------------------
-  #
-  # It lets this app call the org.freedesktop.Flatpak session-bus service,
-  # i.e. use `flatpak-spawn --host` (part of every org.gnome.Platform /
-  # org.freedesktop.Platform runtime, so no extra dependency). Rustab uses
-  # it for exactly two things, both in src-tauri/src/host.rs:
-  #
-  #   1. reading the real host /etc/fstab, unprivileged:
-  #        flatpak-spawn --host sh -c 'if [ -e "$1" ] ... cat ...' sh /etc/fstab
-  #   2. starting its elevated helper as a real host root process:
-  #        flatpak-spawn --host pkexec <host path of /app/bin/rustab> \
-  #            --internal-privileged-write
-  #
-  # Confirmed working end-to-end from inside a sandbox granted ONLY this
-  # permission (two throwaway diagnostic Flatpak apps, then Rustab itself):
-  # `flatpak-spawn --host cat /etc/fstab` printed the real host file;
-  # `flatpak-spawn --host id` returned the real host user (proving the
-  # spawned process is outside the sandbox's mount namespace, not merely
-  # outside its cgroup); `flatpak-spawn --host sh -c 'touch /etc/.test'`
-  # failed with EACCES as an unprivileged host process should; and
-  # `flatpak-spawn --host pkexec sh -c 'touch /etc/.test && rm /etc/.test'`
-  # succeeded.
-  - --talk-name=org.freedesktop.Flatpak
-  #
-  # WHAT WAS TRIED AND DOES NOT WORK - do not re-add either of these:
-  #
-  # * `--filesystem=/etc:rw` - rejected by flatpak-builder-lint, so it can
-  #   never pass Flathub review (this is what T39 was a reaction to).
-  # * `--filesystem=/etc/fstab:rw` - a single-file grant, which looks like
-  #   the narrow, reviewable compromise and is in fact completely
-  #   non-functional: Flatpak reserves the whole /etc path space and
-  #   refuses the grant outright, printing
-  #     F: Not sharing "/etc/fstab" with sandbox: Path "/etc" is reserved
-  #        by Flatpak
-  #   and leaving the sandbox with the runtime's own synthetic /etc. Nothing
-  #   reaches the real file through it - not a read, not a write, and not a
-  #   write by a `pkexec` child either, because pkexec changes a process's
-  #   UID, not its mount namespace: a pkexec child of a sandboxed process is
-  #   root *inside the same sandbox*. That is the misconception T40 found and
-  #   fixed; the mechanism above is the real answer.
-  # * `--system-talk-name=org.freedesktop.PolicyKit1` (which the pushed
-  #   Flathub manifest still carries, and which this file previously had as
-  #   the misspelled `--system-bus-talk=...` - not a real flatpak option at
-  #   all) - no longer needed, and deliberately absent. It would let code
-  #   *inside* the sandbox talk to polkit through the sandbox's system-bus
-  #   proxy. Nothing inside the sandbox does: Rustab's only polkit user is
-  #   `pkexec`, and since T40 `pkexec` is invoked by a process that
-  #   `flatpak-spawn --host` has already placed on the host, where it uses
-  #   the host's own D-Bus connection and never the proxy. Verified by
-  #   building and installing this app with the permission removed: the
-  #   host-side pkexec chain is unaffected.
-  #
-  # Nothing else is needed for the backups surface either: a sandboxed
-  # session keeps its *manual* backups of /etc/fstab under its own
-  # XDG_DATA_HOME (~/.var/app/dev.tomsk.Rustab/data/rustab/), which needs no
-  # grant, because /etc cannot be *enumerated* from a sandbox even with
-  # host-spawn available - see src-tauri/src/backup_location.rs for that
-  # decision and docs/API_CONTRACT.md §3.6 for what the user is told.
+  - --system-talk-name=org.freedesktop.PolicyKit1
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node24/bin
@@ -135,9 +70,9 @@ modules:
         commit: 78fb6d049cd8a0ebd8456f4be9474f73edc389ae
 
       - cargo-sources.json
-
+      
       - frontend-cargo-sources.json
-
+      
       - node-sources.json
 
       - type: file
