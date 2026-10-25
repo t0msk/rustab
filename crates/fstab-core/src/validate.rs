@@ -23,11 +23,24 @@
 //! ## `findmnt` I/O-vs-pure-logic separation
 //!
 //! Like `discovery.rs`'s `lsblk` split, the semantic check is divided into
-//! `run_findmnt_verify` (the actual I/O: render, write to a temp file via
-//! [`std::env::temp_dir`], shell out to `findmnt --verify`) and
-//! `interpret_findmnt_result` (a pure function from `io::Result<FindmntRunResult>`
-//! to `Finding`s, which unit tests exercise directly, including the
-//! "findmnt unavailable" case via a synthetic `io::Error`).
+//! `run_findmnt_verify` (the actual I/O: render the candidate and run
+//! `findmnt --verify --tab-file` against those bytes through a
+//! [`crate::exec::CommandRunner`]) and `interpret_findmnt_result` (a pure
+//! function from `io::Result<FindmntRunResult>` to `Finding`s, which unit
+//! tests exercise directly, including the "findmnt unavailable" case via a
+//! synthetic `io::Error`).
+//!
+//! ## Which process runs `findmnt`
+//!
+//! [`validate`] runs it in *this* process, via
+//! [`crate::exec::DirectRunner`], which stages the rendered candidate in a
+//! throwaway file under [`std::env::temp_dir`] and points `findmnt` at
+//! that. That is the right answer for a CLI, for the elevated helper, and
+//! for the tests - but not for a process that is containerized away from
+//! the system it is editing, where `findmnt` has to run elsewhere to see
+//! the real `/dev` and mount table. [`validate_with`] therefore takes the
+//! runner, and [`validate`] is just that with [`crate::exec::DirectRunner`]
+//! supplied; see [`crate::exec`] for why the seam is shaped the way it is.
 //!
 //! Per SPEC §6 step 2, a failure to even run `findmnt` (missing binary or
 //! other I/O error) is surfaced as a non-blocking [`Severity::Warning`]
@@ -35,13 +48,11 @@
 //! error, since an environment without `findmnt` should still be able to
 //! save a structurally valid fstab.
 
+use crate::exec::{CommandRunner, DirectRunner};
 use crate::model::{Document, Line, SourceId};
 use std::collections::HashMap;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 /// The special `mount_point` value conventionally used by swap entries,
 /// which have no real mount point to collide on. Per fstab convention (e.g.
@@ -232,13 +243,26 @@ impl ValidationReport {
 /// docs) plus a semantic check equivalent to `findmnt --verify --tab-file
 /// <path>` against a temporary rendering of `doc`.
 ///
-/// Never touches the real target file - `doc` is written to a throwaway
+/// Never touches the real target file - `doc` is staged in a throwaway
 /// temp file under [`std::env::temp_dir`] and `findmnt` points at that.
 /// Never panics; if `findmnt` can't be run at all, that's an advisory
 /// [`Severity::Warning`], not a silent pass.
+///
+/// Runs `findmnt` in this process. A caller that must run it somewhere
+/// else (see the module docs) calls [`validate_with`] instead.
 pub fn validate(doc: &Document) -> ValidationReport {
+    validate_with(doc, &DirectRunner)
+}
+
+/// [`validate`], with the process that runs `findmnt --verify` chosen by
+/// the caller.
+///
+/// Identical in every other respect, including which findings block a
+/// save: `runner` decides only *where* `findmnt` runs and where the
+/// rendered candidate is staged for it, never what its output means.
+pub fn validate_with(doc: &Document, runner: &dyn CommandRunner) -> ValidationReport {
     let mut findings = structural_findings(doc);
-    findings.extend(semantic_findings(doc));
+    findings.extend(semantic_findings(doc, runner));
     ValidationReport { findings }
 }
 
@@ -516,9 +540,9 @@ struct FindmntRunResult {
 
 /// Runs only the semantic (`findmnt --verify`) half of validation -
 /// structural checks happen separately - and returns its [`Finding`]s.
-fn semantic_findings(doc: &Document) -> Vec<Finding> {
+fn semantic_findings(doc: &Document, runner: &dyn CommandRunner) -> Vec<Finding> {
     let rendered = doc.to_string();
-    let result = run_findmnt_verify(&rendered);
+    let result = run_findmnt_verify(&rendered, runner);
     interpret_findmnt_result(doc, &result)
 }
 
@@ -843,47 +867,25 @@ fn parse_count_field(field: &str, singular: &str, plural: &str) -> Option<u32> {
     }
 }
 
-/// Keeps temp-file names from concurrent calls (e.g. parallel test
-/// threads) from colliding, since [`std::process::id`] alone is constant
-/// for the whole process lifetime.
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Writes `rendered` to a fresh file under [`std::env::temp_dir`] and
-/// returns its path.
+/// Runs `findmnt --verify --tab-file <staged path>` against a throwaway
+/// file holding `rendered`, through `runner`.
 ///
-/// Only used for the read-only `findmnt --verify` check, which doesn't
-/// need same-filesystem rename atomicity like `writer.rs`'s real save
-/// does. Verification never touches the real target file.
-fn write_candidate_to_temp_file(rendered: &str) -> io::Result<PathBuf> {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "rustab-findmnt-verify-{}-{counter}.tmp",
-        std::process::id()
-    ));
-    fs::write(&path, rendered)?;
-    Ok(path)
-}
-
-/// Runs `findmnt --verify --tab-file <temp path>` against a fresh temp-file
-/// rendering of `rendered`.
+/// `runner` stages the bytes and appends the resulting path as the final
+/// argument (see [`CommandRunner::run`]), because `findmnt --verify`
+/// accepts only a seekable `--tab-file` - there is no stdin mode to use
+/// instead. Verification never touches the real target file.
 ///
-/// Returns `Err` if the temp file couldn't be written or `findmnt` couldn't
+/// Returns `Err` if the candidate couldn't be staged or `findmnt` couldn't
 /// be launched - both treated identically by [`interpret_findmnt_result`]
-/// as "verification unavailable". The temp file is removed afterwards on a
-/// best-effort basis; removal failure isn't reported as an error.
-fn run_findmnt_verify(rendered: &str) -> io::Result<FindmntRunResult> {
-    let temp_path = write_candidate_to_temp_file(rendered)?;
+/// as "verification unavailable". A `findmnt` that ran and rejected the
+/// file is `Ok` with `success: false`.
+fn run_findmnt_verify(rendered: &str, runner: &dyn CommandRunner) -> io::Result<FindmntRunResult> {
+    let output = runner.run(
+        "findmnt",
+        &["--verify", "--tab-file"],
+        Some(rendered.as_bytes()),
+    )?;
 
-    let output_result = Command::new("findmnt")
-        .arg("--verify")
-        .arg("--tab-file")
-        .arg(&temp_path)
-        .output();
-
-    let _ = fs::remove_file(&temp_path);
-
-    let output = output_result?;
     let mut combined_output = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !combined_output.is_empty() {
@@ -902,6 +904,8 @@ fn run_findmnt_verify(rendered: &str) -> io::Result<FindmntRunResult> {
 mod tests {
     use super::*;
     use crate::model::{FstabEntry, Options, SourceId};
+    use std::fs;
+    use std::process::Command;
 
     /// Builds a document with a single entry, for tests that only care
     /// about one structural property.
@@ -2102,5 +2106,63 @@ mod tests {
              report: {:?}",
             report.findings
         );
+    }
+
+    // --- The command-runner seam (see `crate::exec`) ---
+
+    /// The exact command the semantic check is built from, and the exact
+    /// bytes it verifies: the document's own rendering, handed over as
+    /// input so the runner can stage it wherever `findmnt` will run.
+    #[test]
+    fn the_semantic_check_runs_findmnt_verify_against_the_rendered_document() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let runner = crate::exec::RecordingRunner::answering(0, "");
+
+        let report = validate_with(&doc, &runner);
+
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1, "exactly one command per validation");
+        assert_eq!(runs[0].program, "findmnt");
+        assert_eq!(runs[0].args, vec!["--verify", "--tab-file"]);
+        assert_eq!(runs[0].input.as_deref(), Some(doc.to_string().as_bytes()));
+        // A `findmnt` that exited 0 contributes no findings of its own.
+        assert!(
+            !report.has_errors(),
+            "report: {:?}",
+            report.errors().collect::<Vec<_>>()
+        );
+    }
+
+    /// `findmnt`'s verdict is read off the runner's output, not off
+    /// whatever the real `findmnt` on this machine would have said.
+    #[test]
+    fn a_failing_findmnt_from_the_runner_blocks_the_save() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let runner = crate::exec::RecordingRunner::answering(
+            1,
+            "/mnt/data\n   [E] unreachable on boot required source: UUID=…\n\n\
+             0 parse errors, 1 error, 0 warnings\n",
+        );
+
+        let report = validate_with(&doc, &runner);
+
+        assert!(report.has_errors());
+        assert!(report
+            .errors()
+            .any(|finding| finding.message.contains("findmnt --verify: unreachable")));
     }
 }

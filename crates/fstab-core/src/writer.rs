@@ -11,6 +11,9 @@
 //!
 //! 1. **Validate in memory** via [`crate::validate::validate`]. A blocking
 //!    error returns [`WriteError::Validation`] before any write syscall.
+//!    (That step's one external check, `findmnt --verify`, runs in this
+//!    process unless the caller uses [`write_document_with_runner`] to say
+//!    otherwise - see [`crate::exec`].)
 //! 2. **Resolve the effective target.** A symlinked target (e.g.
 //!    etckeeper/nix-managed `/etc/fstab`) is followed, and the write
 //!    applies to its destination - replacing the symlink itself would
@@ -84,6 +87,7 @@
 //! `io::Error`, so failure-injection tests assert "the target is
 //! byte-for-byte untouched" against a real file, not an in-memory model.
 
+use crate::exec::{CommandRunner, DirectRunner};
 use crate::model::Document;
 use crate::validate::{self, Finding, ValidationReport};
 use std::ffi::{OsStr, OsString};
@@ -422,7 +426,27 @@ pub struct WriteOutcome {
 /// Returns a [`WriteError`] identifying the exact failure point; see that
 /// type for which variants leave the target untouched.
 pub fn write_document(target: &Path, candidate: &Document) -> Result<WriteOutcome, WriteError> {
-    write_document_with(target, candidate, &RealFs)
+    write_document_with(target, candidate, &RealFs, &DirectRunner)
+}
+
+/// [`write_document`], with the process that runs step 1's `findmnt
+/// --verify` chosen by the caller.
+///
+/// Identical in every other respect - same sequence, same guarantees, same
+/// errors. The filesystem work is unaffected: `runner` only decides where
+/// the validation step's external check runs, which matters for a process
+/// containerized away from the system it is editing (see
+/// [`crate::exec`]).
+///
+/// # Errors
+///
+/// Exactly [`write_document`]'s.
+pub fn write_document_with_runner(
+    target: &Path,
+    candidate: &Document,
+    runner: &dyn CommandRunner,
+) -> Result<WriteOutcome, WriteError> {
+    write_document_with(target, candidate, &RealFs, runner)
 }
 
 /// One backup of a target, as [`list_backups`] reports it.
@@ -604,18 +628,19 @@ pub fn create_backup(target: &Path) -> Result<CreateBackupOutcome, CreateBackupE
 /// The [`FileSystemOps`]-generic implementation behind [`write_document`].
 ///
 /// Crate-private: production callers get the concrete, `std::fs`-backed
-/// [`write_document`]; the generic parameter lets unit tests inject an
-/// I/O failure at one specific syscall.
+/// [`write_document`] (or [`write_document_with_runner`]); the generic
+/// parameter lets unit tests inject an I/O failure at one specific syscall.
 fn write_document_with<F: FileSystemOps>(
     target: &Path,
     candidate: &Document,
     fsops: &F,
+    runner: &dyn CommandRunner,
 ) -> Result<WriteOutcome, WriteError> {
-    // Step 1 (and 2 - `validate` already runs the `findmnt --verify`
+    // Step 1 (and 2 - `validate_with` already runs the `findmnt --verify`
     // semantic check internally). Deliberately the very first thing that
     // happens: on error we return before any syscall that could modify
     // anything.
-    let report = validate::validate(candidate);
+    let report = validate::validate_with(candidate, runner);
     if report.has_errors() {
         return Err(WriteError::Validation(report));
     }
@@ -1758,8 +1783,8 @@ mod tests {
 
         let spy = SpyFs::new();
         let candidate = valid_candidate("/mnt/fresh");
-        let outcome =
-            write_document_with(&target, &candidate, &spy).expect("the first save should succeed");
+        let outcome = write_document_with(&target, &candidate, &spy, &DirectRunner)
+            .expect("the first save should succeed");
 
         assert_eq!(fs::read_to_string(&target).unwrap(), candidate.to_string());
         assert!(
@@ -1843,7 +1868,8 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::new();
-        write_document_with(&target, &valid_candidate("/mnt/order"), &spy).expect("save");
+        write_document_with(&target, &valid_candidate("/mnt/order"), &spy, &DirectRunner)
+            .expect("save");
 
         assert_eq!(
             spy.ops(),
@@ -1889,8 +1915,13 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::new();
-        let err = write_document_with(&target, &structurally_invalid_candidate(), &spy)
-            .expect_err("a duplicate mount point must be rejected");
+        let err = write_document_with(
+            &target,
+            &structurally_invalid_candidate(),
+            &spy,
+            &DirectRunner,
+        )
+        .expect_err("a duplicate mount point must be rejected");
 
         match &err {
             WriteError::Validation(report) => assert!(report
@@ -1946,11 +1977,43 @@ mod tests {
         );
 
         let spy = SpyFs::new();
-        let err = write_document_with(&target, &candidate, &spy)
+        let err = write_document_with(&target, &candidate, &spy, &DirectRunner)
             .expect_err("a semantically invalid candidate must be rejected");
 
         assert!(matches!(err, WriteError::Validation(_)), "got {err:?}");
         assert!(spy.ops().is_empty());
+        assert_target_untouched(&target);
+        assert_eq!(dir.entry_names(), vec!["fstab".to_string()]);
+    }
+
+    /// The runner given to [`write_document_with_runner`] really is the one
+    /// step 1 verifies through: its verdict blocks the save, and it is
+    /// handed the exact bytes the save would have written. Needs no
+    /// `findmnt` on this machine, by construction.
+    #[test]
+    fn the_given_runner_is_the_one_step_one_verifies_through() {
+        let dir = TempDir::new("runner-seam");
+        let target = dir.join("fstab");
+        write_original(&target);
+
+        let candidate = valid_candidate("/mnt/seam");
+        let runner = crate::exec::RecordingRunner::answering(
+            1,
+            "/mnt/seam\n   [E] unreachable on boot required source: UUID=…\n\n\
+             0 parse errors, 1 error, 0 warnings\n",
+        );
+
+        let err = write_document_with_runner(&target, &candidate, &runner)
+            .expect_err("the runner's verdict must block the save");
+
+        assert!(matches!(err, WriteError::Validation(_)), "got {err:?}");
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].program, "findmnt");
+        assert_eq!(
+            runs[0].input.as_deref(),
+            Some(candidate.to_string().as_bytes())
+        );
         assert_target_untouched(&target);
         assert_eq!(dir.entry_names(), vec!["fstab".to_string()]);
     }
@@ -1969,7 +2032,7 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::failing_at(Op::CreateAndWrite);
-        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy)
+        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy, &DirectRunner)
             .expect_err("the injected write failure must propagate");
 
         assert!(matches!(err, WriteError::Write { .. }), "got {err:?}");
@@ -1996,7 +2059,7 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::failing_at(Op::SetMode);
-        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy)
+        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy, &DirectRunner)
             .expect_err("the injected fchmod failure must propagate");
 
         assert!(matches!(err, WriteError::Metadata { .. }), "got {err:?}");
@@ -2013,7 +2076,7 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::failing_at(Op::SyncFile);
-        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy)
+        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy, &DirectRunner)
             .expect_err("the injected fsync failure must propagate");
 
         assert!(
@@ -2040,7 +2103,7 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::failing_at_nth(Op::SyncDir, 1);
-        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy)
+        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy, &DirectRunner)
             .expect_err("the injected directory fsync failure must propagate");
 
         assert!(
@@ -2072,7 +2135,7 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::failing_at(Op::Rename);
-        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy)
+        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy, &DirectRunner)
             .expect_err("the injected rename failure must propagate");
 
         match &err {
@@ -2101,8 +2164,13 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::with_corrupt_readback("something else entirely\n");
-        let err = write_document_with(&target, &valid_candidate("/mnt/verify"), &spy)
-            .expect_err("a read-back mismatch must be a hard error");
+        let err = write_document_with(
+            &target,
+            &valid_candidate("/mnt/verify"),
+            &spy,
+            &DirectRunner,
+        )
+        .expect_err("a read-back mismatch must be a hard error");
 
         match &err {
             WriteError::Verify {
@@ -2132,7 +2200,7 @@ mod tests {
 
         let candidate = valid_candidate("/mnt/after");
         let spy = SpyFs::failing_at_nth(Op::SyncDir, 2);
-        let err = write_document_with(&target, &candidate, &spy)
+        let err = write_document_with(&target, &candidate, &spy, &DirectRunner)
             .expect_err("an unconfirmed-durability save must not be reported as success");
 
         assert!(
@@ -2165,7 +2233,7 @@ mod tests {
         write_original(&target);
 
         let spy = SpyFs::failing_at(Op::CopyBackup);
-        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy)
+        let err = write_document_with(&target, &valid_candidate("/mnt/never"), &spy, &DirectRunner)
             .expect_err("the injected backup failure must propagate");
 
         assert!(matches!(err, WriteError::Backup { .. }), "got {err:?}");
@@ -2187,7 +2255,7 @@ mod tests {
 
         let candidate = valid_candidate("/mnt/prune");
         let spy = SpyFs::failing_at(Op::ListDir);
-        let outcome = write_document_with(&target, &candidate, &spy)
+        let outcome = write_document_with(&target, &candidate, &spy, &DirectRunner)
             .expect("a pruning problem must not fail the save");
 
         assert_eq!(fs::read_to_string(&target).unwrap(), candidate.to_string());
