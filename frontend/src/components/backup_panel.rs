@@ -19,8 +19,7 @@
 //! sandboxed session cannot do: it *can* have `/etc/fstab` written for it,
 //! it just cannot enumerate the directory.
 //!
-//! T41: shortened to one line - see [`fallback_notice_text`]'s own tests for
-//! the two facts it must still state.
+//! T41: shortened to one line, same two facts.
 
 use wasm_bindgen::JsValue;
 use yew::prelude::*;

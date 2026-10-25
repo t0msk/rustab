@@ -137,19 +137,10 @@ pub fn get_target_info() -> Result<TargetInfoDto, CommandErrorDto> {
 /// `exists: false` with empty text and no lines, which is the correct
 /// starting state for a first-ever save.
 ///
-/// Like every other read of a target that might not be sandbox-visible
-/// ([`resync_external_change_with`], [`save_document_with`]'s courtesy
-/// check, [`refresh_backup_mirror`]), this goes through the injected
-/// [`RealFileReader`] rather than a bare `fs::read` - but only for
-/// [`TargetSource::Environment`]. [`TargetSource::SandboxDefault`]'s
-/// target is always the working draft, which "lives in the user's own
-/// data directory, which a sandboxed process sees normally" (see
-/// `crate::target`'s module docs), so a plain `fs::read` there is correct
-/// and avoids a needless `flatpak-spawn` per load. An explicit
-/// `RUSTAB_TARGET_PATH` carries no such guarantee - it can name `/etc/fstab`
-/// itself, which a Flatpak sandbox hides from a bare `fs::read` behind a
-/// silent `NotFound` (`docs/FLATPAK.md` §3.1) that this command would
-/// otherwise misreport as "no entries yet" instead of reading the real file.
+/// Routes through the injected [`RealFileReader`] for
+/// [`TargetSource::Environment`] only: that target can be `/etc/fstab`
+/// itself, which a bare `fs::read` can't see in a Flatpak sandbox
+/// (`docs/FLATPAK.md` §3.1). The draft target stays a plain `fs::read`.
 ///
 /// # Errors
 ///
@@ -166,10 +157,8 @@ pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
     )
 }
 
-/// Testable body of [`list_entries`]: takes the already-resolved target and
-/// an injected [`RealFileReader`] so a test can exercise the
-/// `TargetSource::Environment` branch without a real sandbox or
-/// `flatpak-spawn`, the same shape [`resync_external_change_with`] uses.
+/// Testable body of [`list_entries`]: takes the reader as a parameter so a
+/// test can exercise the `Environment` branch without a sandbox.
 fn list_entries_with(
     target: &ActiveTarget,
     real_reader: &dyn RealFileReader,
@@ -1522,17 +1511,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         }
     }
 
-    /// T41 - and a defect that predates it: an explicit `RUSTAB_TARGET_PATH`
-    /// naming a path this process cannot reach with a bare `fs::read` (the
-    /// canonical case being `/etc/fstab` itself, hidden from a Flatpak
-    /// sandbox - see `docs/FLATPAK.md` §3.1) used to come back as "no
-    /// entries yet" with no error at all, because `list_entries` read
-    /// `target.path` directly instead of through the injected
-    /// [`RealFileReader`] every other real-file read here already used.
-    /// Proven with a path that genuinely is not on disk, so a `fs::read`
-    /// would return `NotFound` and a pre-fix build would wrongly report
-    /// `exists: false`; routing through the reader instead must report the
-    /// reader's content.
+    /// T41: an `Environment` target unreachable by a bare `fs::read` (e.g.
+    /// `/etc/fstab` under Flatpak) must still load, through the reader.
     #[test]
     fn list_entries_for_an_environment_target_reads_through_the_host_reader() {
         let dir = TempDir::new("list-entries-environment-host-read");
@@ -1552,10 +1532,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         assert_eq!(reader.asked(), vec![unreachable]);
     }
 
-    /// The default draft target is always sandbox-visible (it lives in the
-    /// user's own data directory, not under `/etc/`), so it must keep using
-    /// a plain `fs::read` rather than paying for a `flatpak-spawn` per load -
-    /// proven by a reader that panics if it is ever consulted.
+    /// The draft target is always sandbox-visible, so it must keep using a
+    /// plain `fs::read` - proven by a reader that panics if ever consulted.
     #[test]
     fn list_entries_for_the_default_draft_never_consults_the_host_reader() {
         struct PanicIfAsked;
@@ -1577,10 +1555,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         assert_eq!(view.text, "# the draft, read directly\n");
     }
 
-    /// A genuinely missing `RUSTAB_TARGET_PATH` target must still report
-    /// `exists: false` rather than an error, through the same host-reader
-    /// seam production uses - the `NotFound` branch the host-read fix must
-    /// not have broken.
+    /// A missing `Environment` target must still report `exists: false`,
+    /// not an error, through the reader's `NotFound` branch.
     #[test]
     fn list_entries_for_a_missing_environment_target_reports_not_found_not_an_error() {
         let target = override_target(PathBuf::from("/nonexistent/rustab-tests/fstab"));

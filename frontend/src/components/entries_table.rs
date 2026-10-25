@@ -786,10 +786,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // open - impossible today since the backdrop closes it first, but
     // cheap to keep correct - would not re-focus for no reason.
     //
-    // This programmatic focus() right after a right-click left WebKitGTK's
-    // own `:focus-visible` heuristic flaky - a ring on "Edit" some opens,
-    // none on others - so the button carries `outline-none` to drop the
-    // native ring outright; Enter/Tab/Escape still work without it.
+    // T41: `outline-none` on "Edit" drops a flaky WebKitGTK focus ring here.
     {
         let menu_edit_ref = menu_edit_ref.clone();
         let menu_open = context_menu.is_some();
