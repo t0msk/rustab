@@ -249,7 +249,14 @@ Inside a Flatpak sandbox, `findmnt --verify` runs on the host via
 `flatpak-spawn --host` - the candidate is staged in a temp file on the
 host, because a sandboxed `findmnt` cannot see the host's devices or
 mount points and reports nearly every entry, including `/`, as
-unreachable. The validation results reflect the host's state regardless
+unreachable. The advisory "mount point does not currently exist on disk"
+check runs on the host for the same reason (the `/` a sandboxed process
+sees is the runtime's, so `/boot`, `/opt` and every `/run/media/…` the
+host has would be reported missing), in a **single** batched
+`flatpak-spawn --host` call per validation that asks about all of the
+document's mount points at once - not one call per entry. If the host
+cannot be asked at all, that check emits no findings rather than
+guessing. The validation results reflect the host's state regardless
 of where the app runs.
 
 ### 3.4 `render_candidate`

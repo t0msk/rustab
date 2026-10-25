@@ -1,22 +1,35 @@
-//! The one seam through which this crate runs an external program.
+//! The one seam through which this crate asks the machine it is editing a
+//! question.
 //!
-//! Two of this crate's checks are delegated to util-linux rather than
-//! reimplemented: `findmnt --verify --tab-file <path>` (semantic
-//! validation, [`crate::validate`]) and `lsblk -J -O` (device discovery,
-//! [`crate::discovery`]). Both only mean anything when they run against
-//! *the machine whose fstab is being edited* - they read `/dev`, udev and
-//! the live mount table, none of which a container necessarily shares with
-//! its host.
+//! Three of this crate's checks cannot be answered from its own address
+//! space. Two are delegated to util-linux rather than reimplemented:
+//! `findmnt --verify --tab-file <path>` (semantic validation,
+//! [`crate::validate`]) and `lsblk -J -O` (device discovery,
+//! [`crate::discovery`]); the third is the advisory "does this mount point
+//! exist on disk?" check ([`crate::validate`] again), which is a plain
+//! `stat` rather than a program. All three only mean anything when they
+//! look at *the machine whose fstab is being edited* - they read `/dev`,
+//! udev, the live mount table and the real directory tree, none of which a
+//! container necessarily shares with its host.
 //!
-//! That makes "which process runs this program" a decision this crate must
+//! That makes "which process answers this" a decision this crate must
 //! not make on its own: a GUI inside a Flatpak sandbox has to route the
-//! command out to the host, while a CLI, the elevated helper and the unit
-//! tests all just run it locally. So the choice is injected, exactly as
+//! question out to the host, while a CLI, the elevated helper and the unit
+//! tests all just answer it locally. So the choice is injected, exactly as
 //! [`crate::writer`]'s `FileSystemOps` injects the filesystem: every
 //! externally-observable entry point has a `*_with`/`*_with_runner`
 //! variant taking a [`CommandRunner`], and the plain one passes
 //! [`DirectRunner`]. Nothing here knows what a sandbox is, and nothing here
 //! spawns anything but the program it was asked for.
+//!
+//! ## Why the existence check is batched
+//!
+//! [`CommandRunner::paths_exist`] takes *all* the paths a validation needs
+//! answers for, not one. For [`DirectRunner`] that is irrelevant - it is a
+//! `stat` per path either way - but an out-of-process runner pays a real
+//! per-call cost (a portal round trip and a process spawn), and a document
+//! has one mount point per entry. One question about N paths keeps that
+//! cost independent of the file's size.
 //!
 //! ## Why `input` is a slice and not a path
 //!
@@ -32,16 +45,19 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Runs one external program to completion and hands back its
-/// [`Output`] - the whole of this crate's access to other processes.
+/// Asks the machine whose fstab is being edited a question - the whole of
+/// this crate's access to anything outside its own address space.
 ///
-/// One method, since both call sites want the same thing: run this
-/// program, with these arguments, optionally against this much input, and
-/// let me read the exit status and both output streams myself.
+/// Two methods, because there are two kinds of question: "run this program
+/// and let me read its exit status and output streams myself"
+/// ([`Self::run`]) and "do these paths exist?" ([`Self::paths_exist`]).
+/// The second is not phrased as a program because it does not have to be
+/// one - in this process it is a `stat`, and only an implementation that
+/// has to cross a boundary needs a process for it.
 ///
 /// Shaped after [`crate::writer`]'s own `FileSystemOps` seam: a production
 /// implementation ([`DirectRunner`]) plus whatever doubles a test needs.
@@ -62,6 +78,23 @@ pub trait CommandRunner {
     /// non-zero is `Ok`: deciding what its status, stdout and stderr mean
     /// is the caller's job, not the runner's.
     fn run(&self, program: &str, args: &[&str], input: Option<&[u8]>) -> io::Result<Output>;
+
+    /// Answers, for every path in `paths`, whether it exists on the machine
+    /// being inspected.
+    ///
+    /// Returns one `bool` per input path, in the same order, `true` iff the
+    /// path exists there - [`std::path::Path::exists`]'s semantics,
+    /// symlinks followed, no distinction between a file and a directory.
+    /// Implementations must answer all of them in one round trip (see the
+    /// module docs).
+    ///
+    /// # Errors
+    ///
+    /// An [`io::Error`] only when the question could not be answered *at
+    /// all* - the machine could not be reached, or its answer was
+    /// unintelligible. A path that simply is not there is `Ok(false)`, so
+    /// there is no partial-success case to represent.
+    fn paths_exist(&self, paths: &[&str]) -> io::Result<Vec<bool>>;
 }
 
 /// The runner for a process that is already looking at the machine it is
@@ -98,6 +131,12 @@ impl CommandRunner for DirectRunner {
         }
 
         output
+    }
+
+    /// One `stat` per path, in this process - no program is run, since this
+    /// process is already looking at the filesystem being asked about.
+    fn paths_exist(&self, paths: &[&str]) -> io::Result<Vec<bool>> {
+        Ok(paths.iter().map(|p| Path::new(p).exists()).collect())
     }
 }
 
@@ -138,9 +177,21 @@ pub(crate) struct RecordedRun {
     pub(crate) input: Option<Vec<u8>>,
 }
 
+/// How a [`RecordingRunner`] answers [`CommandRunner::paths_exist`].
+#[cfg(test)]
+enum ExistenceAnswer {
+    /// Every path asked about exists - the default, so a test that is not
+    /// about the existence check sees no findings from it.
+    AllExist,
+    /// Only these paths exist; anything else does not.
+    Only(Vec<String>),
+    /// The question cannot be answered at all, with this message.
+    Unanswerable(String),
+}
+
 /// A [`CommandRunner`] double for the tests of *other* modules: answers
-/// every call with one canned [`Output`] and records what it was asked to
-/// run.
+/// every call with one canned [`Output`] (or one canned existence verdict)
+/// and records what it was asked.
 ///
 /// Lives here, beside the trait, since both call sites need the same two
 /// things from it - proving the exact command line a check is built from,
@@ -154,22 +205,48 @@ pub(crate) struct RecordingRunner {
     stdout: Vec<u8>,
     /// Every call made, in order.
     runs: std::cell::RefCell<Vec<RecordedRun>>,
+    /// What [`CommandRunner::paths_exist`] answers.
+    existence: ExistenceAnswer,
+    /// Every [`CommandRunner::paths_exist`] call's paths, in order - one
+    /// entry per call, so "exactly one batched question" is assertable.
+    exists_queries: std::cell::RefCell<Vec<Vec<String>>>,
 }
 
 #[cfg(test)]
 impl RecordingRunner {
-    /// A runner whose every call exits `code` and prints `stdout`.
+    /// A runner whose every call exits `code` and prints `stdout`, and for
+    /// which every path exists.
     pub(crate) fn answering(code: i32, stdout: &str) -> Self {
         RecordingRunner {
             code,
             stdout: stdout.as_bytes().to_vec(),
             runs: std::cell::RefCell::new(Vec::new()),
+            existence: ExistenceAnswer::AllExist,
+            exists_queries: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// The same runner, but reporting only `paths` as existing.
+    pub(crate) fn with_existing_paths(mut self, paths: &[&str]) -> Self {
+        self.existence =
+            ExistenceAnswer::Only(paths.iter().map(|path| (*path).to_string()).collect());
+        self
+    }
+
+    /// The same runner, but unable to answer the existence question at all.
+    pub(crate) fn with_unanswerable_existence(mut self, message: &str) -> Self {
+        self.existence = ExistenceAnswer::Unanswerable(message.to_string());
+        self
     }
 
     /// The calls this runner was asked to make, in order.
     pub(crate) fn runs(&self) -> Vec<RecordedRun> {
         self.runs.borrow().clone()
+    }
+
+    /// The existence questions this runner was asked, in order.
+    pub(crate) fn exists_queries(&self) -> Vec<Vec<String>> {
+        self.exists_queries.borrow().clone()
     }
 }
 
@@ -188,6 +265,20 @@ impl CommandRunner for RecordingRunner {
             stdout: self.stdout.clone(),
             stderr: Vec::new(),
         })
+    }
+
+    fn paths_exist(&self, paths: &[&str]) -> io::Result<Vec<bool>> {
+        self.exists_queries
+            .borrow_mut()
+            .push(paths.iter().map(|path| (*path).to_string()).collect());
+        match &self.existence {
+            ExistenceAnswer::AllExist => Ok(vec![true; paths.len()]),
+            ExistenceAnswer::Only(existing) => Ok(paths
+                .iter()
+                .map(|path| existing.iter().any(|known| known == path))
+                .collect()),
+            ExistenceAnswer::Unanswerable(message) => Err(io::Error::other(message.clone())),
+        }
     }
 }
 
@@ -248,6 +339,21 @@ mod tests {
             .expect("a non-zero exit must not be an error");
 
         assert_eq!(output.status.code(), Some(3));
+    }
+
+    /// One answer per question, in order - and `/` is the one path every
+    /// machine running this test is guaranteed to have.
+    #[test]
+    fn the_direct_runner_answers_every_path_in_order() {
+        let answers = DirectRunner
+            .paths_exist(&["/", "/rustab-no-such-path", "/"])
+            .expect("a local stat must be answerable");
+
+        assert_eq!(answers, vec![true, false, true]);
+        assert_eq!(
+            DirectRunner.paths_exist(&[]).expect("nothing to answer"),
+            Vec::<bool>::new()
+        );
     }
 
     #[test]

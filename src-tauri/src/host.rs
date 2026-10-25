@@ -36,15 +36,21 @@
 //!    (`flatpak-spawn --host pkexec …`) and must name a **host** path for
 //!    this binary, since `std::env::current_exe()` inside the sandbox
 //!    yields `/app/bin/rustab`, which doesn't exist outside it.
-//! 3. A [`CommandRunner`] - `fstab-core`'s seam for the two system tools
-//!    it shells out to, `findmnt --verify` and `lsblk`. Both answer
-//!    questions about `/dev`, udev and the live mount table, none of which
-//!    the sandbox shares with the host: run inside it, `findmnt --verify`
-//!    calls even `/` "unreachable on boot" and `lsblk` exits 0 reporting no
-//!    device with a UUID. Both are wrong, and the `findmnt` one blocks
-//!    every save. So these run on the host too (see
+//! 3. A [`CommandRunner`] - `fstab-core`'s seam for everything it has to
+//!    ask the edited machine. Two of those are the system tools it shells
+//!    out to, `findmnt --verify` and `lsblk`: both answer questions about
+//!    `/dev`, udev and the live mount table, none of which the sandbox
+//!    shares with the host, so run inside it `findmnt --verify` calls even
+//!    `/` "unreachable on boot" and `lsblk` exits 0 reporting no device
+//!    with a UUID. Both are wrong, and the `findmnt` one blocks every
+//!    save. The third is the advisory "does this mount point exist?"
+//!    check, whose answers come from the sandbox's own `/` - the runtime's -
+//!    so `/boot`, `/opt` and every `/run/media/…` the host really has are
+//!    reported missing. So all three run on the host (see
 //!    [`RUN_WITH_INPUT_SCRIPT`] for the one awkward part - `findmnt` needs
-//!    its input as a *file*, and the sandbox's `/tmp` is private).
+//!    its input as a *file*, and the sandbox's `/tmp` is private - and
+//!    [`EXISTS_BATCH_SCRIPT`] for why the existence check is one call for
+//!    the whole document).
 //!
 //! It doesn't hide the sandbox from the rest of the program: every
 //! function is explicit about which side of the boundary it acts on,
@@ -60,7 +66,7 @@
 //! production runner from [`command_runner`], the same way). Every
 //! testable core function takes its reader as a parameter, so tests pass
 //! [`DirectFs`] or their own double. The pieces that genuinely spawn a
-//! process ([`HostSpawn`]'s two methods and the elevated spawn) are split
+//! process ([`HostSpawn`]'s three methods and the elevated spawn) are split
 //! into a pure "what would be run" half ([`Spawn`], asserted literally by
 //! tests) and a pure "what did it mean" half ([`interpret_read_output`]),
 //! the same split `privileged::interpret_write_output` uses.
@@ -148,6 +154,36 @@ const READ_SCRIPT: &str = r#"if [ -e "$1" ]; then exec cat -- "$1"; else exit 44
 /// A separate script from [`READ_SCRIPT`], not a `-e`-only mode of it, so
 /// "is this path there?" can never be confused with "what does it hold?".
 const EXISTS_SCRIPT: &str = r#"if [ -e "$1" ]; then exit 0; else exit 44; fi"#;
+
+/// The script [`HostSpawn::paths_exist`] runs on the host: print one `1`
+/// per existing path and one `0` per missing one, in the order asked, with
+/// no separators.
+///
+/// ## Why one script for all the paths
+///
+/// `fstab_core::validate`'s advisory existence check asks about every
+/// mount point in the document, i.e. once per entry. A
+/// `flatpak-spawn --host` per path would mean a portal round trip and a
+/// process spawn per entry on every validation, and validation runs on
+/// every edit - so the trait takes the whole list and this answers it in
+/// one call, making the cost independent of the file's size.
+///
+/// ## Why the output is this shape
+///
+/// A single `0`/`1` per path, no delimiter, makes the reply self-checking:
+/// the only well-formed answer to N questions is N characters, so a
+/// truncated or interleaved reply cannot be silently misread as a verdict
+/// about the wrong path. [`interpret_exists_batch_output`] rejects anything
+/// else rather than guessing (a wrong answer here is a false "this mount
+/// point does not exist" warning on a path the user has).
+///
+/// `[ -e ]` is `Path::exists`'s question - it follows symlinks and does not
+/// care what kind of file it finds - and it cannot fail the script: the
+/// loop always prints something for every path, so the exit status is `0`
+/// whatever the verdicts are. The paths are positional (`"$@"`), never
+/// interpolated into the script text, so there is no quoting question.
+const EXISTS_BATCH_SCRIPT: &str =
+    r#"for p in "$@"; do if [ -e "$p" ]; then printf 1; else printf 0; fi; done"#;
 
 /// The script [`HostSpawn::run`] uses when the command it is given has
 /// input: stage stdin in a **host** temp file, run the command with that
@@ -405,7 +441,9 @@ fn interpret_read_output(
 ///
 /// A command with input goes through [`RUN_WITH_INPUT_SCRIPT`], which
 /// stages the bytes in a host temp file and appends its path, honouring
-/// [`CommandRunner::run`]'s contract on the far side of the boundary.
+/// [`CommandRunner::run`]'s contract on the far side of the boundary. The
+/// existence question goes through [`EXISTS_BATCH_SCRIPT`], which answers
+/// the whole list in that same single call.
 ///
 /// Only a failure to launch `flatpak-spawn`, or the staging sentinel, is an
 /// `io::Error`: every other outcome is passed through so that `findmnt`'s
@@ -463,6 +501,89 @@ impl CommandRunner for HostSpawn {
         }
         Ok(output)
     }
+
+    /// One `flatpak-spawn --host` for the whole list, whatever its length -
+    /// see [`EXISTS_BATCH_SCRIPT`].
+    fn paths_exist(&self, paths: &[&str]) -> io::Result<Vec<bool>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plan = exists_batch_plan(paths);
+        let output = plan
+            .command()
+            .output()
+            .map_err(|err| launch_error(&plan, err))?;
+        interpret_exists_batch_output(paths, output.status.code(), &output.stdout, &output.stderr)
+    }
+}
+
+/// What [`HostSpawn::paths_exist`] runs for `paths`:
+/// `flatpak-spawn --host sh -c '<EXISTS_BATCH_SCRIPT>' sh <path…>`.
+///
+/// Pure, so the exact command line is reviewable and regression-tested
+/// without a sandbox, exactly like [`read_plan`] and [`run_plan`].
+///
+/// The second `sh` is the script's `$0`, so the paths start at `$1` and
+/// `"$@"` expands to all of them and nothing else.
+fn exists_batch_plan(paths: &[&str]) -> Spawn {
+    let mut args = vec![
+        OsString::from(HOST_FLAG),
+        OsString::from(SH),
+        OsString::from("-c"),
+        OsString::from(EXISTS_BATCH_SCRIPT),
+        OsString::from(SH),
+    ];
+    args.extend(paths.iter().map(OsString::from));
+    Spawn {
+        program: OsString::from(FLATPAK_SPAWN),
+        args,
+    }
+}
+
+/// Turns a finished batched existence query into one verdict per path.
+///
+/// Pure, like [`interpret_read_output`]: every failure mode is classified
+/// by a function a unit test can call directly, no sandbox needed.
+///
+/// Anything other than exit 0 with exactly one `0`/`1` character per path
+/// is an `io::Error`, never a partial verdict - the caller's check is
+/// advisory, and a guessed answer would surface as a confident claim about
+/// a path nobody actually looked at.
+fn interpret_exists_batch_output(
+    paths: &[&str],
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> io::Result<Vec<bool>> {
+    if code != Some(0) {
+        let how = match code {
+            Some(code) => format!("with status {code}"),
+            None => "on a signal".to_string(),
+        };
+        return Err(io::Error::other(format!(
+            "asking the host which of {} path(s) exist failed: the host command exited {how}{}",
+            paths.len(),
+            stderr_excerpt(stderr)
+        )));
+    }
+    if stdout.len() != paths.len() {
+        return Err(io::Error::other(format!(
+            "asking the host which of {} path(s) exist gave {} answer(s)",
+            paths.len(),
+            stdout.len()
+        )));
+    }
+    stdout
+        .iter()
+        .map(|byte| match byte {
+            b'1' => Ok(true),
+            b'0' => Ok(false),
+            other => Err(io::Error::other(format!(
+                "the host's existence answer contained {:?}, which is neither 0 nor 1",
+                char::from(*other)
+            ))),
+        })
+        .collect()
 }
 
 /// The production [`CommandRunner`] for this process: [`HostSpawn`] inside
@@ -1104,6 +1225,19 @@ mod tests {
             .run("cat", &[], Some(b"payload"))
             .expect("the staged input must reach the host");
         assert_eq!(echoed.stdout, b"payload");
+
+        // The existence check has to see the host's filesystem, not this
+        // sandbox's: the host has `/etc/fstab` (which the sandbox does not)
+        // and no `/.flatpak-info` (which the sandbox does), so this pair of
+        // answers can only come from outside.
+        let answers = runner
+            .paths_exist(&["/etc/fstab", SANDBOX_MARKER_PATH])
+            .expect("the host must be able to answer");
+        assert_eq!(
+            answers,
+            vec![true, false],
+            "the existence check must be answered by the host, not by this sandbox"
+        );
     }
 
     #[test]
@@ -1258,6 +1392,74 @@ mod tests {
         .expect("a cleanly-answered candidate must win");
 
         assert_eq!(picked, system_install);
+    }
+
+    /// The batched shape, literally: one script, then every path as a
+    /// positional argument after the `$0` filler - never one spawn per path.
+    #[test]
+    fn the_batched_existence_plan_passes_every_path_to_one_flatpak_spawn() {
+        let plan = exists_batch_plan(&["/boot", "/mnt/My Disk", "/opt"]);
+
+        assert_eq!(
+            plan.to_string(),
+            "flatpak-spawn --host sh -c ".to_string()
+                + EXISTS_BATCH_SCRIPT
+                + " sh /boot /mnt/My Disk /opt"
+        );
+        // A path with a space is one argument, whatever the Display joining
+        // above looks like.
+        assert_eq!(plan.args.len(), 8);
+        assert_eq!(plan.args[6], OsString::from("/mnt/My Disk"));
+    }
+
+    #[test]
+    fn a_batched_existence_answer_is_one_verdict_per_path_in_order() {
+        let paths = ["/etc/fstab", "/nope", "/boot"];
+
+        assert_eq!(
+            interpret_exists_batch_output(&paths, Some(0), b"101", b"")
+                .expect("a well-formed answer must be accepted"),
+            vec![true, false, true]
+        );
+    }
+
+    /// Every malformed reply is an error rather than a guessed verdict: a
+    /// wrong answer here becomes a confident "this mount point does not
+    /// exist" warning about a path nobody looked at.
+    #[test]
+    fn a_malformed_batched_existence_answer_is_an_error() {
+        let paths = ["/etc/fstab", "/nope"];
+
+        for (code, stdout, stderr) in [
+            (Some(0), &b"1"[..], &b""[..]),
+            (Some(0), &b"111"[..], &b""[..]),
+            (Some(0), &b"1x"[..], &b""[..]),
+            (Some(0), &b""[..], &b""[..]),
+            (Some(1), &b"10"[..], &b"Portal call failed\n"[..]),
+            (None, &b""[..], &b""[..]),
+        ] {
+            let error = interpret_exists_batch_output(&paths, code, stdout, stderr)
+                .expect_err("a malformed answer must fail");
+            assert!(
+                error.to_string().contains("host"),
+                "the message must say who could not answer: {error}"
+            );
+        }
+
+        let denied = interpret_exists_batch_output(&paths, Some(1), b"", b"Portal call failed\n")
+            .expect_err("a denied portal must fail");
+        assert!(denied.to_string().contains("Portal call failed"));
+    }
+
+    /// Nothing to ask means nothing is spawned - asserted on the real
+    /// [`HostSpawn`], since an empty list is the one input it can be given
+    /// outside a sandbox without reaching for `flatpak-spawn`.
+    #[test]
+    fn an_empty_batched_existence_query_spawns_nothing() {
+        assert_eq!(
+            HostSpawn.paths_exist(&[]).expect("nothing to answer"),
+            Vec::<bool>::new()
+        );
     }
 
     #[test]

@@ -493,16 +493,34 @@ Two details the implementation has to get right, both in
   answers `false` for all of them - including the right one. The check is one
   more `flatpak-spawn --host` call.
 
-- **`findmnt --verify` and `lsblk` must run on the host too.** A sandboxed
+- **`findmnt --verify`, `lsblk` and the mount-point existence check must run
+  on the host too.** A sandboxed
   `findmnt` cannot see the host's mount points and incorrectly reports most
   entries (including `/`) as unreachable; a sandboxed `lsblk` exits
-  successfully but reports no UUIDs or labels for any device. The fix routes both through
+  successfully but reports no UUIDs or labels for any device; and the
+  advisory "mount point does not currently exist on disk" check stats the
+  *runtime's* `/`, so `/boot`, `/opt`, `/mnt/…` and every `/run/media/…`
+  that the host really has is reported missing - a false warning on
+  nearly every real fstab. The fix routes all three through
   `flatpak-spawn --host` via an injectable `fstab_core::exec::CommandRunner`
   (selected in `src-tauri/src/host.rs`). For `findmnt`, the candidate is
   staged in a host-side `mktemp` file and passed to `--tab-file`, because
   the sandbox's `/tmp` is invisible to the host and `--tab-file /dev/stdin`
-  fails on a pipe. The elevated helper is unaffected - it already runs on
-  the host.
+  fails on a pipe. The existence check is **batched**: the trait method
+  takes the whole list of paths and the host runner answers it with one
+  `flatpak-spawn --host sh -c 'for p in "$@"; …'` call per validation,
+  printing one `0`/`1` per path in order, so the cost does not scale with
+  the number of entries (each spawn is a portal round trip). A reply that
+  is not exactly one `0`/`1` per path is an error, and an existence check
+  that cannot be answered emits no findings rather than inventing them. The
+  elevated helper is unaffected - it already runs on the host.
+  **Untested in a sandbox so far:** unlike the `findmnt`/`lsblk` routing,
+  the batched existence call has only been exercised by unit tests (its
+  exact command line and its reply parsing). `host.rs`'s
+  `sandbox_smoke_host_runner_runs_on_the_host` now also asserts that the
+  host answers `[true, false]` for `["/etc/fstab", "/.flatpak-info"]`, but
+  that test is `#[ignore]`d and has to be run by hand from an installed
+  Flatpak.
 
 The one real caveat, recorded honestly: the binary that runs on the host is
 the Flatpak-built one, dynamically linked against the *runtime's* GTK,
