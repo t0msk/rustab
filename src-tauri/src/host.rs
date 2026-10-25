@@ -36,6 +36,15 @@
 //!    (`flatpak-spawn --host pkexec …`) and must name a **host** path for
 //!    this binary, since `std::env::current_exe()` inside the sandbox
 //!    yields `/app/bin/rustab`, which doesn't exist outside it.
+//! 3. A [`CommandRunner`] - `fstab-core`'s seam for the two system tools
+//!    it shells out to, `findmnt --verify` and `lsblk`. Both answer
+//!    questions about `/dev`, udev and the live mount table, none of which
+//!    the sandbox shares with the host: run inside it, `findmnt --verify`
+//!    calls even `/` "unreachable on boot" and `lsblk` exits 0 reporting no
+//!    device with a UUID. Both are wrong, and the `findmnt` one blocks
+//!    every save. So these run on the host too (see
+//!    [`RUN_WITH_INPUT_SCRIPT`] for the one awkward part - `findmnt` needs
+//!    its input as a *file*, and the sandbox's `/tmp` is private).
 //!
 //! It doesn't hide the sandbox from the rest of the program: every
 //! function is explicit about which side of the boundary it acts on,
@@ -47,20 +56,28 @@
 //! ## Why `cargo test` never touches any of this
 //!
 //! The production reader comes from [`real_file_reader`], called only
-//! from the production wrappers that also fill in the real path. Every
+//! from the production wrappers that also fill in the real path (and the
+//! production runner from [`command_runner`], the same way). Every
 //! testable core function takes its reader as a parameter, so tests pass
-//! [`DirectFs`] or their own double. The two pieces that genuinely spawn a
-//! process ([`HostSpawn::read`] and the elevated spawn) are split into a
-//! pure "what would be run" half ([`Spawn`], asserted literally by tests)
-//! and a pure "what did it mean" half ([`interpret_read_output`]), the
-//! same split `privileged::interpret_write_output` uses.
+//! [`DirectFs`] or their own double. The pieces that genuinely spawn a
+//! process ([`HostSpawn`]'s two methods and the elevated spawn) are split
+//! into a pure "what would be run" half ([`Spawn`], asserted literally by
+//! tests) and a pure "what did it mean" half ([`interpret_read_output`]),
+//! the same split `privileged::interpret_write_output` uses.
+//!
+//! The one test that does cross the boundary is
+//! [`tests::sandbox_smoke_host_runner_runs_on_the_host`], which is
+//! `#[ignore]`d and returns early unless it finds itself in a sandbox - it
+//! exists to be run by hand inside an installed Flatpak, where it is the
+//! only place this module's host-side behaviour can actually be observed.
 
+use fstab_core::exec::{CommandRunner, DirectRunner};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 /// The file whose existence means "this process is running inside a
 /// Flatpak sandbox" - the `/etc` it sees is the runtime's, not the host's.
@@ -132,6 +149,34 @@ const READ_SCRIPT: &str = r#"if [ -e "$1" ]; then exec cat -- "$1"; else exit 44
 /// "is this path there?" can never be confused with "what does it hold?".
 const EXISTS_SCRIPT: &str = r#"if [ -e "$1" ]; then exit 0; else exit 44; fi"#;
 
+/// The script [`HostSpawn::run`] uses when the command it is given has
+/// input: stage stdin in a **host** temp file, run the command with that
+/// file appended as its last argument, then delete the file and report the
+/// command's own exit status.
+///
+/// ## Why the content has to make this detour
+///
+/// `findmnt --verify` is the one caller with input, and it will only read a
+/// *seekable* `--tab-file`: handed `/dev/stdin` on a pipe it fails with
+/// `findmnt: can't read /dev/stdin: Success`. So the candidate fstab has to
+/// exist as a file the `findmnt` process can open - and that process is on
+/// the host, which cannot see this sandbox's `/tmp` at all. A path from
+/// [`std::env::temp_dir`] would therefore name nothing on the other side.
+/// `mktemp` on the host is the shortest thing that works: the bytes cross
+/// the boundary as the child's stdin, where they already travel safely.
+///
+/// The command and its arguments are positional (`"$@"`), never
+/// interpolated into the script text, so there is no quoting question;
+/// `$(mktemp)`'s result is quoted everywhere it is used. The file is
+/// removed on both paths, and `$s` preserves the command's status across
+/// the `rm`.
+///
+/// A `mktemp` or `cat` failure exits [`STAGING_FAILED_EXIT`] rather than
+/// letting the command run against a missing or truncated file, which for
+/// `findmnt --verify` would mean validating something other than what the
+/// user is about to save.
+const RUN_WITH_INPUT_SCRIPT: &str = r#"t=$(mktemp) || exit 45; cat > "$t" || { rm -f -- "$t"; exit 45; }; "$@" "$t"; s=$?; rm -f -- "$t"; exit $s"#;
+
 /// The exit code [`READ_SCRIPT`]/[`EXISTS_SCRIPT`] use for "that path
 /// doesn't exist on the host" - the only code [`interpret_read_output`]
 /// maps to [`io::ErrorKind::NotFound`].
@@ -142,6 +187,17 @@ const EXISTS_SCRIPT: &str = r#"if [ -e "$1" ]; then exit 0; else exit 44; fi"#;
 /// [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
 /// pins the three together.
 const MISSING_EXIT: i32 = 44;
+
+/// The exit code [`RUN_WITH_INPUT_SCRIPT`] uses for "the input could not be
+/// staged on the host" - the only code [`HostSpawn::run`] turns into an
+/// `io::Error` instead of passing the command's own status through.
+///
+/// Distinct from [`MISSING_EXIT`] so the two host scripts can never be
+/// confused, and chosen on the same grounds (clear of 0/1/2 and of the
+/// 126/127/128+n ranges). It is only ever consulted for a command that was
+/// *given* input, i.e. one that really ran under this script, so a command
+/// of its own that happened to exit 45 cannot be misread.
+const STAGING_FAILED_EXIT: i32 = 45;
 
 /// How much of a failed host command's stderr is quoted back in the
 /// resulting `io::Error` - same bound and reason as `privileged`'s own
@@ -337,6 +393,145 @@ fn interpret_read_output(
             )))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Running a system tool on the host
+// ---------------------------------------------------------------------------
+
+/// `fstab-core`'s command seam, satisfied by running the command on the
+/// host - one `flatpak-spawn --host` per call, exactly like
+/// [`HostSpawn::read`].
+///
+/// A command with input goes through [`RUN_WITH_INPUT_SCRIPT`], which
+/// stages the bytes in a host temp file and appends its path, honouring
+/// [`CommandRunner::run`]'s contract on the far side of the boundary.
+///
+/// Only a failure to launch `flatpak-spawn`, or the staging sentinel, is an
+/// `io::Error`: every other outcome is passed through so that `findmnt`'s
+/// and `lsblk`'s own exit statuses keep being interpreted by `fstab-core`
+/// as they always were. A portal failure therefore arrives as a non-zero
+/// exit with "Portal call failed" in stderr, which `fstab-core` turns into
+/// its conservative blocking finding carrying that text - noisy but
+/// fail-safe, and the right direction to be wrong in for a check that
+/// guards a save.
+impl CommandRunner for HostSpawn {
+    fn run(&self, program: &str, args: &[&str], input: Option<&[u8]>) -> io::Result<Output> {
+        let plan = run_plan(program, args, input.is_some());
+        let mut command = plan.command();
+        let Some(bytes) = input else {
+            let output = command.output().map_err(|err| launch_error(&plan, err))?;
+            return Ok(output);
+        };
+
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|err| launch_error(&plan, err))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other(format!("`{plan}` gave no stdin to write to")))?;
+        let written = stdin.write_all(bytes).and_then(|()| stdin.flush());
+        // Dropped before waiting, or the host-side `cat` would never see EOF
+        // and both processes would block forever.
+        drop(stdin);
+
+        // A broken pipe means the host script already exited - its status
+        // says why (the staging sentinel, most likely), and that is far more
+        // informative than "write failed". Any other write error is real:
+        // reporting it beats letting the command verify a truncated file.
+        if let Err(err) = written {
+            if err.kind() != io::ErrorKind::BrokenPipe {
+                let _ = child.wait();
+                return Err(io::Error::other(format!(
+                    "could not send {program}'s input to the host through `{plan}` ({err})"
+                )));
+            }
+        }
+
+        let output = child.wait_with_output().map_err(|err| {
+            io::Error::other(format!("could not wait for `{plan}` to finish ({err})"))
+        })?;
+        if output.status.code() == Some(STAGING_FAILED_EXIT) {
+            return Err(io::Error::other(format!(
+                "could not stage the input on the host for `{program}`: the host could not \
+                 create a temporary file to receive it{}",
+                stderr_excerpt(&output.stderr)
+            )));
+        }
+        Ok(output)
+    }
+}
+
+/// The production [`CommandRunner`] for this process: [`HostSpawn`] inside
+/// a Flatpak sandbox, `fstab-core`'s own [`DirectRunner`] everywhere else.
+///
+/// The counterpart of [`real_file_reader`], in the same shape and for the
+/// same reason: the only place that consults the real
+/// [`SANDBOX_MARKER_PATH`], with the decision itself in [`runner_for`] so
+/// the tests can drive it against paths of their own.
+pub(crate) fn command_runner() -> &'static dyn CommandRunner {
+    runner_for(Path::new(SANDBOX_MARKER_PATH))
+}
+
+/// Chooses the runner appropriate for a process whose sandbox marker is (or
+/// is not) at `sandbox_marker`.
+///
+/// Parameterized purely so the choice itself is testable without a sandbox;
+/// production always passes [`SANDBOX_MARKER_PATH`].
+fn runner_for(sandbox_marker: &Path) -> &'static dyn CommandRunner {
+    /// The two runners, as values with a `'static` lifetime to hand out.
+    /// Both are zero-sized, so these cost nothing.
+    static HOST: HostSpawn = HostSpawn;
+    static DIRECT: DirectRunner = DirectRunner;
+
+    if sandbox_marker.exists() {
+        &HOST
+    } else {
+        &DIRECT
+    }
+}
+
+/// What [`HostSpawn::run`] runs for `program` and `args`. Two shapes:
+///
+/// - **no input**: `flatpak-spawn --host <program> <args…>`;
+/// - **with input**: `flatpak-spawn --host sh -c '<RUN_WITH_INPUT_SCRIPT>'
+///   sh <program> <args…>`, with the bytes on the child's stdin and the
+///   staged file's path appended by the script itself.
+///
+/// Pure, so both command lines are reviewable and regression-tested
+/// without a sandbox, exactly like [`read_plan`] and [`exists_plan`].
+///
+/// The second `sh` is the script's `$0`, so `<program>` lands in `$1` and
+/// `"$@"` expands to the command and its arguments.
+fn run_plan(program: &str, args: &[&str], has_input: bool) -> Spawn {
+    let mut spawn_args = vec![OsString::from(HOST_FLAG)];
+    if has_input {
+        spawn_args.push(OsString::from(SH));
+        spawn_args.push(OsString::from("-c"));
+        spawn_args.push(OsString::from(RUN_WITH_INPUT_SCRIPT));
+        spawn_args.push(OsString::from(SH));
+    }
+    spawn_args.push(OsString::from(program));
+    spawn_args.extend(args.iter().map(OsString::from));
+    Spawn {
+        program: OsString::from(FLATPAK_SPAWN),
+        args: spawn_args,
+    }
+}
+
+/// The error for a `flatpak-spawn` that could not be started at all.
+///
+/// Its own [`io::ErrorKind`] is deliberately discarded, for
+/// [`HostSpawn::read`]'s reason: a missing `flatpak-spawn` binary is
+/// reported as `NotFound`, which passed through would read as "the thing
+/// you asked about does not exist".
+fn launch_error(plan: &Spawn, err: io::Error) -> io::Error {
+    io::Error::other(format!(
+        "could not run `{plan}` from inside this Flatpak sandbox ({err})"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -807,13 +1002,108 @@ mod tests {
             EXISTS_SCRIPT.contains(&format!("exit {MISSING_EXIT}")),
             "the existence script must exit with the sentinel: {EXISTS_SCRIPT}"
         );
-        assert_ne!(MISSING_EXIT, 0);
-        assert_ne!(MISSING_EXIT, 1, "1 is what every failure already uses");
-        assert_ne!(MISSING_EXIT, 2);
         assert!(
-            !(126..=165).contains(&MISSING_EXIT),
-            "the sentinel must stay clear of the could-not-execute and signal ranges"
+            RUN_WITH_INPUT_SCRIPT.contains(&format!("exit {STAGING_FAILED_EXIT}")),
+            "the with-input script must exit with the staging sentinel: {RUN_WITH_INPUT_SCRIPT}"
         );
+        assert_ne!(
+            MISSING_EXIT, STAGING_FAILED_EXIT,
+            "the two sentinels must stay distinguishable"
+        );
+        for sentinel in [MISSING_EXIT, STAGING_FAILED_EXIT] {
+            assert_ne!(sentinel, 0);
+            assert_ne!(sentinel, 1, "1 is what every failure already uses");
+            assert_ne!(sentinel, 2);
+            assert!(
+                !(126..=165).contains(&sentinel),
+                "the sentinel must stay clear of the could-not-execute and signal ranges"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_run_plan_without_input_is_a_bare_flatpak_spawn_of_the_command() {
+        let plan = run_plan("lsblk", &["-J", "-O"], false);
+
+        assert_eq!(plan.to_string(), "flatpak-spawn --host lsblk -J -O");
+    }
+
+    /// The with-input shape, literally: the script's `$0` filler, then the
+    /// command and its arguments as `"$@"`. The staged file's path is
+    /// deliberately *not* here - the host script appends it, since only the
+    /// host knows a path that exists there.
+    #[test]
+    fn the_host_run_plan_with_input_wraps_the_command_in_the_staging_script() {
+        let plan = run_plan("findmnt", &["--verify", "--tab-file"], true);
+
+        assert_eq!(
+            plan.to_string(),
+            "flatpak-spawn --host sh -c ".to_string()
+                + RUN_WITH_INPUT_SCRIPT
+                + " sh findmnt --verify --tab-file"
+        );
+    }
+
+    /// Outside a sandbox nothing is routed through `flatpak-spawn`, for the
+    /// same reason as the reader's own choice test.
+    #[test]
+    fn the_runner_is_direct_without_a_sandbox_marker_and_host_spawn_with_one() {
+        let dir = TempDir::new("host-runner-choice");
+        let marker = dir.join("flatpak-info");
+
+        let direct = runner_for(&marker);
+        fs::write(&marker, "[Application]\n").expect("seed the marker");
+        let sandboxed = runner_for(&marker);
+
+        // Only the direct runner can be exercised here: it runs the command
+        // in this process, which is observable; the sandboxed one would
+        // spawn `flatpak-spawn`, so only the plan it would build is asserted
+        // (by the two tests above).
+        let output = direct
+            .run("cat", &[], Some(b"payload"))
+            .expect("the direct runner must run cat locally");
+        assert_eq!(output.stdout, b"payload");
+        let _ = sandboxed;
+    }
+
+    /// Only meaningful inside a Flatpak sandbox, which is why it is
+    /// `#[ignore]`d: run it with
+    /// `flatpak run --command=… dev.tomsk.Rustab … --ignored sandbox_smoke`
+    /// from an installed build. Outside one it returns early, so
+    /// `cargo test -- --ignored` stays green on a developer machine.
+    #[test]
+    #[ignore]
+    fn sandbox_smoke_host_runner_runs_on_the_host() {
+        if !Path::new(SANDBOX_MARKER_PATH).exists() {
+            eprintln!(
+                "skipping: this smoke test only means anything inside a Flatpak sandbox \
+                 (no {SANDBOX_MARKER_PATH} here)"
+            );
+            return;
+        }
+
+        let runner = command_runner();
+
+        // The host has no `/.flatpak-info`, so "out" proves the command did
+        // not run in this sandbox.
+        let where_it_ran = runner
+            .run(
+                "sh",
+                &["-c", "test -e /.flatpak-info && echo in || echo out"],
+                None,
+            )
+            .expect("the host command must run");
+        assert_eq!(
+            String::from_utf8_lossy(&where_it_ran.stdout).trim(),
+            "out",
+            "the command must run on the host, not in this sandbox"
+        );
+
+        // And the input staging has to survive the same crossing.
+        let echoed = runner
+            .run("cat", &[], Some(b"payload"))
+            .expect("the staged input must reach the host");
+        assert_eq!(echoed.stdout, b"payload");
     }
 
     #[test]

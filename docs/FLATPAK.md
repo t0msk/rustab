@@ -493,6 +493,17 @@ Two details the implementation has to get right, both in
   answers `false` for all of them - including the right one. The check is one
   more `flatpak-spawn --host` call.
 
+- **`findmnt --verify` and `lsblk` must run on the host too.** A sandboxed
+  `findmnt` cannot see the host's mount points and incorrectly reports most
+  entries (including `/`) as unreachable; a sandboxed `lsblk` exits
+  successfully but reports no UUIDs or labels for any device. The fix routes both through
+  `flatpak-spawn --host` via an injectable `fstab_core::exec::CommandRunner`
+  (selected in `src-tauri/src/host.rs`). For `findmnt`, the candidate is
+  staged in a host-side `mktemp` file and passed to `--tab-file`, because
+  the sandbox's `/tmp` is invisible to the host and `--tab-file /dev/stdin`
+  fails on a pipe. The elevated helper is unaffected - it already runs on
+  the host.
+
 The one real caveat, recorded honestly: the binary that runs on the host is
 the Flatpak-built one, dynamically linked against the *runtime's* GTK,
 WebKitGTK and glibc. It runs on a host that can satisfy those (verified here

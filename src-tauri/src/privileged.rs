@@ -421,6 +421,9 @@ fn handle_write<W: Write>(
 
     // One call, one process, one authorization: validation, backup, temp
     // file, fsyncs, rename and read-back verification all happen inside here.
+    // The plain entry point on purpose: this process was started by
+    // `flatpak-spawn --host pkexec`, so it is already on the host (no
+    // `/.flatpak-info`) and its own `findmnt --verify` sees the real system.
     let candidate = Document::from(candidate);
     match writer::write_document(&target_path, &candidate) {
         Ok(outcome) => respond(
@@ -768,7 +771,10 @@ pub fn save_elevated(
     // authenticate for a save that cannot succeed. `write_document` validates
     // again inside the elevated process, and that call is the authoritative
     // one - this check could be deleted without weakening any guarantee.
-    let report = validate::validate(candidate);
+    // This half runs in the GUI process, which may be sandboxed, so its
+    // `findmnt --verify` goes through the host runner; otherwise it would
+    // reject every document a sandboxed save could ever submit.
+    let report = validate::validate_with(candidate, crate::host::command_runner());
     if report.has_errors() {
         return Err(WriteErrorDto::from(&writer::WriteError::Validation(report)));
     }

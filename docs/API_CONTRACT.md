@@ -245,6 +245,13 @@ there (e.g. if the system changed in between). Treat a `validation` error from
 Note: `findmnt` is an external process, so this is not free. Debounce it;
 don't call it per keystroke.
 
+Inside a Flatpak sandbox, `findmnt --verify` runs on the host via
+`flatpak-spawn --host` - the candidate is staged in a temp file on the
+host, because a sandboxed `findmnt` cannot see the host's devices or
+mount points and reports nearly every entry, including `/`, as
+unreachable. The validation results reflect the host's state regardless
+of where the app runs.
+
 ### 3.4 `render_candidate`
 
 ```
@@ -549,6 +556,10 @@ without a usable `lsblk` yields `{"devices": [], "lsblk_available": false}`,
 and the UI must keep manual entry fully available (`docs/SPEC.md` §8). Show
 "device discovery unavailable", not "no devices found", when
 `lsblk_available` is `false`.
+
+Inside a Flatpak sandbox, `lsblk` likewise runs on the host via
+`flatpak-spawn --host`, since a sandboxed `lsblk` exits successfully but
+reports no UUIDs or labels at all.
 
 ### 3.9 `read_backup`
 

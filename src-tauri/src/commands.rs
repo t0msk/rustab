@@ -69,6 +69,15 @@
 //! `flatpak-spawn`. The elevated write path's own change lives in
 //! [`crate::privileged`] and [`crate::host`]; this module's dispatch is unaffected.
 //!
+//! The same applies to the two system tools `fstab-core` shells out to:
+//! `findmnt --verify` and `lsblk` only describe the machine their own
+//! process can see, so every command here that triggers one
+//! ([`validate_candidate`], [`discover_devices`], and
+//! [`save_document_with`]'s non-elevated branch) passes
+//! [`crate::host::command_runner`] to `fstab-core`'s runner-taking entry
+//! point. Inside a sandbox they run on the host; everywhere else, in this
+//! process, exactly as before.
+//!
 //! ## Why every command is `#[tauri::command(async)]`
 //!
 //! Several do blocking work: `lsblk`, `findmnt`, file I/O, and a `pkexec`
@@ -216,14 +225,17 @@ pub fn resync_external_change() -> Result<DocumentViewDto, CommandErrorDto> {
 
 /// Validates a candidate document without writing anything.
 ///
-/// Runs the identical [`validate::validate`] call a save runs, so the
-/// findings shown in the form are the findings that will block (or not block)
-/// the save. Nothing on disk is touched: the semantic `findmnt --verify`
-/// check inside `validate` renders the candidate to its own throwaway temp
-/// file, never to the target.
+/// Runs the identical validation a save runs, so the findings shown in the
+/// form are the findings that will block (or not block) the save. Nothing
+/// on disk is touched: the semantic `findmnt --verify` check inside
+/// `validate_with` renders the candidate to its own throwaway temp file,
+/// never to the target.
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn validate_candidate(candidate: DocumentDto) -> ValidationReportDto {
-    ValidationReportDto::from(&validate::validate(&Document::from(candidate)))
+    ValidationReportDto::from(&validate::validate_with(
+        &Document::from(candidate),
+        host::command_runner(),
+    ))
 }
 
 /// Renders a candidate document to the exact text a save would write.
@@ -468,7 +480,7 @@ pub fn create_backup() -> Result<BackupInfoDto, CreateBackupErrorDto> {
 /// (`docs/SPEC.md` §8).
 #[tauri::command(async)]
 pub fn discover_devices() -> DeviceDiscoveryDto {
-    DeviceDiscoveryDto::from(&discovery::discover_devices())
+    DeviceDiscoveryDto::from(&discovery::discover_devices_with(host::command_runner()))
 }
 
 /// Opens the directory holding this session's backups in the host file
@@ -1031,9 +1043,11 @@ fn save_document_with(
             candidate,
             &target::ExternalChangeGuard::unchecked(),
         ),
-        TargetSource::Environment => writer::write_document(&target.path, candidate)
-            .map(|outcome| WriteOutcomeDto::from_outcome(&outcome, false))
-            .map_err(|err| WriteErrorDto::from(&err)),
+        TargetSource::Environment => {
+            writer::write_document_with_runner(&target.path, candidate, host::command_runner())
+                .map(|outcome| WriteOutcomeDto::from_outcome(&outcome, false))
+                .map_err(|err| WriteErrorDto::from(&err))
+        }
     }
 }
 
