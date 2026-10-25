@@ -1389,8 +1389,18 @@ pub fn app_shell() -> Html {
         .and_then(|t| t.real_target_backup_fallback_dir.clone())
         .map(AttrValue::from);
 
+    // The webview's own native context menu (Back/Forward/Stop/Reload) has
+    // no use in a desktop app with no navigation - suppressed everywhere so
+    // the only context menu a right-click can ever produce is the entry
+    // row's own custom one (`entries_table.rs`), which calls its own
+    // `prevent_default` and is unaffected by this root-level catch-all.
+    let suppress_native_context_menu = Callback::from(|event: MouseEvent| event.prevent_default());
+
     html! {
-        <div class="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100">
+        <div
+            class="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100"
+            oncontextmenu={suppress_native_context_menu}
+        >
             if let Some(info) = &*target {
                 <TargetBanner
                     path={AttrValue::from(info.path.clone())}
