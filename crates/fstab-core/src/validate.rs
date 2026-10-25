@@ -698,6 +698,16 @@ struct FindmntDetailLine {
 /// different indentation means an output shape this parser hasn't seen.
 const FINDMNT_DETAIL_INDENT: &str = "   ";
 
+/// The indentation a long `[E]`/`[W]` diagnostic wraps its continuation
+/// line to - aligned under the message text, i.e.
+/// [`FINDMNT_DETAIL_INDENT`] plus `"[W] "`'s width (`"[E] "` is the same
+/// width, so one constant covers both). Confirmed against real output: a
+/// system where `/etc/fstab` differs from what systemd has loaded gets an
+/// extra warning long enough to wrap, `"your fstab has been modified, but
+/// systemd still uses the old version;\n       use 'systemctl
+/// daemon-reload' to reload"`.
+const FINDMNT_DETAIL_CONTINUATION_INDENT: &str = "       ";
+
 /// Decomposes `findmnt --verify`'s combined stdout+stderr into one
 /// [`FindmntDetailLine`] per `[E]`/`[W]` diagnostic, plus a
 /// `had_unrecognized_content` flag for anything that didn't fit the
@@ -751,6 +761,23 @@ fn parse_findmnt_detail(text: &str) -> (Vec<FindmntDetailLine>, bool) {
                 None => had_unrecognized_content = true,
             }
             continue;
+        }
+
+        // A wrapped continuation of the diagnostic line just above, not a
+        // new one of its own - folded onto it rather than treated as
+        // unrecognized content (see FINDMNT_DETAIL_CONTINUATION_INDENT).
+        if let Some((_, count)) = open_block.as_ref() {
+            if *count > 0 {
+                if let Some(rest) = line.strip_prefix(FINDMNT_DETAIL_CONTINUATION_INDENT) {
+                    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                        if let Some(last) = detail_lines.last_mut() {
+                            last.message.push(' ');
+                            last.message.push_str(rest);
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         // Any non-diagnostic line ends the block above it; a header that
@@ -1929,6 +1956,29 @@ mod tests {
 
         // A trailing header left open at end of input.
         let (detail, unrecognized) = parse_findmnt_detail("/mnt/data\n   [E] boom\n/mnt/other\n");
+        assert!(unrecognized, "got: {detail:?}");
+    }
+
+    #[test]
+    fn findmnt_detail_parser_folds_a_wrapped_diagnostic_onto_the_line_above() {
+        // T41: real findmnt output - its systemd-reload notice is long
+        // enough to wrap onto a continuation line.
+        let (detail, unrecognized) = parse_findmnt_detail(
+            "/mnt/data\n   [W] your fstab has been modified, but systemd still uses the old \
+             version;\n       use 'systemctl daemon-reload' to reload\n",
+        );
+        assert!(!unrecognized, "got: {detail:?}");
+        assert_eq!(detail.len(), 1);
+        assert_eq!(
+            detail[0].message,
+            "your fstab has been modified, but systemd still uses the old version; \
+             use 'systemctl daemon-reload' to reload"
+        );
+
+        // A continuation-shaped line with no diagnostic above it to fold
+        // onto is still unrecognized, not silently dropped.
+        let (detail, unrecognized) =
+            parse_findmnt_detail("/mnt/data\n       stray continuation, nothing above it\n");
         assert!(unrecognized, "got: {detail:?}");
     }
 
