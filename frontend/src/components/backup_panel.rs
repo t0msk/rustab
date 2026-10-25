@@ -10,16 +10,12 @@
 //! built by [`fallback_notice_text`], kept separate from the `html!` so
 //! it can be unit tested without a DOM.
 //!
-//! T40 note: the banner's second fact - that each save's automatic backup is
-//! still written beside the real `/etc/fstab` - holds because the elevated
-//! helper is started with `flatpak-spawn --host pkexec`, which runs it on the
-//! host rather than inside the sandbox's mount namespace, so it really does
-//! reach the real file. The text says "can't list /etc/" rather than "can't
-//! manage files in /etc/", since that is the accurate description of what a
-//! sandboxed session cannot do: it *can* have `/etc/fstab` written for it,
-//! it just cannot enumerate the directory.
-//!
-//! T41: shortened to one line, same two facts.
+//! In fallback mode, the list returned by `list_backups` also includes the
+//! real `/etc/fstab`'s own automatic backups from the host's `/etc/`, each
+//! flagged `deletable == false` (`BackupInfoDto::deletable`): this sandboxed
+//! install can restore one and show its diff, but cannot delete it, so
+//! `BackupListItem` renders a non-interactive pill in place of the `Delete`
+//! button for those rows.
 
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
@@ -35,10 +31,20 @@ use crate::dto::BackupInfoDto;
 pub fn fallback_notice_text(fallback_dir: Option<&str>) -> Option<String> {
     fallback_dir.map(|dir| {
         format!(
-            "This sandbox can't list /etc/, so backups land in {dir} instead; /etc/fstab's \
-             automatic backups still exist and are recoverable from a rescue environment."
+            "Backups created here are kept in {dir} because this sandbox can't manage files \
+             in /etc/; /etc/fstab's automatic backups are listed too and can be restored, but \
+             not deleted, from here."
         )
     })
+}
+
+/// Tooltip for the pill `BackupListItem` shows in place of `Delete` when
+/// `BackupInfoDto::deletable` is `false`. Kept as a plain function, same
+/// reasoning as [`fallback_notice_text`], so the exact wording is unit
+/// tested without a DOM.
+fn non_deletable_pill_title() -> &'static str {
+    "This backup sits beside the real /etc/fstab. This sandboxed install can restore it and \
+     show its diff, but cannot delete it."
 }
 
 /// Formats a backup's `created_unix_secs` into `(relative, iso)` strings
@@ -196,13 +202,22 @@ pub fn backup_list_item(props: &BackupListItemProps) -> Html {
                 >
                     { "View diff" }
                 </button>
-                <button
-                    type="button"
-                    class="px-3 py-1.5 rounded-md text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-900/20 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
-                    onclick={props.on_delete.clone()}
-                >
-                    { "Delete" }
-                </button>
+                if backup.deletable {
+                    <button
+                        type="button"
+                        class="px-3 py-1.5 rounded-md text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-900/20 text-xs font-medium focus-visible:ring-2 focus-visible:ring-sky-500"
+                        onclick={props.on_delete.clone()}
+                    >
+                        { "Delete" }
+                    </button>
+                } else {
+                    <span
+                        class="inline-block rounded-full bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300 text-xs font-medium px-2 py-0.5"
+                        title={non_deletable_pill_title()}
+                    >
+                        { "Beside /etc/fstab" }
+                    </span>
+                }
             </div>
         </li>
     }
@@ -227,10 +242,10 @@ mod tests {
         assert!(notice.contains(dir));
         assert!(notice.contains("/etc/fstab"));
 
-        // (b) automatic backups from ordinary saves still exist and are
-        // recoverable from a rescue environment.
-        assert!(notice.to_lowercase().contains("recoverable"));
-        assert!(notice.to_lowercase().contains("rescue"));
+        // (b) /etc/fstab's own automatic backups are listed too, and can be
+        // restored but not deleted from here.
+        assert!(notice.to_lowercase().contains("restored"));
+        assert!(notice.to_lowercase().contains("not deleted"));
 
         // (c) exactly one sentence: it ends with a sentence-terminating
         // period and contains no internal ". " that would mark a second
@@ -246,5 +261,14 @@ mod tests {
         // the one it was given.
         let notice = fallback_notice_text(Some("/some/other/path")).unwrap();
         assert!(notice.contains("/some/other/path"));
+    }
+
+    #[test]
+    fn non_deletable_pill_title_names_what_is_and_is_not_possible() {
+        let title = non_deletable_pill_title();
+        assert!(title.contains("/etc/fstab"));
+        assert!(title.to_lowercase().contains("restore"));
+        assert!(title.to_lowercase().contains("diff"));
+        assert!(title.to_lowercase().contains("cannot delete"));
     }
 }

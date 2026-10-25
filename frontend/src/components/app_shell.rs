@@ -1090,7 +1090,15 @@ pub fn app_shell() -> Html {
     let on_backup_delete = {
         let backup_delete_target = backup_delete_target.clone();
         let backup_delete_error = backup_delete_error.clone();
+        let backups = backups.clone();
         Callback::from(move |idx: usize| {
+            // Defensive: `BackupListItem` only wires this callback to a
+            // `Delete` button, never to the non-deletable pill, so this
+            // should be unreachable - but it costs nothing to not trust the
+            // index blindly here too.
+            if !backups.get(idx).is_some_and(|b| b.deletable) {
+                return;
+            }
             backup_delete_error.set(None);
             backup_delete_target.set(Some(idx));
         })
