@@ -14,10 +14,13 @@
 //! still written beside the real `/etc/fstab` - holds because the elevated
 //! helper is started with `flatpak-spawn --host pkexec`, which runs it on the
 //! host rather than inside the sandbox's mount namespace, so it really does
-//! reach the real file. The text says "can't list the contents of /etc/"
-//! rather than "can't manage files in /etc/", since that is the accurate
-//! description of what a sandboxed session cannot do: it *can* have
-//! `/etc/fstab` written for it, it just cannot enumerate the directory.
+//! reach the real file. The text says "can't list /etc/" rather than "can't
+//! manage files in /etc/", since that is the accurate description of what a
+//! sandboxed session cannot do: it *can* have `/etc/fstab` written for it,
+//! it just cannot enumerate the directory.
+//!
+//! T41: shortened to one line - see [`fallback_notice_text`]'s own tests for
+//! the two facts it must still state.
 
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
@@ -33,11 +36,8 @@ use crate::dto::BackupInfoDto;
 pub fn fallback_notice_text(fallback_dir: Option<&str>) -> Option<String> {
     fallback_dir.map(|dir| {
         format!(
-            "Because this sandboxed install can't list the contents of /etc/, backups \
-             you create here are kept in {dir} instead of beside the real /etc/fstab; \
-             the automatic backup made by each ordinary save is still written beside \
-             the real /etc/fstab and, while not shown or manageable here, is not lost - \
-             it is recoverable from a rescue environment."
+            "This sandbox can't list /etc/, so backups land in {dir} instead; /etc/fstab's \
+             automatic backups still exist and are recoverable from a rescue environment."
         )
     })
 }
@@ -228,11 +228,9 @@ mod tests {
         assert!(notice.contains(dir));
         assert!(notice.contains("/etc/fstab"));
 
-        // (b) automatic backups from ordinary saves are still beside the
-        // real file, not shown here, not lost, recoverable from a rescue
-        // environment.
-        assert!(notice.contains("not shown"));
-        assert!(notice.to_lowercase().contains("not lost"));
+        // (b) automatic backups from ordinary saves still exist and are
+        // recoverable from a rescue environment.
+        assert!(notice.to_lowercase().contains("recoverable"));
         assert!(notice.to_lowercase().contains("rescue"));
 
         // (c) exactly one sentence: it ends with a sentence-terminating
