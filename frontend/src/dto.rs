@@ -239,6 +239,14 @@ pub struct BackupInfoDto {
     /// `file_name` - the backend owns the naming scheme and reports the
     /// answer here.
     pub is_manual: bool,
+    /// Whether `delete_backup` would accept this row in this session
+    /// (`docs/API_CONTRACT.md` §3.6). `true` for every row outside fallback
+    /// mode and for the fallback directory's own rows; `false` only for a
+    /// real `/etc/fstab` backup listed from the host's `/etc/` while in
+    /// fallback mode, which this sandboxed install can restore and diff but
+    /// cannot delete. Never inferred from `path` or `target_path` - the
+    /// backend owns the dispatch and reports the answer here.
+    pub deletable: bool,
 }
 
 /// Which of this app's five known external links to open

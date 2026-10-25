@@ -149,6 +149,11 @@ fn describe(target: &Path, backup: &Path, manual: bool) -> Option<BackupInfoDto>
         created_unix_secs: modified_unix_secs(&metadata),
         path: backup.to_string_lossy().into_owned(),
         is_manual: manual,
+        // This module only ever lists a directory the calling session may
+        // also delete from. The one exception - a real `/etc/fstab` backup
+        // listed from the host by a sandboxed session - is built by
+        // `rustab`'s own `host_backups` module, not here.
+        deletable: true,
     })
 }
 

@@ -1017,6 +1017,15 @@ pub struct BackupInfoDto {
     /// backups are pruned once there are more than ten of them, manual ones
     /// are kept until the user deletes them.
     pub is_manual: bool,
+    /// `true` for every backup `commands::delete_backup` accepts in this
+    /// session - i.e. every row [`crate::backups::list`] and
+    /// [`crate::backups::describe_one`] produce.
+    ///
+    /// `false` only for a real `/etc/fstab` backup listed from the host's
+    /// `/etc/` by a sandboxed (fallback-mode) session: such a backup can be
+    /// restored and its content shown, but not deleted from there (see
+    /// `docs/API_CONTRACT.md` §3.6).
+    pub deletable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,10 +1370,11 @@ mod tests {
             size_bytes: 12,
             created_unix_secs: Some(1_760_000_000),
             is_manual: true,
+            deletable: true,
         };
         assert_eq!(
             serde_json::to_string(&backup).expect("serialize"),
-            r#"{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true}"#
+            r#"{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true,"deletable":true}"#
         );
 
         let create_outcome = CreateBackupOutcomeDto {
