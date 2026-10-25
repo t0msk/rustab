@@ -4,9 +4,10 @@
 //! compiled into the shipped binary.
 //!
 //! Duplicates the tiny temp-directory helper `crates/fstab-core/src/writer.rs`
-//! keeps in its own `mod tests`, rather than promoting it into published
-//! API: `fstab-core`'s public surface is the fstab domain, not a
-//! test-utility export for a second crate's scratch directory.
+//! and `crates/rustab-privileged/src/testutil.rs` each keep for themselves,
+//! rather than promoting it into published API: those crates' public
+//! surfaces are the fstab domain and the privileged protocol, not a
+//! test-utility export for another crate's scratch directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -103,7 +103,7 @@ use crate::dto::{
 };
 use crate::host::{self, RealFileReader};
 use crate::privileged;
-use crate::target::{self, ActiveTarget, TargetSource};
+use crate::target::{self, ActiveTarget, ExternalChangeGuardExt, TargetSource};
 use fstab_core::model::Document;
 use fstab_core::{discovery, parser, validate, writer};
 use std::fs;
@@ -701,7 +701,7 @@ fn refresh_backup_mirror(
 /// rendered for display, so the notice shown and the directory the
 /// backup commands act on are one answer, not two that could disagree.
 fn describe_target(target: &ActiveTarget, location: &BackupLocation) -> TargetInfoDto {
-    TargetInfoDto::describe(target, backup_fallback_dir(target, location))
+    target::describe(target, backup_fallback_dir(target, location))
 }
 
 /// Whether *mutating* this session's backups needs the elevated helper.

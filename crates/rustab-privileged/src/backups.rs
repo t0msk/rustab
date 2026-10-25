@@ -3,14 +3,16 @@
 //!
 //! Every function here takes the file whose backups are wanted as a `&Path`
 //! parameter, with no opinion on which file that is - not always the
-//! resolved [`crate::target`], since commands pass the **backup-owning**
-//! path (`crate::commands`'s `backup_target_path`), which for a default
-//! launch is the real `/etc/fstab` rather than the working draft.
+//! active target the GUI resolved, since its commands pass the
+//! **backup-owning** path (`rustab`'s `commands::backup_target_path`),
+//! which for a default launch is the real `/etc/fstab` rather than the
+//! working draft.
 //!
 //! ## Why a frontend-supplied path is safe here
 //!
 //! Every other command refuses to accept a path at all, so a buggy or
-//! compromised UI can't redirect a read or write (see [`crate::target`]).
+//! compromised UI can't redirect a read or write (the GUI's own `target`
+//! module is the only thing that decides which file is in play).
 //! `restore_backup`, `read_backup`, and `delete_backup` are the exceptions,
 //! safe for a structural reason: the path is never used until it's found
 //! in the list [`fstab_core::writer::list_backups`] reports for the
@@ -34,7 +36,7 @@
 //! ## Called on both sides of the privilege boundary
 //!
 //! [`resolve_requested`] is also called *inside* the elevated process, by
-//! [`crate::privileged`]'s backup-deletion handler, against the backup
+//! [`crate::protocol`]'s backup-deletion handler, against the backup
 //! list of the target it has already verified it may manage. The
 //! unprivileged side resolving first is just a courtesy; the elevated
 //! side's own call is what actually decides, since nothing the
@@ -152,7 +154,7 @@ fn describe(target: &Path, backup: &Path, manual: bool) -> Option<BackupInfoDto>
 
 /// Describes a single backup of `target` that has *just* been created, for
 /// a caller that already knows its path (currently
-/// [`crate::commands::create_backup`]).
+/// `commands::create_backup`).
 ///
 /// Goes back through [`writer::list_backups`] rather than trusting the
 /// caller's own idea of the kind, so the row is built from the same source
@@ -170,7 +172,7 @@ pub fn describe_one(target: &Path, backup: &Path) -> Result<Option<BackupInfoDto
     })?;
     let Some(entry) = entries
         .into_iter()
-        .find(|entry| crate::target::is_same_file(&entry.path, backup))
+        .find(|entry| crate::target_identity::is_same_file(&entry.path, backup))
     else {
         return Ok(None);
     };
@@ -194,7 +196,7 @@ pub fn resolve_requested(target: &Path, requested: &str) -> Result<PathBuf, Back
             source,
         })?
         .into_iter()
-        .find(|candidate| crate::target::is_same_file(&candidate.path, requested_path))
+        .find(|candidate| crate::target_identity::is_same_file(&candidate.path, requested_path))
         .map(|candidate| candidate.path)
         .ok_or_else(|| BackupError::NotABackupOfTarget {
             requested: requested.to_string(),
@@ -203,11 +205,11 @@ pub fn resolve_requested(target: &Path, requested: &str) -> Result<PathBuf, Back
 }
 
 /// The directory `path` lives in - used for error messages here, and by
-/// [`crate::commands::open_backup_location`] as the directory to open in the
+/// `commands::open_backup_location` as the directory to open in the
 /// host file manager, since it is also where `path`'s backups live (see the
 /// module docs). Mirrors the `.` fallback [`writer`] itself uses for a bare
 /// relative name.
-pub(crate) fn containing_dir(path: &Path) -> PathBuf {
+pub fn containing_dir(path: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),

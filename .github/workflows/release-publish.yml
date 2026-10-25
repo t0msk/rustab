@@ -23,9 +23,9 @@ name: Release publish
 # inferred from commit messages or diff size (SPEC §12).
 #
 # What one run does:
-#   1. reads the current version (all four version fields are kept in
+#   1. reads the current version (every version field is kept in
 #      lockstep per SPEC §12) and computes the new one,
-#   2. rewrites the version in the three crate manifests and in
+#   2. rewrites the version in all five crate manifests and in
 #      tauri.conf.json, refreshes both Cargo.lock files,
 #   3. commits `chore(release): vX.Y.Z` and an annotated tag `vX.Y.Z`, and
 #      pushes both to `release` atomically,
@@ -144,7 +144,7 @@ jobs:
           # manifest means something upstream is wrong - fail loudly here
           # instead of quietly re-aligning files and hiding it in a
           # release commit.
-          for manifest in crates/fstab-core/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
+          for manifest in crates/fstab-core/Cargo.toml crates/rustab-privileged/Cargo.toml crates/rustab-helper/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
             have="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' "$manifest" | head -n1)"
             if [[ "$have" != "$current" ]]; then
               echo "::error file=$manifest::Version '$have' is out of lockstep with '$current' (SPEC §12). Fix this before releasing."
@@ -193,12 +193,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # `[package]` is the first table in all three manifests, so the
+          # `[package]` is the first table in every manifest, so the
           # first line-initial `version = ` is always the package version.
           # The `0,/re/` address limits the substitution to that first
           # match, which keeps dependency version requirements (always
           # inside inline tables, never line-initial) untouched.
-          for manifest in crates/fstab-core/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
+          for manifest in crates/fstab-core/Cargo.toml crates/rustab-privileged/Cargo.toml crates/rustab-helper/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
             sed -i '0,/^version = /s/^version = .*/version = "'"$NEW"'"/' "$manifest"
           done
 
@@ -213,14 +213,14 @@ jobs:
           # tooling metadata (Tailwind CLI devDependency) and is not one of
           # the artefacts SPEC §12 puts in lockstep.
 
-      - name: Verify all four version fields
+      - name: Verify every version field
         shell: bash
         env:
           NEW: ${{ steps.compute.outputs.new }}
         run: |
           set -euo pipefail
           status=0
-          for manifest in crates/fstab-core/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
+          for manifest in crates/fstab-core/Cargo.toml crates/rustab-privileged/Cargo.toml crates/rustab-helper/Cargo.toml src-tauri/Cargo.toml frontend/Cargo.toml; do
             have="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' "$manifest" | head -n1)"
             if [[ "$have" != "$NEW" ]]; then
               echo "::error file=$manifest::Expected version $NEW after rewrite, found '$have'."
@@ -277,6 +277,8 @@ jobs:
 
           git add \
             crates/fstab-core/Cargo.toml \
+            crates/rustab-privileged/Cargo.toml \
+            crates/rustab-helper/Cargo.toml \
             src-tauri/Cargo.toml \
             frontend/Cargo.toml \
             src-tauri/tauri.conf.json \

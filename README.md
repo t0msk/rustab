@@ -260,6 +260,8 @@ This command automatically starts Trunk's dev server (which watches `frontend/sr
 
 The workspace layout:
 - `crates/fstab-core/` - pure Rust parser, validator, writer (zero GUI dependencies)
+- `crates/rustab-privileged/` - GUI-free half shared by both binaries: the IPC DTOs and the elevated stdin/stdout protocol
+- `crates/rustab-helper/` - the `rustab-helper` binary, statically linkable, run as root under `pkexec`
 - `src-tauri/` - Tauri 2 application shell, command IPC layer, privilege escalation
 - `frontend/` - Yew/WASM user interface (compiled via Trunk, not a workspace member due to target conflicts)
 
@@ -303,9 +305,10 @@ The repository includes an automated test suite covering the parser, validator, 
 cargo test --workspace
 ```
 
-Runs 325 tests across:
+Runs 369 tests across:
 - `crates/fstab-core`: 160 unit tests + 4 fixture-based integration tests
-- `src-tauri/rustab_lib`: 161 command and privilege-escalation tests
+- `crates/rustab-privileged`: 47 DTO, backup-resolution and elevated-protocol tests
+- `src-tauri/rustab_lib`: 158 command and privilege-escalation tests
 
 **Frontend (Yew/WASM):**
 

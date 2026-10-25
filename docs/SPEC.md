@@ -309,7 +309,8 @@ manual text entry must still work if these tools are missing.
 
 ## 12. Versioning
 
-- Every crate (`fstab-core`, the `src-tauri` app, `frontend`) and
+- Every crate (`fstab-core`, `rustab-privileged`, `rustab-helper`, the
+  `src-tauri` app, `frontend`) and
   `src-tauri/tauri.conf.json` start at **`0.0.0`**, not Cargo's default
   `0.1.0`. Keep all of them in lockstep at the same version - this is a
   single-product release, not independently versioned libraries.
