@@ -44,9 +44,6 @@
 mod backup_location;
 pub mod commands;
 mod host;
-// Nothing outside this module's own tests calls it yet: the command layer's
-// dispatch into it (and this `allow`'s removal) is the next step.
-#[allow(dead_code)]
 mod host_backups;
 pub mod privileged;
 pub mod target;

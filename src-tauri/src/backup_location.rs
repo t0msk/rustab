@@ -8,54 +8,70 @@
 //! Flatpak reserves the whole `/etc` path space: the `/etc` a sandboxed
 //! process sees is the runtime's, and no `--filesystem=` grant under `/etc`
 //! is honoured, not even the single-file `/etc/fstab:rw`. So a sandboxed
-//! Rustab can't enumerate the real backup directory, and anything it
+//! Rustab can't manage files in the real backup directory: anything it
 //! created at `/etc/…` would land in the runtime's throwaway `/etc`, not
-//! beside the file the user cares about. For the real target, the three
-//! manual-management operations the Backups panel offers (`list_backups`,
-//! `create_backup`, `delete_backup`) therefore move as a set into
-//! [`fallback_dir`], a directory this process genuinely owns.
+//! beside the file the user cares about, and nothing it tried to unlink
+//! there would be the file it meant. For the real target, the two
+//! manual-management operations the Backups panel offers (`create_backup`
+//! and `delete_backup`) therefore move as a pair into [`fallback_dir`], a
+//! directory this process genuinely owns.
 //!
 //! Reads and writes of the real `/etc/fstab` itself aren't affected: both
 //! go through `flatpak-spawn --host` (see [`crate::host`]), so a save's
 //! automatic backup really does land beside the real file, with the usual
 //! rescue-environment colocation property.
 //!
-//! ## Why the three manual-management operations stay in the fallback dir
+//! ## Why creating and deleting stay in the fallback dir
 //!
-//! Since the elevated helper now runs as real host root, `create_backup`/
-//! `delete_backup` for the real target *could* move back into `/etc/`. They
-//! don't, because `list_backups` can't: it's deliberately unprivileged
-//! (`/etc/` is world-readable; a password prompt to read a directory would
-//! be absurd), so it runs in the sandboxed GUI process via
-//! [`fstab_core::writer::list_backups`]'s own `read_dir`, with no seam to
-//! route that through the host.
+//! Listing is no longer part of the package. It used to be: `list_backups`
+//! is deliberately unprivileged (`/etc/` is world-readable; a password
+//! prompt to read a directory would be absurd), and the only listing this
+//! process could take was [`fstab_core::writer::list_backups`]'s own
+//! in-process `read_dir`, which inside the sandbox enumerates the
+//! runtime's `/etc`. It now reaches the real directory through
+//! [`crate::host`]'s unprivileged host-side listing
+//! ([`crate::host::RealFileReader::list_backup_candidates`], shaped into
+//! rows by [`crate::host_backups`]) - the same lightweight inline-script
+//! pattern this module's own mirror refresh already uses to *read* the real
+//! `/etc/fstab`, not the whole-binary re-exec that was considered and
+//! rejected here (that would have duplicated [`crate::privileged`]'s
+//! security surface and host-library fragility for a routine read, and
+//! doubled the number of hidden re-exec entry points the module's
+//! auditability story relies on staying at one).
 //!
-//! That makes the three a package deal: moving creation/deletion into
-//! `/etc/` while listing stays in the fallback dir would mean a backup the
-//! user just created never appearing in the list it was created from. The
-//! alternative - a second, list-only, never-elevated re-exec flag that
-//! host-spawns this binary to list/read/resolve backup paths on the host -
-//! was rejected: it would duplicate [`crate::privileged`]'s whole security
-//! surface and host-library fragility for a routine read, add a password
-//! prompt to a currently-instant manual backup, and double the number of
-//! hidden re-exec entry points the module's auditability story relies on
-//! staying at one.
+//! Since the elevated helper runs as real host root, `create_backup`/
+//! `delete_backup` for the real target *could* now follow the list into
+//! `/etc/`. They don't, by the maintainer's explicit scoping decision, and
+//! the pragmatic benefits of that are real:
 //!
-//! **The accepted consequence** (also stated in `docs/UI_DESIGN.md` §7):
-//! in fallback mode, automatic backups from ordinary saves sit beside the
-//! real `/etc/fstab` but are **not visible** in `list_backups`'s result,
-//! since this process can't enumerate that directory. Only backups
-//! explicitly created via `create_backup` land in, and are visible and
-//! restorable from, the fallback directory.
+//! - taking a manual backup stays instant, with no password prompt for a
+//!   file the user already owns;
+//! - what you create here you can delete here - every row this session
+//!   produced is a row it can remove, with no "created, now undeletable"
+//!   asymmetry;
+//! - nothing in `/etc/` is ever created or unlinked by the sandboxed GUI,
+//!   which keeps the blast radius of a bug in this module inside the
+//!   user's own data directory.
+//!
+//! **The visible consequence** (also stated in `docs/UI_DESIGN.md` §7): a
+//! fallback-mode `list_backups` shows both directories' backups in one
+//! newest-first list - this session's own from [`fallback_dir`], plus the
+//! automatic ones each save leaves beside the real `/etc/fstab`. The
+//! `/etc/` rows are restore-only: they carry
+//! [`crate::dto::BackupInfoDto::deletable`]` == false`, can be restored and
+//! diffed like any other, and are refused by `delete_backup`.
 //!
 //! ## The fallback's second job
 //!
 //! It also serves as defense-in-depth for a sandbox whose host access is
 //! unavailable (no `flatpak-spawn`, the `org.freedesktop.Flatpak` talk-name
 //! missing or revoked, or the portal denied). Such a session can't read or
-//! save the real `/etc/fstab` at all, but can still take, list, and keep
-//! manual backups in a directory it owns - strictly better than no backup
-//! surface at all.
+//! save the real `/etc/fstab` at all, but can still take and keep manual
+//! backups in a directory it owns - strictly better than no backup surface
+//! at all. Its *list* fails rather than showing half the picture, since
+//! half of it now comes from the host: a session that cannot reach the host
+//! cannot honestly claim to know what restore points exist (see
+//! `crate::commands::list_backups_for`).
 
 use crate::host::{self, RealFileReader};
 use crate::target;
@@ -169,34 +185,38 @@ pub(crate) fn real_target_location() -> &'static BackupLocation {
 ///
 /// Not "is this process sandboxed?" and not "can this process reach the
 /// real `/etc/` by any means?" (yes, via [`crate::host`]) - it's "can
-/// **this process**, using the mechanism the three manual-management
-/// operations actually use, enumerate and manage the real file's own
-/// directory?" `list_backups` is unprivileged by design and does a
-/// `read_dir` **in this process** via [`fstab_core::writer::list_backups`],
-/// which has no sandbox-crossing seam. So the answer is "no" whenever the
-/// directory this process would enumerate isn't the host's real one.
+/// **this process**, acting in its own right, *manage* files in the real
+/// file's own directory, i.e. create and unlink backups there?" Reading
+/// and listing that directory are no longer part of the question: both now
+/// cross the sandbox boundary through [`crate::host`] when they have to
+/// (see the module docs). Creating and deleting do not, by design, so the
+/// answer is "no" whenever the directory this process would act in isn't
+/// the host's real one.
 ///
 /// Two conditions select fallback mode:
 ///
 /// 1. **`sandbox_marker` exists.** Inside a Flatpak sandbox,
-///    `colocated_dir` is the runtime's `/etc`, not the host's - listable,
-///    but the wrong directory, so it would never find the real backups or
-///    put new ones beside the real file.
+///    `colocated_dir` is the runtime's `/etc`, not the host's - perfectly
+///    usable, but the wrong directory, so a backup created there would not
+///    be beside the real file and a delete would not remove the file it
+///    named.
 /// 2. **`colocated_dir` can't be enumerated at all** (`fs::read_dir` fails) -
-///    belt and braces for any other confinement.
+///    belt and braces for any other confinement: a directory this process
+///    cannot even look into is not one it should be creating files in.
 ///
 /// Deliberately **not** probed: whether this process can *write* to
 /// `colocated_dir` (would wrongly answer "no" on every ordinary install,
 /// where `/etc` is root-owned `0755` - creating/deleting there is the
 /// elevated helper's job, not this process's), and whether host-spawn
 /// works right now (can't change this function's result either way, since
-/// listing never uses it; observable instead where it matters, via a
-/// save's own error or a draft that failed to refresh).
+/// neither branch's create/delete uses it; observable instead where it
+/// matters, via a save's own error, a failed backup list, or a draft that
+/// failed to refresh).
 ///
 /// ## The one side effect
 ///
 /// Choosing fallback mode creates `fallback_dir` (recursively, best-effort)
-/// here rather than lazily in each of the three operations, so
+/// here rather than lazily in each operation that needs it, so
 /// `list_backups` doesn't report "No such file or directory" the first
 /// time the panel opens on a healthy install. Failure to create it is
 /// ignored here; the first operation that actually needs it reports the
@@ -342,12 +362,13 @@ mod tests {
     /// listable, it is just the wrong directory, so the marker rather than the
     /// permissions is what selects fallback mode.
     ///
-    /// Still true after T40, and that is the point of keeping this test as it
-    /// is: a sandboxed session whose *reads and saves* now reach the real
-    /// `/etc/fstab` through [`crate::host`] still cannot **enumerate** `/etc/`,
-    /// so its manual-management set still belongs in the fallback directory
-    /// (see [`detect`]'s docs for the question, and the module docs for why
-    /// the alternative was rejected).
+    /// Still true now that a sandboxed session's reads, saves *and* backup
+    /// listings reach the real `/etc/fstab` through [`crate::host`], and that
+    /// is the point of keeping this test as it is: none of those create or
+    /// unlink anything in `/etc/`, which is what this decision is about, so
+    /// manual creation and deletion still belong in the fallback directory
+    /// (see [`detect`]'s docs for the question, and the module docs for the
+    /// scoping decision behind the answer).
     #[test]
     fn a_sandbox_marker_selects_the_fallback_directory() {
         let dir = TempDir::new("location-sandboxed");
