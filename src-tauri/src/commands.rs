@@ -1541,6 +1541,13 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
                 panic!("the default draft target must never go through the host reader")
             }
+
+            fn list_backup_candidates(
+                &self,
+                _target: &Path,
+            ) -> io::Result<Vec<crate::host::BackupCandidate>> {
+                panic!("listing entries must never list anything's backups")
+            }
         }
 
         let dir = TempDir::new("list-entries-draft-no-host-read");

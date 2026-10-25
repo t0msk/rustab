@@ -25,12 +25,18 @@
 //!
 //! ## What this module provides, and what it doesn't
 //!
-//! 1. [`RealFileReader`] - an unprivileged read of a host path, injected
-//!    into every production call site that reads the real `/etc/fstab`
+//! 1. [`RealFileReader`] - the unprivileged reads of the host's `/etc/`,
+//!    shaped like `fstab_core::writer`'s own `FileSystemOps` seam and
+//!    injected into every production call site:
+//!    [`RealFileReader::read`], the whole content of a host file
 //!    (`crate::target`'s draft refresh and change-detection,
 //!    [`crate::commands`]'s re-sync command, and
-//!    [`crate::backup_location::refresh_mirror`]). A one-method trait,
-//!    shaped like `fstab_core::writer`'s own `FileSystemOps` seam.
+//!    [`crate::backup_location::refresh_mirror`]), and
+//!    [`RealFileReader::list_backup_candidates`], the names and metadata of
+//!    the files sitting beside a host file - the sandbox cannot `read_dir`
+//!    the host's `/etc/` at all, so without it the real `/etc/fstab`'s own
+//!    backups are invisible (see [`LIST_SCRIPT`] and
+//!    [`crate::host_backups`]).
 //! 2. [`elevated_plan`] - how the elevated half is spawned: under Flatpak,
 //!    `pkexec` must be invoked on the host
 //!    (`flatpak-spawn --host pkexec …`) and must name a **host** path,
@@ -70,10 +76,14 @@
 //! production runner from [`command_runner`], the same way). Every
 //! testable core function takes its reader as a parameter, so tests pass
 //! [`DirectFs`] or their own double. The pieces that genuinely spawn a
-//! process ([`HostSpawn`]'s three methods and the elevated spawn) are split
+//! process ([`HostSpawn`]'s four methods and the elevated spawn) are split
 //! into a pure "what would be run" half ([`Spawn`], asserted literally by
-//! tests) and a pure "what did it mean" half ([`interpret_read_output`]),
-//! the same split `privileged::interpret_write_output` uses.
+//! tests) and a pure "what did it mean" half ([`interpret_read_output`],
+//! [`interpret_list_output`]), the same split
+//! `privileged::interpret_write_output` uses. [`LIST_SCRIPT`]'s own shell
+//! code is exercised too, by running it through a local `sh` against a temp
+//! directory and checking it agrees with [`DirectFs`] (see
+//! [`tests::the_list_script_and_the_direct_listing_agree_on_one_directory`]).
 //!
 //! The one test that does cross the boundary is
 //! [`tests::sandbox_smoke_host_runner_runs_on_the_host`], which is
@@ -81,13 +91,16 @@
 //! exists to be run by hand inside an installed Flatpak, where it is the
 //! only place this module's host-side behaviour can actually be observed.
 
+use crate::backups;
 use fstab_core::exec::{CommandRunner, DirectRunner};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::SystemTime;
 
 /// The file whose existence means "this process is running inside a
 /// Flatpak sandbox" - the `/etc` it sees is the runtime's, not the host's.
@@ -189,6 +202,79 @@ const EXISTS_SCRIPT: &str = r#"if [ -e "$1" ]; then exit 0; else exit 44; fi"#;
 const EXISTS_BATCH_SCRIPT: &str =
     r#"for p in "$@"; do if [ -e "$p" ]; then printf 1; else printf 0; fi; done"#;
 
+/// The script [`HostSpawn::list_backup_candidates`] runs on the host: one
+/// record per regular file in the directory `$1` whose name starts with
+/// `$2` + `.`, carrying that file's size, modification time and name. Exits
+/// [`MISSING_EXIT`] if the directory itself isn't there.
+///
+/// ## Why a `cd` and a relative glob
+///
+/// `cd -- "$1"` first means the glob pattern is `<file name>.*` with no
+/// directory part, so every name the script prints is a **bare file name** -
+/// the same thing `fs::read_dir` yields, and the same thing
+/// `fstab_core::writer::list_backups_among` expects. Nothing has to strip a
+/// prefix off the far side's output, so a directory whose own name contains
+/// an odd byte cannot confuse the parse.
+///
+/// ## Why `[ -f "$f" ]`
+///
+/// Two jobs at once. It keeps the result to regular files, matching
+/// [`DirectFs`]'s `is_file()` (both follow symlinks, so a symlink to a
+/// regular file counts and a dangling one does not), and it discards the
+/// pattern itself: when nothing matches, POSIX `sh` leaves the glob
+/// unexpanded, so `$f` is the literal `fstab.*` - which `[ -f ]` rejects,
+/// unless a file of that exact name really exists, in which case it is a
+/// genuine candidate and reporting it is correct.
+///
+/// ## Why the record is `<size> SP <mtime> LF <name> NUL`
+///
+/// A file name may contain anything but `/` and `NUL` - spaces, newlines,
+/// quotes, leading `-`. So the name is terminated by the one byte that
+/// cannot occur in it, and it goes **last** in the record, after a
+/// fixed-shape header that is split at its first newline. `stat`'s own
+/// `%n` is not newline-safe and is therefore not used; `$(...)` strips the
+/// trailing newline `stat -c` prints, so the header is exactly two numbers
+/// separated by one space. [`interpret_list_output`] rejects anything else
+/// rather than guessing a row.
+///
+/// A `stat` that fails (the file vanished between the glob and the `stat`)
+/// skips that one file, exactly as [`DirectFs`] skips an entry whose
+/// `fs::metadata` fails.
+///
+/// ## Why the trailing `exit 0`
+///
+/// The script's last command is the loop, whose status is that of the last
+/// `[ -f ]`, `stat` or `printf` it ran - so an empty directory, or one whose
+/// final candidate was skipped, would exit non-zero and be read as "the
+/// listing failed". `exit 0` makes "nothing matched" the success it is.
+///
+/// ## Why [`MISSING_EXIT`] again
+///
+/// "The directory is not on the host" has to be
+/// [`io::ErrorKind::NotFound`] and every transport failure must not be, for
+/// [`READ_SCRIPT`]'s reason: this sentinel can only come from a host shell
+/// that ran and could not enter the directory, while a denied portal or a
+/// missing binary lands on some other code. The same number is reused
+/// because it means the same thing; [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
+/// pins it to the constant.
+///
+/// ## The one place this and [`DirectFs`] disagree
+///
+/// A directory that exists but cannot be *entered* fails the `cd`, so it
+/// arrives as [`MISSING_EXIT`] ("not there on the host") rather than as a
+/// permission error; one that can be entered but not read makes the glob
+/// match nothing, which comes back as an empty listing. [`DirectFs`] reports
+/// `PermissionDenied` for both. Accepted rather than worked around: the only
+/// directory this is ever pointed at is the host's `/etc/`, which is mode
+/// 755 - if it were not, nothing else in this program would work either -
+/// and the alternative is a second sentinel for failures that cannot happen.
+///
+/// `--` keeps a directory or prefix starting with `-` from being read as an
+/// option by `cd` or `stat`, and both are positional (`$1`, `$2`), never
+/// interpolated into the script text, so there is no quoting or injection
+/// question.
+const LIST_SCRIPT: &str = r#"cd -- "$1" || exit 44; for f in "$2".*; do [ -f "$f" ] || continue; s=$(stat -c '%s %Y' -- "$f") || continue; printf '%s\n%s\0' "$s" "$f"; done; exit 0"#;
+
 /// The script [`HostSpawn::run`] uses when the command it is given has
 /// input: stage stdin in a **host** temp file, run the command with that
 /// file appended as its last argument, then delete the file and report the
@@ -217,13 +303,14 @@ const EXISTS_BATCH_SCRIPT: &str =
 /// user is about to save.
 const RUN_WITH_INPUT_SCRIPT: &str = r#"t=$(mktemp) || exit 45; cat > "$t" || { rm -f -- "$t"; exit 45; }; "$@" "$t"; s=$?; rm -f -- "$t"; exit $s"#;
 
-/// The exit code [`READ_SCRIPT`]/[`EXISTS_SCRIPT`] use for "that path
-/// doesn't exist on the host" - the only code [`interpret_read_output`]
-/// maps to [`io::ErrorKind::NotFound`].
+/// The exit code [`READ_SCRIPT`], [`EXISTS_SCRIPT`] and [`LIST_SCRIPT`] use
+/// for "that path doesn't exist on the host" - the only code
+/// [`interpret_read_output`] and [`interpret_list_output`] map to
+/// [`io::ErrorKind::NotFound`].
 ///
 /// Not 1 or 2 (used by `sh`/`cat`/`flatpak-spawn` failures) and outside the
-/// 126/127/128+n shell-signal range. Duplicated literally in both scripts
-/// since a shell script can't interpolate a Rust constant;
+/// 126/127/128+n shell-signal range. Duplicated literally in all three
+/// scripts since a shell script can't interpolate a Rust constant;
 /// [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
 /// pins the three together.
 const MISSING_EXIT: i32 = 44;
@@ -286,14 +373,18 @@ const BIN_DIR: &str = "bin";
 /// Reads a file that lives on the **host**, whichever side of a sandbox
 /// boundary this process is on.
 ///
-/// One method, since every real `/etc/fstab` reader wants only the whole
-/// current content as bytes - no metadata, no listing, no partial read.
-/// Shaped after `fstab_core::writer`'s `FileSystemOps` seam: a production
-/// impl plus a test double.
+/// Two methods, because the real `/etc/fstab` is asked exactly two
+/// unprivileged questions: what does it hold, and what sits beside it (its
+/// own backups). Both are ordinary reads of world-readable content, so
+/// neither involves elevation; they are one trait because every caller that
+/// needs one already has the other injected. Shaped after
+/// `fstab_core::writer`'s `FileSystemOps` seam: a production impl plus a
+/// test double.
 ///
-/// Implementations must honour `fs::read`'s error contract:
-/// [`io::ErrorKind::NotFound`] only for a file that's genuinely not there,
-/// some other kind for every other failure (see [`READ_SCRIPT`]).
+/// Implementations must honour `fs::read`'s and `fs::read_dir`'s error
+/// contract: [`io::ErrorKind::NotFound`] only for a file or directory
+/// that's genuinely not there, some other kind for every other failure (see
+/// [`READ_SCRIPT`]).
 pub(crate) trait RealFileReader {
     /// Reads `path`'s full contents from the host.
     ///
@@ -303,6 +394,50 @@ pub(crate) trait RealFileReader {
     /// other [`io::Error`] if it could not be read, including a failure to
     /// reach the host at all.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// Every **regular file** in `target`'s directory on the host whose name
+    /// starts with `target`'s own file name followed by `.`, with its size
+    /// and modification time.
+    ///
+    /// A deliberately wide net: a *documented superset* of `target`'s
+    /// backups, since what counts as a backup is `fstab-core`'s naming
+    /// grammar and nothing here may hold a second opinion about it.
+    /// [`crate::host_backups`] applies that grammar
+    /// (`fstab_core::writer::list_backups_among`) to the names this returns.
+    ///
+    /// Names are raw bytes, never UTF-8-decoded: a file name may hold
+    /// anything but `/` and `NUL`, and a lossy decode would invent a name
+    /// that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Only if the directory itself could not be listed:
+    /// [`io::ErrorKind::NotFound`] when it does not exist on the host, some
+    /// other kind for every other failure (including being unable to reach
+    /// the host). A `target` with no file-name component is not an error -
+    /// it has no siblings to report, so the result is an empty list.
+    fn list_backup_candidates(&self, target: &Path) -> io::Result<Vec<BackupCandidate>>;
+}
+
+/// One file sitting beside a host file, as
+/// [`RealFileReader::list_backup_candidates`] reports it: a possible backup,
+/// before `fstab-core`'s naming grammar has had its say.
+///
+/// Carries the name rather than a path because that is what both
+/// implementations can produce faithfully (the host-side one works inside
+/// the directory, see [`LIST_SCRIPT`]) and what
+/// `fstab_core::writer::list_backups_among` takes; the path is rebuilt from
+/// the target's own directory by [`crate::host_backups`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackupCandidate {
+    /// The file's name alone, with no directory part, as raw OS bytes.
+    pub(crate) name: OsString,
+    /// Its size in bytes.
+    pub(crate) size_bytes: u64,
+    /// Its modification time as whole seconds since the Unix epoch, or
+    /// `None` if the platform could not report it - the same "taken at"
+    /// timestamp `rustab_privileged::backups` uses.
+    pub(crate) modified_unix_secs: Option<u64>,
 }
 
 /// The reader for a process that is already looking at the real filesystem: a
@@ -318,6 +453,52 @@ impl RealFileReader for DirectFs {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
     }
+
+    fn list_backup_candidates(&self, target: &Path) -> io::Result<Vec<BackupCandidate>> {
+        let Some(file_name) = target.file_name() else {
+            return Ok(Vec::new());
+        };
+        let mut prefix = file_name.to_os_string();
+        prefix.push(".");
+
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(backups::containing_dir(target))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.as_bytes().starts_with(prefix.as_bytes()) {
+                continue;
+            }
+            // `fs::metadata` follows symlinks, like the host script's
+            // `[ -f ]`. A failure here is not the directory's failure: the
+            // file vanished between the listing and the `stat`, or the
+            // symlink dangles. Either way it is not a candidate, and the
+            // other entries still are.
+            let Ok(metadata) = fs::metadata(entry.path()) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            candidates.push(BackupCandidate {
+                size_bytes: metadata.len(),
+                modified_unix_secs: modified_unix_secs(&metadata),
+                name,
+            });
+        }
+        Ok(candidates)
+    }
+}
+
+/// `metadata`'s modification time as whole seconds since the Unix epoch, or
+/// `None` if the platform can't report it - the same reading
+/// `rustab_privileged::backups` takes, so a row built from a direct listing
+/// and one built from a host listing mean the same thing.
+fn modified_unix_secs(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
 }
 
 /// The reader for a process inside a Flatpak sandbox: one
@@ -346,6 +527,176 @@ impl RealFileReader for HostSpawn {
         })?;
         interpret_read_output(path, output.status.code(), output.stdout, &output.stderr)
     }
+
+    fn list_backup_candidates(&self, target: &Path) -> io::Result<Vec<BackupCandidate>> {
+        // Nothing to list, and nothing to ask the host: a path with no
+        // file-name component has no siblings by this method's contract, so
+        // the portal is not bothered at all.
+        if target.file_name().is_none() {
+            return Ok(Vec::new());
+        }
+        let plan = list_plan(target);
+        let output = plan
+            .command()
+            .output()
+            .map_err(|err| launch_error(&plan, err))?;
+        interpret_list_output(
+            &backups::containing_dir(target),
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        )
+    }
+}
+
+/// What [`HostSpawn::list_backup_candidates`] runs for `target`:
+/// `flatpak-spawn --host sh -c '<LIST_SCRIPT>' sh <directory> <file name>`.
+///
+/// Pure, so the exact command line is reviewable and regression-tested
+/// without a sandbox, exactly like [`read_plan`] and [`exists_batch_plan`].
+///
+/// The directory and the file name travel as two operands rather than one
+/// path because the script `cd`s into the first and globs on the second -
+/// see [`LIST_SCRIPT`]. The second `sh` is the script's `$0`, so they land
+/// in `$1` and `$2`.
+fn list_plan(target: &Path) -> Spawn {
+    Spawn {
+        program: OsString::from(FLATPAK_SPAWN),
+        args: vec![
+            OsString::from(HOST_FLAG),
+            OsString::from(SH),
+            OsString::from("-c"),
+            OsString::from(LIST_SCRIPT),
+            OsString::from(SH),
+            backups::containing_dir(target).into_os_string(),
+            target.file_name().unwrap_or_default().to_os_string(),
+        ],
+    }
+}
+
+/// Turns a finished host listing of `dir` into the candidates it names.
+///
+/// Pure, like [`interpret_read_output`], and strict for the same kind of
+/// reason: these names decide which files a restore may be offered, so a
+/// reply that is not exactly [`LIST_SCRIPT`]'s format is an error for the
+/// whole call rather than a partial list with a guessed row in it. Half a
+/// list would read as "that backup is gone".
+fn interpret_list_output(
+    dir: &Path,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> io::Result<Vec<BackupCandidate>> {
+    match code {
+        Some(0) => {}
+        Some(MISSING_EXIT) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} does not exist on the host", dir.display()),
+            ));
+        }
+        other => {
+            let how = match other {
+                Some(code) => format!("with status {code}"),
+                None => "on a signal".to_string(),
+            };
+            return Err(io::Error::other(format!(
+                "could not list {} from outside this Flatpak sandbox: the host listing exited \
+                 {how}{}",
+                dir.display(),
+                stderr_excerpt(stderr)
+            )));
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut rest = stdout;
+    while let Some(end) = rest.iter().position(|byte| *byte == 0) {
+        candidates.push(list_record(dir, &rest[..end])?);
+        rest = &rest[end + 1..];
+    }
+    // Everything after the last NUL must be nothing: a non-empty tail is a
+    // record whose name was cut short, which must never be reported as a
+    // (shorter) file name that may well exist.
+    if !rest.is_empty() {
+        return Err(malformed_listing(
+            dir,
+            "the last record is not NUL-terminated",
+        ));
+    }
+    Ok(candidates)
+}
+
+/// Parses one `<size> SP <mtime> LF <name>` record from a host listing of
+/// `dir` (the NUL terminator already removed).
+///
+/// Split at the record's *first* newline, so a newline inside the file name
+/// stays inside the name where it belongs.
+fn list_record(dir: &Path, record: &[u8]) -> io::Result<BackupCandidate> {
+    let Some(newline) = record.iter().position(|byte| *byte == b'\n') else {
+        return Err(malformed_listing(
+            dir,
+            "a record has no newline between its metadata and its file name",
+        ));
+    };
+    let (header, name) = (&record[..newline], &record[newline + 1..]);
+
+    let Ok(header) = std::str::from_utf8(header) else {
+        return Err(malformed_listing(dir, "a record's metadata is not text"));
+    };
+    let Some((size, modified)) = header.split_once(' ') else {
+        return Err(malformed_listing(
+            dir,
+            "a record's metadata is not a size and a time separated by one space",
+        ));
+    };
+    // Only ASCII digits, so a sign, a space, whitespace, an empty field or a
+    // third field is refused rather than parsed into something plausible.
+    if [size, modified]
+        .iter()
+        .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(malformed_listing(
+            dir,
+            "a record's size and time are not both plain decimal numbers",
+        ));
+    }
+    let (Ok(size_bytes), Ok(modified_unix_secs)) = (size.parse::<u64>(), modified.parse::<u64>())
+    else {
+        return Err(malformed_listing(
+            dir,
+            "a record's size or time does not fit in 64 bits",
+        ));
+    };
+
+    if name.is_empty() {
+        return Err(malformed_listing(dir, "a record has an empty file name"));
+    }
+    // A directory entry's name can never contain `/`, so one here means the
+    // record is not what this script produces - and a path, unlike a name,
+    // could point outside the directory that was listed.
+    if name.contains(&b'/') {
+        return Err(malformed_listing(
+            dir,
+            "a record's file name contains a path separator",
+        ));
+    }
+
+    Ok(BackupCandidate {
+        name: OsString::from_vec(name.to_vec()),
+        size_bytes,
+        modified_unix_secs: Some(modified_unix_secs),
+    })
+}
+
+/// The error for a host listing that did not come back in
+/// [`LIST_SCRIPT`]'s format, naming the directory and what was wrong with
+/// it.
+fn malformed_listing(dir: &Path, what: &str) -> io::Error {
+    io::Error::other(format!(
+        "the host's listing of {} could not be read: {what}",
+        dir.display()
+    ))
 }
 
 /// The production reader for this process: [`HostSpawn`] inside a Flatpak
@@ -1037,6 +1388,14 @@ impl RealFileReader for StubReader {
             Err((kind, message)) => Err(io::Error::new(*kind, message.clone())),
         }
     }
+
+    /// Always an empty listing: this double exists to serve (or fail) the
+    /// *content* of one file, and a caller that cares about a listing wants
+    /// a double of its own saying which names it sees - a canned non-empty
+    /// list here would be shared by every test that only wanted a read.
+    fn list_backup_candidates(&self, _target: &Path) -> io::Result<Vec<BackupCandidate>> {
+        Ok(Vec::new())
+    }
 }
 
 /// `": <stderr>"`, truncated, or `""` when the child said nothing.
@@ -1157,6 +1516,15 @@ mod tests {
             "the existence script must exit with the sentinel: {EXISTS_SCRIPT}"
         );
         assert!(
+            LIST_SCRIPT.contains(&format!("exit {MISSING_EXIT}")),
+            "the listing script must exit with the sentinel: {LIST_SCRIPT}"
+        );
+        assert!(
+            LIST_SCRIPT.trim_end().ends_with("exit 0"),
+            "the listing script must end in a success exit, or an empty \
+             directory would read as a failure: {LIST_SCRIPT}"
+        );
+        assert!(
             RUN_WITH_INPUT_SCRIPT.contains(&format!("exit {STAGING_FAILED_EXIT}")),
             "the with-input script must exit with the staging sentinel: {RUN_WITH_INPUT_SCRIPT}"
         );
@@ -1271,6 +1639,26 @@ mod tests {
             vec![true, false],
             "the existence check must be answered by the host, not by this sandbox"
         );
+
+        // And the listing has to come from the host's own `/etc/`, which this
+        // sandbox cannot `read_dir` at all: anything at all coming back is
+        // already proof it was listed outside. Every name must be a sibling
+        // of `/etc/fstab` and never `/etc/fstab` itself, since a row built
+        // from the target would offer restoring the file over itself.
+        let candidates = real_file_reader()
+            .list_backup_candidates(Path::new("/etc/fstab"))
+            .expect("the host must be able to list /etc/");
+        for candidate in &candidates {
+            assert_ne!(
+                candidate.name,
+                OsString::from("fstab"),
+                "the target itself must never be listed as one of its backups"
+            );
+            assert!(
+                candidate.name.as_bytes().starts_with(b"fstab."),
+                "only siblings of /etc/fstab may be listed: {candidate:?}"
+            );
+        }
     }
 
     #[test]
@@ -1330,6 +1718,311 @@ mod tests {
 
         assert!(error.contains('…'));
         assert!(error.len() < long.len());
+    }
+
+    /// One `<size> SP <mtime> LF <name> NUL` record, built the way
+    /// [`LIST_SCRIPT`]'s `printf` does, so the tests below can state the
+    /// bytes they mean without escaping a NUL into a literal.
+    fn record(header: &str, name: &[u8]) -> Vec<u8> {
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes
+    }
+
+    /// Seeds `dir` with the mix every listing test needs: two real backups,
+    /// files that only look like one, another target's backup, the target
+    /// itself, a subdirectory, a dangling symlink, and a name holding a
+    /// newline.
+    fn seed_listing_dir(dir: &Path) {
+        for name in [
+            "fstab",
+            "fstab.rustab-backup.0000000001.000000002",
+            "fstab.rustab-backup.0000000001.000000003.manual",
+            "fstab.bak",
+            // A file whose name really is the glob pattern, so "the pattern
+            // matched nothing" and "the pattern is the file" stay distinct.
+            "fstab.*",
+            "other.rustab-backup.0000000001.000000002",
+            "fstab.odd\nname",
+        ] {
+            fs::write(dir.join(name), format!("# {name}\n")).expect("seed a file");
+        }
+        fs::create_dir(dir.join("fstab.dir")).expect("seed a subdirectory");
+        std::os::unix::fs::symlink(dir.join("fstab.nowhere"), dir.join("fstab.link"))
+            .expect("seed a dangling symlink");
+    }
+
+    /// The names [`seed_listing_dir`] leaves that are both `fstab.`-prefixed
+    /// and regular files - the whole answer either implementation may give,
+    /// sorted so an unordered listing can be compared against it.
+    fn expected_candidate_names() -> Vec<OsString> {
+        let mut names: Vec<OsString> = [
+            "fstab.*",
+            "fstab.bak",
+            "fstab.odd\nname",
+            "fstab.rustab-backup.0000000001.000000002",
+            "fstab.rustab-backup.0000000001.000000003.manual",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        names.sort();
+        names
+    }
+
+    /// The names of `candidates`, sorted - `fs::read_dir` has no order of
+    /// its own, so only the set is asserted.
+    fn sorted_names(candidates: &[BackupCandidate]) -> Vec<OsString> {
+        let mut names: Vec<OsString> = candidates
+            .iter()
+            .map(|candidate| candidate.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_host_list_plan_is_a_flatpak_spawn_of_the_list_script() {
+        let plan = list_plan(Path::new("/etc/fstab"));
+
+        assert_eq!(plan.program, OsString::from("flatpak-spawn"));
+        assert_eq!(
+            plan.args,
+            vec![
+                OsString::from("--host"),
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(LIST_SCRIPT),
+                OsString::from("sh"),
+                OsString::from("/etc"),
+                OsString::from("fstab"),
+            ]
+        );
+        // The directory has to be `$1` and the file name `$2`, i.e. the two
+        // operands after the script's `$0` filler.
+        assert_eq!(plan.args[5], OsString::from("/etc"));
+        assert_eq!(plan.args[6], OsString::from("fstab"));
+    }
+
+    #[test]
+    fn a_well_formed_host_listing_becomes_candidates_in_order() {
+        let mut stdout = record("12 1760000000", b"fstab.rustab-backup.0000000001.000000002");
+        stdout.extend(record("345 1760000900", b"fstab.bak"));
+
+        assert_eq!(
+            interpret_list_output(Path::new("/etc"), Some(0), &stdout, b"")
+                .expect("a well-formed listing must be accepted"),
+            vec![
+                BackupCandidate {
+                    name: OsString::from("fstab.rustab-backup.0000000001.000000002"),
+                    size_bytes: 12,
+                    modified_unix_secs: Some(1_760_000_000),
+                },
+                BackupCandidate {
+                    name: OsString::from("fstab.bak"),
+                    size_bytes: 345,
+                    modified_unix_secs: Some(1_760_000_900),
+                },
+            ]
+        );
+
+        // A directory with nothing beside the target is an empty listing, not
+        // a malformed one.
+        assert_eq!(
+            interpret_list_output(Path::new("/etc"), Some(0), b"", b"")
+                .expect("an empty listing must be accepted"),
+            Vec::new()
+        );
+    }
+
+    /// A file name is bytes, and every byte but `/` and NUL is legal in one -
+    /// so none of these may be decoded, split, trimmed or lost, least of all
+    /// the one holding a newline, which must stay a single candidate.
+    #[test]
+    fn adversarial_file_names_survive_a_host_listing_as_bytes() {
+        let names: Vec<&[u8]> = vec![
+            b"fstab.rustab-backup.0000000001.000000002",
+            b"fstab.with space",
+            b"-n",
+            b"fstab.*",
+            b"fstab.!",
+            b"fstab.(x)",
+            b"fstab.\\040odd",
+            b"fstab.odd\nname",
+        ];
+        let stdout: Vec<u8> = names.iter().flat_map(|name| record("1 2", name)).collect();
+
+        let listed = interpret_list_output(Path::new("/etc"), Some(0), &stdout, b"")
+            .expect("awkward names are still well-formed records");
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|candidate| candidate.name.clone())
+                .collect::<Vec<_>>(),
+            names
+                .iter()
+                .map(|name| OsString::from_vec(name.to_vec()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            listed.len(),
+            names.len(),
+            "the name holding a newline must stay one candidate: {listed:?}"
+        );
+    }
+
+    /// Every malformed reply is an error for the whole call: a guessed row
+    /// here would offer a restore of a file nobody looked at, and a dropped
+    /// row would read as "that backup is gone".
+    #[test]
+    fn a_malformed_host_listing_is_an_error_rather_than_a_guessed_row() {
+        let mut unterminated = record("1 2", b"fstab.bak");
+        unterminated.pop();
+
+        for (what, stdout) in [
+            ("no NUL after the last record", unterminated),
+            ("three header fields", record("1 2 3", b"fstab.bak")),
+            ("a non-numeric header", record("a b", b"fstab.bak")),
+            ("a negative size", record("-1 2", b"fstab.bak")),
+            ("an empty header field", record(" 2", b"fstab.bak")),
+            ("an empty name", record("1 2", b"")),
+            (
+                "a name with a path separator",
+                record("1 2", b"../fstab.bak"),
+            ),
+            ("no newline in the record", b"12\0".to_vec()),
+        ] {
+            let error = interpret_list_output(Path::new("/etc"), Some(0), &stdout, b"")
+                .expect_err("a malformed listing must fail");
+            assert_ne!(
+                error.kind(),
+                io::ErrorKind::NotFound,
+                "{what} is not a missing directory"
+            );
+            assert!(
+                error.to_string().contains("/etc"),
+                "the message must name the directory ({what}): {error}"
+            );
+        }
+
+        // A denied portal must stay distinguishable from "the directory is
+        // not there", for `interpret_read_output`'s reason.
+        let denied = interpret_list_output(
+            Path::new("/etc"),
+            Some(1),
+            b"",
+            b"Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown\n",
+        )
+        .expect_err("a portal failure must fail");
+        assert_ne!(denied.kind(), io::ErrorKind::NotFound);
+        assert!(denied.to_string().contains("Portal call failed"));
+
+        let missing = interpret_list_output(Path::new("/etc"), Some(MISSING_EXIT), b"", b"")
+            .expect_err("the sentinel must fail");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(missing.to_string().contains("/etc"));
+
+        let signalled = interpret_list_output(Path::new("/etc"), None, b"", b"")
+            .expect_err("a killed listing must fail");
+        assert_ne!(signalled.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_direct_listing_reports_only_the_prefixed_regular_files() {
+        let dir = TempDir::new("host-direct-list");
+        seed_listing_dir(dir.path());
+
+        let listed = DirectFs
+            .list_backup_candidates(&dir.join("fstab"))
+            .expect("the directory is readable");
+
+        assert_eq!(sorted_names(&listed), expected_candidate_names());
+        for candidate in &listed {
+            let on_disk = fs::metadata(dir.path().join(&candidate.name)).expect("stat");
+            assert_eq!(candidate.size_bytes, on_disk.len());
+            assert!(candidate.size_bytes > 0);
+            assert!(
+                candidate.modified_unix_secs.is_some(),
+                "a file on a local filesystem has a modification time: {candidate:?}"
+            );
+        }
+    }
+
+    /// The directory's own absence is the one failure this method reports,
+    /// and it has to be `NotFound`; a target with no file name has no
+    /// siblings rather than an error.
+    #[test]
+    fn a_direct_listing_fails_only_on_the_directory_itself() {
+        let dir = TempDir::new("host-direct-list-missing");
+
+        let error = DirectFs
+            .list_backup_candidates(&dir.join("nowhere/fstab"))
+            .expect_err("a missing directory must fail");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+        assert_eq!(
+            DirectFs
+                .list_backup_candidates(Path::new("/"))
+                .expect("a path with no file name is not a failure"),
+            Vec::new()
+        );
+    }
+
+    /// The test that keeps the two implementations honest: [`LIST_SCRIPT`]
+    /// is run by a real local `sh` against a real directory (no
+    /// `flatpak-spawn` involved - this exercises the shell code, which is
+    /// the half unit tests otherwise never execute) and its output, parsed
+    /// by [`interpret_list_output`], must equal what [`DirectFs`] reports
+    /// for the same directory.
+    #[test]
+    fn the_list_script_and_the_direct_listing_agree_on_one_directory() {
+        let dir = TempDir::new("host-list-script");
+        seed_listing_dir(dir.path());
+
+        let output = Command::new(SH)
+            .arg("-c")
+            .arg(LIST_SCRIPT)
+            .arg(SH)
+            .arg(dir.path())
+            .arg("fstab")
+            .output()
+            .expect("sh and stat exist on a development machine");
+        let mut from_script = interpret_list_output(
+            dir.path(),
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        )
+        .expect("the script's own output must be well-formed");
+        let mut direct = DirectFs
+            .list_backup_candidates(&dir.join("fstab"))
+            .expect("the directory is readable");
+
+        for candidates in [&mut from_script, &mut direct] {
+            candidates.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        assert_eq!(from_script, direct);
+        assert_eq!(sorted_names(&from_script), expected_candidate_names());
+        assert!(
+            from_script
+                .iter()
+                .any(|candidate| candidate.name.as_bytes().contains(&b'\n')),
+            "the name holding a newline must come back from the script too: {from_script:?}"
+        );
+
+        // An absent directory is the sentinel, from the script itself.
+        let missing = Command::new(SH)
+            .arg("-c")
+            .arg(LIST_SCRIPT)
+            .arg(SH)
+            .arg(dir.join("nowhere"))
+            .arg("fstab")
+            .output()
+            .expect("sh exists");
+        assert_eq!(missing.status.code(), Some(MISSING_EXIT));
     }
 
     #[test]

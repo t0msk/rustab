@@ -16,8 +16,13 @@
 //!   directory used when it can't (a Flatpak sandbox can't, since the
 //!   `/etc` it sees is the runtime's).
 //! - `host`: knows this process may be inside a Flatpak sandbox, so
-//!   reading the real `/etc/fstab` and starting the elevated helper both
-//!   happen *on the host*, through `flatpak-spawn --host`.
+//!   reading the real `/etc/fstab`, listing what sits beside it and
+//!   starting the elevated helper all happen *on the host*, through
+//!   `flatpak-spawn --host`.
+//! - `host_backups`: the real `/etc/fstab`'s own backups, listed and read
+//!   through `host` - the read-only counterpart of `backups` for a session
+//!   that cannot see the directory they live in. Lists and reads only;
+//!   nothing there writes or unlinks.
 //! - [`privileged`]: the unprivileged half of the three elevated
 //!   operations (writing `/etc/fstab`, deleting a backup, creating a
 //!   manual backup) - the `pkexec` re-exec and the interpretation of what
@@ -39,6 +44,10 @@
 mod backup_location;
 pub mod commands;
 mod host;
+// Nothing outside this module's own tests calls it yet: the command layer's
+// dispatch into it (and this `allow`'s removal) is the next step.
+#[allow(dead_code)]
+mod host_backups;
 pub mod privileged;
 pub mod target;
 
