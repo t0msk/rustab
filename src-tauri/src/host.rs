@@ -31,11 +31,15 @@
 //!    [`crate::commands`]'s re-sync command, and
 //!    [`crate::backup_location::refresh_mirror`]). A one-method trait,
 //!    shaped like `fstab_core::writer`'s own `FileSystemOps` seam.
-//! 2. [`elevated_self_plan`] - how the elevated helper is spawned: under
-//!    Flatpak, `pkexec` must be invoked on the host
-//!    (`flatpak-spawn --host pkexec …`) and must name a **host** path for
-//!    this binary, since `std::env::current_exe()` inside the sandbox
-//!    yields `/app/bin/rustab`, which doesn't exist outside it.
+//! 2. [`elevated_plan`] - how the elevated half is spawned: under Flatpak,
+//!    `pkexec` must be invoked on the host
+//!    (`flatpak-spawn --host pkexec …`) and must name a **host** path,
+//!    since `std::env::current_exe()` inside the sandbox yields
+//!    `/app/bin/rustab`, which doesn't exist outside it. The binary named
+//!    there is `rustab-helper` - the GUI-free, statically-linked elevated
+//!    binary - not the GUI itself, whose GTK, WebKitGTK and glibc come
+//!    from the runtime and may be unavailable on the host that has to run
+//!    it.
 //! 3. A [`CommandRunner`] - `fstab-core`'s seam for everything it has to
 //!    ask the edited machine. Two of those are the system tools it shells
 //!    out to, `findmnt --verify` and `lsblk`: both answer questions about
@@ -243,9 +247,15 @@ const STDERR_EXCERPT_LIMIT: usize = 500;
 /// Rustab's Flatpak application id - `tauri.conf.json`'s `identifier`.
 const APP_ID: &str = "dev.tomsk.Rustab";
 
-/// The `command:` the Flatpak manifest installs into `/app/bin`, i.e. the
-/// final component of this binary's path inside an installed Flatpak.
-const APP_COMMAND: &str = "rustab";
+/// The elevated binary the Flatpak manifest installs beside the GUI in
+/// `/app/bin`, i.e. the final component of the path `pkexec` is handed on
+/// the host.
+///
+/// Not the `command:` (`rustab`, the GUI): inside a Flatpak the process
+/// that runs on the host is `rustab-helper`, which links no GUI library and
+/// is built as a static binary for exactly that reason - see
+/// [`elevated_plan`] and `crates/rustab-helper`.
+const HELPER_COMMAND: &str = "rustab-helper";
 
 /// Where a Flatpak app's files are, relative to a Flatpak **installation**
 /// root: `app/<app id>/current/active/files`.
@@ -266,7 +276,7 @@ const SYSTEM_INSTALLATION: &str = "/var/lib/flatpak";
 const APP_PATH_KEY: &str = "app-path";
 
 /// `bin`, the subdirectory of an app's `files` directory that
-/// `install -Dm755 … /app/bin/rustab` lands in (`/app` *is* `files`).
+/// `install -Dm755 … /app/bin/rustab-helper` lands in (`/app` *is* `files`).
 const BIN_DIR: &str = "bin";
 
 // ---------------------------------------------------------------------------
@@ -697,56 +707,76 @@ impl fmt::Display for Spawn {
     }
 }
 
-/// How this process re-executes itself as root with `flag`, on whichever
-/// side of a sandbox boundary it has to happen.
+/// How the elevated half is started as root, on whichever side of a sandbox
+/// boundary that has to happen.
 ///
-/// The production entry point for [`crate::privileged`]'s one spawn. Two shapes:
+/// The production entry point for [`crate::privileged`]'s one spawn. Two
+/// shapes, and they do not name the same executable:
 ///
-/// - **not sandboxed**: `pkexec <current_exe> <flag>`.
-/// - **sandboxed**: `flatpak-spawn --host pkexec <host path of this binary>
-///   <flag>` - `pkexec` alone would authorize root *inside* the sandbox
-///   (can't see the real `/etc/`); `flatpak-spawn --host` alone would reach
-///   the real `/etc/` unprivileged (can't write it). Both together are needed.
+/// - **not sandboxed**: `pkexec <current_exe> <flag>` - this binary
+///   re-executed with its hidden flag, as it always was. Its libraries are
+///   the ones it was built against on this very machine, so re-exec is free
+///   and there is nothing to keep in version lockstep.
+/// - **sandboxed**: `flatpak-spawn --host pkexec <host path>/bin/rustab-helper`,
+///   with **no flag** - `rustab-helper` reads one request on stdin and
+///   refuses any argument at all. `pkexec` alone would authorize root
+///   *inside* the sandbox (can't see the real `/etc/`); `flatpak-spawn
+///   --host` alone would reach the real `/etc/` unprivileged (can't write
+///   it). Both together are needed.
 ///
-/// `current_exe()` resolves to `/app/bin/rustab` inside the sandbox, which
-/// doesn't exist on the host, so [`host_binary`] finds the host path of
-/// the same binary instead.
+/// ## Why the sandboxed shape runs a different binary
+///
+/// The process `flatpak-spawn --host pkexec` starts runs on the **host**,
+/// with the host's libraries - not the runtime's. The GUI binary is linked
+/// against the runtime's GTK, WebKitGTK and glibc, so exec'ing it there
+/// works only on a host that happens to satisfy all of them, and fails
+/// before it reads a byte of its request on one that doesn't.
+/// `rustab-helper` is the same elevated code
+/// (`rustab_privileged::protocol::handle_privileged_request`) in a binary
+/// with no GUI dependency, built as a static executable, so the host's
+/// libraries are not consulted at all.
+///
+/// `current_exe()` also resolves to `/app/bin/rustab` inside the sandbox,
+/// which names nothing on the host, so [`host_helper_binary`] resolves the
+/// helper's host-side path instead.
 ///
 /// # Errors
 ///
 /// An [`io::Error`] if the binary's path couldn't be determined -
-/// `current_exe()`'s own error outside a sandbox, or [`host_binary`]'s
-/// "nowhere to be found" error inside one. Nothing is spawned either way.
-pub(crate) fn elevated_self_plan(flag: &str) -> io::Result<Spawn> {
-    elevated_self_plan_with(
+/// `current_exe()`'s own error outside a sandbox, or
+/// [`host_helper_binary`]'s "nowhere to be found" error inside one.
+/// Nothing is spawned either way.
+pub(crate) fn elevated_plan(flag: &str) -> io::Result<Spawn> {
+    elevated_plan_with(
         Path::new(SANDBOX_MARKER_PATH).exists(),
         std::env::current_exe,
-        || host_binary(sandbox_info(), std::env::var_os("HOME"), &host_path_exists),
+        || host_helper_binary(sandbox_info(), std::env::var_os("HOME"), &host_path_exists),
         flag,
     )
 }
 
-/// The decision inside [`elevated_self_plan`], with every input injected.
+/// The decision inside [`elevated_plan`], with every input injected.
 ///
-/// `current_exe` and `host_binary` are closures rather than resolved values so
-/// that neither is evaluated in the branch that does not use it: a test for
-/// the sandboxed plan must not depend on this binary's own path, and a test
-/// for the ordinary plan must not depend on a Flatpak installation existing.
-fn elevated_self_plan_with(
+/// `current_exe` and `host_helper_binary` are closures rather than resolved
+/// values so that neither is evaluated in the branch that does not use it: a
+/// test for the sandboxed plan must not depend on this binary's own path, and
+/// a test for the ordinary plan must not depend on a Flatpak installation
+/// existing. `flag` is likewise only meaningful in the ordinary branch - the
+/// helper takes none.
+fn elevated_plan_with(
     sandboxed: bool,
     current_exe: impl FnOnce() -> io::Result<PathBuf>,
-    host_binary: impl FnOnce() -> io::Result<PathBuf>,
+    host_helper_binary: impl FnOnce() -> io::Result<PathBuf>,
     flag: &str,
 ) -> io::Result<Spawn> {
     if sandboxed {
-        let binary = host_binary()?;
+        let helper = host_helper_binary()?;
         Ok(Spawn {
             program: OsString::from(FLATPAK_SPAWN),
             args: vec![
                 OsString::from(HOST_FLAG),
                 OsString::from(PKEXEC),
-                binary.into_os_string(),
-                OsString::from(flag),
+                helper.into_os_string(),
             ],
         })
     } else {
@@ -758,19 +788,21 @@ fn elevated_self_plan_with(
     }
 }
 
-/// This binary's path **on the host**, for a process running inside a
-/// Flatpak sandbox.
+/// The elevated helper's path **on the host**, for a process running inside
+/// a Flatpak sandbox.
 ///
-/// Three candidates, in order, first one that exists on the host wins:
+/// Three candidates, in order, first one that exists on the host wins -
+/// resolved exactly like the GUI's own host path used to be, since the
+/// helper is installed beside it in the same `/app/bin`:
 ///
-/// 1. `<app-path from /.flatpak-info>/bin/rustab` - Flatpak writes the
-///    host path of this app's `files` directory into the sandbox's own
+/// 1. `<app-path from /.flatpak-info>/bin/rustab-helper` - Flatpak writes
+///    the host path of this app's `files` directory into the sandbox's own
 ///    `/.flatpak-info` (`[Instance] app-path=…`), so this is correct for
 ///    any install layout, architecture, or branch.
 /// 2. The user-install layout:
-///    `$HOME/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab`.
+///    `$HOME/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper`.
 /// 3. The system-install layout (`flatpak install` without `--user`):
-///    `/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab`.
+///    `/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper`.
 ///
 /// 2 and 3 are kept as fallbacks in case a future Flatpak version drops
 /// the `app-path` key that 1 depends on.
@@ -794,12 +826,12 @@ fn elevated_self_plan_with(
 /// [`io::ErrorKind::NotFound`] if the host reports that none of the candidates
 /// exists; the first probe error (kind preserved) if the host could not be
 /// asked about any of them at all.
-fn host_binary(
+fn host_helper_binary(
     sandbox_info: Option<String>,
     home: Option<OsString>,
     exists: &dyn Fn(&Path) -> io::Result<bool>,
 ) -> io::Result<PathBuf> {
-    let candidates = host_binary_candidates(sandbox_info.as_deref(), home.as_deref());
+    let candidates = host_helper_candidates(sandbox_info.as_deref(), home.as_deref());
     let mut probe_failure = None;
     for candidate in &candidates {
         match exists(candidate) {
@@ -820,18 +852,19 @@ fn host_binary(
         Some(err) => Err(io::Error::new(
             err.kind(),
             format!(
-                "Rustab is running inside a Flatpak sandbox, so the elevated helper has to be \
-                 started from this app's host-side path, but the host could not be asked \
-                 whether that path ({named}) exists: {err}. Saving the real /etc/fstab needs \
-                 the Flatpak permission --talk-name=org.freedesktop.Flatpak."
+                "Rustab is running inside a Flatpak sandbox, so the elevated helper \
+                 ({HELPER_COMMAND}) has to be started from this app's host-side path, but the \
+                 host could not be asked whether that path ({named}) exists: {err}. Saving the \
+                 real /etc/fstab needs the Flatpak permission \
+                 --talk-name=org.freedesktop.Flatpak."
             ),
         )),
         None => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "Rustab is running inside a Flatpak sandbox, so the elevated helper has to be \
-                 started from this app's host-side path, but no Rustab executable was found at \
-                 {named}. Reinstalling the Flatpak \
+                "Rustab is running inside a Flatpak sandbox, so the elevated helper \
+                 ({HELPER_COMMAND}) has to be started from this app's host-side path, but no \
+                 {HELPER_COMMAND} executable was found at {named}. Reinstalling the Flatpak \
                  (`flatpak install --reinstall dev.tomsk.Rustab`) restores it; until then, \
                  saving the real /etc/fstab cannot work from this sandbox."
             ),
@@ -895,15 +928,15 @@ fn exists_plan(path: &Path) -> Spawn {
     }
 }
 
-/// The candidate host paths [`host_binary`] tries, in order, for the
+/// The candidate host paths [`host_helper_binary`] tries, in order, for the
 /// `/.flatpak-info` content and `$HOME` value given.
 ///
-/// Split out from [`host_binary`] so the *list* can be asserted
+/// Split out from [`host_helper_binary`] so the *list* can be asserted
 /// independently of the existence check that picks from it.
-fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> Vec<PathBuf> {
+fn host_helper_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(3);
     if let Some(app_files) = sandbox_info.and_then(app_path_in_sandbox_info) {
-        candidates.push(app_files.join(BIN_DIR).join(APP_COMMAND));
+        candidates.push(app_files.join(BIN_DIR).join(HELPER_COMMAND));
     }
     if let Some(home) = home.filter(|home| !home.is_empty()) {
         candidates.push(
@@ -913,7 +946,7 @@ fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> V
                 .join(APP_ID)
                 .join(APP_FILES_IN_INSTALLATION)
                 .join(BIN_DIR)
-                .join(APP_COMMAND),
+                .join(HELPER_COMMAND),
         );
     }
     candidates.push(
@@ -922,7 +955,7 @@ fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> V
             .join(APP_ID)
             .join(APP_FILES_IN_INSTALLATION)
             .join(BIN_DIR)
-            .join(APP_COMMAND),
+            .join(HELPER_COMMAND),
     );
     candidates
 }
@@ -1301,10 +1334,10 @@ mod tests {
 
     #[test]
     fn the_unsandboxed_elevation_plan_is_pkexec_on_this_binary() {
-        let plan = elevated_self_plan_with(
+        let plan = elevated_plan_with(
             false,
             || Ok(PathBuf::from("/usr/bin/rustab")),
-            || panic!("the host binary must not be looked for outside a sandbox"),
+            || panic!("the host helper must not be looked for outside a sandbox"),
             "--internal-privileged-write",
         )
         .expect("the plan must be buildable");
@@ -1315,14 +1348,17 @@ mod tests {
         );
     }
 
+    /// The sandboxed shape, literally: the **helper** on the host, and no
+    /// flag - `rustab-helper` refuses any argument, so passing the GUI's
+    /// hidden flag would make every elevated operation fail.
     #[test]
-    fn the_sandboxed_elevation_plan_host_spawns_pkexec_on_the_host_binary() {
-        let plan = elevated_self_plan_with(
+    fn the_sandboxed_elevation_plan_host_spawns_pkexec_on_the_host_helper() {
+        let plan = elevated_plan_with(
             true,
             || panic!("current_exe is meaningless inside the sandbox and must not be consulted"),
             || {
                 Ok(PathBuf::from(
-                    "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab",
+                    "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper",
                 ))
             },
             "--internal-privileged-write",
@@ -1332,17 +1368,16 @@ mod tests {
         assert_eq!(
             plan.to_string(),
             "flatpak-spawn --host pkexec \
-             /var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab \
-             --internal-privileged-write"
+             /var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
         );
     }
 
     #[test]
-    fn an_unfindable_host_binary_fails_the_plan_rather_than_guessing() {
-        let error = elevated_self_plan_with(
+    fn an_unfindable_host_helper_fails_the_plan_rather_than_guessing() {
+        let error = elevated_plan_with(
             true,
             || panic!("not consulted"),
-            || host_binary(None, None, &|_| Ok(false)),
+            || host_helper_binary(None, None, &|_| Ok(false)),
             "--internal-privileged-write",
         )
         .expect_err("a plan that cannot name a real binary must fail");
@@ -1350,8 +1385,14 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains(SYSTEM_INSTALLATION));
         assert!(
-            error.to_string().contains("no Rustab executable was found"),
-            "the message must say the installation is missing: {error}"
+            error
+                .to_string()
+                .contains("no rustab-helper executable was found"),
+            "the message must name the helper that is missing: {error}"
+        );
+        assert!(
+            error.to_string().contains("bin/rustab-helper"),
+            "the message must name the paths that were tried: {error}"
         );
     }
 
@@ -1362,7 +1403,7 @@ mod tests {
     /// missing installation.
     #[test]
     fn a_probe_that_cannot_reach_the_host_is_not_reported_as_a_missing_binary() {
-        let error = host_binary(None, None, &|_| {
+        let error = host_helper_binary(None, None, &|_| {
             Err(io::Error::other("Portal call failed: ServiceUnknown"))
         })
         .expect_err("an unanswerable probe must fail");
@@ -1379,10 +1420,10 @@ mod tests {
     #[test]
     fn a_single_failed_probe_does_not_hide_a_candidate_that_does_exist() {
         let home = OsString::from("/home/u");
-        let candidates = host_binary_candidates(Some(SANDBOX_INFO), Some(&home));
+        let candidates = host_helper_candidates(Some(SANDBOX_INFO), Some(&home));
         let system_install = candidates[2].clone();
 
-        let picked = host_binary(Some(SANDBOX_INFO.to_string()), Some(home), &|candidate| {
+        let picked = host_helper_binary(Some(SANDBOX_INFO.to_string()), Some(home), &|candidate| {
             if candidate == system_install {
                 Ok(true)
             } else {
@@ -1464,35 +1505,37 @@ mod tests {
 
     #[test]
     fn the_host_existence_plan_is_a_flatpak_spawn_of_the_existence_script() {
-        let plan = exists_plan(Path::new("/var/lib/flatpak/app/x/files/bin/rustab"));
+        let plan = exists_plan(Path::new("/var/lib/flatpak/app/x/files/bin/rustab-helper"));
 
         assert_eq!(
             plan.to_string(),
             "flatpak-spawn --host sh -c ".to_string()
                 + EXISTS_SCRIPT
-                + " sh /var/lib/flatpak/app/x/files/bin/rustab"
+                + " sh /var/lib/flatpak/app/x/files/bin/rustab-helper"
         );
     }
 
     #[test]
     fn the_app_path_from_flatpak_info_is_the_first_candidate() {
-        let candidates = host_binary_candidates(Some(SANDBOX_INFO), Some(OsStr::new("/home/u")));
+        let candidates = host_helper_candidates(Some(SANDBOX_INFO), Some(OsStr::new("/home/u")));
 
         assert_eq!(
             candidates[0],
             PathBuf::from(
-                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/x86_64/test/abc/files/bin/rustab"
+                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/x86_64/test/abc/files/bin/rustab-helper"
             )
         );
         assert_eq!(
             candidates[1],
             PathBuf::from(
-                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )
         );
         assert_eq!(
             candidates[2],
-            PathBuf::from("/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab")
+            PathBuf::from(
+                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
+            )
         );
     }
 
@@ -1501,15 +1544,15 @@ mod tests {
     #[test]
     fn the_system_install_is_always_a_candidate() {
         assert_eq!(
-            host_binary_candidates(None, None),
+            host_helper_candidates(None, None),
             vec![PathBuf::from(
-                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )]
         );
         assert_eq!(
-            host_binary_candidates(Some("[Application]\nname=x\n"), Some(OsStr::new(""))),
+            host_helper_candidates(Some("[Application]\nname=x\n"), Some(OsStr::new(""))),
             vec![PathBuf::from(
-                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )]
         );
     }
@@ -1533,10 +1576,10 @@ mod tests {
     #[test]
     fn the_first_candidate_that_exists_is_used() {
         let home = OsString::from("/home/u");
-        let candidates = host_binary_candidates(Some("app-path=/nowhere/files\n"), Some(&home));
+        let candidates = host_helper_candidates(Some("app-path=/nowhere/files\n"), Some(&home));
         let user_install = candidates[1].clone();
 
-        let picked = host_binary(
+        let picked = host_helper_binary(
             Some("app-path=/nowhere/files\n".to_string()),
             Some(home),
             &|candidate| Ok(candidate == user_install),
@@ -1547,7 +1590,7 @@ mod tests {
         assert_eq!(
             picked,
             PathBuf::from(
-                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )
         );
     }

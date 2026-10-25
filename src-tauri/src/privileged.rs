@@ -16,7 +16,9 @@
 //! All three share one dispatch point: the stdin request is a union tagged
 //! by `op`, so [`run_internal_if_requested`] still checks exactly one
 //! hidden argument and turns *this* process into root through exactly one
-//! path, auditable as such.
+//! path, auditable as such. The `rustab-helper` binary has the same
+//! property with no argument at all: its whole `main` is that one
+//! dispatch.
 //!
 //! ## The requirement
 //!
@@ -56,7 +58,7 @@
 //! normally brings is avoided by sharing the crate rather than by avoiding
 //! the binary.
 //!
-//! ## Where that re-exec happens, inside a Flatpak sandbox
+//! ## What happens instead, inside a Flatpak sandbox
 //!
 //! The `pkexec` invocation must run on the **host**, via `flatpak-spawn
 //! --host`, naming the elevated binary by its host-side path rather than
@@ -64,10 +66,16 @@
 //! mount namespace, so a `pkexec` child started inside the sandbox is root
 //! *in the sandbox*, with no path to the real `/etc/fstab` at all.
 //! `flatpak-spawn --host pkexec <host path>` gives a genuine host root
-//! process instead. All of that lives in [`crate::host`]; the only line
-//! here that knows about it is in [`run_elevated`]. Nothing else in this
-//! module's protocol or dispatch changes, and the single-flag property
-//! holds.
+//! process instead.
+//!
+//! The binary named there is **the helper, with no flag**:
+//! `flatpak-spawn --host pkexec <app-path>/bin/rustab-helper`.
+//! `rustab-helper` refuses any argument, so [`INTERNAL_WRITE_FLAG`] is not
+//! passed in that shape and is a GUI-only entry point. All of that lives
+//! in [`crate::host`]; the only line here that knows about it is in
+//! [`run_elevated`]. Nothing in this module's protocol, request shape or
+//! response interpretation changes, and each binary still has exactly one
+//! way in.
 //!
 //! ## What this side deliberately does *not* decide
 //!
@@ -97,15 +105,18 @@ use std::process::{Output, Stdio};
 // `crate::commands` and this module's tests all see one module, as they did
 // when both halves lived here.
 pub use rustab_privileged::protocol::{
-    handle_privileged_request, PrivilegedRequest, PrivilegedResponse, EXIT_OK,
+    handle_privileged_request, protocol_error_body, PrivilegedRequest, PrivilegedResponse, EXIT_OK,
     EXIT_OPERATION_ERROR, EXIT_PROTOCOL_ERROR,
 };
 
-/// The hidden first argument that turns this binary into the elevated helper.
+/// The hidden first argument that turns **this** binary into the elevated
+/// helper.
 ///
 /// Not a public CLI: an implementation detail of the escalation mechanism,
-/// with an unstable stdin/stdout protocol. Only [`save_elevated`],
-/// [`delete_backup_elevated`], and [`create_backup_elevated`] pass it.
+/// with an unstable stdin/stdout protocol. The only thing that ever passes
+/// it is [`crate::host::elevated_plan`]'s ordinary-install shape - inside a
+/// Flatpak the elevated process is `rustab-helper`, which takes no argument
+/// at all, so this flag never travels there.
 ///
 /// The name predates the two backup operations and now carries any
 /// [`PrivilegedRequest`] variant; kept as-is since changing it buys
@@ -134,8 +145,8 @@ const PKEXEC_NOT_AUTHORIZED: i32 = 127;
 ///
 /// Called as the very first statement of `main` so that, in elevated mode,
 /// no Tauri runtime, webview, plugin or logger is ever initialized. This is
-/// the *only* branch in the whole program that can do that, for any of the
-/// three operations - see the module docs.
+/// the *only* branch in this binary that can do that, for any of the three
+/// operations - see the module docs.
 ///
 /// The work itself is [`handle_privileged_request`], the same function
 /// `rustab-helper` calls: this branch is the argv check and the stdio
@@ -147,7 +158,14 @@ pub fn run_internal_if_requested() -> Option<i32> {
         return None;
     }
     if args.next().is_some() {
-        eprintln!("{INTERNAL_WRITE_FLAG} takes no further arguments");
+        // Reported in the protocol's own error shape on stdout as well as in
+        // prose on stderr, exactly as `rustab-helper` reports its own argv
+        // refusal: the unprivileged side parses stdout, and the rule it
+        // relies on is that exit code 2 always comes with a JSON body,
+        // whichever of the two elevated binaries produced it.
+        let message = stray_argument_message();
+        println!("{}", protocol_error_body(&message));
+        eprintln!("{message}");
         return Some(EXIT_PROTOCOL_ERROR);
     }
 
@@ -158,6 +176,17 @@ pub fn run_internal_if_requested() -> Option<i32> {
         &mut stdout,
         Path::new(target::REAL_FSTAB_PATH),
     ))
+}
+
+/// What [`run_internal_if_requested`] says when it is handed an argument it
+/// does not know, on both stdout (wrapped by [`protocol_error_body`]) and
+/// stderr.
+///
+/// A function of its own only so a test can pin the shape of that refusal
+/// without driving a second process: the branch itself reads the real
+/// `argv` and writes the real stdout.
+fn stray_argument_message() -> String {
+    format!("{INTERNAL_WRITE_FLAG} takes no further arguments; nothing was done")
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +202,9 @@ pub fn run_internal_if_requested() -> Option<i32> {
 /// child whose stdin failed, and which failures mean "provably never acted".
 #[derive(Debug)]
 enum LaunchFailure {
-    /// No path to re-exec: [`std::env::current_exe`] failed, or - inside a
-    /// Flatpak sandbox - this binary wasn't found at any host-side path
-    /// (see [`crate::host::elevated_self_plan`]). The helper never ran.
+    /// No path to start: [`std::env::current_exe`] failed, or - inside a
+    /// Flatpak sandbox - `rustab-helper` wasn't found at any host-side path
+    /// (see [`crate::host::elevated_plan`]). The helper never ran.
     NoExePath(io::Error),
     /// The request could not be serialized - a bug between the two halves.
     /// The helper never ran.
@@ -205,8 +234,8 @@ impl LaunchFailure {
     }
 }
 
-/// Re-executes this binary as root with [`INTERNAL_WRITE_FLAG`], hands
-/// `request` to it on stdin, and returns what it printed and exited with.
+/// Starts the elevated half as root, hands `request` to it on stdin, and
+/// returns what it printed and exited with.
 ///
 /// The whole `pkexec` plumbing for **both** operations, in one function,
 /// since the spawn/stdin-write/pipe-close/wait sequence is identical for
@@ -217,24 +246,27 @@ impl LaunchFailure {
 /// Performs no filesystem writes of its own - just JSON over a pipe.
 ///
 /// Under Flatpak, *which command* is spawned changes: not `pkexec <this
-/// binary> <flag>` but `flatpak-spawn --host pkexec <host path> <flag>`,
-/// since `pkexec` alone would produce a root process still inside the
-/// sandbox, unable to see the real `/etc/`. That decision and the
-/// host-path resolution both live in [`crate::host::elevated_self_plan`];
-/// this function only asks for the plan and runs it.
+/// binary> <flag>` but `flatpak-spawn --host pkexec
+/// <host path>/bin/rustab-helper`, with no flag - `pkexec` alone would
+/// produce a root process still inside the sandbox, unable to see the real
+/// `/etc/`, and the GUI binary cannot be trusted to exec on an unknown
+/// host. That decision, the choice of binary and the host-path resolution
+/// all live in [`crate::host::elevated_plan`]; this function only asks for
+/// the plan and runs it.
 ///
 /// Everything after the spawn is untouched and deliberately so: writing the
 /// request to stdin, closing it, waiting, and handing the exit code, stdout
 /// and stderr to the `interpret_*_output` functions all behave identically
-/// through `flatpak-spawn --host pkexec`, which passes stdio through and exits
-/// with the child's status (confirmed by the T40 diagnostics). The helper on
-/// the other end is the same binary running the same [`INTERNAL_WRITE_FLAG`]
-/// branch; it simply runs on the host, where - having no `/.flatpak-info` of
-/// its own - it reads and writes the real filesystem directly, exactly as the
-/// non-Flatpak case always did.
+/// through `flatpak-spawn --host pkexec`, which passes stdio through and
+/// exits with the child's status (confirmed by the sandbox diagnostics
+/// recorded in `docs/FLATPAK.md` §3.2). The process on the other end runs
+/// the same [`handle_privileged_request`] compiled from the same source -
+/// in the Flatpak case from the helper's `main` instead of this binary's
+/// flag branch - and it runs on the host, where, having no
+/// `/.flatpak-info` of its own, it reads and writes the real filesystem
+/// directly, exactly as the non-Flatpak case always did.
 fn run_elevated(request: &PrivilegedRequest) -> Result<Output, LaunchFailure> {
-    let plan =
-        crate::host::elevated_self_plan(INTERNAL_WRITE_FLAG).map_err(LaunchFailure::NoExePath)?;
+    let plan = crate::host::elevated_plan(INTERNAL_WRITE_FLAG).map_err(LaunchFailure::NoExePath)?;
     let payload = serde_json::to_vec(request).map_err(LaunchFailure::Serialize)?;
 
     let mut child = plan
@@ -787,6 +819,34 @@ mod tests {
             "UUID=11111111-2222-3333-4444-555555555555 /mnt/clash ext4 noauto 0 2\n\
              UUID=22222222-3333-4444-5555-666666666666 /mnt/clash ext4 noauto 0 2\n",
         )
+    }
+
+    // -- this binary's elevated entry point ---------------------------------
+
+    /// A stray argument is refused with a parsable protocol body on stdout,
+    /// not only a line on stderr, so "exit code 2 always comes with a JSON
+    /// body" holds for this binary exactly as it does for `rustab-helper` -
+    /// and the write side reads that body as an operation that provably
+    /// touched nothing.
+    #[test]
+    fn a_stray_argument_is_refused_with_a_parsable_protocol_error() {
+        let body = protocol_error_body(&stray_argument_message());
+
+        let error = interpret_write_output(
+            Path::new("/etc/fstab"),
+            Some(EXIT_PROTOCOL_ERROR),
+            body.as_bytes(),
+            b"",
+        )
+        .expect_err("a refused argv is not a completed write");
+
+        assert_eq!(error.kind, WriteErrorKindDto::Internal);
+        assert!(error.target_unchanged);
+        assert!(
+            error.message.contains(INTERNAL_WRITE_FLAG) && error.message.contains("nothing"),
+            "the refusal must say what was refused and that nothing happened: {}",
+            error.message
+        );
     }
 
     // -- interpretation of the child's output -------------------------------

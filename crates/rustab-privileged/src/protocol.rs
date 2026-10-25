@@ -353,6 +353,11 @@ fn handle_write<W: Write>(
 
     // One call, one process, one authorization: validation, backup, temp
     // file, fsyncs, rename and read-back verification all happen inside here.
+    // The plain entry point on purpose: whichever way this process was
+    // launched - an ordinary install's `pkexec` child, or `rustab-helper`
+    // started by `flatpak-spawn --host pkexec` - it is already on the host
+    // (no `/.flatpak-info`), so its own `findmnt --verify` and existence
+    // checks see the real system.
     let candidate = Document::from(candidate);
     match writer::write_document(&target_path, &candidate) {
         Ok(outcome) => respond(
