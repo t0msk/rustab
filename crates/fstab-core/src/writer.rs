@@ -478,18 +478,40 @@ pub struct BackupEntry {
 /// Returns the underlying [`io::Error`] if the target's directory can't
 /// be read. A `target` with no file-name component yields an empty list.
 pub fn list_backups(target: &Path) -> io::Result<Vec<BackupEntry>> {
-    let Some(file_name) = target.file_name() else {
+    if target.file_name().is_none() {
         return Ok(Vec::new());
+    }
+    let names = RealFs.list_dir_file_names(&containing_dir(target))?;
+    Ok(list_backups_among(target, &names))
+}
+
+/// The subset of `names` that are backups of `target`, oldest first - the
+/// classification [`list_backups`] performs once it has read the directory,
+/// and nothing else.
+///
+/// `names` are the plain file names of the entries in `target`'s own
+/// directory. Exists so a caller that obtained those names *some other way* -
+/// from another process, or from another machine - can apply this module's
+/// backup-naming grammar without duplicating it: the grammar is the only
+/// thing standing between a restore (or a prune) and a user's unrelated
+/// files, so there must be exactly one implementation of it.
+///
+/// Every name that is not *exactly* a backup of `target` is dropped,
+/// including `target` itself, a different target's backup in the same
+/// directory, and any near miss (see [`list_backups`] for the scheme). A
+/// `target` with no file-name component yields an empty list, exactly as
+/// [`list_backups`] does.
+pub fn list_backups_among(target: &Path, names: &[OsString]) -> Vec<BackupEntry> {
+    let Some(file_name) = target.file_name() else {
+        return Vec::new();
     };
-    let dir = containing_dir(target);
-    let names = RealFs.list_dir_file_names(&dir)?;
-    Ok(sorted_backups(&dir, &names, file_name)
+    sorted_backups(&containing_dir(target), names, file_name)
         .into_iter()
         .map(|(name, path)| BackupEntry {
             path,
             manual: name.manual,
         })
-        .collect())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2756,6 +2778,62 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// `list_backups_among` is the grammar on its own, so it is asserted
+    /// against names a directory listing never has to have produced - and
+    /// against `list_backups` itself, on a directory seeded with those exact
+    /// names, so the two can never drift apart.
+    #[test]
+    fn list_backups_among_classifies_names_the_way_list_backups_does() {
+        let dir = TempDir::new("among");
+        let target = dir.join("fstab");
+        let names = [
+            // Valid, deliberately out of chronological order.
+            "fstab.rustab-backup.0000000003.000000000",
+            "fstab.rustab-backup.0000000001.000000002",
+            "fstab.rustab-backup.0000000002.000000000.manual",
+            // Near misses, every one of which must be dropped.
+            "fstab.rustab-backup.1.2",
+            "fstab.rustab-backup.0000000001.000000002.old",
+            "fstab.rustab-backup.aaaaaaaaaa.bbbbbbbbb",
+            "other.rustab-backup.0000000001.000000002",
+            "fstab.bak",
+            "fstab",
+            // One name holding a newline: it is a single name, so it must be
+            // rejected whole rather than read as the two valid names it
+            // textually contains.
+            "fstab.rustab-backup.0000000004.000000000\nfstab.rustab-backup.0000000005.000000000",
+        ];
+        let os_names: Vec<OsString> = names.iter().map(OsString::from).collect();
+
+        let among = list_backups_among(&target, &os_names);
+        assert_eq!(
+            among,
+            vec![
+                BackupEntry {
+                    path: dir.join("fstab.rustab-backup.0000000001.000000002"),
+                    manual: false,
+                },
+                BackupEntry {
+                    path: dir.join("fstab.rustab-backup.0000000002.000000000.manual"),
+                    manual: true,
+                },
+                BackupEntry {
+                    path: dir.join("fstab.rustab-backup.0000000003.000000000"),
+                    manual: false,
+                },
+            ]
+        );
+
+        for name in names {
+            fs::write(dir.join(name), "x").expect("seed the name");
+        }
+        assert_eq!(list_backups(&target).expect("listing"), among);
+
+        // A target with no file-name component has no backups rather than an
+        // error, on this entry point too.
+        assert_eq!(list_backups_among(Path::new("/"), &os_names), Vec::new());
     }
 
     /// Proves the temp file name is derived from the target's own name (so two
