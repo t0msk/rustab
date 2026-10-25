@@ -93,10 +93,14 @@ pub struct TargetInfoDto {
     /// that isn't `/etc/fstab` itself.
     ///
     /// When `Some(dir)`: backups created explicitly land in `dir` with no
-    /// password prompt, while each save's automatic backup still lands
-    /// beside the real `/etc/fstab` via the elevated writer but is **not
-    /// listed**, since this process can't enumerate that directory - not
-    /// lost, just not shown or managed in-app (`docs/UI_DESIGN.md` §7).
+    /// password prompt, and `create_backup`/`delete_backup` only ever touch
+    /// `dir` - never the host's `/etc/`. Each save's automatic backup still
+    /// lands beside the real `/etc/fstab` via the elevated writer; `dir`
+    /// isn't where it's listed from, but `list_backups` does show it, as a
+    /// restore-only row (`BackupInfoDto::deletable == false`), by having the
+    /// GUI's `host` module ask an unprivileged `flatpak-spawn --host` to
+    /// list the host's `/etc/` on this process's behalf (`docs/UI_DESIGN.md`
+    /// §7).
     ///
     /// A display path, never sent back: backup-path-taking commands
     /// always match against the real backup list regardless.
