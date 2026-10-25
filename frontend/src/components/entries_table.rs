@@ -785,6 +785,11 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // `ContextMenuState`, so re-opening on a different row while already
     // open - impossible today since the backdrop closes it first, but
     // cheap to keep correct - would not re-focus for no reason.
+    //
+    // This programmatic focus() right after a right-click left WebKitGTK's
+    // own `:focus-visible` heuristic flaky - a ring on "Edit" some opens,
+    // none on others - so the button carries `outline-none` to drop the
+    // native ring outright; Enter/Tab/Escape still work without it.
     {
         let menu_edit_ref = menu_edit_ref.clone();
         let menu_open = context_menu.is_some();
@@ -1107,7 +1112,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                         ref={menu_edit_ref.clone()}
                         type="button"
                         role="menuitem"
-                        class="block w-full text-left px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700"
+                        class="block w-full text-left px-3 py-1.5 outline-none hover:bg-slate-100 dark:hover:bg-slate-700"
                         onclick={on_menu_edit}
                     >
                         { "Edit" }
