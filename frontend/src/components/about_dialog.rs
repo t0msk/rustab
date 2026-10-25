@@ -138,7 +138,7 @@ pub fn about_dialog(props: &AboutDialogProps) -> Html {
                         onclick={on_sponsors_click}
                     >
                         <HeartIcon />
-                        { "GitHub Sponsors" }
+                        { "Support" }
                     </button>
                     <button
                         type="button"
