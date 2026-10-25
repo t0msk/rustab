@@ -902,11 +902,22 @@ file escalates nothing.
 | `delete_backup` | `delete_backup` (§3.10) | Resolve the requested path against the target's real backup list, then one `remove_file`. |
 | `create_backup` | `create_backup` (§3.11) | One `fstab_core::writer::create_backup` call: copy the target to a new `.manual` backup beside it and `fsync` the copy. The target is only read. |
 
-They share a **single** hidden re-exec flag. Which operation is being asked
-for is a field of the request, not a second flag, so there is exactly one
-branch in the whole program that can turn Rustab into a root process, and the
-"no Tauri runtime, webview, plugin or logger is ever initialized as root"
-property stays a one-flag check.
+Which operation is being asked for is a **field of the request**, not a
+second flag or a second binary. One build produces two executables that can
+run as root, and each has exactly one way in:
+
+- `rustab`, the GUI, enters elevated mode only through the single hidden
+  flag `--internal-privileged-write`, checked as the first statement of
+  `main`. That keeps the "no Tauri runtime, webview, plugin or logger is
+  ever initialized as root" property a one-flag check.
+- `rustab-helper`, used by the Flatpak (§4.3 step 2, §4.5), *is* that
+  branch and nothing else: its whole `main` is the argv refusal plus the one
+  dispatch call, and it links no GUI library at all.
+
+So adding the second and third operations added no entry point to either -
+each is one `match` arm behind the same dispatch - and the elevated surface
+is still one function, compiled once, in the shared `rustab-privileged`
+crate.
 
 ### 4.3 The mechanism
 
@@ -923,30 +934,42 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    pre-check, since its request carries no path but the target. None of these
    write anything and none is **the safety net** (see §4.6) - each has a
    counterpart inside the elevated process, which is the one that decides.
-2. It re-executes **its own binary** as
-   `pkexec <rustab> --internal-privileged-write`, with stdin, stdout and
-   stderr piped. (The flag's name is historical - it predates the two backup
-   operations and now carries any of them. It is deliberately unchanged: the
-   point is that there is exactly one such string.)
+2. It starts the elevated process, with stdin, stdout and stderr piped.
+   *Which* process, and *where* it runs, is the only part of this mechanism
+   that is environment-dependent:
 
-   Which `<rustab>` and *where* that `pkexec` runs depends on one thing, and
-   it is the only part of this mechanism that is environment-dependent (T40):
-
-   - **ordinary install**: `std::env::current_exe()`, `pkexec` run directly;
+   - **ordinary install**: it re-executes **its own binary** as
+     `pkexec <rustab> --internal-privileged-write`, `pkexec` run directly,
+     `<rustab>` being `std::env::current_exe()`. (The flag's name is
+     historical - it predates the two backup operations and now carries any
+     of them. It is deliberately unchanged: the point is that there is
+     exactly one such string.)
    - **inside a Flatpak sandbox** (detected by `/.flatpak-info`):
-     `flatpak-spawn --host pkexec <host path of this binary>
-     --internal-privileged-write`. `pkexec` alone would not do: it changes a
-     process's UID, not its mount namespace, so a `pkexec` child of a
-     sandboxed process is root *inside the same sandbox*, where `/etc` is the
-     runtime's own and the host's `/etc/fstab` is unreachable by any path
-     (Flatpak reserves `/etc` and refuses even `--filesystem=/etc/fstab:rw`).
-     `flatpak-spawn --host` is what puts the process on the host; `pkexec`
-     behind it is what makes it root. The host path is resolved from the
-     `app-path` key Flatpak itself writes into the sandbox's `/.flatpak-info`,
-     falling back to the user and system Flatpak installation layouts, and the
-     operation fails with a `privilege_escalation` error naming those paths if
-     none of them exists - it never guesses. Needs
-     `--talk-name=org.freedesktop.Flatpak` in the manifest and nothing else.
+     `flatpak-spawn --host pkexec <host app-path>/bin/rustab-helper`, with
+     **no flag** - `rustab-helper` reads one request on stdin and refuses
+     any argument.
+
+     Two things make that shape necessary rather than merely different.
+     `pkexec` alone would not do: it changes a process's UID, not its mount
+     namespace, so a `pkexec` child of a sandboxed process is root *inside
+     the same sandbox*, where `/etc` is the runtime's own and the host's
+     `/etc/fstab` is unreachable by any path (Flatpak reserves `/etc` and
+     refuses even `--filesystem=/etc/fstab:rw`). `flatpak-spawn --host` is
+     what puts the process on the host; `pkexec` behind it is what makes it
+     root. And the process that lands on the host runs with the *host's*
+     libraries, not the runtime's - so it cannot be the GUI binary, which is
+     dynamically linked against the runtime's GTK, WebKitGTK and glibc; it
+     is `rustab-helper`, the same elevated code built as a self-contained
+     static binary (§4.5).
+
+     The helper's host path is resolved from the `app-path` key Flatpak
+     itself writes into the sandbox's `/.flatpak-info`, falling back to the
+     user and system Flatpak installation layouts, and the operation fails
+     with a `privilege_escalation` error naming every `…/bin/rustab-helper`
+     path it tried if none of them exists - it never guesses. Existence is
+     checked **on the host**, since none of those paths is visible from
+     inside the sandbox. Needs `--talk-name=org.freedesktop.Flatpak` in the
+     manifest and nothing else.
 
    Everything in steps 3-6 below is identical either way: `flatpak-spawn
    --host` passes stdio through and exits with the child's status, and the
@@ -968,11 +991,14 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    protocol is one build talking to itself, and a missing field defaulting to
    "no record" would be a fail-open default on the one check that exists to
    fail closed.
-4. The elevated process, in `main()`, sees `--internal-privileged-write` as
-   `argv[1]` **before anything else starts** - no Tauri runtime, no webview,
-   no plugins, no logger are ever initialized in a root process. It reads
-   stdin to EOF exactly once, refuses any `target` other than `/etc/fstab`
-   (for either operation), and then:
+4. The elevated process dispatches **before anything else starts** - no
+   Tauri runtime, no webview, no plugins, no logger are ever initialized in
+   a root process. In the GUI binary that is `main()` seeing
+   `--internal-privileged-write` as `argv[1]`, as its first statement; in
+   `rustab-helper` there is nothing to branch on, because refusing argv and
+   dispatching is all its `main` contains. Either way it reads stdin to EOF
+   exactly once, refuses any `target` other than `/etc/fstab` (for every
+   operation), and then:
    - `write`: unless `allow_external_change` is `true`, re-reads the verified
      target **in this process** and compares it with
      `last_known_real_content`; if they differ it answers
@@ -1016,7 +1042,12 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    Exit codes: `0` success, `1` the operation was attempted and failed (a JSON
    error body is present), `2` the request itself was unusable (a JSON error
    body is still present; nothing was written and nothing was deleted).
-   Diagnostics go to stderr, never stdout.
+   Exit `2` **always** carries a body, including the one case that happens
+   before stdin is read at all - a stray argument - and that holds for both
+   binaries: the GUI's flag branch and `rustab-helper` each print the same
+   write-shaped error object (`kind: "internal"`, `target_unchanged: true`)
+   on stdout alongside their human-readable line on stderr. Diagnostics go
+   to stderr, never stdout.
 6. The unprivileged side parses that object. A parsable response always wins
    over the exit code - it is the helper's own account of what it did. A
    response that answers a *different* operation is not an account of this
@@ -1032,10 +1063,11 @@ elevated side reconstructs the identical document the user was shown and lets
 chain whose output could differ from the first one's.
 
 This stdin/stdout protocol is internal, undocumented as an interface and
-unstable by design (§11): nothing but this binary ever speaks it, to itself,
-in a single build. It is described here because it is the mechanism the
-`privilege_escalation` error kinds refer to, not because anything else may
-use it.
+unstable by design (§11): nothing but Rustab's own two executables ever
+speaks it, to each other, and both are compiled from one build out of one
+shared crate - so there is no version skew for it to survive. It is
+described here because it is the mechanism the `privilege_escalation` error
+kinds refer to, not because anything else may use it.
 
 ### 4.4 Why a write does the *entire* atomic operation as root
 
@@ -1055,8 +1087,11 @@ By construction, not by convention:
   target holds either its complete old content or its complete new content -
   because `write_document` is the only thing that ever touched the disk.
 - It is the *same* audited code: not a copy, not a port, not a
-  reimplementation. The elevated path calls the identical function compiled
-  from the identical source in the same build.
+  reimplementation. Both elevated binaries link the same
+  `rustab-privileged` crate and call the identical function compiled from
+  the identical source in the same build - the only difference between them
+  is what starts it (a flag branch in the GUI's `main`, or `rustab-helper`'s
+  entire `main`).
 
 None of this applies to the two backup operations, and none of it is needed
 there: neither touches the target file (a `create_backup` only *reads* it),
@@ -1067,28 +1102,68 @@ rename, no verification pass in either. Their guarantee is narrower and
 simpler: either the named backup is gone / the new backup exists, or nothing
 changed.
 
-### 4.5 Why a re-exec and not a separate helper binary
+### 4.5 Why an ordinary install re-execs, and why the Flatpak uses a separate static helper
 
-A dedicated `rustab-helper` executable is the textbook answer. It was
-rejected deliberately:
+A dedicated `rustab-helper` executable is the textbook answer, and this
+document used to reject it outright. It now exists - but only because the
+Flatpak forced the issue, and the ordinary install still re-execs. The
+honest version of both halves of that decision:
 
-- **One artifact to build, package and sign.** A second binary has to be
-  added to the bundle, installed at a known absolute path, kept
-  version-locked with the GUI, and signed separately in formats that sign
-  executables. `docs/SPEC.md` §13/§14 describe a single-binary bundle.
-- **A helper can drift; a re-exec cannot.** A stale helper speaking an older
-  request format while the GUI speaks a newer one is a real hazard for a tool
-  that writes `/etc/fstab`. There is no "the helper's copy of the write
-  logic" here, because there is no copy.
-- **No security benefit is given up.** A helper's advantage would be a
-  smaller elevated code surface, but the elevated surface here is already
-  minimal and provably so: the flag is checked as the first statement of
-  `main`, matched as `argv[1]` exactly, extra arguments are refused, and the
-  elevated process reads stdin, performs one of three operations, prints JSON
-  and exits. Adding the second and third operations did not add entry points -
-  each added one `match` arm behind the same single flag (§4.2).
+**Why the ordinary install still re-execs.** On a machine where the GUI
+binary was built and installed, re-exec'ing it costs nothing and gives up
+nothing:
+
+- **Fewer artifacts to install at a known path.** The re-exec names
+  `std::env::current_exe()`, so there is no second path to get right, no
+  "the helper is not where the GUI expected it" failure mode, and nothing
+  extra for a distro package to place. (This is also why the ordinary path
+  deliberately does *not* go looking for a sibling `rustab-helper`:
+  shipping the helper everywhere is a packaging decision, not an
+  implementation detail, and it has not been taken.)
+- **No security benefit is given up.** The elevated surface of the re-exec
+  is already minimal and provably so: the flag is checked as the first
+  statement of `main`, matched as `argv[1]` exactly, extra arguments are
+  refused, and the elevated process reads stdin, performs one of three
+  operations, prints JSON and exits (§4.2).
 - **The authorization cost is identical.** `pkexec` prompts per invocation
   either way, so nothing improves for the user.
+
+**Why the Flatpak cannot re-exec, and what replaced it.** Under Flatpak the
+`pkexec` must happen on the **host** (§4.3 step 2, `docs/FLATPAK.md` §3),
+and a process started there runs against the host's libraries. The GUI
+binary is dynamically linked against the *runtime's* GTK, WebKitGTK and
+glibc, so re-exec'ing it on the host works only on a host that happens to
+satisfy all of them, and on one that does not it fails at `exec` - before
+reading a byte of its request, after the user has already typed a password.
+That is not a failure mode a tool that writes `/etc/fstab` should carry for
+packaging convenience. So the Flatpak ships `rustab-helper`: the same
+elevated code in a binary that depends on nothing but
+`rustab-privileged`/`fstab-core`/`serde`, built as a static (`static-pie`,
+musl) executable, which therefore consults no host library at all.
+
+The two objections this document previously raised against a helper are
+answered, not ignored:
+
+- **"A helper can drift; a re-exec cannot."** Still a real hazard - but
+  drift is prevented here by *sharing the implementation*, not by avoiding
+  the binary. There is no "the helper's copy of the write logic": both
+  executables link the one `rustab-privileged` crate, are produced by the
+  same build from the same workspace, and are installed together into the
+  same `/app/bin` by the same manifest step. A stale helper beside a newer
+  GUI is not a state this packaging can reach.
+- **"A second artifact to build, package and sign."** True, and accepted
+  for the Flatpak only, where it is one extra `cargo build` and one extra
+  `install` in `flatpak/dev.tomsk.Rustab.yml`, and where Flatpak signs the
+  whole bundle rather than individual executables. The `.deb`/`.rpm`/
+  `.AppImage` bundles of `docs/SPEC.md` §13 still carry the GUI binary
+  alone, and nothing in them needs the helper.
+
+The one claim that has to be *reversed* rather than defended: a separate
+helper does not widen the elevated surface here - it narrows it. The
+re-exec'd GUI binary is a root process that happens to have Tauri, a
+webview, plugins and a logger linked into it and is trusted not to
+initialize them; `rustab-helper` has none of them linked at all, and its
+`main` contains nothing but the argv refusal and the one dispatch call.
 
 ### 4.6 Why the target path is sent as data, and re-checked
 
@@ -1760,10 +1835,11 @@ individually by `dto::tests::every_validation_field_spelling_is_exactly_as_docum
   The same applies to a deletion: a backup deleted while a save is pruning
   old backups can produce an `invalid_backup` from either side, which means
   "it is already gone", not "something is wrong".
-- **The internal flag is not a public CLI.** `rustab
-  --internal-privileged-write` and its stdin/stdout protocol (all three
-  operations of it) are an implementation detail of §4, unstable by design,
-  and must not be invoked by anything but the escalation path.
+- **Neither elevated entry point is a public CLI.** `rustab
+  --internal-privileged-write`, the `rustab-helper` binary, and the
+  stdin/stdout protocol both of them speak (all three operations of it) are
+  an implementation detail of §4, unstable by design, and must not be
+  invoked by anything but the escalation path.
 - **Manual smoke test of the elevated paths** (deliberately not automated -
   they need a password prompt and touch the real file and its backups; run
   them by hand on a machine you can afford to fix, and check
