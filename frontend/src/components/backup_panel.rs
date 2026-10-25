@@ -11,17 +11,13 @@
 //! it can be unit tested without a DOM.
 //!
 //! T40 note: the banner's second fact - that each save's automatic backup is
-//! still written beside the real `/etc/fstab` - was in doubt for exactly as
-//! long as it took to find out *why* a sandboxed save could not reach that
-//! file (the elevated helper was being started with a bare `pkexec`, which
-//! changes a process's UID but not its mount namespace, so it stayed inside
-//! the sandbox). The backend now starts it with `flatpak-spawn --host pkexec`,
-//! which makes it a real host root process, so the statement is true and
-//! verified rather than assumed. The wording is unchanged apart from saying
-//! "can't list the contents of /etc/" instead of "can't manage files in
-//! /etc/", which is the accurate description of what a sandboxed session
-//! cannot do: it *can* have `/etc/fstab` written for it, it just cannot
-//! enumerate the directory.
+//! still written beside the real `/etc/fstab` - holds because the elevated
+//! helper is started with `flatpak-spawn --host pkexec`, which runs it on the
+//! host rather than inside the sandbox's mount namespace, so it really does
+//! reach the real file. The text says "can't list the contents of /etc/"
+//! rather than "can't manage files in /etc/", since that is the accurate
+//! description of what a sandboxed session cannot do: it *can* have
+//! `/etc/fstab` written for it, it just cannot enumerate the directory.
 
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
@@ -37,13 +33,11 @@ use crate::dto::BackupInfoDto;
 pub fn fallback_notice_text(fallback_dir: Option<&str>) -> Option<String> {
     fallback_dir.map(|dir| {
         format!(
-            "Backups you create here are being kept in {dir}, not beside the real \
-             /etc/fstab, because this sandboxed install can't list the contents of \
-             /etc/. Automatic backups taken during ordinary \
-             saves are still written beside the real /etc/fstab and are not shown in this \
-             list, but they are not lost: they're recoverable from a rescue environment \
-             (e.g. booting a live/rescue disk), just not visible or manageable from inside \
-             this app."
+            "Because this sandboxed install can't list the contents of /etc/, backups \
+             you create here are kept in {dir} instead of beside the real /etc/fstab; \
+             the automatic backup made by each ordinary save is still written beside \
+             the real /etc/fstab and, while not shown or manageable here, is not lost - \
+             it is recoverable from a rescue environment."
         )
     })
 }
@@ -237,9 +231,16 @@ mod tests {
         // (b) automatic backups from ordinary saves are still beside the
         // real file, not shown here, not lost, recoverable from a rescue
         // environment.
-        assert!(notice.contains("not shown in this list"));
+        assert!(notice.contains("not shown"));
         assert!(notice.to_lowercase().contains("not lost"));
         assert!(notice.to_lowercase().contains("rescue"));
+
+        // (c) exactly one sentence: it ends with a sentence-terminating
+        // period and contains no internal ". " that would mark a second
+        // sentence. (Not a bare period count: `dir` itself may contain a
+        // literal '.', e.g. a `.local` path component.)
+        assert!(notice.ends_with('.'));
+        assert!(!notice.contains(". "));
     }
 
     #[test]
