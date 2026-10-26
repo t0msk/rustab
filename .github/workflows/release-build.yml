@@ -237,6 +237,23 @@ jobs:
           # release, so it's the only part replaced with a glob.
           zsync_glob="$(echo "$appimage_name" | sed -E 's/_[0-9]+\.[0-9]+\.[0-9]+_/_*_/').zsync"
 
+          # linuxdeploy writes some of the AppDir's top-level convenience
+          # symlinks (.DirIcon, the *.desktop symlink) as absolute paths
+          # rooted at this runner's own working directory - squashfs stores
+          # a symlink's target as a literal string, not resolved at mount
+          # time, so every one of them is broken the moment the packaged
+          # AppImage runs on any other machine (issue #15: AppManager
+          # refusing to install, "Symlink target not found" naming this
+          # exact CI path). Rewritten relative here, before packaging,
+          # while the absolute targets still resolve on this machine for
+          # `ln --relative` to compute the right relative form.
+          while IFS= read -r -d '' link; do
+            target="$(readlink "$link")"
+            case "$target" in
+              /*) ln -sfr "$target" "$link" ;;
+            esac
+          done < <(find "$appdir_name" -type l -print0)
+
           rm -f "$appimage_name"
           ./appimagetool -u "gh-releases-zsync|t0msk|rustab|latest|${zsync_glob}" "$appdir_name" "$appimage_name"
 
