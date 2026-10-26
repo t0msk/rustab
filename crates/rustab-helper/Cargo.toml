@@ -1,6 +1,6 @@
 [package]
 name = "rustab-helper"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "GUI-free elevated helper for Rustab: reads one JSON request on stdin, performs it on /etc/fstab, prints one JSON response."
