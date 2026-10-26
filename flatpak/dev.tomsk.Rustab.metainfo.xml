@@ -47,24 +47,24 @@
   -->
   <screenshots>
     <screenshot type="default">
-      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/entries-table.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.2.0/docs/screenshots/entries-table.png</image>
       <caption>The main entries table, with UUID/PARTUUID/LABEL/PARTLABEL/swap/bind-mount sources</caption>
     </screenshot>
     <screenshot>
-      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/edit-entry.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.2.0/docs/screenshots/edit-entry.png</image>
       <caption>Editing an entry's fields, options, and mount point</caption>
     </screenshot>
     <screenshot>
-      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/add-entry.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.2.0/docs/screenshots/add-entry.png</image>
       <caption>Adding an entry with inline validation feedback as you type</caption>
     </screenshot>
     <screenshot>
-      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/review-save-summary.png</image>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.2.0/docs/screenshots/review-save-summary.png</image>
       <caption>Reviewing exactly what changed before anything is written to disk</caption>
     </screenshot>
     <screenshot>
-      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.1.2/docs/screenshots/backups.png</image>
-      <caption>Automatic, timestamped backups on every save</caption>
+      <image>https://cdn.jsdelivr.net/gh/t0msk/rustab@v0.2.0/docs/screenshots/review-save-raw-diff.png</image>
+      <caption>Reviewing a save as a unified raw diff</caption>
     </screenshot>
   </screenshots>
 

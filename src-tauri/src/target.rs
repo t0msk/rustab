@@ -96,6 +96,7 @@
 //! [`TargetSource::Environment`] save branch needs to know whether
 //! writing *that path* requires elevation.
 
+use crate::dto::{TargetInfoDto, TargetSourceDto};
 use crate::host::{self, RealFileReader};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -109,8 +110,12 @@ use std::sync::{Arc, OnceLock};
 /// `docs/API_CONTRACT.md` and `.env.example`.
 pub const TARGET_PATH_ENV: &str = "RUSTAB_TARGET_PATH";
 
-/// The one path that counts as "the real thing" (see [`ActiveTarget::is_real`]).
-pub const REAL_FSTAB_PATH: &str = "/etc/fstab";
+// Lives in the helper's own crate (see `crate::privileged`) since the
+// elevated side re-checks this on data from a pipe; re-exported so every
+// caller here still sees one `target` module.
+pub use rustab_privileged::target_identity::{
+    is_same_file, ExternalChange, ExternalChangeGuard, REAL_FSTAB_PATH,
+};
 
 /// Directory, relative to the user's data dir, holding the sandbox target.
 const SANDBOX_DIR_NAME: &str = "rustab";
@@ -391,26 +396,6 @@ fn is_real_fstab(path: &Path) -> bool {
     is_same_file(path, Path::new(REAL_FSTAB_PATH))
 }
 
-/// Returns `true` if `path` and `other` name the same file: same literal
-/// path, or both canonicalize to one destination (so a symlink in either
-/// direction still counts). A path that can't be canonicalized is only
-/// matched literally.
-///
-/// The generalization of [`is_real_fstab`], exposed because the elevated
-/// writer applies the identical test to a target path it received as data
-/// (see [`crate::privileged`]) - one implementation means the "is this the
-/// real file, escalate" check and the "am I allowed to write this" check
-/// can never disagree.
-pub(crate) fn is_same_file(path: &Path, other: &Path) -> bool {
-    if path == other {
-        return true;
-    }
-    match (fs::canonicalize(path), fs::canonicalize(other)) {
-        (Ok(resolved), Ok(resolved_other)) => resolved == resolved_other,
-        _ => false,
-    }
-}
-
 /// Prepares the sandbox file - the working draft - and its parent
 /// directory for use.
 ///
@@ -656,66 +641,48 @@ pub(crate) fn sync_sandbox_after_save(sandbox_path: &Path, bytes: &[u8]) -> io::
 }
 
 // ---------------------------------------------------------------------------
-// External-change detection (T36)
+// External-change detection: the GUI side's half
 // ---------------------------------------------------------------------------
 
-/// What a real-file write knows about `/etc/fstab`'s content before it
-/// starts, and whether the user has already chosen to overwrite an
-/// external change.
+/// The two things only the GUI process can do with an
+/// [`ExternalChangeGuard`]: build one from the last-known-real marker, and
+/// run the comparison through an injected reader.
 ///
-/// The whole input of the "did the real file change under us?" check,
-/// travelling as two flat fields inside `PrivilegedRequest::Write` so the
-/// check can run *again*, inside the elevated process, immediately
-/// before `write_document` runs - the authoritative check, since
-/// `pkexec`'s password wait leaves a window for the file to change that a
-/// pre-prompt-only check would miss.
-///
-/// The comparison is the marker's recorded bytes vs. `/etc/fstab`'s
-/// current bytes, never the draft against the real file - a draft
-/// differing from the marker is just unsaved edits.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalChangeGuard {
-    /// The content Rustab last knew the real `/etc/fstab` to hold - the
-    /// [`last_known_real_marker`]'s content, as recorded by the last refresh
-    /// or the last successful save ([`sync_sandbox_after_save`]).
-    ///
-    /// `None` means no usable record (no marker yet, an unreadable one,
-    /// non-UTF-8 content, or a target kind that keeps no marker at all -
-    /// see [`ExternalChangeGuard::unchecked`]). With nothing to compare
-    /// against, no external change can be established and the write
-    /// proceeds - the alternative, blocking every write a best-effort
-    /// marker write had failed for, would make the file uneditable for a
-    /// reason the user can't see or fix.
-    pub last_known_real_content: Option<String>,
-    /// `true` only when the user has been shown the external diff and
-    /// explicitly asked for the write anyway, making
-    /// [`ExternalChangeGuard::detect`] report nothing for this one
-    /// request.
-    ///
-    /// A separate signal from [`Self::last_known_real_content`], since
-    /// "the user confirmed" and "Rustab never knew" must stay distinguishable.
-    pub allow_external_change: bool,
-}
-
-/// An external change to the real `/etc/fstab`, as detected by
-/// [`ExternalChangeGuard::detect`]: both sides of the diff the user is shown.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalChange {
-    /// What Rustab last knew the file to hold - the "old" side.
-    pub last_known: String,
-    /// What the file holds right now - the "new" side, i.e. the content the
-    /// write would replace.
-    pub current: String,
-}
-
-impl ExternalChangeGuard {
+/// An extension trait because the guard itself is shared with the elevated
+/// helper and therefore defined in `rustab-privileged` (see
+/// [`crate::privileged`]), while both of these depend on things that exist
+/// only here - [`last_known_real_marker`] and the marker file it names, and
+/// [`crate::host::RealFileReader`], which knows this process may be inside
+/// a Flatpak sandbox. The verdict itself is *not* reimplemented here: both
+/// halves compute it in
+/// [`ExternalChangeGuard::detect_read_with`](rustab_privileged::target_identity::ExternalChangeGuard::detect_read_with),
+/// once.
+pub(crate) trait ExternalChangeGuardExt {
     /// The guard for a default-launch write: the recorded marker content
     /// beside `sandbox_path`, plus the user's explicit "write anyway" answer.
     ///
     /// Every failure to read the marker lands on `None` (no record) rather
     /// than on an error, for the reason spelled out on
-    /// [`Self::last_known_real_content`].
-    pub fn from_marker(sandbox_path: &Path, allow_external_change: bool) -> Self {
+    /// [`ExternalChangeGuard::last_known_real_content`].
+    fn from_marker(sandbox_path: &Path, allow_external_change: bool) -> Self;
+
+    /// [`ExternalChangeGuard::detect`] with the read of `real_fstab`
+    /// injected, for the unprivileged GUI process, which can't read that
+    /// file with `fs::read` inside a Flatpak sandbox (see [`crate::host`]).
+    ///
+    /// Only *where the bytes come from* differs from the elevated side's
+    /// `detect`; an unreadable real file still means "report no change", so
+    /// broken host access just degrades to no courtesy check rather than
+    /// blocking saves.
+    fn detect_with(
+        &self,
+        real_fstab: &Path,
+        real_reader: &dyn RealFileReader,
+    ) -> Option<ExternalChange>;
+}
+
+impl ExternalChangeGuardExt for ExternalChangeGuard {
+    fn from_marker(sandbox_path: &Path, allow_external_change: bool) -> Self {
         let last_known_real_content = last_known_real_marker(sandbox_path)
             .and_then(|marker| fs::read(marker).ok())
             // Non-UTF-8 marker bytes cannot be carried through the JSON
@@ -729,79 +696,38 @@ impl ExternalChangeGuard {
         }
     }
 
-    /// The guard for a write that has no marker to compare against at all:
-    /// case 3 of `crate::commands::save_document_with` (an explicit
-    /// `RUSTAB_TARGET_PATH=/etc/fstab`), which deliberately keeps no
-    /// last-known-content marker.
-    ///
-    /// Carries no record, so [`Self::detect`] reports nothing and that path
-    /// behaves exactly as it did before T36. `allow_external_change` is
-    /// `false` because nothing was confirmed - the check is skipped for want
-    /// of an expectation, not for want of a warning.
-    pub fn unchecked() -> Self {
-        ExternalChangeGuard {
-            last_known_real_content: None,
-            allow_external_change: false,
-        }
-    }
-
-    /// Compares what Rustab last knew against what `real_fstab` holds right
-    /// now, returning both sides when they differ.
-    ///
-    /// `None` - "no external change to report" - for each of:
-    ///
-    /// - the user already confirmed the overwrite
-    ///   ([`Self::allow_external_change`]);
-    /// - there is no usable record to compare against
-    ///   ([`Self::last_known_real_content`]);
-    /// - `real_fstab` cannot be read at all (missing, or no permission).
-    ///   Nothing can be established in that case, and a file that is *gone*
-    ///   is not an edit to warn about: the write recreates it, the same
-    ///   first-ever-save state [`refresh_sandbox_if_real_changed`] already
-    ///   treats as "nothing to compare";
-    /// - the bytes match.
-    ///
-    /// The comparison is byte-exact against the recorded bytes. Only the
-    /// *reported* current content is lossy ([`String::from_utf8_lossy`]),
-    /// since it exists to be rendered as a diff.
-    ///
-    /// This is the check as the **elevated helper** performs it
-    /// (`crate::privileged::handle_write`), which is always looking at the
-    /// real filesystem (started by `pkexec` directly, or by
-    /// `flatpak-spawn --host pkexec` outside any sandbox). So a plain
-    /// `fs::read` is right here, and this is Rustab's one authoritative
-    /// read (see [`Self::detect_with`] for the unprivileged side's
-    /// courtesy check, which may have a sandbox boundary in the way).
-    pub fn detect(&self, real_fstab: &Path) -> Option<ExternalChange> {
-        self.detect_with(real_fstab, &host::DirectFs)
-    }
-
-    /// [`Self::detect`] with the read of `real_fstab` injected, for the
-    /// unprivileged GUI process, which can't read that file with
-    /// `fs::read` inside a Flatpak sandbox (see [`crate::host`]).
-    ///
-    /// Only *where the bytes come from* differs; the verdict is computed
-    /// identically for both callers. An unreadable real file still means
-    /// "report no change", so broken host access just degrades to no
-    /// courtesy check rather than blocking saves.
-    pub(crate) fn detect_with(
+    fn detect_with(
         &self,
         real_fstab: &Path,
         real_reader: &dyn RealFileReader,
     ) -> Option<ExternalChange> {
-        if self.allow_external_change {
-            return None;
-        }
-        let last_known = self.last_known_real_content.as_deref()?;
-        let current = real_reader.read(real_fstab).ok()?;
-        if current == last_known.as_bytes() {
-            return None;
-        }
-        Some(ExternalChange {
-            last_known: last_known.to_string(),
-            current: String::from_utf8_lossy(&current).into_owned(),
-        })
+        self.detect_read_with(real_fstab, |path| real_reader.read(path))
     }
+}
+
+/// Describes `target` for the frontend, with the fallback backup directory
+/// this session is using for the real `/etc/fstab`'s backups (`None` if
+/// none - see [`TargetInfoDto::real_target_backup_fallback_dir`]).
+///
+/// Here rather than on [`TargetInfoDto`] itself, which lives in the
+/// GUI-free `rustab-privileged` crate and so cannot name [`ActiveTarget`]:
+/// resolving the active target is this module's job, and the DTO only
+/// carries the answer across the boundary.
+///
+/// Takes the fallback directory as a parameter rather than deriving it from
+/// `target`, since it's a property of *this process's* access to `/etc/`,
+/// not of the resolved target itself. `crate::commands::describe_target`
+/// computes the answer for every caller.
+pub(crate) fn describe(target: &ActiveTarget, backup_fallback_dir: Option<&Path>) -> TargetInfoDto {
+    TargetInfoDto::new(
+        &target.path,
+        target.is_real,
+        match target.source {
+            TargetSource::Environment => TargetSourceDto::Environment,
+            TargetSource::SandboxDefault => TargetSourceDto::SandboxDefault,
+        },
+        backup_fallback_dir,
+    )
 }
 
 /// Writes `bytes` onto `path` as a sibling temp file plus a `rename`,

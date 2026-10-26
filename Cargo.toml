@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/fstab-core", "src-tauri"]
+members = [
+    "crates/fstab-core",
+    "crates/rustab-privileged",
+    "crates/rustab-helper",
+    "src-tauri",
+]
 
 # NOTE: `frontend/` is intentionally NOT a workspace member. It compiles to
 # wasm32-unknown-unknown and is built independently via `trunk`; including it

@@ -33,12 +33,13 @@ this guide pretends was already done.
 What *has* happened since, and what §3 now rests on: a local
 `flatpak-builder --user --install` build of this app was run and installed,
 and the sandboxed read/elevate mechanism was exercised against the real host
-`/etc/fstab` (reads and the full helper spawn chain). The one thing still
-untested is a **completed elevated write**: finishing that needs a human at
-a polkit authentication dialog, and no automated session should drive one.
-The maintainer's remaining check is therefore "press Save in the Flatpak
-build, authenticate, confirm `/etc/fstab` changed and a backup appeared
-beside it".
+`/etc/fstab`. The manifest build of `rustab-helper` and the host spawn of the
+helper from inside the sandbox have both been verified (§3.2). One thing
+remains **untested**: a **completed elevated write** through the helper. That
+needs a human at a polkit authentication dialog, and no automated session
+should drive one - the maintainer's check is "press Save in the Flatpak build,
+authenticate, confirm `/etc/fstab` changed and a backup appeared beside it".
+§3.2 records exactly what was verified and what was not.
 
 ---
 
@@ -401,8 +402,10 @@ features are ever added, mirror them in the manifest's build-commands too.
 > since been tested, twice over (two throwaway diagnostic Flatpak apps, then
 > Rustab itself, built with `flatpak-builder --user --install` and exercised
 > in a real sandbox), and the answer is **§3.2's Option D**:
-> `flatpak-spawn --host pkexec <host path of this binary>`, enabled by the
-> single permission `--talk-name=org.freedesktop.Flatpak`.
+> `flatpak-spawn --host pkexec <host path of the elevated binary>`, enabled
+> by the single permission `--talk-name=org.freedesktop.Flatpak`. (*Which*
+> elevated binary has since changed - it is `rustab-helper`, not the GUI;
+> the mechanism is unchanged. See the status note in §3.2.)
 >
 > Options A and B below are **kept for the record only**, because both rest
 > on a premise that turned out to be false and someone will otherwise
@@ -438,15 +441,18 @@ Two independent facts, both confirmed by experiment rather than inference:
 Together these mean the elevated writer must be made to run as a **genuine
 host process**, not merely as root. That is what §3.2's Option D does.
 
-Rustab's architecture (`docs/API_CONTRACT.md` §4) uses a re-exec
-mechanism: when saving, restoring, deleting, or creating a backup against
-the real `/etc/fstab`, the unprivileged GUI process re-executes its own
-binary via `pkexec`, passing a tagged JSON request on stdin
+Rustab's architecture (`docs/API_CONTRACT.md` §4) escalates by spawning a
+second process: when saving, restoring, deleting, or creating a backup
+against the real `/etc/fstab`, the unprivileged GUI process starts the
+elevated half via `pkexec` and passes it a tagged JSON request on stdin
 (`{"op": "write" | "delete_backup" | "create_backup", ...}` - the protocol
 grew two more operations since the previous version of this doc was
 written, see §4.2-4.3 of `API_CONTRACT.md`; nothing about the sandbox
-analysis below changes because of that, since all three still go through
-the identical single re-exec flag).
+analysis below changes because of that, since all three travel through the
+one request union). On an ordinary install that second process is the GUI
+binary re-exec'd with a hidden flag; under Flatpak it is `rustab-helper`
+(see §3.2's status note). The sandbox analysis below is about where the
+`pkexec` has to happen and applies to both.
 
 In a normal (non-sandboxed) Linux system, `pkexec` can reach the host's
 polkit daemon, authenticate, run elevated, and write to the host
@@ -477,7 +483,7 @@ What was confirmed, from inside a sandbox granted *only* that:
 | `flatpak-spawn --host id` | the real host user - proof the process is outside the sandbox's mount namespace, not merely outside its cgroup |
 | `flatpak-spawn --host sh -c 'touch /etc/.test'` | `Permission denied` - correct for an unprivileged host process |
 | `flatpak-spawn --host pkexec sh -c 'touch /etc/.test && rm -f /etc/.test'` | **succeeds** - real root on the real `/etc/` |
-| `echo '<request>' \| flatpak-spawn --host <app-path>/bin/rustab --internal-privileged-write` | the helper's own JSON response on stdout, correct exit code - stdio and exit status pass through unchanged |
+| `echo '<request>' | flatpak-spawn --host <app-path>/bin/rustab-helper` | the helper's JSON response and exit code pass through; verified 2026-10-25: the spawn chain is confirmed to work from inside an installed Flatpak sandbox |
 
 Two details the implementation has to get right, both in
 `src-tauri/src/host.rs`:
@@ -486,22 +492,147 @@ Two details the implementation has to get right, both in
   inside the sandbox is `/app/bin/rustab`, which does not exist on the host.
   The host path comes from the `app-path` key Flatpak writes into the
   sandbox's own `/.flatpak-info`, with the user/system installation layouts
-  (`$HOME/.local/share/flatpak/app/<id>/current/active/files/bin/rustab`,
-  `/var/lib/flatpak/app/<id>/…`) as fallbacks.
+  (`$HOME/.local/share/flatpak/app/<id>/current/active/files/bin/…`,
+  `/var/lib/flatpak/app/<id>/…`) as fallbacks. The binary named there is
+  `rustab-helper`, not `rustab` - see the status note after this table.
 - **Existence of that path must be checked on the host, not locally.** None
   of those paths is visible from inside the sandbox, so `Path::exists()`
   answers `false` for all of them - including the right one. The check is one
   more `flatpak-spawn --host` call.
 
-The one real caveat, recorded honestly: the binary that runs on the host is
-the Flatpak-built one, dynamically linked against the *runtime's* GTK,
-WebKitGTK and glibc. It runs on a host that can satisfy those (verified here
-with `ldd` and by running it), but a host without `libwebkit2gtk-4.1.so.0`,
-or with an older glibc than the runtime's, would fail at exec and the save
-would fail with a `privilege_escalation` error. If that ever shows up in the
-field, the mitigations are to invoke it through the runtime's own loader
-(`/.flatpak-info` also records `runtime-path`) or to ship a small
-statically-linked helper binary.
+- **`findmnt --verify`, `lsblk` and the mount-point existence check must run
+  on the host too.** A sandboxed
+  `findmnt` cannot see the host's mount points and incorrectly reports most
+  entries (including `/`) as unreachable; a sandboxed `lsblk` exits
+  successfully but reports no UUIDs or labels for any device; and the
+  advisory "mount point does not currently exist on disk" check stats the
+  *runtime's* `/`, so `/boot`, `/opt`, `/mnt/…` and every `/run/media/…`
+  that the host really has is reported missing - a false warning on
+  nearly every real fstab. The fix routes all three through
+  `flatpak-spawn --host` via an injectable `fstab_core::exec::CommandRunner`
+  (selected in `src-tauri/src/host.rs`). For `findmnt`, the candidate is
+  staged in a host-side `mktemp` file and passed to `--tab-file`, because
+  the sandbox's `/tmp` is invisible to the host and `--tab-file /dev/stdin`
+  fails on a pipe. The existence check is **batched**: the trait method
+  takes the whole list of paths and the host runner answers it with one
+  `flatpak-spawn --host sh -c 'for p in "$@"; …'` call per validation,
+  printing one `0`/`1` per path in order, so the cost does not scale with
+  the number of entries (each spawn is a portal round trip). A reply that
+  is not exactly one `0`/`1` per path is an error, and an existence check
+  that cannot be answered emits no findings rather than inventing them. The
+  elevated helper is unaffected - it already runs on the host.
+  **Verified in a sandbox (2026-10-25):** the batched script, run through
+  `flatpak-spawn --host` from inside the installed Flatpak for
+  `/boot /opt /mnt /run/media /nope`, answered `11110`; the same loop run
+  inside the sandbox answered `00000` - the false "missing" reports this fix
+  removes, side by side with the right answer. The `#[ignore]`d
+  `sandbox_smoke_host_runner_runs_on_the_host` (in `src-tauri/src/host.rs`),
+  run inside that sandbox, also passed, asserting `[true, false]` for
+  `["/etc/fstab", "/.flatpak-info"]`.
+- **The real `/etc/fstab`'s backups are listed on the host too (T42).** In fallback
+  mode, `list_backups` now returns both the fallback directory's own rows and a merged
+  list of automatic backups sitting beside the real `/etc/fstab` in the host's `/etc/`.
+  The host listing is fetched via an unprivileged `flatpak-spawn --host sh -c '<script>'`
+  call whose script `cd`s into `/etc/`, globs `fstab.*`, and prints each matching regular
+  file as `<size> <mtime>\n<name>\0` records via `stat`. The sandboxed side parses those
+  NUL-terminated records strictly and applies `fstab_core::writer::list_backups_among` to
+  the names - the same lightweight inline-script pattern already used for `cat` and the
+  batched existence check above, not a re-exec. The merged list is sorted newest first.
+  If the host listing fails, `list_backups` rejects loudly (kind `list_backups`) rather
+  than silently omitting the host rows. See `docs/API_CONTRACT.md` §3.6 and §9 for the
+  UI consequences: host-listed rows are marked non-deletable (`deletable: false`), and
+  `restore_backup`/`read_backup` can resolve against them via `flatpak-spawn --host cat`,
+  while `delete_backup`/`create_backup` remain anchored to the fallback directory only.
+
+##### Status note: the dynamic-linking caveat, and the helper that now answers it
+
+The caveat this section used to end on was real: the binary
+`flatpak-spawn --host pkexec` exec'd was the Flatpak-built GUI, dynamically
+linked against the *runtime's* GTK, WebKitGTK and glibc. It ran on the host
+used for the experiments above (checked with `ldd` and by running it), but a
+host without `libwebkit2gtk-4.1.so.0`, or with an older glibc than the
+runtime's, would have failed at `exec` - after the user had already typed
+their password - and the save would have surfaced a `privilege_escalation`
+error.
+
+**That is no longer the shape of the mechanism.** The elevated half now
+lives in its own GUI-free crate (`crates/rustab-privileged`) and is also
+built as its own binary, `crates/rustab-helper`, which depends on nothing
+but that crate (and so `fstab-core`, `serde`, `serde_json`): no Tauri, no
+GTK, no WebKitGTK, no logger. Under Flatpak the app runs
+`flatpak-spawn --host pkexec <app-path>/bin/rustab-helper` - with **no
+flag**, since the helper refuses any argument and reads one JSON request on
+stdin - so the host's libraries are not consulted at all. The GUI's
+`--internal-privileged-write` re-exec is kept for ordinary, non-Flatpak
+installs, where the binary and the host are the same machine
+(`docs/API_CONTRACT.md` §4.5 has the full reasoning for the split).
+
+What is **verified**, and how:
+
+- **the manifest build step (2026-10-25)**: a full `flatpak-builder --user
+  --install` build against `org.gnome.Sdk//51` + `rust-stable//26.08` succeeded.
+  The build log shows both helper build-commands running: `Compiling
+  rustab-privileged v0.1.3`, `Compiling rustab-helper v0.1.3`, `Finished release
+  ... in 5.70s`, then `install -Dm755 target/x86_64-unknown-linux-musl/release/rustab-helper
+  /app/bin/rustab-helper`. Installed as `dev.tomsk.Rustab//t41-test`.
+- **the helper's properties (2026-10-25)**: `/app/bin/rustab-helper` is `ELF
+  64-bit LSB pie executable, x86-64, static-pie linked, stripped`, 852744 bytes.
+  On the host, `ldd` says `statically linked` and `readelf -d` shows zero
+  `NEEDED` entries - the helper depends on nothing but itself.
+- **the sandboxed spawn chain to the helper (2026-10-25)**: from inside the
+  installed `//t41-test` sandbox, `flatpak-spawn --host
+  <app-path>/bin/rustab-helper` (no `pkexec`, so no prompt) was fed three
+  requests the helper must refuse, and refused each exactly as the protocol
+  says: `garbage` on stdin → `{"status":"error","error":{"kind":"internal",…}}`,
+  exit 2; `{"op":"create_backup","target":"/tmp/not-fstab"}` →
+  `{"status":"backup_create_failed","error":{"kind":"invalid_target",…}}`,
+  exit 1; a stray argument → the JSON body on stdout, the diagnostic on
+  stderr, exit 2. The host-side existence probe for that path exited 0. So
+  the helper is found, runs on the host, and its stdout and exit status
+  survive the boundary unchanged - no request that *completes* an operation
+  was sent (that is the untested item below). The `#[ignore]`d
+  `sandbox_smoke_host_runner_runs_on_the_host` (in `src-tauri/src/host.rs`)
+  was also run inside that sandbox, via the host-built test binary, and
+  passed.
+- the helper links statically: `cargo build --release -p rustab-helper
+  --target x86_64-unknown-linux-musl` produces an ELF that `file` calls
+  `static-pie linked`, with no `DT_NEEDED` entry and no `PT_INTERP` - run
+  locally, outside Flatpak (verified 2026-10-25);
+- the SDK extension `org.freedesktop.Sdk.Extension.rust-stable//26.08`
+  ships rustc 1.98.0 with **only** the `x86_64-unknown-linux-gnu` std, and
+  has `gcc`/`cc` but no `musl-gcc` - which is why the manifest has to supply
+  the musl std itself (verified 2026-10-25);
+- that supplying it is enough: inside `flatpak run -d org.gnome.Sdk//51`,
+  dropping `rust-std-1.98.0-x86_64-unknown-linux-musl`'s
+  `lib/rustlib/x86_64-unknown-linux-musl` into a `cp -rs` copy of the SDK
+  sysroot and building a dependency-free crate with
+  `RUSTFLAGS=--sysroot=… cargo --offline build --release --target
+  x86_64-unknown-linux-musl` yielded a `static-pie` binary (627 kB) that ran
+  on the host and could spawn subprocesses. No `musl-gcc` was needed -
+  Rust's musl target carries its own `crt1.o`/`libc.a` (verified
+  2026-10-25).
+
+What is **untested**:
+
+- **a `pkexec`-fronted completed operation**: a real save to `/etc/fstab`
+  via `flatpak-spawn --host pkexec <app-path>/bin/rustab-helper`, with user
+  authentication and a completed write to the real file, has not been
+  performed. This needs a human at the
+  polkit dialog. The maintainer's test is to press Save, authenticate, and
+  confirm that `/etc/fstab` changed and a backup appeared beside it.
+- **aarch64 build (untested)**: the aarch64 musl tarball/sha256 entry in the
+  manifest has only been checked for the sha256 value; no aarch64 build was run.
+- **GUI launch in sandbox (untested)**: the GUI itself was not launched inside
+  the `//t41-test` sandbox in the 2026-10-25 session (only shells and the test
+  binary were).
+
+**One coupling to keep in mind**: the manifest now downloads two `rust-std`
+tarballs (`wasm32-unknown-unknown` for the frontend, `<arch>-unknown-linux-musl`
+for the helper) and both must be the **exact** rustc version the SDK
+extension ships - 1.98.0 for `//26.08`. A std built by a different rustc is
+rejected by the one in the sandbox, so bumping the runtime means bumping
+both URLs and both `sha256`s together. The manifest says so in a comment
+beside them.
 
 #### Option A (KEPT FOR THE RECORD - does not work): Host filesystem access + implicit policy
 
@@ -553,12 +684,14 @@ for a more principled, tightly-controlled mechanism instead of a bare
 **Non-negotiable**: before submitting to Flathub, any Flatpak manifest
 must be built and tested on an actual Flatpak-enabled system. Since T40,
 steps 1 and 2 below **have been done** (local `flatpak-builder --user
---install`, app launches, draft loads from the real `/etc/fstab`), and step
-3's first question is answered (the whole spawn chain reaches the elevated
-helper and gets its JSON response back; `pkexec` is reachable from the
-sandbox via the host). What remains **[MAINTAINER ACTION]** is everything
-that needs a human at an authentication dialog, i.e. step 3's "does the
-write complete" onwards:
+--install`, app launches, draft loads from the real `/etc/fstab`),
+and on 2026-10-25 the rebuilt manifest - now also producing
+`/app/bin/rustab-helper` - was built and installed the same way, with the
+spawn chain to the helper exercised from inside the sandbox (§3.2's status
+note has the evidence). Step 3's first question is therefore answered
+(`pkexec` and the helper are both reachable from the sandbox via the host).
+What remains **[MAINTAINER ACTION]** is everything that needs a human at an
+authentication dialog, i.e. step 3's "does the write complete" onwards:
 
 1. Build locally:
    ```bash

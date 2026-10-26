@@ -55,7 +55,7 @@ fn path_to_wire(path: &Path) -> String {
 // Target info
 // ---------------------------------------------------------------------------
 
-/// How the active target was chosen - mirrors [`crate::target::TargetSource`].
+/// How the active target was chosen - mirrors `rustab`'s `target::TargetSource`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetSourceDto {
@@ -93,10 +93,14 @@ pub struct TargetInfoDto {
     /// that isn't `/etc/fstab` itself.
     ///
     /// When `Some(dir)`: backups created explicitly land in `dir` with no
-    /// password prompt, while each save's automatic backup still lands
-    /// beside the real `/etc/fstab` via the elevated writer but is **not
-    /// listed**, since this process can't enumerate that directory - not
-    /// lost, just not shown or managed in-app (`docs/UI_DESIGN.md` §7).
+    /// password prompt, and `create_backup`/`delete_backup` only ever touch
+    /// `dir` - never the host's `/etc/`. Each save's automatic backup still
+    /// lands beside the real `/etc/fstab` via the elevated writer; `dir`
+    /// isn't where it's listed from, but `list_backups` does show it, as a
+    /// restore-only row (`BackupInfoDto::deletable == false`), by having the
+    /// GUI's `host` module ask an unprivileged `flatpak-spawn --host` to
+    /// list the host's `/etc/` on this process's behalf (`docs/UI_DESIGN.md`
+    /// §7).
     ///
     /// A display path, never sent back: backup-path-taking commands
     /// always match against the real backup list regardless.
@@ -104,27 +108,26 @@ pub struct TargetInfoDto {
 }
 
 impl TargetInfoDto {
-    /// Describes `target` for the frontend, with the fallback backup
-    /// directory this session is using for the real `/etc/fstab`'s
-    /// backups (`None` if none - see
+    /// Renders an already-resolved target for the frontend, with the
+    /// fallback backup directory this session is using for the real
+    /// `/etc/fstab`'s backups (`None` if none - see
     /// [`TargetInfoDto::real_target_backup_fallback_dir`]).
     ///
-    /// Takes that directory as a parameter rather than deriving it from
-    /// `target`, since it's a property of *this process's* access to
-    /// `/etc/`, not of the resolved [`crate::target::ActiveTarget`]
-    /// itself. `crate::commands::describe_target` computes the answer for
-    /// every caller.
-    pub(crate) fn describe(
-        target: &crate::target::ActiveTarget,
+    /// Takes the three facts rather than the GUI crate's `ActiveTarget`,
+    /// which this crate deliberately knows nothing about: resolving the
+    /// target is the GUI's job (`rustab`'s `target::describe` is the one
+    /// caller), and this layer's job is only to carry the answer across the
+    /// boundary unchanged.
+    pub fn new(
+        path: &Path,
+        is_real: bool,
+        source: TargetSourceDto,
         backup_fallback_dir: Option<&Path>,
     ) -> Self {
         TargetInfoDto {
-            path: path_to_wire(&target.path),
-            is_real: target.is_real,
-            source: match target.source {
-                crate::target::TargetSource::Environment => TargetSourceDto::Environment,
-                crate::target::TargetSource::SandboxDefault => TargetSourceDto::SandboxDefault,
-            },
+            path: path_to_wire(path),
+            is_real,
+            source,
             real_target_backup_fallback_dir: backup_fallback_dir.map(path_to_wire),
         }
     }
@@ -399,7 +402,7 @@ impl From<DocumentDto> for Document {
     }
 }
 
-/// What [`crate::commands::list_entries`] returns: the active target, the
+/// What `rustab`'s `commands::list_entries` returns: the active target, the
 /// file's exact text, and its parsed form.
 ///
 /// `text` is included deliberately even though `document` could be
@@ -562,7 +565,7 @@ pub struct WriteOutcomeDto {
     /// `true` if the write was performed by the elevated helper via `pkexec`.
     /// Set by the unprivileged side after the helper reports back - the
     /// helper itself cannot know how it was launched, so it always emits
-    /// `false` (see [`crate::privileged`]).
+    /// `false` (see [`crate::protocol`]).
     pub elevated: bool,
     /// The one non-fatal warning a successful save can carry: the real
     /// `/etc/fstab` was written, but the local working draft beside it
@@ -705,8 +708,8 @@ pub struct WriteErrorDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalChangeDto {
     /// What Rustab last knew the real `/etc/fstab` to hold - the **old** side
-    /// of the diff (the content of the last-known-real marker, see
-    /// `crate::target`).
+    /// of the diff (the content of the last-known-real marker, kept by
+    /// `rustab`'s `target` module).
     pub last_known_content: String,
     /// What the real `/etc/fstab` holds **right now** - the new side, i.e. the
     /// content the refused write would have replaced.
@@ -835,7 +838,7 @@ pub enum CommandErrorKindDto {
     ReadTarget,
     /// The target's bytes are not valid UTF-8, so it cannot be represented or
     /// safely re-serialized. Also reported for a *backup* whose bytes are not
-    /// valid UTF-8 (see [`crate::commands::read_backup`]), rather than adding
+    /// valid UTF-8 (see `commands::read_backup`), rather than adding
     /// a second kind that would mean the same thing to the frontend.
     NotUtf8,
     /// The target's directory could not be listed for backups.
@@ -849,19 +852,19 @@ pub enum CommandErrorKindDto {
     /// but is not valid UTF-8 is reported as [`CommandErrorKindDto::NotUtf8`].
     ReadBackup,
     /// The host file manager could not be launched
-    /// ([`crate::commands::open_backup_location`]) - the `xdg-open` binary is
+    /// (`commands::open_backup_location`) - the `xdg-open` binary is
     /// missing, or starting it failed for some other reason.
     OpenLocation,
     /// The host browser could not be launched
-    /// ([`crate::commands::open_external_link`]) - the `xdg-open` binary is
+    /// (`commands::open_external_link`) - the `xdg-open` binary is
     /// missing, or starting it failed for some other reason.
     OpenExternalLink,
-    /// [`crate::commands::open_path_in_file_manager`]'s own kind - the host
+    /// `commands::open_path_in_file_manager`'s own kind - the host
     /// file manager could not be launched for the frontend-supplied path
     /// (the `xdg-open` binary is missing, or starting it failed for some
     /// other reason).
     OpenPath,
-    /// [`crate::commands::resync_external_change`] could not re-sync the
+    /// `commands::resync_external_change` could not re-sync the
     /// working draft from the real `/etc/fstab` (T37). Covers two distinct
     /// situations, deliberately under one kind because the frontend treats
     /// them identically: the active target is not the default working draft
@@ -895,7 +898,7 @@ impl CommandErrorDto {
 // ---------------------------------------------------------------------------
 
 /// Which of this app's five known external links to open
-/// ([`crate::commands::open_external_link`]) - a closed set, not a raw
+/// (`commands::open_external_link`) - a closed set, not a raw
 /// URL, by design: see that command's own doc comment for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -925,7 +928,7 @@ pub enum ExternalLinkDto {
 impl ExternalLinkDto {
     /// The literal URL (or URI, for `Email`) for this link. Hardcoded here,
     /// not supplied by the frontend - see the command's doc comment.
-    pub(crate) fn url(self) -> &'static str {
+    pub fn url(self) -> &'static str {
         match self {
             ExternalLinkDto::GithubRepo => "https://github.com/t0msk/rustab",
             ExternalLinkDto::GithubSponsors => "https://github.com/sponsors/t0msk",
@@ -968,7 +971,7 @@ pub enum DeleteBackupErrorKindDto {
     Delete,
 }
 
-/// A failed [`crate::commands::delete_backup`].
+/// A failed `commands::delete_backup`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteBackupErrorDto {
     /// Which part failed.
@@ -994,9 +997,9 @@ impl DeleteBackupErrorDto {
 /// One backup of the active target, automatic or manual.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupInfoDto {
-    /// Full path, and the exact string [`crate::commands::restore_backup`],
-    /// [`crate::commands::read_backup`] and
-    /// [`crate::commands::delete_backup`] expect back.
+    /// Full path, and the exact string `commands::restore_backup`,
+    /// `commands::read_backup` and
+    /// `commands::delete_backup` expect back.
     pub path: String,
     /// Just the file name, for a compact list display.
     pub file_name: String,
@@ -1009,7 +1012,7 @@ pub struct BackupInfoDto {
     /// not report it.
     pub created_unix_secs: Option<u64>,
     /// `true` if a user asked for this backup explicitly
-    /// ([`crate::commands::create_backup`]), `false` if a save made it on its
+    /// (`commands::create_backup`), `false` if a save made it on its
     /// own. Reported by `fstab-core`, which owns the naming scheme the
     /// distinction is encoded in - the frontend must not try to infer it from
     /// `file_name`.
@@ -1018,19 +1021,28 @@ pub struct BackupInfoDto {
     /// backups are pruned once there are more than ten of them, manual ones
     /// are kept until the user deletes them.
     pub is_manual: bool,
+    /// `true` for every backup `commands::delete_backup` accepts in this
+    /// session - i.e. every row [`crate::backups::list`] and
+    /// [`crate::backups::describe_one`] produce.
+    ///
+    /// `false` only for a real `/etc/fstab` backup listed from the host's
+    /// `/etc/` by a sandboxed (fallback-mode) session: such a backup can be
+    /// restored and its content shown, but not deleted from there (see
+    /// `docs/API_CONTRACT.md` §3.6).
+    pub deletable: bool,
 }
 
 // ---------------------------------------------------------------------------
 // Manual backup creation
 // ---------------------------------------------------------------------------
 
-/// What a successful [`crate::commands::create_backup`] did, as the elevated
+/// What a successful `commands::create_backup` did, as the elevated
 /// helper reports it.
 ///
 /// Internal to the escalation protocol rather than part of the command's own
 /// return shape: the command resolves this into a [`BackupInfoDto`] so the
 /// frontend gets a row in exactly the shape
-/// [`crate::commands::list_backups`] already hands it, with no second backup
+/// `commands::list_backups` already hands it, with no second backup
 /// shape to mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateBackupOutcomeDto {
@@ -1094,7 +1106,7 @@ pub enum CreateBackupErrorKindDto {
     PrivilegeEscalation,
 }
 
-/// A failed [`crate::commands::create_backup`].
+/// A failed `commands::create_backup`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateBackupErrorDto {
     /// Which part failed.
@@ -1187,7 +1199,6 @@ impl From<&DiscoveryResult> for DeviceDiscoveryDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{ActiveTarget, TargetSource};
     use fstab_core::model::Line;
     use fstab_core::parser;
     use fstab_core::validate::Severity;
@@ -1300,7 +1311,8 @@ mod tests {
         );
 
         // The one T34 addition, on the wire: a successful save that could not
-        // update the working draft (see `crate::commands::save_document_with`).
+        // update the working draft (see `rustab`'s
+        // `commands::save_document_with`).
         let warned = WriteOutcomeDto {
             draft_sync_warning: Some("w".to_string()),
             ..outcome
@@ -1325,7 +1337,7 @@ mod tests {
 
         // The T36 addition, on the wire: the one error kind that carries two
         // file bodies, because the frontend builds a diff out of them
-        // (`crate::target::ExternalChangeGuard`).
+        // ([`crate::target_identity::ExternalChangeGuard`]).
         let external = WriteErrorDto {
             message: "m".to_string(),
             path: None,
@@ -1362,10 +1374,11 @@ mod tests {
             size_bytes: 12,
             created_unix_secs: Some(1_760_000_000),
             is_manual: true,
+            deletable: true,
         };
         assert_eq!(
             serde_json::to_string(&backup).expect("serialize"),
-            r#"{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true}"#
+            r#"{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true,"deletable":true}"#
         );
 
         let create_outcome = CreateBackupOutcomeDto {
@@ -1816,23 +1829,19 @@ mod tests {
 
     #[test]
     fn target_info_reports_the_source_it_was_resolved_from() {
-        let sandbox = TargetInfoDto::describe(
-            &ActiveTarget {
-                path: PathBuf::from("/home/u/.local/share/rustab/fstab.sandbox"),
-                is_real: false,
-                source: TargetSource::SandboxDefault,
-            },
+        let sandbox = TargetInfoDto::new(
+            Path::new("/home/u/.local/share/rustab/fstab.sandbox"),
+            false,
+            TargetSourceDto::SandboxDefault,
             None,
         );
         assert_eq!(sandbox.source, TargetSourceDto::SandboxDefault);
         assert!(!sandbox.is_real);
 
-        let explicit = TargetInfoDto::describe(
-            &ActiveTarget {
-                path: PathBuf::from("/etc/fstab"),
-                is_real: true,
-                source: TargetSource::Environment,
-            },
+        let explicit = TargetInfoDto::new(
+            Path::new("/etc/fstab"),
+            true,
+            TargetSourceDto::Environment,
             None,
         );
         assert_eq!(explicit.source, TargetSourceDto::Environment);
@@ -1843,26 +1852,25 @@ mod tests {
     /// frontend builds a visible notice out of it, so the name and the `null`
     /// case are as load-bearing as the path itself.
     ///
-    /// *Which* target gets a fallback directory is `crate::commands`'s
-    /// decision (`backup_fallback_dir`, asserted there); this layer's job is
-    /// only to carry the answer across the boundary unchanged.
+    /// *Which* target gets a fallback directory is the GUI crate's
+    /// `commands::backup_fallback_dir` decision (asserted there); this
+    /// layer's job is only to carry the answer across the boundary
+    /// unchanged.
     #[test]
     fn target_info_carries_the_real_target_backup_fallback_dir_verbatim() {
-        let default_launch = ActiveTarget {
-            path: PathBuf::from("/home/u/.local/share/rustab/fstab.draft"),
-            is_real: false,
-            source: TargetSource::SandboxDefault,
-        };
+        let draft = Path::new("/home/u/.local/share/rustab/fstab.draft");
 
-        let colocated = TargetInfoDto::describe(&default_launch, None);
+        let colocated = TargetInfoDto::new(draft, false, TargetSourceDto::SandboxDefault, None);
         assert_eq!(colocated.real_target_backup_fallback_dir, None);
         assert_eq!(
             serde_json::to_string(&colocated).expect("serialize"),
             r##"{"path":"/home/u/.local/share/rustab/fstab.draft","is_real":false,"source":"sandbox_default","real_target_backup_fallback_dir":null}"##
         );
 
-        let fallback = TargetInfoDto::describe(
-            &default_launch,
+        let fallback = TargetInfoDto::new(
+            draft,
+            false,
+            TargetSourceDto::SandboxDefault,
             Some(Path::new("/home/u/.local/share/rustab/etc-fstab-backups")),
         );
         assert_eq!(
@@ -2024,7 +2032,7 @@ mod tests {
     }
 
     /// Error DTOs make the round trip too: the elevated helper serializes one
-    /// and the unprivileged side deserializes it (see [`crate::privileged`]).
+    /// and the unprivileged side deserializes it (see [`crate::protocol`]).
     #[test]
     fn error_dtos_round_trip_through_json() {
         let dto = WriteErrorDto::from(&WriteError::Backup {

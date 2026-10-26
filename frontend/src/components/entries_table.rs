@@ -70,6 +70,21 @@
 //! Nothing here introduces an app-level per-entry identity: `expanded`,
 //! `on_move`, and `candidate_index` keep their exact position-based
 //! meaning, and the frozen keys live and die with one gesture.
+//!
+//! **Context menu.** Right-clicking a row's main `<tr>` - never its
+//! expanded detail `<tr>` - replaces WebKitGTK's own browser context menu
+//! with a small "Edit"/"Delete" one, calling the same `on_edit`/
+//! `on_delete` callbacks the row's own icon buttons already call rather
+//! than duplicating their logic. `EntriesTable` owns the one piece of
+//! state this needs (which row, and where the pointer was), next to
+//! [`DragState`]. A transparent backdrop closes the menu on any outside
+//! click, and a right-click anywhere else while it is open dismisses it
+//! instead of opening a second one or falling through to the native
+//! menu - that backdrop exists only while the menu is open, so no other
+//! right-click in the app is affected, and there is still no app-wide
+//! context-menu handling anywhere. `Escape`, focusing the first item on
+//! open, and a pure [`clamp_menu_position`] helper that keeps the panel
+//! on-screen round out the pattern; nothing like it existed here already.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -670,6 +685,42 @@ fn measure_rows(tbody: &web_sys::Element, row_count: usize) -> Option<Vec<RowMet
     group_row_metrics(&raw, row_count)
 }
 
+/// One open row context menu (module docs): which row it was opened on
+/// and the client coordinates it should appear at. Held in a `use_state`
+/// in `EntriesTable`, next to [`DragState`] - `None` means closed.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ContextMenuState {
+    candidate_index: usize,
+    x: f64,
+    y: f64,
+}
+
+/// Estimated on-screen size of the context menu panel, used only to keep
+/// it inside the viewport ([`clamp_menu_position`]). Not a real
+/// measurement - the panel's position has to be decided before it is
+/// rendered - but comfortably larger than the two-item menu this file
+/// ever draws.
+const CONTEXT_MENU_WIDTH_PX: f64 = 160.0;
+const CONTEXT_MENU_HEIGHT_PX: f64 = 76.0;
+
+/// Shifts a `menu_width` x `menu_height` menu opened at `(x, y)` left
+/// and/or up, if needed, so it stays fully inside a `viewport_width` x
+/// `viewport_height` viewport - never past the right/bottom edge, and
+/// never into negative territory even when the viewport itself is
+/// smaller than the menu.
+fn clamp_menu_position(
+    x: f64,
+    y: f64,
+    menu_width: f64,
+    menu_height: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+) -> (f64, f64) {
+    let max_x = (viewport_width - menu_width).max(0.0);
+    let max_y = (viewport_height - menu_height).max(0.0);
+    (x.min(max_x).max(0.0), y.min(max_y).max(0.0))
+}
+
 #[function_component(EntriesTable)]
 pub fn entries_table(props: &EntriesTableProps) -> Html {
     // Hooks must run unconditionally on every render (Rules of Hooks) - this
@@ -679,6 +730,12 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
     // panics with "Hooks are called conditionally".
     let expanded: UseStateHandle<HashSet<usize>> = use_state(HashSet::new);
     let drag: UseStateHandle<Option<DragState>> = use_state(|| None);
+    // The row context menu (module docs): `None` when closed, `Some`
+    // while a right-click-opened "Edit"/"Delete" popup is showing.
+    let context_menu: UseStateHandle<Option<ContextMenuState>> = use_state(|| None);
+    // Focused when the menu opens, so Escape/Tab/Enter work without any
+    // further wiring (module docs).
+    let menu_edit_ref = use_node_ref();
     // The two halves of click-vs-drag disambiguation, held outside Yew's
     // render cycle (module docs): `pending_gesture` is a press that may or
     // may not become a drag, rendering nothing so promotion sees the
@@ -719,6 +776,23 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                     let _ = style.remove_property("-webkit-user-select");
                 }
             }
+        });
+    }
+
+    // Focuses "Edit" on open for keyboard Tab/Enter/Escape. Keyed on
+    // `menu_open`, not the whole state, so re-opening doesn't re-focus.
+    //
+    // T41: `outline-none` on "Edit" drops a flaky WebKitGTK focus ring here.
+    {
+        let menu_edit_ref = menu_edit_ref.clone();
+        let menu_open = context_menu.is_some();
+        use_effect_with(menu_open, move |menu_open| {
+            if *menu_open {
+                if let Some(element) = menu_edit_ref.cast::<web_sys::HtmlElement>() {
+                    let _ = element.focus();
+                }
+            }
+            || ()
         });
     }
 
@@ -936,6 +1010,119 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
         })
     };
 
+    // The row context menu itself (module docs) - rendered once per table,
+    // not per row, since only one can be open at a time. `html!{}` when
+    // closed, so it costs nothing in the common case.
+    let context_menu_html: Html = if let Some(menu) = *context_menu {
+        let viewport = web_sys::window();
+        let (viewport_width, viewport_height) = match viewport.as_ref() {
+            Some(window) => (
+                window
+                    .inner_width()
+                    .ok()
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(menu.x + CONTEXT_MENU_WIDTH_PX),
+                window
+                    .inner_height()
+                    .ok()
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(menu.y + CONTEXT_MENU_HEIGHT_PX),
+            ),
+            // No window to ask: fall back to the raw coordinates by
+            // reporting a viewport exactly as big as the menu needs,
+            // which makes `clamp_menu_position` a no-op.
+            None => (
+                menu.x + CONTEXT_MENU_WIDTH_PX,
+                menu.y + CONTEXT_MENU_HEIGHT_PX,
+            ),
+        };
+        let (menu_x, menu_y) = clamp_menu_position(
+            menu.x,
+            menu.y,
+            CONTEXT_MENU_WIDTH_PX,
+            CONTEXT_MENU_HEIGHT_PX,
+            viewport_width,
+            viewport_height,
+        );
+        let menu_style = AttrValue::from(format!("left: {menu_x}px; top: {menu_y}px"));
+        let candidate_index = menu.candidate_index;
+
+        let close_menu = {
+            let context_menu = context_menu.clone();
+            Callback::from(move |_: MouseEvent| context_menu.set(None))
+        };
+        // A right-click elsewhere while the menu is open dismisses it
+        // rather than stacking a second popup.
+        let on_backdrop_context_menu = {
+            let context_menu = context_menu.clone();
+            Callback::from(move |event: MouseEvent| {
+                event.prevent_default();
+                context_menu.set(None);
+            })
+        };
+        let on_menu_edit = {
+            let context_menu = context_menu.clone();
+            let cb = props.on_edit.clone();
+            Callback::from(move |_: MouseEvent| {
+                context_menu.set(None);
+                cb.emit(candidate_index);
+            })
+        };
+        let on_menu_delete = {
+            let context_menu = context_menu.clone();
+            let cb = props.on_delete.clone();
+            Callback::from(move |_: MouseEvent| {
+                context_menu.set(None);
+                cb.emit(candidate_index);
+            })
+        };
+        let on_menu_keydown = {
+            let context_menu = context_menu.clone();
+            Callback::from(move |event: KeyboardEvent| {
+                if event.key() == "Escape" {
+                    context_menu.set(None);
+                }
+            })
+        };
+
+        html! {
+            <>
+                <div
+                    class="fixed inset-0 z-40"
+                    onclick={close_menu}
+                    oncontextmenu={on_backdrop_context_menu}
+                ></div>
+                <div
+                    role="menu"
+                    class="fixed z-50 min-w-[10rem] rounded-md bg-white dark:bg-slate-800 shadow-lg border border-slate-200 dark:border-slate-700 py-1 text-sm"
+                    style={menu_style}
+                    tabindex="-1"
+                    onkeydown={on_menu_keydown}
+                >
+                    <button
+                        ref={menu_edit_ref.clone()}
+                        type="button"
+                        role="menuitem"
+                        class="block w-full text-left px-3 py-1.5 outline-none hover:bg-slate-100 dark:hover:bg-slate-700"
+                        onclick={on_menu_edit}
+                    >
+                        { "Edit" }
+                    </button>
+                    <button
+                        type="button"
+                        role="menuitem"
+                        class="block w-full text-left px-3 py-1.5 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30"
+                        onclick={on_menu_delete}
+                    >
+                        { "Delete" }
+                    </button>
+                </div>
+            </>
+        }
+    } else {
+        html! {}
+    };
+
     html! {
         <div class="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
             <table class="w-full text-sm">
@@ -990,6 +1177,19 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                             Callback::from(move |e: MouseEvent| {
                                 e.stop_propagation();
                                 cb.emit(candidate_index);
+                            })
+                        };
+                        // Opens the row's own context menu on right-click.
+                        let on_context_menu = {
+                            let context_menu = context_menu.clone();
+                            Callback::from(move |event: MouseEvent| {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                context_menu.set(Some(ContextMenuState {
+                                    candidate_index,
+                                    x: f64::from(event.client_x()),
+                                    y: f64::from(event.client_y()),
+                                }));
                             })
                         };
                         // `pointerdown` anywhere on this row (T52): record
@@ -1105,6 +1305,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                                         on_move_down={on_move_down}
                                         on_edit={on_edit}
                                         on_delete={on_delete}
+                                        on_context_menu={on_context_menu}
                                         on_drag_start={on_drag_start}
                                         on_drag_move={on_drag_move.clone()}
                                         on_drag_end={on_drag_end.clone()}
@@ -1124,6 +1325,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                                     on_move_down={on_move_down}
                                     on_edit={on_edit}
                                     on_delete={on_delete}
+                                    on_context_menu={on_context_menu}
                                     on_drag_start={on_drag_start}
                                     on_drag_move={on_drag_move.clone()}
                                     on_drag_end={on_drag_end.clone()}
@@ -1137,6 +1339,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                     }) }
                 </tbody>
             </table>
+            { context_menu_html }
         </div>
     }
 }
@@ -1176,6 +1379,13 @@ pub struct EntryRowProps {
     pub on_move_down: Option<Callback<MouseEvent>>,
     pub on_edit: Callback<MouseEvent>,
     pub on_delete: Callback<MouseEvent>,
+    /// Opens the row context menu (module docs) in place of WebKitGTK's
+    /// own one, hung as `oncontextmenu` on this row's main `<tr>` only -
+    /// never on its expanded detail `<tr>`, which keeps the native menu.
+    /// `EntriesTable` owns the actual menu state and the Edit/Delete
+    /// actions it offers; this only reports where, and on which row, a
+    /// right-click happened.
+    pub on_context_menu: Callback<MouseEvent>,
     /// Whole-row pointer wiring (T48, revised by T52 - §13.11) - the
     /// gesture's whole state machine (pending press, 5px promotion,
     /// committed drag) lives in `EntriesTable`, which owns the document
@@ -1399,6 +1609,7 @@ pub fn entry_row(props: &EntryRowProps) -> Html {
                 data-row-position={row_position.clone()}
                 title={row_title}
                 onclick={props.on_toggle.clone()}
+                oncontextmenu={props.on_context_menu.clone()}
                 onpointerdown={props.on_drag_start.clone()}
                 onpointermove={props.on_drag_move.clone()}
                 onpointerup={props.on_drag_end.clone()}
@@ -1613,6 +1824,9 @@ pub struct UnparsedEntryRowProps {
     pub on_move_down: Option<Callback<MouseEvent>>,
     pub on_edit: Callback<MouseEvent>,
     pub on_delete: Callback<MouseEvent>,
+    /// See `EntryRowProps::on_context_menu` - same contract, hung on this
+    /// row's own (and only) `<tr>`.
+    pub on_context_menu: Callback<MouseEvent>,
     /// Same drag wiring and drag-only visuals as `EntryRowProps` - a raw
     /// row is grabbed and reordered exactly like a parsed one (§13.11),
     /// with its raw-line `<pre>` excluded from the gesture so that text
@@ -1655,6 +1869,7 @@ pub fn unparsed_entry_row(props: &UnparsedEntryRowProps) -> Html {
             class={row_class}
             style={drag_transform_style(props.drag_offset)}
             data-row-position={props.row_position.to_string()}
+            oncontextmenu={props.on_context_menu.clone()}
             onpointerdown={props.on_drag_start.clone()}
             onpointermove={props.on_drag_move.clone()}
             onpointerup={props.on_drag_end.clone()}
@@ -2213,6 +2428,44 @@ mod tests {
         assert_eq!(
             group_row_metrics(&[(0, 0.0, 44.0), (5, 0.0, 44.0)], 1),
             None
+        );
+    }
+
+    #[test]
+    fn a_menu_that_fits_is_left_at_the_opened_position() {
+        assert_eq!(
+            clamp_menu_position(100.0, 100.0, 160.0, 76.0, 1200.0, 800.0),
+            (100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn a_menu_opened_past_the_right_edge_is_pulled_back_inside() {
+        assert_eq!(
+            clamp_menu_position(1150.0, 100.0, 160.0, 76.0, 1200.0, 800.0),
+            (1040.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn a_menu_opened_past_the_bottom_edge_is_pulled_back_inside() {
+        assert_eq!(
+            clamp_menu_position(100.0, 780.0, 160.0, 76.0, 1200.0, 800.0),
+            (100.0, 724.0)
+        );
+    }
+
+    #[test]
+    fn a_menu_opened_past_both_edges_never_lands_at_a_negative_coordinate() {
+        assert_eq!(
+            clamp_menu_position(1150.0, 780.0, 160.0, 76.0, 1200.0, 800.0),
+            (1040.0, 724.0)
+        );
+        // Even a viewport smaller than the menu itself must not clamp to a
+        // negative coordinate.
+        assert_eq!(
+            clamp_menu_position(10.0, 10.0, 160.0, 76.0, 50.0, 40.0),
+            (0.0, 0.0)
         );
     }
 }
