@@ -468,11 +468,8 @@ impl RealFileReader for DirectFs {
             if !name.as_bytes().starts_with(prefix.as_bytes()) {
                 continue;
             }
-            // `fs::metadata` follows symlinks, like the host script's
-            // `[ -f ]`. A failure here is not the directory's failure: the
-            // file vanished between the listing and the `stat`, or the
-            // symlink dangles. Either way it is not a candidate, and the
-            // other entries still are.
+            // A vanished file or dangling symlink is just not a candidate,
+            // not a failure of the whole listing.
             let Ok(metadata) = fs::metadata(entry.path()) else {
                 continue;
             };
@@ -1640,11 +1637,8 @@ mod tests {
             "the existence check must be answered by the host, not by this sandbox"
         );
 
-        // And the listing has to come from the host's own `/etc/`, which this
-        // sandbox cannot `read_dir` at all: anything at all coming back is
-        // already proof it was listed outside. Every name must be a sibling
-        // of `/etc/fstab` and never `/etc/fstab` itself, since a row built
-        // from the target would offer restoring the file over itself.
+        // Listing must come from the host's /etc/, not this sandbox; a name
+        // equal to `/etc/fstab` itself would offer restoring it over itself.
         let candidates = real_file_reader()
             .list_backup_candidates(Path::new("/etc/fstab"))
             .expect("the host must be able to list /etc/");

@@ -3309,13 +3309,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     // (`crate::backup_location::detect`) is tested in its own module, against
     // its own temp directories; what is asserted *here* is what each command
     // does once the answer is known - which is the half that could silently
-    // elevate, act on the wrong directory, or quietly show an incomplete list
-    // of restore points.
+    // elevate, act on the wrong directory, or show an incomplete list.
     //
-    // The real file's own directory doubles as the host's `/etc/`: the reader
-    // these tests inject reads and lists it for real (`DirectFs`, or a
-    // recording/failing double), which is exactly what the production
-    // host-spawned reader does from the other side of the sandbox boundary.
+    // The real file's own directory doubles as the host's `/etc/`, read and
+    // listed by the same injected reader production routes through the host.
 
     /// The fallback directory for these tests, in a third directory distinct
     /// from both the draft's and the real file's, so "which directory did this

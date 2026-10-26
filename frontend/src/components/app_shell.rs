@@ -1092,10 +1092,8 @@ pub fn app_shell() -> Html {
         let backup_delete_error = backup_delete_error.clone();
         let backups = backups.clone();
         Callback::from(move |idx: usize| {
-            // Defensive: `BackupListItem` only wires this callback to a
-            // `Delete` button, never to the non-deletable pill, so this
-            // should be unreachable - but it costs nothing to not trust the
-            // index blindly here too.
+            // Defensive: `BackupListItem` never wires Delete to a
+            // non-deletable row, but don't trust the index blindly either.
             if !backups.get(idx).is_some_and(|b| b.deletable) {
                 return;
             }

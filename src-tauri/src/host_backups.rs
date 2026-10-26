@@ -72,19 +72,14 @@ pub(crate) fn list(target: &Path, reader: &dyn RealFileReader) -> io::Result<Vec
         .collect();
 
     let mut entries = writer::list_backups_among(target, &names);
-    // `list_backups_among` reports oldest first, like `list_backups`;
-    // reversed here once, exactly where `backups::list` reverses it, so the
-    // frontend never has to know which end is which.
+    // Reversed to newest-first, mirroring where `backups::list` does it.
     entries.reverse();
 
     Ok(entries
         .into_iter()
         .filter_map(|entry| {
-            // The name is what the two halves are joined on: it came from
-            // `candidates` and `list_backups_among` only ever returns a
-            // subset of what it was given, so a miss here is unreachable -
-            // and if it ever happened, skipping the row is better than
-            // inventing metadata for it.
+            // A name miss is unreachable (candidates is entries' own source),
+            // but skipping the row beats inventing metadata for it.
             let name = entry.path.file_name()?;
             let candidate = candidates.iter().find(|candidate| candidate.name == name)?;
             Some(BackupInfoDto {
