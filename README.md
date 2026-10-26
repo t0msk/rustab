@@ -264,9 +264,11 @@ The workspace layout:
 
 #### Troubleshooting: blank/white window on launch
 
-This used to require a manual fix, but no longer should: on startup (`src-tauri/src/render_env.rs`) Rustab detects the two GPU/driver situations most consistently linked to this bug - Nvidia's proprietary driver (`/proc/driver/nvidia/version` present) and running inside a VM (the `hypervisor` CPU flag in `/proc/cpuinfo`) - and automatically forces WebKitGTK's software renderer (plus `GDK_BACKEND=x11` if the session is Wayland) before the webview starts. WebKitGTK's hardware compositing/DMA-BUF renderer otherwise fails silently instead of falling back, producing a completely blank white window instead of the UI.
+This used to require a manual fix, but no longer should: on every launch, Rustab tries GPU-accelerated rendering first (so the common case keeps full hardware speed), and only falls back to WebKitGTK's software renderer if hardware rendering actually fails on this machine. The mechanism (`src-tauri/src/render_env.rs`) re-executes itself as a watched child; if that child crashes within the first few seconds - which is how this bug actually manifests on the one GPU/driver combination it was reproduced against (Nvidia's proprietary driver + a Wayland session: a `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.` crash, not a silent blank window) - it relaunches once with the software-render workaround forced, and that's the window you see. A machine that was never affected pays nothing for this: the first child *is* the real, already-visible app the whole time, hardware-accelerated throughout.
 
-If `cargo tauri dev` (or the built binary) still opens a blank/white window despite that - i.e. your GPU/driver combination isn't one of the two detected ones - force it by hand with the same variables detection would have set:
+An earlier version of this fix guessed from the GPU alone (any Nvidia proprietary driver, or any VM) and forced software rendering preemptively on that guess. That was wrong: most Nvidia users never hit this bug, so it cost all of them real scrolling/repaint performance for nothing - exactly the tradeoff this section used to warn about for the old fully-manual fix. The current mechanism only pays the software-render cost on a machine where hardware rendering actually failed.
+
+If a GPU/driver combination fails in some other way - not an early crash this re-exec-and-watch approach would catch - force the workaround by hand with the same variables the fallback would have set:
 
 ```bash
 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
@@ -278,7 +280,7 @@ If you're on a pure Wayland session and the window fails to open at all (rather 
 GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 ```
 
-Any variable you set yourself always wins over detection. Two escape hatches cover the rest: `RUSTAB_FORCE_SOFTWARE_RENDER=1` applies the workaround unconditionally (for a GPU/driver combination detection doesn't recognize), and `RUSTAB_SKIP_RENDER_DETECTION=1` disables detection entirely (if you want hardware rendering despite being on a detected machine, or need the pre-detection behavior back for some other reason).
+Any variable you set yourself always wins over the fallback. Two escape hatches cover the rest: `RUSTAB_FORCE_SOFTWARE_RENDER=1` applies the workaround unconditionally, skipping the probe (for a failure mode probing wouldn't catch anyway), and `RUSTAB_SKIP_RENDER_DETECTION=1` disables this mechanism entirely, running hardware rendering with no safety net (if you want to confirm a problem yourself, or need the pre-fallback behavior back for some other reason).
 
 ### Release Build
 

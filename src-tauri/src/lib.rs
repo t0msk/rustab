@@ -29,10 +29,10 @@
 //!   came back, plus the hidden internal subcommand that dispatches into
 //!   the elevated half.
 //! - [`commands`]: the `#[tauri::command]` functions themselves.
-//! - `render_env` (Linux only): detects known-bad GPU/driver combinations
-//!   (Nvidia's proprietary driver, most VMs) and forces WebKitGTK's
-//!   software renderer on before the webview starts, so the blank-window
-//!   bug documented in `README.md` no longer needs a manual env var.
+//! - [`render_env`]: tries hardware rendering first on every launch, and
+//!   falls back to WebKitGTK's software renderer only if that actually
+//!   fails on this machine - see its own module doc, and `README.md`'s
+//!   "Troubleshooting: blank/white window on launch" section.
 //!
 //! The GUI-free half lives in the `rustab-privileged` crate, which the
 //! `rustab-helper` binary links too, so the elevated code can be built
@@ -60,7 +60,13 @@ mod testutil;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    render_env::apply();
+    // Only the process `render_env` itself re-executed (marker set) skips
+    // this and builds the real app directly - see its own module doc.
+    if std::env::var_os(render_env::SUPERVISED_MARKER).is_none() {
+        if let Some(code) = render_env::relaunch_supervised() {
+            std::process::exit(code);
+        }
+    }
 
     tauri::Builder::default()
         .setup(|app| {
