@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// [`relaunch_supervised`] accepts it as the real app. Margin over the
 /// ~2.5-2.8s the one reproduced crash took (Nvidia + Wayland: a GDK
 /// Wayland protocol-error abort, exit code 1).
-const PROBE_WINDOW: Duration = Duration::from_millis(4000);
+const PROBE_WINDOW: Duration = Duration::from_millis(5000);
 
 /// Set on every child this module spawns, so that child skips supervising
 /// itself and builds the real app directly.
