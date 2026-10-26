@@ -3463,8 +3463,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     /// through the host reader and restore-only.
     ///
     /// The draft's own backups are still not listed - "whose backups am I
-    /// looking at" is unchanged by T42, only "which directories do they live
-    /// in" is.
+    /// looking at" is unchanged by the host listing, only "which
+    /// directories do they live in" is.
     #[test]
     fn a_fallback_launch_lists_the_real_files_backups_alongside_the_fallback_directorys() {
         let dir = TempDir::new("fallback-list");
@@ -3650,9 +3650,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     /// Deleting in fallback mode unlinks the file in-process, with no
     /// `pkexec` prompt - and refuses one of the real file's own backups
-    /// before any dispatch, even though T42 now *lists* those: a row the
-    /// panel renders restore-only must fail closed here if a frontend ever
-    /// asks for it anyway, unlinking nothing and escalating nothing.
+    /// before any dispatch, even though the real file's backups are now
+    /// *listed*: a row the panel renders restore-only must fail closed
+    /// here if a frontend ever asks for it anyway, unlinking nothing and
+    /// escalating nothing.
     #[test]
     fn a_fallback_launch_deletes_a_fallback_backup_in_process_and_refuses_the_real_files() {
         let dir = TempDir::new("fallback-delete");
@@ -3753,9 +3754,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     }
 
     /// `open_backup_location` opens the directory this session's *own*
-    /// backups go to - the fallback one, unchanged by T42. The merged list
-    /// now has rows from `/etc/` too, but only one directory can be opened,
-    /// and this is the one whose contents the user can actually manage.
+    /// backups go to - the fallback one, unchanged by the merged list,
+    /// which now has rows from `/etc/` too, but only one directory can be
+    /// opened, and this is the one whose contents the user can actually
+    /// manage.
     #[test]
     fn a_fallback_launch_opens_the_fallback_directory() {
         let dir = TempDir::new("fallback-open");
@@ -3885,9 +3887,9 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     /// Restoring one of the real file's own backups in fallback mode: its
     /// content is read through the host seam, and the write is the same
-    /// single elevated one aimed at the real file - the point of T42 being
-    /// that the automatic backups became restorable, not that restoring
-    /// changed.
+    /// single elevated one aimed at the real file - the point of listing
+    /// them being that the automatic backups became restorable, not that
+    /// restoring changed.
     #[test]
     fn a_fallback_launch_restores_a_host_backup_through_the_reader_and_still_elevates_once() {
         let dir = TempDir::new("fallback-restore-host");
