@@ -264,7 +264,9 @@ The workspace layout:
 
 #### Troubleshooting: blank/white window on launch
 
-If `cargo tauri dev` (or the built binary) opens a completely blank or white window instead of the UI, this is a known WebKitGTK issue on some GPU/driver combinations (common under certain Nvidia drivers, Wayland sessions, and virtual machines) - WebKitGTK's hardware compositing/DMA-BUF renderer fails silently instead of falling back. Force software rendering by setting these two environment variables before launching:
+This used to require a manual fix, but no longer should: on startup (`src-tauri/src/render_env.rs`) Rustab detects the two GPU/driver situations most consistently linked to this bug - Nvidia's proprietary driver (`/proc/driver/nvidia/version` present) and running inside a VM (the `hypervisor` CPU flag in `/proc/cpuinfo`) - and automatically forces WebKitGTK's software renderer (plus `GDK_BACKEND=x11` if the session is Wayland) before the webview starts. WebKitGTK's hardware compositing/DMA-BUF renderer otherwise fails silently instead of falling back, producing a completely blank white window instead of the UI.
+
+If `cargo tauri dev` (or the built binary) still opens a blank/white window despite that - i.e. your GPU/driver combination isn't one of the two detected ones - force it by hand with the same variables detection would have set:
 
 ```bash
 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
@@ -275,6 +277,8 @@ If you're on a pure Wayland session and the window fails to open at all (rather 
 ```bash
 GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 ```
+
+Any variable you set yourself always wins over detection. Two escape hatches cover the rest: `RUSTAB_FORCE_SOFTWARE_RENDER=1` applies the workaround unconditionally (for a GPU/driver combination detection doesn't recognize), and `RUSTAB_SKIP_RENDER_DETECTION=1` disables detection entirely (if you want hardware rendering despite being on a detected machine, or need the pre-detection behavior back for some other reason).
 
 ### Release Build
 

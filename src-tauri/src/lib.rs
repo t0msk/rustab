@@ -29,6 +29,10 @@
 //!   came back, plus the hidden internal subcommand that dispatches into
 //!   the elevated half.
 //! - [`commands`]: the `#[tauri::command]` functions themselves.
+//! - `render_env` (Linux only): detects known-bad GPU/driver combinations
+//!   (Nvidia's proprietary driver, most VMs) and forces WebKitGTK's
+//!   software renderer on before the webview starts, so the blank-window
+//!   bug documented in `README.md` no longer needs a manual env var.
 //!
 //! The GUI-free half lives in the `rustab-privileged` crate, which the
 //! `rustab-helper` binary links too, so the elevated code can be built
@@ -46,6 +50,7 @@ pub mod commands;
 mod host;
 mod host_backups;
 pub mod privileged;
+pub mod render_env;
 pub mod target;
 
 pub use rustab_privileged::{backups, dto};
@@ -55,6 +60,8 @@ mod testutil;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    render_env::apply();
+
     tauri::Builder::default()
         .setup(|app| {
             if cfg!(debug_assertions) {

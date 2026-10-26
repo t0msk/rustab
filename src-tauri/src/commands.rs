@@ -1326,10 +1326,12 @@ fn open_backup_location_with(
 /// what the file manager itself does afterwards is none of this command's
 /// business.
 fn open_in_file_manager(dir: &Path) -> io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(dir)
-        .spawn()
-        .map(|_child| ())
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(dir);
+    // The file manager this launches is unrelated to Rustab's own WebKitGTK
+    // instance: don't force it into software rendering too (see render_env).
+    crate::render_env::strip_from(&mut cmd);
+    cmd.spawn().map(|_child| ())
 }
 
 /// [`open_external_link`], with the actual browser launch injectable -
@@ -1359,10 +1361,13 @@ fn open_external_link_with(
 /// generic seam over, and keeping this separate means zero risk of
 /// regressing the already-shipped `open_backup_location`).
 fn open_browser(url: &str) -> io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .spawn()
-        .map(|_child| ())
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url);
+    // Same reason as open_in_file_manager: the browser/mail client this
+    // launches shouldn't inherit a software-rendering override meant for
+    // Rustab's own WebKitGTK instance.
+    crate::render_env::strip_from(&mut cmd);
+    cmd.spawn().map(|_child| ())
 }
 
 /// [`open_path_in_file_manager`], with the actual launch of a GUI program

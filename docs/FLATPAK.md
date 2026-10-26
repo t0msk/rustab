@@ -191,41 +191,70 @@ On some GPU/driver combinations (seen directly during this project's own
 development - certain Nvidia drivers, Wayland sessions, and VMs are the
 common pattern), WebKitGTK's hardware-compositing/DMA-BUF renderer fails
 silently instead of falling back, producing a completely blank white
-window instead of the UI. The documented fix (see `README.md`'s own
-"Troubleshooting: blank/white window on launch" section, which this
-mirrors for the Flatpak case) is forcing software rendering via two
-environment variables:
+window instead of the UI.
+
+**This is now detected and fixed automatically**, in the app's own code
+(`src-tauri/src/render_env.rs`, called first thing in
+`src-tauri/src/lib.rs::run`), not just documented as a manual env var:
+before the webview starts, it checks for the two situations most
+consistently linked to this bug - Nvidia's proprietary driver
+(`/proc/driver/nvidia/version` present, since the open `nouveau` driver
+doesn't hit it) and running inside a VM (the `hypervisor` CPU flag in
+`/proc/cpuinfo`) - and if either is true, sets the same environment
+variables `README.md`'s "Troubleshooting: blank/white window on launch"
+section used to ask the user to set by hand:
 
 ```
-WEBKIT_DISABLE_COMPOSITING_MODE=1
+WEBKIT_DISABLE_HARDWARE_ACCELERATION=1
 WEBKIT_DISABLE_DMABUF_RENDERER=1
+WEBKIT_DISABLE_COMPOSITING_MODE=1
+LIBGL_ALWAYS_SOFTWARE=1
 ```
+
+plus `GDK_BACKEND=x11` if the session is Wayland (Nvidia's EGL/Wayland path
+is the one most consistently reported as broken; X11/XWayland sidesteps it
+at the cost of XWayland's fuzzier HiDPI scaling). Each one is only set if
+not already present (`var_os(...).is_none()`), so anything the user or the
+Flatpak override below sets explicitly always wins. Variables this app set
+itself are stripped back out before it spawns `xdg-open` (opening a
+backup's folder, or a link in the browser/mail client), so an unrelated
+program never inherits a software-rendering override meant for Rustab's
+own WebKitGTK instance.
 
 **The tradeoff**: this fixes the blank window, but software-rendered
 WebKitGTK scrolls/repaints noticeably slower than GPU-accelerated
 rendering - more visible with a longer entries table (a real `/etc/fstab`
 has far more DOM content per row than a short practice file) or a large
 raw-text view. This is inherent to forcing software rendering on an
-affected system, not something fixable in the app's own code.
+affected system, not something fixable in the app's own code - which is
+exactly why detection stays narrow (Nvidia proprietary driver and VMs
+only) instead of forcing it for everyone: most users are on Mesa
+(AMD/Intel) bare metal, where the hardware path works fine and is
+genuinely faster.
 
-**This is deliberately not baked into the manifest/`finish-args` as an
-always-on default** - most users will never hit the underlying GPU bug,
-and forcing software rendering unconditionally would make the app
-artificially slower for everyone else for no benefit. Instead, a user who
-actually hits the blank-window symptom applies the fix themselves, the
-Flatpak-native way (equivalent to setting the env vars before launching a
-plain binary, but persists across launches including from a GUI
-launcher - no need to open a terminal every time):
+If your GPU/driver combination isn't one detection recognizes but still
+hits this bug, or the opposite (detection flags your machine but you know
+hardware rendering works fine there), two escape hatches exist, settable
+the Flatpak-native way (persists across launches, including from a GUI
+launcher - no terminal needed each time):
 
 ```bash
+# Force the software-render workaround regardless of detection:
+flatpak override --user --env=RUSTAB_FORCE_SOFTWARE_RENDER=1 dev.tomsk.Rustab
+
+# Or disable detection entirely and fall back to the pre-detection behaviour:
+flatpak override --user --env=RUSTAB_SKIP_RENDER_DETECTION=1 dev.tomsk.Rustab
+
+# Or set any of the individual WebKit/GDK/LIBGL variables above directly -
+# an explicit value always overrides what detection would have chosen:
 flatpak override --user \
   --env=WEBKIT_DISABLE_COMPOSITING_MODE=1 \
   --env=WEBKIT_DISABLE_DMABUF_RENDERER=1 \
   dev.tomsk.Rustab
 ```
 
-To undo it: `flatpak override --user --reset dev.tomsk.Rustab` (or
-`--unset-env` for just these two keys).
+To undo any of these: `flatpak override --user --reset dev.tomsk.Rustab`
+(or `--unset-env` for just the keys you set).
 
 ---
 
