@@ -529,6 +529,20 @@ Two details the implementation has to get right, both in
   `sandbox_smoke_host_runner_runs_on_the_host` (in `src-tauri/src/host.rs`),
   run inside that sandbox, also passed, asserting `[true, false]` for
   `["/etc/fstab", "/.flatpak-info"]`.
+- **The real `/etc/fstab`'s backups are listed on the host too (T42).** In fallback
+  mode, `list_backups` now returns both the fallback directory's own rows and a merged
+  list of automatic backups sitting beside the real `/etc/fstab` in the host's `/etc/`.
+  The host listing is fetched via an unprivileged `flatpak-spawn --host sh -c '<script>'`
+  call whose script `cd`s into `/etc/`, globs `fstab.*`, and prints each matching regular
+  file as `<size> <mtime>\n<name>\0` records via `stat`. The sandboxed side parses those
+  NUL-terminated records strictly and applies `fstab_core::writer::list_backups_among` to
+  the names - the same lightweight inline-script pattern already used for `cat` and the
+  batched existence check above, not a re-exec. The merged list is sorted newest first.
+  If the host listing fails, `list_backups` rejects loudly (kind `list_backups`) rather
+  than silently omitting the host rows. See `docs/API_CONTRACT.md` §3.6 and §9 for the
+  UI consequences: host-listed rows are marked non-deletable (`deletable: false`), and
+  `restore_backup`/`read_backup` can resolve against them via `flatpak-spawn --host cat`,
+  while `delete_backup`/`create_backup` remain anchored to the fallback directory only.
 
 ##### Status note: the dynamic-linking caveat, and the helper that now answers it
 

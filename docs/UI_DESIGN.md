@@ -595,7 +595,7 @@ user restore one")
 
 Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
 
-- **Fallback-location notice (T39)**: when `TargetInfoDto.real_target_backup_fallback_dir`
+- **Fallback-location notice (T39, updated T42)**: when `TargetInfoDto.real_target_backup_fallback_dir`
   (`docs/API_CONTRACT.md` §6) is non-null, a persistent amber notice banner
   (`bg-amber-50 dark:bg-amber-900/20`, `border-amber-300 dark:border-amber-800`,
   `text-amber-900 dark:text-amber-200`, `role="status"`) renders above the list/
@@ -604,28 +604,37 @@ Component: **BackupPanel**, reached via the `Backups` tab in HeaderBar (§1).
   whether any backup happens to exist yet. Amber (informational-but-important), not red
   (nothing has failed) and not a tooltip or toast (a toast disappears; this fact has to
   still be findable the next time someone opens this tab, possibly in a rescue
-  scenario where guessing wrong about where a backup lives is costly). The copy states
-  two things plainly, both now fixed *and verified* by the backend and documented in
-  `docs/API_CONTRACT.md` §6: (a) backups created from this panel are being kept in the
-  given directory instead of beside `/etc/fstab`, because this sandboxed install can't
-  *enumerate* `/etc/` directly, and need no password prompt; (b) the automatic backups
-  each ordinary save takes are **still** written beside the real `/etc/fstab` and are
-  **not shown in this list**, because the sandboxed process cannot enumerate that
-  directory - they are not lost, and remain recoverable from a rescue environment
-  (e.g. booting a live/rescue disk), just not visible or manageable from inside the app.
-  Silently omitting fact (b) would have left a user who only reads the list believing
-  their automatic backups had stopped happening, which is exactly the wrong impression
-  for a rescue scenario.
-  Fact (b) was briefly in doubt during T39 (the reasoning that the elevated `pkexec`
-  writer "runs fully unsandboxed" is wrong - `pkexec` changes UID, not mount namespace),
-  and T40 settled it in the affirmative by fixing the mechanism rather than the wording:
-  the elevated writer is now started with `flatpak-spawn --host pkexec`, so it is a
-  genuine host root process and its backup-before-write step really does land in the
-  host's `/etc/` (`docs/API_CONTRACT.md` §4.3). The banner therefore says it as fact.
-  What the banner deliberately does **not** mention is the mechanism: a user reading a
-  Backups tab does not need to know about `flatpak-spawn`, only where their files are.
-  Built from `backup_panel::fallback_notice_text`, a plain function kept separate from
-  the `html!` so its exact wording is unit-testable without a DOM.
+  scenario where guessing wrong about where a backup lives is costly). The banner is
+  one sentence, exactly: "Backups created here are kept in {dir} because this sandbox
+  can't manage files in /etc/; /etc/fstab's automatic backups are listed too and can
+  be restored, but not deleted, from here." This single sentence covers both the fallback
+  directory's own rows and the automatic backups now also listed from the host (§9's
+  `deletable` field gates what the UI can do with each). The reasoning for one sentence
+  instead of multiple facts: every row on screen, whether created here or listed from the
+  host, has two properties shown directly (the Automatic/Manual badge, and the
+  Delete-button-or-pill treatment via `deletable`), so splitting the banner further into
+  separate clauses would duplicate information the UI already makes visible per row. One
+  sentence is sufficient to answer the user's core question: "why are my backups here instead
+  of next to the real file?" Built from `backup_panel::fallback_notice_text`, a plain
+  function kept separate from the `html!` so its exact wording is unit-testable without a DOM.
+
+- **Non-deletable backup row treatment (T42)**: a row with `deletable: false` (§9 and
+  `docs/API_CONTRACT.md` §9) renders, in place of the Delete button, a non-interactive
+  pill badge with violet tones (`bg-violet-100 dark:bg-violet-900/40 text-violet-700
+  dark:text-violet-300`, same rounded-pill shape as the Automatic/Manual badges) reading "Beside /etc/fstab" with `title` tooltip
+  "This backup sits beside the real /etc/fstab. This sandboxed install can restore it and
+  show its diff, but cannot delete it." The pill uses violet rather than slate (the
+  Automatic/Manual colors) to signal that this is a capability boundary, not just a label.
+  A disabled Delete button was considered and rejected: a disabled state reads as transient
+  ("wait, maybe this will become enabled") while a pill reads as a permanent property of
+  where the file lives. `Restore` and `View diff` buttons stay on every row, including
+  non-deletable ones. For such a row `BackupRestoreConfirmDialog`'s `{target path}` reads
+  `/etc/fstab` itself (its `target_path` is the real file, not the fallback mirror), so the
+  confirmation names the file actually being restored. `AppShell::on_backup_delete` guards
+  defensively and ignores a row index with `deletable: false`, though the Delete button's
+  absence makes that path unreachable in normal UI flow. The pill's title is built by
+  `backup_panel::non_deletable_pill_title`, a pure function unit-tested without a DOM.
+
 - **"Create backup" button**, living in `HeaderBar`'s top-right contextual action
   slot - the same slot `"+ Add Entry"` occupies while the `Entries` tab is active.
   It renders only while the `Backups` tab is active, and `"+ Add Entry"` is absent

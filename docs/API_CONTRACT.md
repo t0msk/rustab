@@ -397,6 +397,12 @@ with `create_backup` (§3.11), `false` for one a save took on its own. Do not
 infer this from `file_name` - the backend owns the naming scheme and reports
 the answer.
 
+`deletable` is `true` for every row this session's `delete_backup` command
+accepts, `false` only for a backup of the real `/etc/fstab` listed from the
+host in fallback mode. The frontend must not infer this from `path` or
+`target_path`. For a non-deletable row, render a non-interactive status pill
+instead of a Delete button (§7 and `docs/UI_DESIGN.md` §7).
+
 At most 10 **automatic** backups are kept per target
 (`fstab_core::writer::MAX_BACKUPS`); older ones are pruned by a save, which
 reports them in `WriteOutcomeDto.pruned_backups`. Manual backups are exempt:
@@ -426,78 +432,46 @@ Error kinds: `target_resolution`, `list_backups`.
 > `writes_real_file` confirmation checkbox a save has (`docs/UI_DESIGN.md` §2).
 > Listing and reading stayed unprivileged - `/etc/` is world-readable.
 
-> **T39/T40: when `/etc/` cannot be *enumerated*, the real file's manual
-> backups move.** Flatpak reserves the whole `/etc` path space: the `/etc` a
+> **T39/T40/T42: fallback-mode listing now includes the real /etc/fstab's own
+> backups.** Flatpak reserves the whole `/etc` path space: the `/etc` a
 > sandboxed process sees is the runtime's own, and **no `--filesystem=` grant
 > under `/etc` is honoured at all** - neither `/etc:rw` (which Flathub's linter
 > rejects anyway) nor the single-file `/etc/fstab:rw`, which the sandbox
 > refuses outright (`Path "/etc" is reserved by Flatpak`). So a sandboxed
-> Rustab cannot list `/etc/`, and cannot create a file beside the real
-> `/etc/fstab` in-process.
->
-> **The T39-era open question is resolved (T40), and the answer is "yes,
-> writing works - but not for the reason T39 gave".** T39 assumed the `pkexec`
-> re-exec "runs unsandboxed as root". It does not: `pkexec` changes a
-> process's UID, not its mount namespace, so a `pkexec` child of a sandboxed
-> process is root *inside the same sandbox* and cannot touch the host's
-> `/etc/fstab` either. T40 replaced that mechanism with the one that does
-> work, confirmed end-to-end against a real build: the unprivileged side reads
-> the real file with `flatpak-spawn --host`, and the elevated helper is started
-> with `flatpak-spawn --host pkexec <host path of the binary>`, which runs it
-> as a genuine **host** root process outside every sandbox (needs only
-> `--talk-name=org.freedesktop.Flatpak`, no `--filesystem=` at all). So under
-> the Flatpak build a save really does write the real `/etc/fstab`, and
-> `write_document`'s **automatic** backup and atomic-rename temp file really
-> are created in the host's `/etc/` - the colocation property those backups
-> exist for is intact.
->
-> What stays exactly as T39 built it, and why: the three **manual-management**
-> operations move together into a per-user fallback directory
+> Rustab cannot list `/etc/` in-process, and cannot create a file beside the
+> real `/etc/fstab` there either. The solution remains as T39 built it: the three
+> **manual-management operations** (`create_backup`, `delete_backup`,
+> `open_backup_location`) are anchored to a per-user fallback directory
 > (`$XDG_DATA_HOME/rustab/etc-fstab-backups/`, which under Flatpak is
 > `~/.var/app/dev.tomsk.Rustab/data/rustab/etc-fstab-backups/`), reported by
-> `real_target_backup_fallback_dir` (§6). This command lists that directory,
-> `create_backup` (§3.11) copies the real file's current content into it,
-> `delete_backup` (§3.10) unlinks from it, and neither of the latter two
-> escalates, because that directory belongs to the user. `restore_backup`
-> (§3.7) resolves its `backup_path` against that same list but is otherwise
+> `real_target_backup_fallback_dir` (§6). `create_backup` copies the real file's
+> current content into it, `delete_backup` unlinks from it, and neither
+> escalates, because that directory belongs to the user. `restore_backup` (§3.7)
+> resolves its `backup_path` against the merged list (see below) but is otherwise
 > untouched: it still writes `/etc/fstab`, so it still elevates.
 >
-> The reason they stay there even though creating and deleting *could* now
-> happen in the host's `/etc/` (both already go through the elevated helper) is
-> **this command**: `list_backups` is deliberately unprivileged - `/etc/` is
-> world-readable, and prompting for a password to read a directory would be
-> absurd - so it runs in the sandboxed GUI process and enumerates the
-> directory *there*, where `/etc` is the runtime's. Moving creation and
-> deletion without it would mean a backup the user just created never appearing
-> in the list it was created from, which is worse than a consistent fallback.
-> The alternative - a second, never-elevated internal re-exec flag that
-> host-spawns this binary just to list, read and resolve backups in the host's
-> `/etc/` - was considered and rejected; `src-tauri/src/backup_location.rs`'s
-> module docs carry the full reasoning (it is not one flag but a second
-> request/response protocol covering `list_backups`, `read_backup` and the
-> `backup_path` resolution all three path-taking commands depend on, and it
-> would put the most fragile mechanism in the app - executing the
-> runtime-linked binary on the host - on a routine read path).
->
-> **The accepted consequence, which the frontend states plainly rather than
-> implying** (`docs/UI_DESIGN.md` §7): in fallback mode this command does
-> **not** report the automatic backups each save leaves beside `/etc/fstab`.
-> Since T40 those are confirmed to be getting written; a sandboxed process
-> simply cannot enumerate them. They remain recoverable from a rescue
-> environment, which is the property they exist for - the in-app list just
-> cannot prove they are there. Rows in fallback mode therefore all describe the
-> fallback directory, and their `target_path` is the mirror file inside it
-> (`<fallback dir>/fstab`, a byte-for-byte copy of `/etc/fstab` as of the
-> moment the backup was taken) rather than `/etc/fstab` itself - the file name,
-> timestamp and `is_manual` flag follow the usual scheme, so such a file can be
-> copied back into `/etc/` by hand and is still recognized as a backup of the
-> real file.
->
-> Fallback mode is also what a sandbox with **no** host access falls back to
-> (no `flatpak-spawn` in the runtime, the `org.freedesktop.Flatpak` talk-name
-> missing or revoked): such a session cannot read or save the real `/etc/fstab`
-> at all, but it can still take, list and restore manual backups in a directory
-> it owns.
+> **What changed in T42: listing now reports both sources.** `list_backups` in
+> fallback mode returns BOTH the fallback directory's rows AND a listing of the
+> real `/etc/fstab`'s own backups fetched from the host through an unprivileged
+> call. The host listing is made via one `flatpak-spawn --host sh -c '<script>'`
+> invocation whose script changes into the real `/etc` directory, globs
+> `fstab.*`, and prints each matching regular file as `<size> <mtime>\n<name>\0`
+> records via `stat`. The sandboxed side parses those NUL-terminated records
+> strictly (any malformed record fails the whole call) and applies
+> `fstab_core::writer::list_backups_among` to the names - the same lightweight
+> inline-script pattern the unprivileged file-read already uses, not a re-exec.
+> The merged list is sorted newest first. The two key consequences for the UI
+> (stated plainly in `docs/UI_DESIGN.md` §7): (1) the fallback directory's own
+> rows remain creatable and deletable here, with no password prompt; (2) the real
+> `/etc/fstab`'s automatic backups and any manual ones an non-sandboxed install left
+> there are now listed and restorable, but marked non-deletable (`deletable:
+> false`, §9) because the sandboxed session has no authority to unlink them. If
+> the host listing fails (portal denied, `flatpak-spawn` missing, or any I/O
+> error), `list_backups` rejects with kind `list_backups`, naming the host
+> directory and the cause - a loud failure rather than silently omitting the
+> host rows; the consequence that a sandbox with no host access loses its ability
+> to list the real file's backups is accepted (such a session can't read or save
+> the real file either).
 
 ### 3.7 `restore_backup`
 
@@ -515,6 +489,14 @@ opening the Backups panel and clicking Restore is the identical hazard through
 the identical code path, so a restore rejects with `kind: "external_change"`
 in exactly the same situations a save does, and is repeated with `true` after
 the user has seen the diff and confirmed.
+
+In fallback mode, `backup_path` is resolved against the merged list
+(fallback directory first, then host backups) and a host-resolved backup is
+read through the host reader (`flatpak-spawn --host cat`), never through
+`fs::read`. Matching against host rows uses literal path equality (the
+sandbox cannot stat those files), so the frontend must send back the exact
+`path` string from the row. For a host row, `target_path` is `/etc/fstab`
+itself, not a mirror file.
 
 A restore is not a copy and not a shortcut. The backup's text is parsed and
 then goes through *the same* save path as `save`: it is validated, the content
@@ -581,6 +563,10 @@ the real backup list before it is ever used as a path, so `/etc/shadow`,
 `../../etc/fstab`, a different target's backup and a near-miss file name all
 fail closed with `invalid_backup` - nothing is read.
 
+In fallback mode, a host-resolved backup is read through the host reader
+(`flatpak-spawn --host cat`), never through `fs::read` or the local
+filesystem.
+
 Intended for a backup-diff view: diff this against `list_entries`'s `text` to
 show what restoring this backup would change. There is no `render_candidate`
 step involved - both sides are already raw text.
@@ -629,14 +615,14 @@ paths fail closed with `invalid_backup` and nothing is removed.
   in-process with no prompt. The frontend's delete confirmation is gated on
   that same predicate, so a default launch's delete now carries the explicit
   acknowledgement checkbox too (`docs/UI_DESIGN.md` §2).
-- **T39's one exception to that:** when `real_target_backup_fallback_dir` (§6)
-  is set, the real file's backups are not in `/etc/` but in a directory inside
-  the user's own data directory, so the unlink happens in-process with **no**
-  prompt - there is no root-owned file involved to need one. The backup being
-  deleted is one of that directory's own; anything else, including a backup
-  sitting beside the real `/etc/fstab`, is not in §3.6's list for that session
-  and fails closed with `invalid_backup` exactly as any other foreign path
-  does.
+- **In fallback mode, the fallback directory's own rows are deletable with no
+  prompt, but a host row's path handed to `delete_backup` fails closed with
+  `invalid_backup` and nothing is removed** - never reaching the elevated
+  dispatch. This is the maintainer's explicit scoping decision: listing and
+  restoring host rows are now supported; deleting them is not, with the
+  pragmatic benefit that a manual backup the user creates stays creatable and
+  deletable here in the fallback directory, with symmetry and no password
+  prompt.
 - Resolution happens *before* the dispatch in both branches, so a
   `backup_path` that cannot work is refused without costing the user a
   password prompt. That is a courtesy only: the elevated process re-resolves
@@ -688,16 +674,16 @@ copy of the draft could not be.
   the same single `pkexec` re-exec - see §4, and the same `is_real || source
   == sandbox_default` predicate as §3.10. Only an explicit override naming
   some other, user-owned file is copied in-process with no prompt.
-- **T39: and, now, a real file whose backups are not in `/etc/`.** When
-  `real_target_backup_fallback_dir` (§6) is set, this command reads the real
-  `/etc/fstab`'s current bytes, stages them in that directory's mirror file and
-  copies *that* to a new manual backup there - all in-process, with no prompt,
-  because the directory is the user's own. The resulting backup is therefore
+- **In fallback mode, creating a backup remains anchored to the fallback
+  directory only.** No privilege escalation, in-process, no password prompt.
+  The user creates a backup of the real `/etc/fstab`'s current content by
+  reading it (via `flatpak-spawn --host cat` on the sandboxed side) and
+  copying that to a new manual backup in the fallback directory - which is
   still a snapshot of `/etc/fstab` as it is at the moment the button is
-  pressed, which is the only thing that would make the button honest. If the
-  real file cannot be read at all, the rejection is the usual
-  `target_missing` (it does not exist) or `backup` (any other I/O failure),
-  and nothing is created.
+  pressed, the only thing that would make the button honest. Nothing in
+  `/etc/` is ever created by the sandboxed GUI. If the real file cannot be
+  read at all, the rejection is the usual `target_missing` (it does not exist)
+  or `backup` (any other I/O failure), and nothing is created.
 - **A target that does not exist yet is an error, not a no-op.** The kind is
   `target_missing`, and the UI should say what the message says: there is no
   file to back up yet, save once first. An explicit "back this up now" must
@@ -730,7 +716,9 @@ listed actually are, rather than the working draft's own directory, which
 holds none of them. An explicit `RUSTAB_TARGET_PATH` opens that path's own
 directory, unchanged. By the same rule, since T39 a session whose
 `real_target_backup_fallback_dir` (§6) is set opens *that* directory - it is
-still "where the rows on screen are".
+still "where the rows this session can *manage* are", even though fallback
+mode now also lists the real file's backups from `/etc/` (§3.6): those rows
+cannot be deleted from here, so the fallback directory stays the one opened.
 
 **No privilege escalation, for either case.** `/etc/` is world-readable and
 world-executable, the same reasoning §3.9 already gives for reading a
@@ -1392,22 +1380,27 @@ session can read or save the real `/etc/fstab`. A Flatpak session reports a
 fallback directory here *and* reads and writes the real file normally, through
 `flatpak-spawn --host` (§3.6, §4). The field answers one narrow question -
 "where are this session's manual backups of `/etc/fstab`?" - and nothing
-broader.
+broader. Since T42 it also indicates that `list_backups` will fetch the real
+file's backup list from the host and include those rows too, merged with the
+fallback directory's, and that `restore_backup`/`read_backup` can resolve
+against host rows.
 
-When it is a string, that directory is exactly where `list_backups` (§3.6),
-`create_backup` (§3.11) and `delete_backup` (§3.10) act, and what
-`open_backup_location` (§3.12) opens - and two things are true that the UI has
-to state plainly rather than imply (`docs/UI_DESIGN.md` §7):
+When it is a string, that directory is exactly where `create_backup` (§3.11)
+and `delete_backup` (§3.10) *create and destroy* their own rows - `open_backup_location`
+(§3.12) opens it - and three things are true that the UI has to state plainly
+rather than imply (`docs/UI_DESIGN.md` §7):
 
-- backups the user creates explicitly land in that directory, not in `/etc/`,
-  and need no password prompt at all;
+- backups the user creates here land in that directory, not in `/etc/`, and
+  need no password prompt at all;
 - the automatic backups each save takes are **still written beside the real
   `/etc/fstab`** by the elevated writer - which since T40 is a verified fact
   rather than an assumption, because that writer now runs as a real host root
-  process (§3.6) - and are **not listed**, because this process cannot
-  enumerate that directory. They are not lost: they remain recoverable from a
-  rescue environment, which is the whole reason they are put there - the
-  in-app list simply cannot prove they exist.
+  process (§3.6) - and `list_backups` now lists them too, merged newest-first
+  with the fallback directory's own rows. They are marked non-deletable
+  (`deletable: false` in §9) - the sandboxed session can restore or view them,
+  but cannot delete them;
+- if the host listing fails for any reason, `list_backups` rejects loudly
+  (kind `list_backups`) rather than silently omitting the host rows.
 
 Treat it as display text. No command accepts a directory, and the three
 commands that do take a path (§3.7, §3.9, §3.10) match what they are given
@@ -1640,7 +1633,7 @@ already uses, never `write_document`.
 | `target_resolution` | The active target could not be determined | every read-side command |
 | `read_target` | The target exists but could not be read | `list_entries` |
 | `not_utf8` | The bytes read are not valid UTF-8 and are refused rather than mangled | `list_entries` (the target), `read_backup` (a backup), `resync_external_change` (the real `/etc/fstab`) |
-| `list_backups` | The target's directory could not be listed | `list_backups` |
+| `list_backups` | The target's directory could not be listed, or (in fallback mode) the host listing failed | `list_backups` |
 | `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read. Nothing was read. | `read_backup` |
 | `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
 | `open_location` | The host file manager could not be launched | `open_backup_location` |
@@ -1702,7 +1695,8 @@ message say it.
   "target_path": "/etc/fstab",
   "size_bytes": 1842,
   "created_unix_secs": 1760000000,
-  "is_manual": false }
+  "is_manual": false,
+  "deletable": true }
 ```
 
 `path` is the exact string to hand back to `restore_backup` (§3.7),
@@ -1720,6 +1714,16 @@ naming scheme the distinction is encoded in and reports it here; the frontend
 must not parse `file_name` to work it out. The practical difference is
 retention: automatic backups are pruned past 10 per target, manual ones never
 are (§3.6).
+
+`deletable` is `true` for every row that `delete_backup` (§3.10) accepts in
+this session - all rows outside fallback mode, and (in fallback mode) the
+fallback directory's own rows. It is `false` **only** for a backup listed from
+the real `/etc/fstab` in fallback mode: the automatic backups the elevated
+writer deposits there, and any manual backups an non-sandboxed install left beside
+the real file. The frontend must not infer this from `path` or `target_path` -
+read the field directly. For a non-deletable row, the UI renders a
+non-interactive status pill in place of a Delete button (§7 and
+`docs/UI_DESIGN.md` §7).
 
 ### `DeviceDiscoveryDto` / `DeviceInfoDto`
 
@@ -1755,7 +1759,7 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 {"kind":"external_change","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null,"external_change":{"last_known_content":"# old\n","current_content":"# new\n"}}
 {"kind":"not_utf8","message":"m"}
 {"kind":"invalid_backup","message":"m"}
-{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true}
+{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true,"deletable":true}
 {"target":"/p","backup":"/p.b","pruned_backups":[],"notes":["n"]}
 {"kind":"target_missing","message":"m"}
 {"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}
