@@ -545,10 +545,8 @@ fn mount_point_missing_findings(doc: &Document, runner: &dyn CommandRunner) -> V
         }
     }
 
-    // An advisory check that could not be answered emits nothing: inventing
-    // "does not exist" warnings because the host was unreachable would
-    // flood the UI with claims about a filesystem nobody looked at. A reply
-    // of the wrong length is treated the same way - it is not an answer.
+    // Unanswered or wrong-length replies emit nothing - never invent
+    // "does not exist" warnings about a filesystem nobody looked at.
     let Ok(answers) = runner.paths_exist(&queried) else {
         return Vec::new();
     };

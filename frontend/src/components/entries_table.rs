@@ -779,12 +779,8 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
         });
     }
 
-    // Focuses the menu's "Edit" item the moment it opens, so a keyboard
-    // user can immediately Tab/Enter/Escape without a prior click inside
-    // the panel (module docs). Keyed on `menu_open` rather than the whole
-    // `ContextMenuState`, so re-opening on a different row while already
-    // open - impossible today since the backdrop closes it first, but
-    // cheap to keep correct - would not re-focus for no reason.
+    // Focuses "Edit" on open for keyboard Tab/Enter/Escape. Keyed on
+    // `menu_open`, not the whole state, so re-opening doesn't re-focus.
     //
     // T41: `outline-none` on "Edit" drops a flaky WebKitGTK focus ring here.
     {
@@ -1056,9 +1052,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
             Callback::from(move |_: MouseEvent| context_menu.set(None))
         };
         // A right-click elsewhere while the menu is open dismisses it
-        // rather than opening the native menu underneath or stacking a
-        // second popup - this backdrop only exists while a menu is open,
-        // so no other right-click in the app is affected (module docs).
+        // rather than stacking a second popup.
         let on_backdrop_context_menu = {
             let context_menu = context_menu.clone();
             Callback::from(move |event: MouseEvent| {
@@ -1185,11 +1179,7 @@ pub fn entries_table(props: &EntriesTableProps) -> Html {
                                 cb.emit(candidate_index);
                             })
                         };
-                        // Opens the row context menu in place of the
-                        // browser's own one (module docs). Suppressing the
-                        // native menu only here, on the row's main `<tr>`,
-                        // is exactly what keeps every other right-click in
-                        // the app untouched.
+                        // Opens the row's own context menu on right-click.
                         let on_context_menu = {
                             let context_menu = context_menu.clone();
                             Callback::from(move |event: MouseEvent| {

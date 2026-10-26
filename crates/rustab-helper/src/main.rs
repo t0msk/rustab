@@ -25,11 +25,9 @@ use std::io;
 use std::path::Path;
 
 fn main() {
-    // Nothing but argv[0] is accepted. Any extra argument means the caller
-    // is not the Rustab build this binary belongs to, and a root process is
-    // the wrong place to start guessing what was meant. The refusal is
-    // reported in the protocol's own error shape on stdout - the caller
-    // parses that - with the human-readable half on stderr.
+    // No arguments accepted - a root process is the wrong place to guess
+    // what an unexpected one meant. Refusal goes to stdout (protocol shape,
+    // what the caller parses) and stderr (human-readable).
     if std::env::args_os().nth(1).is_some() {
         println!(
             "{}",

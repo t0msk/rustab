@@ -99,11 +99,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Output, Stdio};
 
-// The elevated half, in a crate the helper binary can link statically (see
-// the module docs). Re-exported rather than referenced through its own path
-// so `rustab_lib::privileged` still names the whole mechanism - `main.rs`,
-// `crate::commands` and this module's tests all see one module, as they did
-// when both halves lived here.
+// Re-exported so `rustab_lib::privileged` still names the whole mechanism,
+// as it did before the elevated half moved to its own crate (module docs).
 pub use rustab_privileged::protocol::{
     handle_privileged_request, protocol_error_body, PrivilegedRequest, PrivilegedResponse, EXIT_OK,
     EXIT_OPERATION_ERROR, EXIT_PROTOCOL_ERROR,
@@ -158,11 +155,8 @@ pub fn run_internal_if_requested() -> Option<i32> {
         return None;
     }
     if args.next().is_some() {
-        // Reported in the protocol's own error shape on stdout as well as in
-        // prose on stderr, exactly as `rustab-helper` reports its own argv
-        // refusal: the unprivileged side parses stdout, and the rule it
-        // relies on is that exit code 2 always comes with a JSON body,
-        // whichever of the two elevated binaries produced it.
+        // Same shape as `rustab-helper`'s own argv refusal: exit code 2
+        // always carries a JSON body on stdout, from either binary.
         let message = stray_argument_message();
         println!("{}", protocol_error_body(&message));
         eprintln!("{message}");

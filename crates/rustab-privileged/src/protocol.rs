@@ -242,10 +242,8 @@ pub fn handle_privileged_request<R: Read, W: Write>(
         );
     }
 
-    // A framing failure is reported before the operation is known, so it is
-    // reported in the write-shaped `Error` variant; the delete path knows to
-    // read that too (see `interpret_delete_output` on the unprivileged side).
-    // Nothing has touched disk at this point, in any operation.
+    // Before the operation is known, so reported in the write-shaped
+    // `Error` variant; the delete path reads that too. Disk untouched.
     let request: PrivilegedRequest = match serde_json::from_str(&raw) {
         Ok(request) => request,
         Err(err) => {
@@ -332,11 +330,8 @@ fn handle_write<W: Write>(
         );
     }
 
-    // The authoritative external-change check: re-read the verified target
-    // *in this process*, now that the authentication wait is over, and refuse
-    // rather than overwrite content that appeared while it was on screen.
-    // Nothing has touched the disk at this point, which is why the error can
-    // promise `target_unchanged`.
+    // Re-read in this process, now that the auth wait is over, and refuse
+    // rather than overwrite a change that appeared while it was on screen.
     if let Some(change) = guard.detect(&target_path) {
         return respond(
             output,
@@ -351,13 +346,8 @@ fn handle_write<W: Write>(
         );
     }
 
-    // One call, one process, one authorization: validation, backup, temp
-    // file, fsyncs, rename and read-back verification all happen inside here.
-    // The plain entry point on purpose: whichever way this process was
-    // launched - an ordinary install's `pkexec` child, or `rustab-helper`
-    // started by `flatpak-spawn --host pkexec` - it is already on the host
-    // (no `/.flatpak-info`), so its own `findmnt --verify` and existence
-    // checks see the real system.
+    // One call, one process, one authorization. Plain entry point on
+    // purpose: however launched, this process is already on the host.
     let candidate = Document::from(candidate);
     match writer::write_document(&target_path, &candidate) {
         Ok(outcome) => respond(
@@ -587,10 +577,8 @@ mod tests {
         allowed_target: &Path,
         candidate: &Document,
     ) -> (i32, PrivilegedResponse) {
-        // No record of the file's previous content, which is the one guard
-        // that disables the external-change check entirely - so these tests
-        // exercise exactly the pre-check behaviour of the helper. The guarded
-        // variants have their own helper below.
+        // Unchecked disables the external-change guard entirely - exercises
+        // the helper's pre-check behaviour; guarded variants are below.
         run_helper_guarded(
             target,
             allowed_target,
@@ -769,10 +757,8 @@ mod tests {
 
     // -- the authoritative external-change check -----------------------------
     //
-    // These exercise the real `handle_privileged_request` against a temp file
-    // standing in for `/etc/fstab`, which is the point of its `allowed_target`
-    // parameter: the check under test genuinely *reads* the target, and
-    // `cargo test` must never read the machine's own file.
+    // Against a temp file standing in for `/etc/fstab` (`allowed_target`),
+    // since the check under test genuinely reads the target.
 
     /// The check that actually protects the file: the request says what the
     /// unprivileged side last knew, the helper re-reads the target *itself*,

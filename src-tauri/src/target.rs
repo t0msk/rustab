@@ -110,13 +110,9 @@ use std::sync::{Arc, OnceLock};
 /// `docs/API_CONTRACT.md` and `.env.example`.
 pub const TARGET_PATH_ENV: &str = "RUSTAB_TARGET_PATH";
 
-// The part of "which file is the real one" the elevated side re-checks on
-// data it received over a pipe, so it lives in the crate the helper binary
-// links (see `crate::privileged`). Re-exported rather than referenced
-// through its own path, so every caller here keeps seeing one `target`
-// module: `REAL_FSTAB_PATH` is still the one hardcoded path, and
-// `is_same_file` is still the one implementation of the identity test the
-// "escalate?" and "am I allowed to write this?" questions share.
+// Lives in the helper's own crate (see `crate::privileged`) since the
+// elevated side re-checks this on data from a pipe; re-exported so every
+// caller here still sees one `target` module.
 pub use rustab_privileged::target_identity::{
     is_same_file, ExternalChange, ExternalChangeGuard, REAL_FSTAB_PATH,
 };

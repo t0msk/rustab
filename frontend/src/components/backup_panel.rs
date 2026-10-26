@@ -247,10 +247,8 @@ mod tests {
         assert!(notice.to_lowercase().contains("restored"));
         assert!(notice.to_lowercase().contains("not deleted"));
 
-        // (c) exactly one sentence: it ends with a sentence-terminating
-        // period and contains no internal ". " that would mark a second
-        // sentence. (Not a bare period count: `dir` itself may contain a
-        // literal '.', e.g. a `.local` path component.)
+        // (c) exactly one sentence - not a bare period count, since `dir`
+        // may itself contain a literal '.' (e.g. `.local`).
         assert!(notice.ends_with('.'));
         assert!(!notice.contains(". "));
     }

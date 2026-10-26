@@ -834,10 +834,8 @@ impl CommandRunner for HostSpawn {
         // and both processes would block forever.
         drop(stdin);
 
-        // A broken pipe means the host script already exited - its status
-        // says why (the staging sentinel, most likely), and that is far more
-        // informative than "write failed". Any other write error is real:
-        // reporting it beats letting the command verify a truncated file.
+        // A broken pipe means the host script already exited - its exit
+        // status is more informative than "write failed". Other errors are real.
         if let Err(err) = written {
             if err.kind() != io::ErrorKind::BrokenPipe {
                 let _ = child.wait();
@@ -1574,10 +1572,8 @@ mod tests {
         fs::write(&marker, "[Application]\n").expect("seed the marker");
         let sandboxed = runner_for(&marker);
 
-        // Only the direct runner can be exercised here: it runs the command
-        // in this process, which is observable; the sandboxed one would
-        // spawn `flatpak-spawn`, so only the plan it would build is asserted
-        // (by the two tests above).
+        // Only the direct runner is exercised here - the sandboxed one
+        // would spawn `flatpak-spawn`; its plan is asserted above instead.
         let output = direct
             .run("cat", &[], Some(b"payload"))
             .expect("the direct runner must run cat locally");
@@ -1624,10 +1620,8 @@ mod tests {
             .expect("the staged input must reach the host");
         assert_eq!(echoed.stdout, b"payload");
 
-        // The existence check has to see the host's filesystem, not this
-        // sandbox's: the host has `/etc/fstab` (which the sandbox does not)
-        // and no `/.flatpak-info` (which the sandbox does), so this pair of
-        // answers can only come from outside.
+        // This pair can only come from the host: it has `/etc/fstab` and no
+        // `/.flatpak-info`, the opposite of this sandbox.
         let answers = runner
             .paths_exist(&["/etc/fstab", SANDBOX_MARKER_PATH])
             .expect("the host must be able to answer");
