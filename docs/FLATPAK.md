@@ -189,7 +189,11 @@ of the earlier scope boundary that already ruled it out for this session.
 
 On some GPU/driver combinations, WebKitGTK's hardware-compositing/DMA-BUF
 renderer fails instead of falling back, producing a blank or unusable
-window instead of the UI.
+window instead of the UI. Related upstream reports: WebKit #258834,
+tauri-apps/tauri#9304 (a Mesa ≥24 instance of this same fragility on
+Wayland, on GNOME 46+/Plasma 6/Fedora 40+); this app's own reproduction
+was Nvidia's proprietary driver on Wayland, a different GPU/driver pairing
+hitting the same general class of bug.
 
 **This is now detected and fixed automatically, at runtime, without
 guessing from the GPU** - in the app's own code (`src-tauri/src/render_env.rs`,

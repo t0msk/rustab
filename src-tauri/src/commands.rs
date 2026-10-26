@@ -1328,8 +1328,7 @@ fn open_backup_location_with(
 fn open_in_file_manager(dir: &Path) -> io::Result<()> {
     let mut cmd = std::process::Command::new("xdg-open");
     cmd.arg(dir);
-    // The file manager this launches is unrelated to Rustab's own WebKitGTK
-    // instance: don't force it into software rendering too (see render_env).
+    // Don't force the file manager into software rendering too.
     crate::render_env::strip_from(&mut cmd);
     cmd.spawn().map(|_child| ())
 }
@@ -1363,9 +1362,7 @@ fn open_external_link_with(
 fn open_browser(url: &str) -> io::Result<()> {
     let mut cmd = std::process::Command::new("xdg-open");
     cmd.arg(url);
-    // Same reason as open_in_file_manager: the browser/mail client this
-    // launches shouldn't inherit a software-rendering override meant for
-    // Rustab's own WebKitGTK instance.
+    // Same reason as open_in_file_manager.
     crate::render_env::strip_from(&mut cmd);
     cmd.spawn().map(|_child| ())
 }

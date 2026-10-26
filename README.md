@@ -264,11 +264,9 @@ The workspace layout:
 
 #### Troubleshooting: blank/white window on launch
 
-This used to require a manual fix, but no longer should: on every launch, Rustab tries GPU-accelerated rendering first (so the common case keeps full hardware speed), and only falls back to WebKitGTK's software renderer if hardware rendering actually fails on this machine. The mechanism (`src-tauri/src/render_env.rs`) re-executes itself as a watched child; if that child crashes within the first few seconds - which is how this bug actually manifests on the one GPU/driver combination it was reproduced against (Nvidia's proprietary driver + a Wayland session: a `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.` crash, not a silent blank window) - it relaunches once with the software-render workaround forced, and that's the window you see. A machine that was never affected pays nothing for this: the first child *is* the real, already-visible app the whole time, hardware-accelerated throughout.
+**If the window flashes or the app seems to briefly restart when it launches, that's expected** on a machine where GPU-accelerated rendering doesn't work. Rustab tries hardware rendering first, every launch; if that fails, it relaunches itself once with WebKitGTK's software renderer and keeps running from there (see `src-tauri/src/render_env.rs` for the mechanism and the known upstream issues behind it). On an unaffected machine this costs nothing - the first launch already *is* the real, GPU-accelerated app, no relaunch at all.
 
-An earlier version of this fix guessed from the GPU alone (any Nvidia proprietary driver, or any VM) and forced software rendering preemptively on that guess. That was wrong: most Nvidia users never hit this bug, so it cost all of them real scrolling/repaint performance for nothing - exactly the tradeoff this section used to warn about for the old fully-manual fix. The current mechanism only pays the software-render cost on a machine where hardware rendering actually failed.
-
-If a GPU/driver combination fails in some other way - not an early crash this re-exec-and-watch approach would catch - force the workaround by hand with the same variables the fallback would have set:
+If that fallback doesn't trigger but you still get a blank/white window - a GPU/driver failure mode this mechanism doesn't catch - force the same workaround by hand:
 
 ```bash
 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
