@@ -2567,12 +2567,29 @@ version = "0.1.3"
 dependencies = [
  "fstab-core",
  "log",
+ "rustab-privileged",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-log",
+]
+
+[[package]]
+name = "rustab-helper"
+version = "0.1.3"
+dependencies = [
+ "rustab-privileged",
+]
+
+[[package]]
+name = "rustab-privileged"
+version = "0.1.3"
+dependencies = [
+ "fstab-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -23,25 +23,45 @@
 //! ## `findmnt` I/O-vs-pure-logic separation
 //!
 //! Like `discovery.rs`'s `lsblk` split, the semantic check is divided into
-//! `run_findmnt_verify` (the actual I/O: render, write to a temp file via
-//! [`std::env::temp_dir`], shell out to `findmnt --verify`) and
-//! `interpret_findmnt_result` (a pure function from `io::Result<FindmntRunResult>`
-//! to `Finding`s, which unit tests exercise directly, including the
-//! "findmnt unavailable" case via a synthetic `io::Error`).
+//! `run_findmnt_verify` (the actual I/O: render the candidate and run
+//! `findmnt --verify --tab-file` against those bytes through a
+//! [`crate::exec::CommandRunner`]) and `interpret_findmnt_result` (a pure
+//! function from `io::Result<FindmntRunResult>` to `Finding`s, which unit
+//! tests exercise directly, including the "findmnt unavailable" case via a
+//! synthetic `io::Error`).
+//!
+//! ## Which process answers the system's questions
+//!
+//! Two checks here are about the machine being edited rather than about the
+//! document: the `findmnt --verify` one, and the advisory "mount point
+//! exists on disk" one. Both go through the same
+//! [`crate::exec::CommandRunner`] seam, so a process containerized away
+//! from that machine (a Flatpak sandbox, whose `/` is the runtime's) can
+//! route them to it. The existence check asks about every mount point in
+//! one call, not one call per entry.
+//!
+//! [`validate`] runs `findmnt` in *this* process, via
+//! [`crate::exec::DirectRunner`], which stages the rendered candidate in a
+//! throwaway file under [`std::env::temp_dir`] and points `findmnt` at
+//! that. That is the right answer for a CLI, for the elevated helper, and
+//! for the tests - but not for a process that is containerized away from
+//! the system it is editing, where `findmnt` has to run elsewhere to see
+//! the real `/dev` and mount table. [`validate_with`] therefore takes the
+//! runner, and [`validate`] is just that with [`crate::exec::DirectRunner`]
+//! supplied; see [`crate::exec`] for why the seam is shaped the way it is.
 //!
 //! Per SPEC §6 step 2, a failure to even run `findmnt` (missing binary or
 //! other I/O error) is surfaced as a non-blocking [`Severity::Warning`]
 //! saying verification ran in degraded mode - never silent, never a hard
 //! error, since an environment without `findmnt` should still be able to
-//! save a structurally valid fstab.
+//! save a structurally valid fstab. An unanswerable *existence* question is
+//! treated differently - it emits nothing at all, see
+//! [`mount_point_missing_findings`].
 
+use crate::exec::{CommandRunner, DirectRunner};
 use crate::model::{Document, Line, SourceId};
 use std::collections::HashMap;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The special `mount_point` value conventionally used by swap entries,
 /// which have no real mount point to collide on. Per fstab convention (e.g.
@@ -232,13 +252,26 @@ impl ValidationReport {
 /// docs) plus a semantic check equivalent to `findmnt --verify --tab-file
 /// <path>` against a temporary rendering of `doc`.
 ///
-/// Never touches the real target file - `doc` is written to a throwaway
+/// Never touches the real target file - `doc` is staged in a throwaway
 /// temp file under [`std::env::temp_dir`] and `findmnt` points at that.
 /// Never panics; if `findmnt` can't be run at all, that's an advisory
 /// [`Severity::Warning`], not a silent pass.
+///
+/// Runs `findmnt` in this process. A caller that must run it somewhere
+/// else (see the module docs) calls [`validate_with`] instead.
 pub fn validate(doc: &Document) -> ValidationReport {
-    let mut findings = structural_findings(doc);
-    findings.extend(semantic_findings(doc));
+    validate_with(doc, &DirectRunner)
+}
+
+/// [`validate`], with the process that runs `findmnt --verify` chosen by
+/// the caller.
+///
+/// Identical in every other respect, including which findings block a
+/// save: `runner` decides only *where* `findmnt` runs and where the
+/// rendered candidate is staged for it, never what its output means.
+pub fn validate_with(doc: &Document, runner: &dyn CommandRunner) -> ValidationReport {
+    let mut findings = structural_findings(doc, runner);
+    findings.extend(semantic_findings(doc, runner));
     ValidationReport { findings }
 }
 
@@ -248,15 +281,15 @@ pub fn validate(doc: &Document) -> ValidationReport {
 
 /// Runs all structural checks against `doc` and returns every [`Finding`]
 /// produced. Pure and I/O-free except for the "mount point exists on disk"
-/// advisory check, which does a single [`Path::exists`] stat call per entry.
-fn structural_findings(doc: &Document) -> Vec<Finding> {
+/// advisory check, which asks `runner` about every mount point at once.
+fn structural_findings(doc: &Document, runner: &dyn CommandRunner) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     findings.extend(malformed_line_findings(doc));
     findings.extend(empty_fs_type_findings(doc));
     findings.extend(duplicate_mount_point_findings(doc));
     findings.extend(malformed_uuid_findings(doc));
-    findings.extend(mount_point_missing_findings(doc));
+    findings.extend(mount_point_missing_findings(doc, runner));
     findings.extend(trailing_comment_contains_newline_findings(doc));
 
     findings
@@ -470,8 +503,20 @@ fn looks_like_fat_volume_id(value: &str) -> bool {
 /// [`crate::model::decode_escaped_whitespace`] before the existence check,
 /// since the raw (possibly `\040`-escaped) text would never match a real
 /// on-disk path - but the finding itself reports the raw text, as stored.
-fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
-    doc.lines
+///
+/// ## Why this goes through the runner
+///
+/// "Does this path exist?" has to be asked of the machine whose fstab is
+/// being edited, and a process inside a Flatpak sandbox is not it: the
+/// `/` it sees is the runtime's, so `/boot`, `/opt` and every
+/// `/run/media/…` would be reported missing even though the host has them
+/// all. So the question goes to `runner`, which is the host's when there is
+/// one - in a single batched call, since an out-of-process runner pays per
+/// call and a document has one mount point per entry (see
+/// [`crate::exec::CommandRunner::paths_exist`]).
+fn mount_point_missing_findings(doc: &Document, runner: &dyn CommandRunner) -> Vec<Finding> {
+    let candidates: Vec<(usize, &str, String)> = doc
+        .lines
         .iter()
         .enumerate()
         .filter_map(|(idx, line)| match line {
@@ -479,17 +524,49 @@ fn mount_point_missing_findings(doc: &Document) -> Vec<Finding> {
             _ => None,
         })
         .filter(|(_, entry)| entry.mount_point != SWAP_NONE_MOUNT_POINT)
-        .filter(|(_, entry)| {
-            !Path::new(&crate::model::decode_escaped_whitespace(&entry.mount_point)).exists()
-        })
         .map(|(idx, entry)| {
-            Finding::warning_at(
-                format!(
-                    "mount point {:?} does not currently exist on disk",
-                    entry.mount_point
-                ),
-                FindingField::MountPoint,
+            (
                 idx,
+                entry.mount_point.as_str(),
+                crate::model::decode_escaped_whitespace(&entry.mount_point),
+            )
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Asked once each, however many entries share a mount point (a
+    // duplicate is its own blocking error, but this check still runs).
+    let mut queried: Vec<&str> = Vec::with_capacity(candidates.len());
+    for (_, _, decoded) in &candidates {
+        if !queried.contains(&decoded.as_str()) {
+            queried.push(decoded.as_str());
+        }
+    }
+
+    // Unanswered or wrong-length replies emit nothing - never invent
+    // "does not exist" warnings about a filesystem nobody looked at.
+    let Ok(answers) = runner.paths_exist(&queried) else {
+        return Vec::new();
+    };
+    if answers.len() != queried.len() {
+        return Vec::new();
+    }
+
+    candidates
+        .iter()
+        .filter(|(_, _, decoded)| {
+            queried
+                .iter()
+                .position(|path| *path == decoded.as_str())
+                .is_some_and(|at| !answers[at])
+        })
+        .map(|(idx, raw, _)| {
+            Finding::warning_at(
+                format!("mount point {raw:?} does not currently exist on disk"),
+                FindingField::MountPoint,
+                *idx,
             )
         })
         .collect()
@@ -516,9 +593,9 @@ struct FindmntRunResult {
 
 /// Runs only the semantic (`findmnt --verify`) half of validation -
 /// structural checks happen separately - and returns its [`Finding`]s.
-fn semantic_findings(doc: &Document) -> Vec<Finding> {
+fn semantic_findings(doc: &Document, runner: &dyn CommandRunner) -> Vec<Finding> {
     let rendered = doc.to_string();
-    let result = run_findmnt_verify(&rendered);
+    let result = run_findmnt_verify(&rendered, runner);
     interpret_findmnt_result(doc, &result)
 }
 
@@ -619,6 +696,16 @@ struct FindmntDetailLine {
 /// different indentation means an output shape this parser hasn't seen.
 const FINDMNT_DETAIL_INDENT: &str = "   ";
 
+/// The indentation a long `[E]`/`[W]` diagnostic wraps its continuation
+/// line to - aligned under the message text, i.e.
+/// [`FINDMNT_DETAIL_INDENT`] plus `"[W] "`'s width (`"[E] "` is the same
+/// width, so one constant covers both). Confirmed against real output: a
+/// system where `/etc/fstab` differs from what systemd has loaded gets an
+/// extra warning long enough to wrap, `"your fstab has been modified, but
+/// systemd still uses the old version;\n       use 'systemctl
+/// daemon-reload' to reload"`.
+const FINDMNT_DETAIL_CONTINUATION_INDENT: &str = "       ";
+
 /// Decomposes `findmnt --verify`'s combined stdout+stderr into one
 /// [`FindmntDetailLine`] per `[E]`/`[W]` diagnostic, plus a
 /// `had_unrecognized_content` flag for anything that didn't fit the
@@ -672,6 +759,23 @@ fn parse_findmnt_detail(text: &str) -> (Vec<FindmntDetailLine>, bool) {
                 None => had_unrecognized_content = true,
             }
             continue;
+        }
+
+        // A wrapped continuation of the diagnostic line just above, not a
+        // new one of its own - folded onto it rather than treated as
+        // unrecognized content (see FINDMNT_DETAIL_CONTINUATION_INDENT).
+        if let Some((_, count)) = open_block.as_ref() {
+            if *count > 0 {
+                if let Some(rest) = line.strip_prefix(FINDMNT_DETAIL_CONTINUATION_INDENT) {
+                    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                        if let Some(last) = detail_lines.last_mut() {
+                            last.message.push(' ');
+                            last.message.push_str(rest);
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         // Any non-diagnostic line ends the block above it; a header that
@@ -843,47 +947,25 @@ fn parse_count_field(field: &str, singular: &str, plural: &str) -> Option<u32> {
     }
 }
 
-/// Keeps temp-file names from concurrent calls (e.g. parallel test
-/// threads) from colliding, since [`std::process::id`] alone is constant
-/// for the whole process lifetime.
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Writes `rendered` to a fresh file under [`std::env::temp_dir`] and
-/// returns its path.
+/// Runs `findmnt --verify --tab-file <staged path>` against a throwaway
+/// file holding `rendered`, through `runner`.
 ///
-/// Only used for the read-only `findmnt --verify` check, which doesn't
-/// need same-filesystem rename atomicity like `writer.rs`'s real save
-/// does. Verification never touches the real target file.
-fn write_candidate_to_temp_file(rendered: &str) -> io::Result<PathBuf> {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "rustab-findmnt-verify-{}-{counter}.tmp",
-        std::process::id()
-    ));
-    fs::write(&path, rendered)?;
-    Ok(path)
-}
-
-/// Runs `findmnt --verify --tab-file <temp path>` against a fresh temp-file
-/// rendering of `rendered`.
+/// `runner` stages the bytes and appends the resulting path as the final
+/// argument (see [`CommandRunner::run`]), because `findmnt --verify`
+/// accepts only a seekable `--tab-file` - there is no stdin mode to use
+/// instead. Verification never touches the real target file.
 ///
-/// Returns `Err` if the temp file couldn't be written or `findmnt` couldn't
+/// Returns `Err` if the candidate couldn't be staged or `findmnt` couldn't
 /// be launched - both treated identically by [`interpret_findmnt_result`]
-/// as "verification unavailable". The temp file is removed afterwards on a
-/// best-effort basis; removal failure isn't reported as an error.
-fn run_findmnt_verify(rendered: &str) -> io::Result<FindmntRunResult> {
-    let temp_path = write_candidate_to_temp_file(rendered)?;
+/// as "verification unavailable". A `findmnt` that ran and rejected the
+/// file is `Ok` with `success: false`.
+fn run_findmnt_verify(rendered: &str, runner: &dyn CommandRunner) -> io::Result<FindmntRunResult> {
+    let output = runner.run(
+        "findmnt",
+        &["--verify", "--tab-file"],
+        Some(rendered.as_bytes()),
+    )?;
 
-    let output_result = Command::new("findmnt")
-        .arg("--verify")
-        .arg("--tab-file")
-        .arg(&temp_path)
-        .output();
-
-    let _ = fs::remove_file(&temp_path);
-
-    let output = output_result?;
     let mut combined_output = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !combined_output.is_empty() {
@@ -902,6 +984,8 @@ fn run_findmnt_verify(rendered: &str) -> io::Result<FindmntRunResult> {
 mod tests {
     use super::*;
     use crate::model::{FstabEntry, Options, SourceId};
+    use std::fs;
+    use std::process::Command;
 
     /// Builds a document with a single entry, for tests that only care
     /// about one structural property.
@@ -1202,7 +1286,7 @@ mod tests {
             0,
             2,
         ));
-        let findings = mount_point_missing_findings(&doc);
+        let findings = mount_point_missing_findings(&doc, &DirectRunner);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
     }
@@ -1217,7 +1301,7 @@ mod tests {
             0,
             1,
         ));
-        assert!(mount_point_missing_findings(&doc).is_empty());
+        assert!(mount_point_missing_findings(&doc, &DirectRunner).is_empty());
     }
 
     /// Regression test: a mount point containing an octal-escaped space
@@ -1241,7 +1325,7 @@ mod tests {
             0,
             2,
         ));
-        let findings = mount_point_missing_findings(&doc);
+        let findings = mount_point_missing_findings(&doc, &DirectRunner);
 
         fs::remove_dir_all(&dir).expect("clean up the test directory");
         assert!(findings.is_empty(), "{findings:?}");
@@ -1257,7 +1341,7 @@ mod tests {
             0,
             0,
         ));
-        assert!(mount_point_missing_findings(&doc).is_empty());
+        assert!(mount_point_missing_findings(&doc, &DirectRunner).is_empty());
     }
 
     #[test]
@@ -1274,7 +1358,7 @@ mod tests {
                 2,
             )),
         ]);
-        let findings = mount_point_missing_findings(&doc);
+        let findings = mount_point_missing_findings(&doc, &DirectRunner);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].field, Some(FindingField::MountPoint));
         assert_eq!(findings[0].line_index, Some(2));
@@ -1307,7 +1391,7 @@ mod tests {
                 2,
             )),
         ]);
-        let findings = mount_point_missing_findings(&doc);
+        let findings = mount_point_missing_findings(&doc, &DirectRunner);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].field, Some(FindingField::MountPoint));
         assert_eq!(findings[1].field, Some(FindingField::MountPoint));
@@ -1339,11 +1423,11 @@ mod tests {
         )]);
 
         assert!(
-            structural_findings(&doc)
+            structural_findings(&doc, &DirectRunner)
                 .iter()
                 .all(|finding| finding.field != Some(FindingField::Description)),
             "no structural check may be about a description any more: {:?}",
-            structural_findings(&doc)
+            structural_findings(&doc, &DirectRunner)
         );
     }
 
@@ -1874,6 +1958,29 @@ mod tests {
     }
 
     #[test]
+    fn findmnt_detail_parser_folds_a_wrapped_diagnostic_onto_the_line_above() {
+        // T41: real findmnt output - its systemd-reload notice is long
+        // enough to wrap onto a continuation line.
+        let (detail, unrecognized) = parse_findmnt_detail(
+            "/mnt/data\n   [W] your fstab has been modified, but systemd still uses the old \
+             version;\n       use 'systemctl daemon-reload' to reload\n",
+        );
+        assert!(!unrecognized, "got: {detail:?}");
+        assert_eq!(detail.len(), 1);
+        assert_eq!(
+            detail[0].message,
+            "your fstab has been modified, but systemd still uses the old version; \
+             use 'systemctl daemon-reload' to reload"
+        );
+
+        // A continuation-shaped line with no diagnostic above it to fold
+        // onto is still unrecognized, not silently dropped.
+        let (detail, unrecognized) =
+            parse_findmnt_detail("/mnt/data\n       stray continuation, nothing above it\n");
+        assert!(unrecognized, "got: {detail:?}");
+    }
+
+    #[test]
     fn findmnt_parse_error_line_is_recognized_only_to_be_discarded() {
         assert!(is_findmnt_parse_error_line(
             "findmnt: /tmp/rustab-findmnt-verify-1-0.tmp: parse error at line 3 -- ignored"
@@ -2102,5 +2209,202 @@ mod tests {
              report: {:?}",
             report.findings
         );
+    }
+
+    // --- The command-runner seam (see `crate::exec`) ---
+
+    /// The exact command the semantic check is built from, and the exact
+    /// bytes it verifies: the document's own rendering, handed over as
+    /// input so the runner can stage it wherever `findmnt` will run.
+    #[test]
+    fn the_semantic_check_runs_findmnt_verify_against_the_rendered_document() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let runner = crate::exec::RecordingRunner::answering(0, "");
+
+        let report = validate_with(&doc, &runner);
+
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1, "exactly one command per validation");
+        assert_eq!(runs[0].program, "findmnt");
+        assert_eq!(runs[0].args, vec!["--verify", "--tab-file"]);
+        assert_eq!(runs[0].input.as_deref(), Some(doc.to_string().as_bytes()));
+        // A `findmnt` that exited 0 contributes no findings of its own.
+        assert!(
+            !report.has_errors(),
+            "report: {:?}",
+            report.errors().collect::<Vec<_>>()
+        );
+    }
+
+    /// `findmnt`'s verdict is read off the runner's output, not off
+    /// whatever the real `findmnt` on this machine would have said.
+    #[test]
+    fn a_failing_findmnt_from_the_runner_blocks_the_save() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+            "/mnt/data",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let runner = crate::exec::RecordingRunner::answering(
+            1,
+            "/mnt/data\n   [E] unreachable on boot required source: UUID=…\n\n\
+             0 parse errors, 1 error, 0 warnings\n",
+        );
+
+        let report = validate_with(&doc, &runner);
+
+        assert!(report.has_errors());
+        assert!(report
+            .errors()
+            .any(|finding| finding.message.contains("findmnt --verify: unreachable")));
+    }
+
+    /// A three-entry document with `none` among the mount points, so the
+    /// batching and the exemption are proven together: one question, asked
+    /// about exactly the decoded mount points that are not exempt.
+    #[test]
+    fn the_existence_check_asks_one_batched_question_for_the_whole_document() {
+        let doc = Document::from_lines(vec![
+            Line::Entry(FstabEntry::new(
+                SourceId::Uuid("11111111-2222-3333-4444-555555555555".into()),
+                "/boot",
+                "vfat",
+                Options::new(),
+                0,
+                2,
+            )),
+            Line::Comment(" a comment between entries".to_string()),
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sda5".into()),
+                "none",
+                "swap",
+                Options::new(),
+                0,
+                0,
+            )),
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sdb1".into()),
+                "/mnt/My\\040Disk",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )),
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sdc1".into()),
+                "/opt",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )),
+        ]);
+        let runner = crate::exec::RecordingRunner::answering(0, "");
+
+        validate_with(&doc, &runner);
+
+        let queries = runner.exists_queries();
+        assert_eq!(
+            queries.len(),
+            1,
+            "exactly one existence question per validation"
+        );
+        assert_eq!(queries[0], vec!["/boot", "/mnt/My Disk", "/opt"]);
+    }
+
+    /// The runner's verdict is what decides, not this machine's filesystem:
+    /// `/boot` is reported missing even where it exists, and the path that
+    /// exists nowhere real produces no finding because the runner says it
+    /// is there.
+    #[test]
+    fn the_existence_findings_follow_the_runners_answers() {
+        let doc = Document::from_lines(vec![
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sda1".into()),
+                "/boot",
+                "vfat",
+                Options::new(),
+                0,
+                2,
+            )),
+            Line::Entry(FstabEntry::new(
+                SourceId::Path("/dev/sdb1".into()),
+                "/this/path/almost-certainly/does/not/exist/on/any/machine",
+                "ext4",
+                Options::new(),
+                0,
+                2,
+            )),
+        ]);
+        let runner = crate::exec::RecordingRunner::answering(0, "")
+            .with_existing_paths(&["/this/path/almost-certainly/does/not/exist/on/any/machine"]);
+
+        let report = validate_with(&doc, &runner);
+
+        let missing: Vec<_> = report
+            .warnings()
+            .filter(|finding| finding.message.contains("does not currently exist on disk"))
+            .collect();
+        assert_eq!(missing.len(), 1, "{:?}", report.findings);
+        assert!(missing[0].message.contains("/boot"));
+        assert_eq!(missing[0].line_index, Some(0));
+    }
+
+    /// An advisory check nobody could answer must stay silent: a sandbox
+    /// that cannot reach the host must not claim every mount point is gone.
+    #[test]
+    fn an_unanswerable_existence_question_produces_no_findings() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Path("/dev/sda1".into()),
+            "/this/path/almost-certainly/does/not/exist/on/any/machine",
+            "ext4",
+            Options::new(),
+            0,
+            2,
+        ));
+        let runner = crate::exec::RecordingRunner::answering(0, "")
+            .with_unanswerable_existence("Portal call failed: ServiceUnknown");
+
+        let report = validate_with(&doc, &runner);
+
+        assert_eq!(runner.exists_queries().len(), 1, "it must still be asked");
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("does not currently exist on disk")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// No non-exempt mount point means nothing to ask about - and an
+    /// out-of-process runner must not be made to spawn anything for an
+    /// empty question.
+    #[test]
+    fn a_document_with_nothing_to_check_asks_no_existence_question() {
+        let doc = doc_with_entry(FstabEntry::new(
+            SourceId::Path("/dev/sda5".into()),
+            "none",
+            "swap",
+            Options::new(),
+            0,
+            0,
+        ));
+        let runner = crate::exec::RecordingRunner::answering(0, "");
+
+        validate_with(&doc, &runner);
+
+        assert!(runner.exists_queries().is_empty());
     }
 }

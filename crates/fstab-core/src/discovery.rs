@@ -23,11 +23,22 @@
 //! not running at all; callers fall back to manual text entry in the
 //! latter case. Unparseable JSON from a successful run counts as
 //! "available, zero devices" - see [`parse_lsblk_json`].
+//!
+//! ## Which process runs `lsblk`
+//!
+//! `lsblk` reports what *its own* process can see of `/dev` and udev, so a
+//! process containerized away from the system being edited would get a
+//! clean exit and an empty device list - a silent wrong answer rather than
+//! a failure. [`discover_devices_with`] therefore takes the
+//! [`crate::exec::CommandRunner`] that decides where `lsblk` runs, and
+//! [`discover_devices`] is that with [`crate::exec::DirectRunner`]
+//! supplied. See [`crate::exec`] for the full reasoning.
 
 use std::io;
-use std::process::Command;
 
 use serde_json::Value;
+
+use crate::exec::{CommandRunner, DirectRunner};
 
 /// One block device or partition discovered via `lsblk`, carrying whichever
 /// device-identifier fields fstab entries can reference as a source.
@@ -75,14 +86,15 @@ pub struct DiscoveryResult {
     pub lsblk_available: bool,
 }
 
-/// Runs `lsblk -J -O` and returns its raw stdout.
+/// Runs `lsblk -J -O` through `runner` and returns its raw stdout.
 ///
 /// Returns `Err` if the binary couldn't be launched or exited non-zero (the
 /// `io::Error` message carries the exit status, not stderr). Kept separate
 /// from [`parse_lsblk_json`] so the parsing logic can be unit-tested with
-/// canned input, without `lsblk` installed.
-fn run_lsblk() -> io::Result<String> {
-    let output = Command::new("lsblk").args(["-J", "-O"]).output()?;
+/// canned input, without `lsblk` installed. No input is staged: `lsblk`
+/// reads the system, not a file.
+fn run_lsblk(runner: &dyn CommandRunner) -> io::Result<String> {
+    let output = runner.run("lsblk", &["-J", "-O"], None)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "lsblk exited with status {}",
@@ -167,8 +179,21 @@ fn non_empty_string(value: Option<&Value>) -> Option<String> {
 ///
 /// Never panics and never returns an error the caller must handle - see
 /// [`DiscoveryResult`] for how soft failure is modeled.
+///
+/// Runs `lsblk` in this process. A caller that must run it somewhere else
+/// (see the module docs) calls [`discover_devices_with`] instead.
 pub fn discover_devices() -> DiscoveryResult {
-    match run_lsblk() {
+    discover_devices_with(&DirectRunner)
+}
+
+/// [`discover_devices`], with the process that runs `lsblk` chosen by the
+/// caller.
+///
+/// Identical in every other respect, including the soft-failure contract:
+/// `runner` decides only *where* `lsblk` runs, never how its output is
+/// read.
+pub fn discover_devices_with(runner: &dyn CommandRunner) -> DiscoveryResult {
+    match run_lsblk(runner) {
         Ok(raw) => DiscoveryResult {
             devices: parse_lsblk_json(&raw),
             lsblk_available: true,
@@ -330,5 +355,41 @@ mod tests {
         if !result.lsblk_available {
             assert!(result.devices.is_empty());
         }
+    }
+
+    // --- The command-runner seam (see `crate::exec`) ---
+
+    /// The exact command discovery is built from, and that a successful run
+    /// is parsed into devices through the seam rather than from whatever
+    /// this machine's own `lsblk` reports.
+    #[test]
+    fn discovery_runs_lsblk_with_json_and_all_columns_and_parses_its_output() {
+        let runner = crate::exec::RecordingRunner::answering(0, SAMPLE_LSBLK_JSON);
+
+        let result = discover_devices_with(&runner);
+
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1, "exactly one command per discovery");
+        assert_eq!(runs[0].program, "lsblk");
+        assert_eq!(runs[0].args, vec!["-J", "-O"]);
+        assert_eq!(
+            runs[0].input, None,
+            "lsblk reads the system, so it must be given no staged input"
+        );
+        assert!(result.lsblk_available);
+        let paths: Vec<&str> = result.devices.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["/dev/sda", "/dev/sda1", "/dev/sda2", "/dev/sdb"]);
+    }
+
+    /// A non-zero exit from the seam is the soft failure SPEC §8 wants, not
+    /// a panic and not a partial list.
+    #[test]
+    fn a_non_zero_lsblk_exit_from_the_runner_is_reported_as_unavailable() {
+        let runner = crate::exec::RecordingRunner::answering(1, SAMPLE_LSBLK_JSON);
+
+        let result = discover_devices_with(&runner);
+
+        assert!(!result.lsblk_available);
+        assert!(result.devices.is_empty());
     }
 }

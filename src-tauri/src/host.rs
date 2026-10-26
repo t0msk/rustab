@@ -25,17 +25,42 @@
 //!
 //! ## What this module provides, and what it doesn't
 //!
-//! 1. [`RealFileReader`] - an unprivileged read of a host path, injected
-//!    into every production call site that reads the real `/etc/fstab`
+//! 1. [`RealFileReader`] - the unprivileged reads of the host's `/etc/`,
+//!    shaped like `fstab_core::writer`'s own `FileSystemOps` seam and
+//!    injected into every production call site:
+//!    [`RealFileReader::read`], the whole content of a host file
 //!    (`crate::target`'s draft refresh and change-detection,
 //!    [`crate::commands`]'s re-sync command, and
-//!    [`crate::backup_location::refresh_mirror`]). A one-method trait,
-//!    shaped like `fstab_core::writer`'s own `FileSystemOps` seam.
-//! 2. [`elevated_self_plan`] - how the elevated helper is spawned: under
-//!    Flatpak, `pkexec` must be invoked on the host
-//!    (`flatpak-spawn --host pkexec …`) and must name a **host** path for
-//!    this binary, since `std::env::current_exe()` inside the sandbox
-//!    yields `/app/bin/rustab`, which doesn't exist outside it.
+//!    [`crate::backup_location::refresh_mirror`]), and
+//!    [`RealFileReader::list_backup_candidates`], the names and metadata of
+//!    the files sitting beside a host file - the sandbox cannot `read_dir`
+//!    the host's `/etc/` at all, so without it the real `/etc/fstab`'s own
+//!    backups are invisible (see [`LIST_SCRIPT`] and
+//!    [`crate::host_backups`]).
+//! 2. [`elevated_plan`] - how the elevated half is spawned: under Flatpak,
+//!    `pkexec` must be invoked on the host
+//!    (`flatpak-spawn --host pkexec …`) and must name a **host** path,
+//!    since `std::env::current_exe()` inside the sandbox yields
+//!    `/app/bin/rustab`, which doesn't exist outside it. The binary named
+//!    there is `rustab-helper` - the GUI-free, statically-linked elevated
+//!    binary - not the GUI itself, whose GTK, WebKitGTK and glibc come
+//!    from the runtime and may be unavailable on the host that has to run
+//!    it.
+//! 3. A [`CommandRunner`] - `fstab-core`'s seam for everything it has to
+//!    ask the edited machine. Two of those are the system tools it shells
+//!    out to, `findmnt --verify` and `lsblk`: both answer questions about
+//!    `/dev`, udev and the live mount table, none of which the sandbox
+//!    shares with the host, so run inside it `findmnt --verify` calls even
+//!    `/` "unreachable on boot" and `lsblk` exits 0 reporting no device
+//!    with a UUID. Both are wrong, and the `findmnt` one blocks every
+//!    save. The third is the advisory "does this mount point exist?"
+//!    check, whose answers come from the sandbox's own `/` - the runtime's -
+//!    so `/boot`, `/opt` and every `/run/media/…` the host really has are
+//!    reported missing. So all three run on the host (see
+//!    [`RUN_WITH_INPUT_SCRIPT`] for the one awkward part - `findmnt` needs
+//!    its input as a *file*, and the sandbox's `/tmp` is private - and
+//!    [`EXISTS_BATCH_SCRIPT`] for why the existence check is one call for
+//!    the whole document).
 //!
 //! It doesn't hide the sandbox from the rest of the program: every
 //! function is explicit about which side of the boundary it acts on,
@@ -47,20 +72,35 @@
 //! ## Why `cargo test` never touches any of this
 //!
 //! The production reader comes from [`real_file_reader`], called only
-//! from the production wrappers that also fill in the real path. Every
+//! from the production wrappers that also fill in the real path (and the
+//! production runner from [`command_runner`], the same way). Every
 //! testable core function takes its reader as a parameter, so tests pass
-//! [`DirectFs`] or their own double. The two pieces that genuinely spawn a
-//! process ([`HostSpawn::read`] and the elevated spawn) are split into a
-//! pure "what would be run" half ([`Spawn`], asserted literally by tests)
-//! and a pure "what did it mean" half ([`interpret_read_output`]), the
-//! same split `privileged::interpret_write_output` uses.
+//! [`DirectFs`] or their own double. The pieces that genuinely spawn a
+//! process ([`HostSpawn`]'s four methods and the elevated spawn) are split
+//! into a pure "what would be run" half ([`Spawn`], asserted literally by
+//! tests) and a pure "what did it mean" half ([`interpret_read_output`],
+//! [`interpret_list_output`]), the same split
+//! `privileged::interpret_write_output` uses. [`LIST_SCRIPT`]'s own shell
+//! code is exercised too, by running it through a local `sh` against a temp
+//! directory and checking it agrees with [`DirectFs`] (see
+//! [`tests::the_list_script_and_the_direct_listing_agree_on_one_directory`]).
+//!
+//! The one test that does cross the boundary is
+//! [`tests::sandbox_smoke_host_runner_runs_on_the_host`], which is
+//! `#[ignore]`d and returns early unless it finds itself in a sandbox - it
+//! exists to be run by hand inside an installed Flatpak, where it is the
+//! only place this module's host-side behaviour can actually be observed.
 
+use crate::backups;
+use fstab_core::exec::{CommandRunner, DirectRunner};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::SystemTime;
 
 /// The file whose existence means "this process is running inside a
 /// Flatpak sandbox" - the `/etc` it sees is the runtime's, not the host's.
@@ -132,16 +172,159 @@ const READ_SCRIPT: &str = r#"if [ -e "$1" ]; then exec cat -- "$1"; else exit 44
 /// "is this path there?" can never be confused with "what does it hold?".
 const EXISTS_SCRIPT: &str = r#"if [ -e "$1" ]; then exit 0; else exit 44; fi"#;
 
-/// The exit code [`READ_SCRIPT`]/[`EXISTS_SCRIPT`] use for "that path
-/// doesn't exist on the host" - the only code [`interpret_read_output`]
-/// maps to [`io::ErrorKind::NotFound`].
+/// The script [`HostSpawn::paths_exist`] runs on the host: print one `1`
+/// per existing path and one `0` per missing one, in the order asked, with
+/// no separators.
+///
+/// ## Why one script for all the paths
+///
+/// `fstab_core::validate`'s advisory existence check asks about every
+/// mount point in the document, i.e. once per entry. A
+/// `flatpak-spawn --host` per path would mean a portal round trip and a
+/// process spawn per entry on every validation, and validation runs on
+/// every edit - so the trait takes the whole list and this answers it in
+/// one call, making the cost independent of the file's size.
+///
+/// ## Why the output is this shape
+///
+/// A single `0`/`1` per path, no delimiter, makes the reply self-checking:
+/// the only well-formed answer to N questions is N characters, so a
+/// truncated or interleaved reply cannot be silently misread as a verdict
+/// about the wrong path. [`interpret_exists_batch_output`] rejects anything
+/// else rather than guessing (a wrong answer here is a false "this mount
+/// point does not exist" warning on a path the user has).
+///
+/// `[ -e ]` is `Path::exists`'s question - it follows symlinks and does not
+/// care what kind of file it finds - and it cannot fail the script: the
+/// loop always prints something for every path, so the exit status is `0`
+/// whatever the verdicts are. The paths are positional (`"$@"`), never
+/// interpolated into the script text, so there is no quoting question.
+const EXISTS_BATCH_SCRIPT: &str =
+    r#"for p in "$@"; do if [ -e "$p" ]; then printf 1; else printf 0; fi; done"#;
+
+/// The script [`HostSpawn::list_backup_candidates`] runs on the host: one
+/// record per regular file in the directory `$1` whose name starts with
+/// `$2` + `.`, carrying that file's size, modification time and name. Exits
+/// [`MISSING_EXIT`] if the directory itself isn't there.
+///
+/// ## Why a `cd` and a relative glob
+///
+/// `cd -- "$1"` first means the glob pattern is `<file name>.*` with no
+/// directory part, so every name the script prints is a **bare file name** -
+/// the same thing `fs::read_dir` yields, and the same thing
+/// `fstab_core::writer::list_backups_among` expects. Nothing has to strip a
+/// prefix off the far side's output, so a directory whose own name contains
+/// an odd byte cannot confuse the parse.
+///
+/// ## Why `[ -f "$f" ]`
+///
+/// Two jobs at once. It keeps the result to regular files, matching
+/// [`DirectFs`]'s `is_file()` (both follow symlinks, so a symlink to a
+/// regular file counts and a dangling one does not), and it discards the
+/// pattern itself: when nothing matches, POSIX `sh` leaves the glob
+/// unexpanded, so `$f` is the literal `fstab.*` - which `[ -f ]` rejects,
+/// unless a file of that exact name really exists, in which case it is a
+/// genuine candidate and reporting it is correct.
+///
+/// ## Why the record is `<size> SP <mtime> LF <name> NUL`
+///
+/// A file name may contain anything but `/` and `NUL` - spaces, newlines,
+/// quotes, leading `-`. So the name is terminated by the one byte that
+/// cannot occur in it, and it goes **last** in the record, after a
+/// fixed-shape header that is split at its first newline. `stat`'s own
+/// `%n` is not newline-safe and is therefore not used; `$(...)` strips the
+/// trailing newline `stat -c` prints, so the header is exactly two numbers
+/// separated by one space. [`interpret_list_output`] rejects anything else
+/// rather than guessing a row.
+///
+/// A `stat` that fails (the file vanished between the glob and the `stat`)
+/// skips that one file, exactly as [`DirectFs`] skips an entry whose
+/// `fs::metadata` fails.
+///
+/// ## Why the trailing `exit 0`
+///
+/// The script's last command is the loop, whose status is that of the last
+/// `[ -f ]`, `stat` or `printf` it ran - so an empty directory, or one whose
+/// final candidate was skipped, would exit non-zero and be read as "the
+/// listing failed". `exit 0` makes "nothing matched" the success it is.
+///
+/// ## Why [`MISSING_EXIT`] again
+///
+/// "The directory is not on the host" has to be
+/// [`io::ErrorKind::NotFound`] and every transport failure must not be, for
+/// [`READ_SCRIPT`]'s reason: this sentinel can only come from a host shell
+/// that ran and could not enter the directory, while a denied portal or a
+/// missing binary lands on some other code. The same number is reused
+/// because it means the same thing; [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
+/// pins it to the constant.
+///
+/// ## The one place this and [`DirectFs`] disagree
+///
+/// A directory that exists but cannot be *entered* fails the `cd`, so it
+/// arrives as [`MISSING_EXIT`] ("not there on the host") rather than as a
+/// permission error; one that can be entered but not read makes the glob
+/// match nothing, which comes back as an empty listing. [`DirectFs`] reports
+/// `PermissionDenied` for both. Accepted rather than worked around: the only
+/// directory this is ever pointed at is the host's `/etc/`, which is mode
+/// 755 - if it were not, nothing else in this program would work either -
+/// and the alternative is a second sentinel for failures that cannot happen.
+///
+/// `--` keeps a directory or prefix starting with `-` from being read as an
+/// option by `cd` or `stat`, and both are positional (`$1`, `$2`), never
+/// interpolated into the script text, so there is no quoting or injection
+/// question.
+const LIST_SCRIPT: &str = r#"cd -- "$1" || exit 44; for f in "$2".*; do [ -f "$f" ] || continue; s=$(stat -c '%s %Y' -- "$f") || continue; printf '%s\n%s\0' "$s" "$f"; done; exit 0"#;
+
+/// The script [`HostSpawn::run`] uses when the command it is given has
+/// input: stage stdin in a **host** temp file, run the command with that
+/// file appended as its last argument, then delete the file and report the
+/// command's own exit status.
+///
+/// ## Why the content has to make this detour
+///
+/// `findmnt --verify` is the one caller with input, and it will only read a
+/// *seekable* `--tab-file`: handed `/dev/stdin` on a pipe it fails with
+/// `findmnt: can't read /dev/stdin: Success`. So the candidate fstab has to
+/// exist as a file the `findmnt` process can open - and that process is on
+/// the host, which cannot see this sandbox's `/tmp` at all. A path from
+/// [`std::env::temp_dir`] would therefore name nothing on the other side.
+/// `mktemp` on the host is the shortest thing that works: the bytes cross
+/// the boundary as the child's stdin, where they already travel safely.
+///
+/// The command and its arguments are positional (`"$@"`), never
+/// interpolated into the script text, so there is no quoting question;
+/// `$(mktemp)`'s result is quoted everywhere it is used. The file is
+/// removed on both paths, and `$s` preserves the command's status across
+/// the `rm`.
+///
+/// A `mktemp` or `cat` failure exits [`STAGING_FAILED_EXIT`] rather than
+/// letting the command run against a missing or truncated file, which for
+/// `findmnt --verify` would mean validating something other than what the
+/// user is about to save.
+const RUN_WITH_INPUT_SCRIPT: &str = r#"t=$(mktemp) || exit 45; cat > "$t" || { rm -f -- "$t"; exit 45; }; "$@" "$t"; s=$?; rm -f -- "$t"; exit $s"#;
+
+/// The exit code [`READ_SCRIPT`], [`EXISTS_SCRIPT`] and [`LIST_SCRIPT`] use
+/// for "that path doesn't exist on the host" - the only code
+/// [`interpret_read_output`] and [`interpret_list_output`] map to
+/// [`io::ErrorKind::NotFound`].
 ///
 /// Not 1 or 2 (used by `sh`/`cat`/`flatpak-spawn` failures) and outside the
-/// 126/127/128+n shell-signal range. Duplicated literally in both scripts
-/// since a shell script can't interpolate a Rust constant;
+/// 126/127/128+n shell-signal range. Duplicated literally in all three
+/// scripts since a shell script can't interpolate a Rust constant;
 /// [`tests::the_host_scripts_exit_with_the_sentinel_this_module_looks_for`]
 /// pins the three together.
 const MISSING_EXIT: i32 = 44;
+
+/// The exit code [`RUN_WITH_INPUT_SCRIPT`] uses for "the input could not be
+/// staged on the host" - the only code [`HostSpawn::run`] turns into an
+/// `io::Error` instead of passing the command's own status through.
+///
+/// Distinct from [`MISSING_EXIT`] so the two host scripts can never be
+/// confused, and chosen on the same grounds (clear of 0/1/2 and of the
+/// 126/127/128+n ranges). It is only ever consulted for a command that was
+/// *given* input, i.e. one that really ran under this script, so a command
+/// of its own that happened to exit 45 cannot be misread.
+const STAGING_FAILED_EXIT: i32 = 45;
 
 /// How much of a failed host command's stderr is quoted back in the
 /// resulting `io::Error` - same bound and reason as `privileged`'s own
@@ -151,9 +334,15 @@ const STDERR_EXCERPT_LIMIT: usize = 500;
 /// Rustab's Flatpak application id - `tauri.conf.json`'s `identifier`.
 const APP_ID: &str = "dev.tomsk.Rustab";
 
-/// The `command:` the Flatpak manifest installs into `/app/bin`, i.e. the
-/// final component of this binary's path inside an installed Flatpak.
-const APP_COMMAND: &str = "rustab";
+/// The elevated binary the Flatpak manifest installs beside the GUI in
+/// `/app/bin`, i.e. the final component of the path `pkexec` is handed on
+/// the host.
+///
+/// Not the `command:` (`rustab`, the GUI): inside a Flatpak the process
+/// that runs on the host is `rustab-helper`, which links no GUI library and
+/// is built as a static binary for exactly that reason - see
+/// [`elevated_plan`] and `crates/rustab-helper`.
+const HELPER_COMMAND: &str = "rustab-helper";
 
 /// Where a Flatpak app's files are, relative to a Flatpak **installation**
 /// root: `app/<app id>/current/active/files`.
@@ -174,7 +363,7 @@ const SYSTEM_INSTALLATION: &str = "/var/lib/flatpak";
 const APP_PATH_KEY: &str = "app-path";
 
 /// `bin`, the subdirectory of an app's `files` directory that
-/// `install -Dm755 … /app/bin/rustab` lands in (`/app` *is* `files`).
+/// `install -Dm755 … /app/bin/rustab-helper` lands in (`/app` *is* `files`).
 const BIN_DIR: &str = "bin";
 
 // ---------------------------------------------------------------------------
@@ -184,14 +373,18 @@ const BIN_DIR: &str = "bin";
 /// Reads a file that lives on the **host**, whichever side of a sandbox
 /// boundary this process is on.
 ///
-/// One method, since every real `/etc/fstab` reader wants only the whole
-/// current content as bytes - no metadata, no listing, no partial read.
-/// Shaped after `fstab_core::writer`'s `FileSystemOps` seam: a production
-/// impl plus a test double.
+/// Two methods, because the real `/etc/fstab` is asked exactly two
+/// unprivileged questions: what does it hold, and what sits beside it (its
+/// own backups). Both are ordinary reads of world-readable content, so
+/// neither involves elevation; they are one trait because every caller that
+/// needs one already has the other injected. Shaped after
+/// `fstab_core::writer`'s `FileSystemOps` seam: a production impl plus a
+/// test double.
 ///
-/// Implementations must honour `fs::read`'s error contract:
-/// [`io::ErrorKind::NotFound`] only for a file that's genuinely not there,
-/// some other kind for every other failure (see [`READ_SCRIPT`]).
+/// Implementations must honour `fs::read`'s and `fs::read_dir`'s error
+/// contract: [`io::ErrorKind::NotFound`] only for a file or directory
+/// that's genuinely not there, some other kind for every other failure (see
+/// [`READ_SCRIPT`]).
 pub(crate) trait RealFileReader {
     /// Reads `path`'s full contents from the host.
     ///
@@ -201,6 +394,50 @@ pub(crate) trait RealFileReader {
     /// other [`io::Error`] if it could not be read, including a failure to
     /// reach the host at all.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// Every **regular file** in `target`'s directory on the host whose name
+    /// starts with `target`'s own file name followed by `.`, with its size
+    /// and modification time.
+    ///
+    /// A deliberately wide net: a *documented superset* of `target`'s
+    /// backups, since what counts as a backup is `fstab-core`'s naming
+    /// grammar and nothing here may hold a second opinion about it.
+    /// [`crate::host_backups`] applies that grammar
+    /// (`fstab_core::writer::list_backups_among`) to the names this returns.
+    ///
+    /// Names are raw bytes, never UTF-8-decoded: a file name may hold
+    /// anything but `/` and `NUL`, and a lossy decode would invent a name
+    /// that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Only if the directory itself could not be listed:
+    /// [`io::ErrorKind::NotFound`] when it does not exist on the host, some
+    /// other kind for every other failure (including being unable to reach
+    /// the host). A `target` with no file-name component is not an error -
+    /// it has no siblings to report, so the result is an empty list.
+    fn list_backup_candidates(&self, target: &Path) -> io::Result<Vec<BackupCandidate>>;
+}
+
+/// One file sitting beside a host file, as
+/// [`RealFileReader::list_backup_candidates`] reports it: a possible backup,
+/// before `fstab-core`'s naming grammar has had its say.
+///
+/// Carries the name rather than a path because that is what both
+/// implementations can produce faithfully (the host-side one works inside
+/// the directory, see [`LIST_SCRIPT`]) and what
+/// `fstab_core::writer::list_backups_among` takes; the path is rebuilt from
+/// the target's own directory by [`crate::host_backups`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackupCandidate {
+    /// The file's name alone, with no directory part, as raw OS bytes.
+    pub(crate) name: OsString,
+    /// Its size in bytes.
+    pub(crate) size_bytes: u64,
+    /// Its modification time as whole seconds since the Unix epoch, or
+    /// `None` if the platform could not report it - the same "taken at"
+    /// timestamp `rustab_privileged::backups` uses.
+    pub(crate) modified_unix_secs: Option<u64>,
 }
 
 /// The reader for a process that is already looking at the real filesystem: a
@@ -216,6 +453,49 @@ impl RealFileReader for DirectFs {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
     }
+
+    fn list_backup_candidates(&self, target: &Path) -> io::Result<Vec<BackupCandidate>> {
+        let Some(file_name) = target.file_name() else {
+            return Ok(Vec::new());
+        };
+        let mut prefix = file_name.to_os_string();
+        prefix.push(".");
+
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(backups::containing_dir(target))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.as_bytes().starts_with(prefix.as_bytes()) {
+                continue;
+            }
+            // A vanished file or dangling symlink is just not a candidate,
+            // not a failure of the whole listing.
+            let Ok(metadata) = fs::metadata(entry.path()) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            candidates.push(BackupCandidate {
+                size_bytes: metadata.len(),
+                modified_unix_secs: modified_unix_secs(&metadata),
+                name,
+            });
+        }
+        Ok(candidates)
+    }
+}
+
+/// `metadata`'s modification time as whole seconds since the Unix epoch, or
+/// `None` if the platform can't report it - the same reading
+/// `rustab_privileged::backups` takes, so a row built from a direct listing
+/// and one built from a host listing mean the same thing.
+fn modified_unix_secs(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
 }
 
 /// The reader for a process inside a Flatpak sandbox: one
@@ -244,6 +524,176 @@ impl RealFileReader for HostSpawn {
         })?;
         interpret_read_output(path, output.status.code(), output.stdout, &output.stderr)
     }
+
+    fn list_backup_candidates(&self, target: &Path) -> io::Result<Vec<BackupCandidate>> {
+        // Nothing to list, and nothing to ask the host: a path with no
+        // file-name component has no siblings by this method's contract, so
+        // the portal is not bothered at all.
+        if target.file_name().is_none() {
+            return Ok(Vec::new());
+        }
+        let plan = list_plan(target);
+        let output = plan
+            .command()
+            .output()
+            .map_err(|err| launch_error(&plan, err))?;
+        interpret_list_output(
+            &backups::containing_dir(target),
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        )
+    }
+}
+
+/// What [`HostSpawn::list_backup_candidates`] runs for `target`:
+/// `flatpak-spawn --host sh -c '<LIST_SCRIPT>' sh <directory> <file name>`.
+///
+/// Pure, so the exact command line is reviewable and regression-tested
+/// without a sandbox, exactly like [`read_plan`] and [`exists_batch_plan`].
+///
+/// The directory and the file name travel as two operands rather than one
+/// path because the script `cd`s into the first and globs on the second -
+/// see [`LIST_SCRIPT`]. The second `sh` is the script's `$0`, so they land
+/// in `$1` and `$2`.
+fn list_plan(target: &Path) -> Spawn {
+    Spawn {
+        program: OsString::from(FLATPAK_SPAWN),
+        args: vec![
+            OsString::from(HOST_FLAG),
+            OsString::from(SH),
+            OsString::from("-c"),
+            OsString::from(LIST_SCRIPT),
+            OsString::from(SH),
+            backups::containing_dir(target).into_os_string(),
+            target.file_name().unwrap_or_default().to_os_string(),
+        ],
+    }
+}
+
+/// Turns a finished host listing of `dir` into the candidates it names.
+///
+/// Pure, like [`interpret_read_output`], and strict for the same kind of
+/// reason: these names decide which files a restore may be offered, so a
+/// reply that is not exactly [`LIST_SCRIPT`]'s format is an error for the
+/// whole call rather than a partial list with a guessed row in it. Half a
+/// list would read as "that backup is gone".
+fn interpret_list_output(
+    dir: &Path,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> io::Result<Vec<BackupCandidate>> {
+    match code {
+        Some(0) => {}
+        Some(MISSING_EXIT) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} does not exist on the host", dir.display()),
+            ));
+        }
+        other => {
+            let how = match other {
+                Some(code) => format!("with status {code}"),
+                None => "on a signal".to_string(),
+            };
+            return Err(io::Error::other(format!(
+                "could not list {} from outside this Flatpak sandbox: the host listing exited \
+                 {how}{}",
+                dir.display(),
+                stderr_excerpt(stderr)
+            )));
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut rest = stdout;
+    while let Some(end) = rest.iter().position(|byte| *byte == 0) {
+        candidates.push(list_record(dir, &rest[..end])?);
+        rest = &rest[end + 1..];
+    }
+    // Everything after the last NUL must be nothing: a non-empty tail is a
+    // record whose name was cut short, which must never be reported as a
+    // (shorter) file name that may well exist.
+    if !rest.is_empty() {
+        return Err(malformed_listing(
+            dir,
+            "the last record is not NUL-terminated",
+        ));
+    }
+    Ok(candidates)
+}
+
+/// Parses one `<size> SP <mtime> LF <name>` record from a host listing of
+/// `dir` (the NUL terminator already removed).
+///
+/// Split at the record's *first* newline, so a newline inside the file name
+/// stays inside the name where it belongs.
+fn list_record(dir: &Path, record: &[u8]) -> io::Result<BackupCandidate> {
+    let Some(newline) = record.iter().position(|byte| *byte == b'\n') else {
+        return Err(malformed_listing(
+            dir,
+            "a record has no newline between its metadata and its file name",
+        ));
+    };
+    let (header, name) = (&record[..newline], &record[newline + 1..]);
+
+    let Ok(header) = std::str::from_utf8(header) else {
+        return Err(malformed_listing(dir, "a record's metadata is not text"));
+    };
+    let Some((size, modified)) = header.split_once(' ') else {
+        return Err(malformed_listing(
+            dir,
+            "a record's metadata is not a size and a time separated by one space",
+        ));
+    };
+    // Only ASCII digits, so a sign, a space, whitespace, an empty field or a
+    // third field is refused rather than parsed into something plausible.
+    if [size, modified]
+        .iter()
+        .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(malformed_listing(
+            dir,
+            "a record's size and time are not both plain decimal numbers",
+        ));
+    }
+    let (Ok(size_bytes), Ok(modified_unix_secs)) = (size.parse::<u64>(), modified.parse::<u64>())
+    else {
+        return Err(malformed_listing(
+            dir,
+            "a record's size or time does not fit in 64 bits",
+        ));
+    };
+
+    if name.is_empty() {
+        return Err(malformed_listing(dir, "a record has an empty file name"));
+    }
+    // A directory entry's name can never contain `/`, so one here means the
+    // record is not what this script produces - and a path, unlike a name,
+    // could point outside the directory that was listed.
+    if name.contains(&b'/') {
+        return Err(malformed_listing(
+            dir,
+            "a record's file name contains a path separator",
+        ));
+    }
+
+    Ok(BackupCandidate {
+        name: OsString::from_vec(name.to_vec()),
+        size_bytes,
+        modified_unix_secs: Some(modified_unix_secs),
+    })
+}
+
+/// The error for a host listing that did not come back in
+/// [`LIST_SCRIPT`]'s format, naming the directory and what was wrong with
+/// it.
+fn malformed_listing(dir: &Path, what: &str) -> io::Error {
+    io::Error::other(format!(
+        "the host's listing of {} could not be read: {what}",
+        dir.display()
+    ))
 }
 
 /// The production reader for this process: [`HostSpawn`] inside a Flatpak
@@ -340,6 +790,228 @@ fn interpret_read_output(
 }
 
 // ---------------------------------------------------------------------------
+// Running a system tool on the host
+// ---------------------------------------------------------------------------
+
+/// `fstab-core`'s command seam, satisfied by running the command on the
+/// host - one `flatpak-spawn --host` per call, exactly like
+/// [`HostSpawn::read`].
+///
+/// A command with input goes through [`RUN_WITH_INPUT_SCRIPT`], which
+/// stages the bytes in a host temp file and appends its path, honouring
+/// [`CommandRunner::run`]'s contract on the far side of the boundary. The
+/// existence question goes through [`EXISTS_BATCH_SCRIPT`], which answers
+/// the whole list in that same single call.
+///
+/// Only a failure to launch `flatpak-spawn`, or the staging sentinel, is an
+/// `io::Error`: every other outcome is passed through so that `findmnt`'s
+/// and `lsblk`'s own exit statuses keep being interpreted by `fstab-core`
+/// as they always were. A portal failure therefore arrives as a non-zero
+/// exit with "Portal call failed" in stderr, which `fstab-core` turns into
+/// its conservative blocking finding carrying that text - noisy but
+/// fail-safe, and the right direction to be wrong in for a check that
+/// guards a save.
+impl CommandRunner for HostSpawn {
+    fn run(&self, program: &str, args: &[&str], input: Option<&[u8]>) -> io::Result<Output> {
+        let plan = run_plan(program, args, input.is_some());
+        let mut command = plan.command();
+        let Some(bytes) = input else {
+            let output = command.output().map_err(|err| launch_error(&plan, err))?;
+            return Ok(output);
+        };
+
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|err| launch_error(&plan, err))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other(format!("`{plan}` gave no stdin to write to")))?;
+        let written = stdin.write_all(bytes).and_then(|()| stdin.flush());
+        // Dropped before waiting, or the host-side `cat` would never see EOF
+        // and both processes would block forever.
+        drop(stdin);
+
+        // A broken pipe means the host script already exited - its exit
+        // status is more informative than "write failed". Other errors are real.
+        if let Err(err) = written {
+            if err.kind() != io::ErrorKind::BrokenPipe {
+                let _ = child.wait();
+                return Err(io::Error::other(format!(
+                    "could not send {program}'s input to the host through `{plan}` ({err})"
+                )));
+            }
+        }
+
+        let output = child.wait_with_output().map_err(|err| {
+            io::Error::other(format!("could not wait for `{plan}` to finish ({err})"))
+        })?;
+        if output.status.code() == Some(STAGING_FAILED_EXIT) {
+            return Err(io::Error::other(format!(
+                "could not stage the input on the host for `{program}`: the host could not \
+                 create a temporary file to receive it{}",
+                stderr_excerpt(&output.stderr)
+            )));
+        }
+        Ok(output)
+    }
+
+    /// One `flatpak-spawn --host` for the whole list, whatever its length -
+    /// see [`EXISTS_BATCH_SCRIPT`].
+    fn paths_exist(&self, paths: &[&str]) -> io::Result<Vec<bool>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plan = exists_batch_plan(paths);
+        let output = plan
+            .command()
+            .output()
+            .map_err(|err| launch_error(&plan, err))?;
+        interpret_exists_batch_output(paths, output.status.code(), &output.stdout, &output.stderr)
+    }
+}
+
+/// What [`HostSpawn::paths_exist`] runs for `paths`:
+/// `flatpak-spawn --host sh -c '<EXISTS_BATCH_SCRIPT>' sh <path…>`.
+///
+/// Pure, so the exact command line is reviewable and regression-tested
+/// without a sandbox, exactly like [`read_plan`] and [`run_plan`].
+///
+/// The second `sh` is the script's `$0`, so the paths start at `$1` and
+/// `"$@"` expands to all of them and nothing else.
+fn exists_batch_plan(paths: &[&str]) -> Spawn {
+    let mut args = vec![
+        OsString::from(HOST_FLAG),
+        OsString::from(SH),
+        OsString::from("-c"),
+        OsString::from(EXISTS_BATCH_SCRIPT),
+        OsString::from(SH),
+    ];
+    args.extend(paths.iter().map(OsString::from));
+    Spawn {
+        program: OsString::from(FLATPAK_SPAWN),
+        args,
+    }
+}
+
+/// Turns a finished batched existence query into one verdict per path.
+///
+/// Pure, like [`interpret_read_output`]: every failure mode is classified
+/// by a function a unit test can call directly, no sandbox needed.
+///
+/// Anything other than exit 0 with exactly one `0`/`1` character per path
+/// is an `io::Error`, never a partial verdict - the caller's check is
+/// advisory, and a guessed answer would surface as a confident claim about
+/// a path nobody actually looked at.
+fn interpret_exists_batch_output(
+    paths: &[&str],
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> io::Result<Vec<bool>> {
+    if code != Some(0) {
+        let how = match code {
+            Some(code) => format!("with status {code}"),
+            None => "on a signal".to_string(),
+        };
+        return Err(io::Error::other(format!(
+            "asking the host which of {} path(s) exist failed: the host command exited {how}{}",
+            paths.len(),
+            stderr_excerpt(stderr)
+        )));
+    }
+    if stdout.len() != paths.len() {
+        return Err(io::Error::other(format!(
+            "asking the host which of {} path(s) exist gave {} answer(s)",
+            paths.len(),
+            stdout.len()
+        )));
+    }
+    stdout
+        .iter()
+        .map(|byte| match byte {
+            b'1' => Ok(true),
+            b'0' => Ok(false),
+            other => Err(io::Error::other(format!(
+                "the host's existence answer contained {:?}, which is neither 0 nor 1",
+                char::from(*other)
+            ))),
+        })
+        .collect()
+}
+
+/// The production [`CommandRunner`] for this process: [`HostSpawn`] inside
+/// a Flatpak sandbox, `fstab-core`'s own [`DirectRunner`] everywhere else.
+///
+/// The counterpart of [`real_file_reader`], in the same shape and for the
+/// same reason: the only place that consults the real
+/// [`SANDBOX_MARKER_PATH`], with the decision itself in [`runner_for`] so
+/// the tests can drive it against paths of their own.
+pub(crate) fn command_runner() -> &'static dyn CommandRunner {
+    runner_for(Path::new(SANDBOX_MARKER_PATH))
+}
+
+/// Chooses the runner appropriate for a process whose sandbox marker is (or
+/// is not) at `sandbox_marker`.
+///
+/// Parameterized purely so the choice itself is testable without a sandbox;
+/// production always passes [`SANDBOX_MARKER_PATH`].
+fn runner_for(sandbox_marker: &Path) -> &'static dyn CommandRunner {
+    /// The two runners, as values with a `'static` lifetime to hand out.
+    /// Both are zero-sized, so these cost nothing.
+    static HOST: HostSpawn = HostSpawn;
+    static DIRECT: DirectRunner = DirectRunner;
+
+    if sandbox_marker.exists() {
+        &HOST
+    } else {
+        &DIRECT
+    }
+}
+
+/// What [`HostSpawn::run`] runs for `program` and `args`. Two shapes:
+///
+/// - **no input**: `flatpak-spawn --host <program> <args…>`;
+/// - **with input**: `flatpak-spawn --host sh -c '<RUN_WITH_INPUT_SCRIPT>'
+///   sh <program> <args…>`, with the bytes on the child's stdin and the
+///   staged file's path appended by the script itself.
+///
+/// Pure, so both command lines are reviewable and regression-tested
+/// without a sandbox, exactly like [`read_plan`] and [`exists_plan`].
+///
+/// The second `sh` is the script's `$0`, so `<program>` lands in `$1` and
+/// `"$@"` expands to the command and its arguments.
+fn run_plan(program: &str, args: &[&str], has_input: bool) -> Spawn {
+    let mut spawn_args = vec![OsString::from(HOST_FLAG)];
+    if has_input {
+        spawn_args.push(OsString::from(SH));
+        spawn_args.push(OsString::from("-c"));
+        spawn_args.push(OsString::from(RUN_WITH_INPUT_SCRIPT));
+        spawn_args.push(OsString::from(SH));
+    }
+    spawn_args.push(OsString::from(program));
+    spawn_args.extend(args.iter().map(OsString::from));
+    Spawn {
+        program: OsString::from(FLATPAK_SPAWN),
+        args: spawn_args,
+    }
+}
+
+/// The error for a `flatpak-spawn` that could not be started at all.
+///
+/// Its own [`io::ErrorKind`] is deliberately discarded, for
+/// [`HostSpawn::read`]'s reason: a missing `flatpak-spawn` binary is
+/// reported as `NotFound`, which passed through would read as "the thing
+/// you asked about does not exist".
+fn launch_error(plan: &Spawn, err: io::Error) -> io::Error {
+    io::Error::other(format!(
+        "could not run `{plan}` from inside this Flatpak sandbox ({err})"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Spawning the elevated helper
 // ---------------------------------------------------------------------------
 
@@ -381,56 +1053,76 @@ impl fmt::Display for Spawn {
     }
 }
 
-/// How this process re-executes itself as root with `flag`, on whichever
-/// side of a sandbox boundary it has to happen.
+/// How the elevated half is started as root, on whichever side of a sandbox
+/// boundary that has to happen.
 ///
-/// The production entry point for [`crate::privileged`]'s one spawn. Two shapes:
+/// The production entry point for [`crate::privileged`]'s one spawn. Two
+/// shapes, and they do not name the same executable:
 ///
-/// - **not sandboxed**: `pkexec <current_exe> <flag>`.
-/// - **sandboxed**: `flatpak-spawn --host pkexec <host path of this binary>
-///   <flag>` - `pkexec` alone would authorize root *inside* the sandbox
-///   (can't see the real `/etc/`); `flatpak-spawn --host` alone would reach
-///   the real `/etc/` unprivileged (can't write it). Both together are needed.
+/// - **not sandboxed**: `pkexec <current_exe> <flag>` - this binary
+///   re-executed with its hidden flag, as it always was. Its libraries are
+///   the ones it was built against on this very machine, so re-exec is free
+///   and there is nothing to keep in version lockstep.
+/// - **sandboxed**: `flatpak-spawn --host pkexec <host path>/bin/rustab-helper`,
+///   with **no flag** - `rustab-helper` reads one request on stdin and
+///   refuses any argument at all. `pkexec` alone would authorize root
+///   *inside* the sandbox (can't see the real `/etc/`); `flatpak-spawn
+///   --host` alone would reach the real `/etc/` unprivileged (can't write
+///   it). Both together are needed.
 ///
-/// `current_exe()` resolves to `/app/bin/rustab` inside the sandbox, which
-/// doesn't exist on the host, so [`host_binary`] finds the host path of
-/// the same binary instead.
+/// ## Why the sandboxed shape runs a different binary
+///
+/// The process `flatpak-spawn --host pkexec` starts runs on the **host**,
+/// with the host's libraries - not the runtime's. The GUI binary is linked
+/// against the runtime's GTK, WebKitGTK and glibc, so exec'ing it there
+/// works only on a host that happens to satisfy all of them, and fails
+/// before it reads a byte of its request on one that doesn't.
+/// `rustab-helper` is the same elevated code
+/// (`rustab_privileged::protocol::handle_privileged_request`) in a binary
+/// with no GUI dependency, built as a static executable, so the host's
+/// libraries are not consulted at all.
+///
+/// `current_exe()` also resolves to `/app/bin/rustab` inside the sandbox,
+/// which names nothing on the host, so [`host_helper_binary`] resolves the
+/// helper's host-side path instead.
 ///
 /// # Errors
 ///
 /// An [`io::Error`] if the binary's path couldn't be determined -
-/// `current_exe()`'s own error outside a sandbox, or [`host_binary`]'s
-/// "nowhere to be found" error inside one. Nothing is spawned either way.
-pub(crate) fn elevated_self_plan(flag: &str) -> io::Result<Spawn> {
-    elevated_self_plan_with(
+/// `current_exe()`'s own error outside a sandbox, or
+/// [`host_helper_binary`]'s "nowhere to be found" error inside one.
+/// Nothing is spawned either way.
+pub(crate) fn elevated_plan(flag: &str) -> io::Result<Spawn> {
+    elevated_plan_with(
         Path::new(SANDBOX_MARKER_PATH).exists(),
         std::env::current_exe,
-        || host_binary(sandbox_info(), std::env::var_os("HOME"), &host_path_exists),
+        || host_helper_binary(sandbox_info(), std::env::var_os("HOME"), &host_path_exists),
         flag,
     )
 }
 
-/// The decision inside [`elevated_self_plan`], with every input injected.
+/// The decision inside [`elevated_plan`], with every input injected.
 ///
-/// `current_exe` and `host_binary` are closures rather than resolved values so
-/// that neither is evaluated in the branch that does not use it: a test for
-/// the sandboxed plan must not depend on this binary's own path, and a test
-/// for the ordinary plan must not depend on a Flatpak installation existing.
-fn elevated_self_plan_with(
+/// `current_exe` and `host_helper_binary` are closures rather than resolved
+/// values so that neither is evaluated in the branch that does not use it: a
+/// test for the sandboxed plan must not depend on this binary's own path, and
+/// a test for the ordinary plan must not depend on a Flatpak installation
+/// existing. `flag` is likewise only meaningful in the ordinary branch - the
+/// helper takes none.
+fn elevated_plan_with(
     sandboxed: bool,
     current_exe: impl FnOnce() -> io::Result<PathBuf>,
-    host_binary: impl FnOnce() -> io::Result<PathBuf>,
+    host_helper_binary: impl FnOnce() -> io::Result<PathBuf>,
     flag: &str,
 ) -> io::Result<Spawn> {
     if sandboxed {
-        let binary = host_binary()?;
+        let helper = host_helper_binary()?;
         Ok(Spawn {
             program: OsString::from(FLATPAK_SPAWN),
             args: vec![
                 OsString::from(HOST_FLAG),
                 OsString::from(PKEXEC),
-                binary.into_os_string(),
-                OsString::from(flag),
+                helper.into_os_string(),
             ],
         })
     } else {
@@ -442,19 +1134,21 @@ fn elevated_self_plan_with(
     }
 }
 
-/// This binary's path **on the host**, for a process running inside a
-/// Flatpak sandbox.
+/// The elevated helper's path **on the host**, for a process running inside
+/// a Flatpak sandbox.
 ///
-/// Three candidates, in order, first one that exists on the host wins:
+/// Three candidates, in order, first one that exists on the host wins -
+/// resolved exactly like the GUI's own host path used to be, since the
+/// helper is installed beside it in the same `/app/bin`:
 ///
-/// 1. `<app-path from /.flatpak-info>/bin/rustab` - Flatpak writes the
-///    host path of this app's `files` directory into the sandbox's own
+/// 1. `<app-path from /.flatpak-info>/bin/rustab-helper` - Flatpak writes
+///    the host path of this app's `files` directory into the sandbox's own
 ///    `/.flatpak-info` (`[Instance] app-path=…`), so this is correct for
 ///    any install layout, architecture, or branch.
 /// 2. The user-install layout:
-///    `$HOME/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab`.
+///    `$HOME/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper`.
 /// 3. The system-install layout (`flatpak install` without `--user`):
-///    `/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab`.
+///    `/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper`.
 ///
 /// 2 and 3 are kept as fallbacks in case a future Flatpak version drops
 /// the `app-path` key that 1 depends on.
@@ -478,12 +1172,12 @@ fn elevated_self_plan_with(
 /// [`io::ErrorKind::NotFound`] if the host reports that none of the candidates
 /// exists; the first probe error (kind preserved) if the host could not be
 /// asked about any of them at all.
-fn host_binary(
+fn host_helper_binary(
     sandbox_info: Option<String>,
     home: Option<OsString>,
     exists: &dyn Fn(&Path) -> io::Result<bool>,
 ) -> io::Result<PathBuf> {
-    let candidates = host_binary_candidates(sandbox_info.as_deref(), home.as_deref());
+    let candidates = host_helper_candidates(sandbox_info.as_deref(), home.as_deref());
     let mut probe_failure = None;
     for candidate in &candidates {
         match exists(candidate) {
@@ -504,18 +1198,19 @@ fn host_binary(
         Some(err) => Err(io::Error::new(
             err.kind(),
             format!(
-                "Rustab is running inside a Flatpak sandbox, so the elevated helper has to be \
-                 started from this app's host-side path, but the host could not be asked \
-                 whether that path ({named}) exists: {err}. Saving the real /etc/fstab needs \
-                 the Flatpak permission --talk-name=org.freedesktop.Flatpak."
+                "Rustab is running inside a Flatpak sandbox, so the elevated helper \
+                 ({HELPER_COMMAND}) has to be started from this app's host-side path, but the \
+                 host could not be asked whether that path ({named}) exists: {err}. Saving the \
+                 real /etc/fstab needs the Flatpak permission \
+                 --talk-name=org.freedesktop.Flatpak."
             ),
         )),
         None => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "Rustab is running inside a Flatpak sandbox, so the elevated helper has to be \
-                 started from this app's host-side path, but no Rustab executable was found at \
-                 {named}. Reinstalling the Flatpak \
+                "Rustab is running inside a Flatpak sandbox, so the elevated helper \
+                 ({HELPER_COMMAND}) has to be started from this app's host-side path, but no \
+                 {HELPER_COMMAND} executable was found at {named}. Reinstalling the Flatpak \
                  (`flatpak install --reinstall dev.tomsk.Rustab`) restores it; until then, \
                  saving the real /etc/fstab cannot work from this sandbox."
             ),
@@ -579,15 +1274,15 @@ fn exists_plan(path: &Path) -> Spawn {
     }
 }
 
-/// The candidate host paths [`host_binary`] tries, in order, for the
+/// The candidate host paths [`host_helper_binary`] tries, in order, for the
 /// `/.flatpak-info` content and `$HOME` value given.
 ///
-/// Split out from [`host_binary`] so the *list* can be asserted
+/// Split out from [`host_helper_binary`] so the *list* can be asserted
 /// independently of the existence check that picks from it.
-fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> Vec<PathBuf> {
+fn host_helper_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(3);
     if let Some(app_files) = sandbox_info.and_then(app_path_in_sandbox_info) {
-        candidates.push(app_files.join(BIN_DIR).join(APP_COMMAND));
+        candidates.push(app_files.join(BIN_DIR).join(HELPER_COMMAND));
     }
     if let Some(home) = home.filter(|home| !home.is_empty()) {
         candidates.push(
@@ -597,7 +1292,7 @@ fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> V
                 .join(APP_ID)
                 .join(APP_FILES_IN_INSTALLATION)
                 .join(BIN_DIR)
-                .join(APP_COMMAND),
+                .join(HELPER_COMMAND),
         );
     }
     candidates.push(
@@ -606,7 +1301,7 @@ fn host_binary_candidates(sandbox_info: Option<&str>, home: Option<&OsStr>) -> V
             .join(APP_ID)
             .join(APP_FILES_IN_INSTALLATION)
             .join(BIN_DIR)
-            .join(APP_COMMAND),
+            .join(HELPER_COMMAND),
     );
     candidates
 }
@@ -687,6 +1382,14 @@ impl RealFileReader for StubReader {
             Ok(bytes) => Ok(bytes.clone()),
             Err((kind, message)) => Err(io::Error::new(*kind, message.clone())),
         }
+    }
+
+    /// Always an empty listing: this double exists to serve (or fail) the
+    /// *content* of one file, and a caller that cares about a listing wants
+    /// a double of its own saying which names it sees - a canned non-empty
+    /// list here would be shared by every test that only wanted a read.
+    fn list_backup_candidates(&self, _target: &Path) -> io::Result<Vec<BackupCandidate>> {
+        Ok(Vec::new())
     }
 }
 
@@ -807,13 +1510,143 @@ mod tests {
             EXISTS_SCRIPT.contains(&format!("exit {MISSING_EXIT}")),
             "the existence script must exit with the sentinel: {EXISTS_SCRIPT}"
         );
-        assert_ne!(MISSING_EXIT, 0);
-        assert_ne!(MISSING_EXIT, 1, "1 is what every failure already uses");
-        assert_ne!(MISSING_EXIT, 2);
         assert!(
-            !(126..=165).contains(&MISSING_EXIT),
-            "the sentinel must stay clear of the could-not-execute and signal ranges"
+            LIST_SCRIPT.contains(&format!("exit {MISSING_EXIT}")),
+            "the listing script must exit with the sentinel: {LIST_SCRIPT}"
         );
+        assert!(
+            LIST_SCRIPT.trim_end().ends_with("exit 0"),
+            "the listing script must end in a success exit, or an empty \
+             directory would read as a failure: {LIST_SCRIPT}"
+        );
+        assert!(
+            RUN_WITH_INPUT_SCRIPT.contains(&format!("exit {STAGING_FAILED_EXIT}")),
+            "the with-input script must exit with the staging sentinel: {RUN_WITH_INPUT_SCRIPT}"
+        );
+        assert_ne!(
+            MISSING_EXIT, STAGING_FAILED_EXIT,
+            "the two sentinels must stay distinguishable"
+        );
+        for sentinel in [MISSING_EXIT, STAGING_FAILED_EXIT] {
+            assert_ne!(sentinel, 0);
+            assert_ne!(sentinel, 1, "1 is what every failure already uses");
+            assert_ne!(sentinel, 2);
+            assert!(
+                !(126..=165).contains(&sentinel),
+                "the sentinel must stay clear of the could-not-execute and signal ranges"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_run_plan_without_input_is_a_bare_flatpak_spawn_of_the_command() {
+        let plan = run_plan("lsblk", &["-J", "-O"], false);
+
+        assert_eq!(plan.to_string(), "flatpak-spawn --host lsblk -J -O");
+    }
+
+    /// The with-input shape, literally: the script's `$0` filler, then the
+    /// command and its arguments as `"$@"`. The staged file's path is
+    /// deliberately *not* here - the host script appends it, since only the
+    /// host knows a path that exists there.
+    #[test]
+    fn the_host_run_plan_with_input_wraps_the_command_in_the_staging_script() {
+        let plan = run_plan("findmnt", &["--verify", "--tab-file"], true);
+
+        assert_eq!(
+            plan.to_string(),
+            "flatpak-spawn --host sh -c ".to_string()
+                + RUN_WITH_INPUT_SCRIPT
+                + " sh findmnt --verify --tab-file"
+        );
+    }
+
+    /// Outside a sandbox nothing is routed through `flatpak-spawn`, for the
+    /// same reason as the reader's own choice test.
+    #[test]
+    fn the_runner_is_direct_without_a_sandbox_marker_and_host_spawn_with_one() {
+        let dir = TempDir::new("host-runner-choice");
+        let marker = dir.join("flatpak-info");
+
+        let direct = runner_for(&marker);
+        fs::write(&marker, "[Application]\n").expect("seed the marker");
+        let sandboxed = runner_for(&marker);
+
+        // Only the direct runner is exercised here - the sandboxed one
+        // would spawn `flatpak-spawn`; its plan is asserted above instead.
+        let output = direct
+            .run("cat", &[], Some(b"payload"))
+            .expect("the direct runner must run cat locally");
+        assert_eq!(output.stdout, b"payload");
+        let _ = sandboxed;
+    }
+
+    /// Only meaningful inside a Flatpak sandbox, which is why it is
+    /// `#[ignore]`d: run it with
+    /// `flatpak run --command=… dev.tomsk.Rustab … --ignored sandbox_smoke`
+    /// from an installed build. Outside one it returns early, so
+    /// `cargo test -- --ignored` stays green on a developer machine.
+    #[test]
+    #[ignore]
+    fn sandbox_smoke_host_runner_runs_on_the_host() {
+        if !Path::new(SANDBOX_MARKER_PATH).exists() {
+            eprintln!(
+                "skipping: this smoke test only means anything inside a Flatpak sandbox \
+                 (no {SANDBOX_MARKER_PATH} here)"
+            );
+            return;
+        }
+
+        let runner = command_runner();
+
+        // The host has no `/.flatpak-info`, so "out" proves the command did
+        // not run in this sandbox.
+        let where_it_ran = runner
+            .run(
+                "sh",
+                &["-c", "test -e /.flatpak-info && echo in || echo out"],
+                None,
+            )
+            .expect("the host command must run");
+        assert_eq!(
+            String::from_utf8_lossy(&where_it_ran.stdout).trim(),
+            "out",
+            "the command must run on the host, not in this sandbox"
+        );
+
+        // And the input staging has to survive the same crossing.
+        let echoed = runner
+            .run("cat", &[], Some(b"payload"))
+            .expect("the staged input must reach the host");
+        assert_eq!(echoed.stdout, b"payload");
+
+        // This pair can only come from the host: it has `/etc/fstab` and no
+        // `/.flatpak-info`, the opposite of this sandbox.
+        let answers = runner
+            .paths_exist(&["/etc/fstab", SANDBOX_MARKER_PATH])
+            .expect("the host must be able to answer");
+        assert_eq!(
+            answers,
+            vec![true, false],
+            "the existence check must be answered by the host, not by this sandbox"
+        );
+
+        // Listing must come from the host's /etc/, not this sandbox; a name
+        // equal to `/etc/fstab` itself would offer restoring it over itself.
+        let candidates = real_file_reader()
+            .list_backup_candidates(Path::new("/etc/fstab"))
+            .expect("the host must be able to list /etc/");
+        for candidate in &candidates {
+            assert_ne!(
+                candidate.name,
+                OsString::from("fstab"),
+                "the target itself must never be listed as one of its backups"
+            );
+            assert!(
+                candidate.name.as_bytes().starts_with(b"fstab."),
+                "only siblings of /etc/fstab may be listed: {candidate:?}"
+            );
+        }
     }
 
     #[test]
@@ -875,12 +1708,317 @@ mod tests {
         assert!(error.len() < long.len());
     }
 
+    /// One `<size> SP <mtime> LF <name> NUL` record, built the way
+    /// [`LIST_SCRIPT`]'s `printf` does, so the tests below can state the
+    /// bytes they mean without escaping a NUL into a literal.
+    fn record(header: &str, name: &[u8]) -> Vec<u8> {
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes
+    }
+
+    /// Seeds `dir` with the mix every listing test needs: two real backups,
+    /// files that only look like one, another target's backup, the target
+    /// itself, a subdirectory, a dangling symlink, and a name holding a
+    /// newline.
+    fn seed_listing_dir(dir: &Path) {
+        for name in [
+            "fstab",
+            "fstab.rustab-backup.0000000001.000000002",
+            "fstab.rustab-backup.0000000001.000000003.manual",
+            "fstab.bak",
+            // A file whose name really is the glob pattern, so "the pattern
+            // matched nothing" and "the pattern is the file" stay distinct.
+            "fstab.*",
+            "other.rustab-backup.0000000001.000000002",
+            "fstab.odd\nname",
+        ] {
+            fs::write(dir.join(name), format!("# {name}\n")).expect("seed a file");
+        }
+        fs::create_dir(dir.join("fstab.dir")).expect("seed a subdirectory");
+        std::os::unix::fs::symlink(dir.join("fstab.nowhere"), dir.join("fstab.link"))
+            .expect("seed a dangling symlink");
+    }
+
+    /// The names [`seed_listing_dir`] leaves that are both `fstab.`-prefixed
+    /// and regular files - the whole answer either implementation may give,
+    /// sorted so an unordered listing can be compared against it.
+    fn expected_candidate_names() -> Vec<OsString> {
+        let mut names: Vec<OsString> = [
+            "fstab.*",
+            "fstab.bak",
+            "fstab.odd\nname",
+            "fstab.rustab-backup.0000000001.000000002",
+            "fstab.rustab-backup.0000000001.000000003.manual",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        names.sort();
+        names
+    }
+
+    /// The names of `candidates`, sorted - `fs::read_dir` has no order of
+    /// its own, so only the set is asserted.
+    fn sorted_names(candidates: &[BackupCandidate]) -> Vec<OsString> {
+        let mut names: Vec<OsString> = candidates
+            .iter()
+            .map(|candidate| candidate.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_host_list_plan_is_a_flatpak_spawn_of_the_list_script() {
+        let plan = list_plan(Path::new("/etc/fstab"));
+
+        assert_eq!(plan.program, OsString::from("flatpak-spawn"));
+        assert_eq!(
+            plan.args,
+            vec![
+                OsString::from("--host"),
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(LIST_SCRIPT),
+                OsString::from("sh"),
+                OsString::from("/etc"),
+                OsString::from("fstab"),
+            ]
+        );
+        // The directory has to be `$1` and the file name `$2`, i.e. the two
+        // operands after the script's `$0` filler.
+        assert_eq!(plan.args[5], OsString::from("/etc"));
+        assert_eq!(plan.args[6], OsString::from("fstab"));
+    }
+
+    #[test]
+    fn a_well_formed_host_listing_becomes_candidates_in_order() {
+        let mut stdout = record("12 1760000000", b"fstab.rustab-backup.0000000001.000000002");
+        stdout.extend(record("345 1760000900", b"fstab.bak"));
+
+        assert_eq!(
+            interpret_list_output(Path::new("/etc"), Some(0), &stdout, b"")
+                .expect("a well-formed listing must be accepted"),
+            vec![
+                BackupCandidate {
+                    name: OsString::from("fstab.rustab-backup.0000000001.000000002"),
+                    size_bytes: 12,
+                    modified_unix_secs: Some(1_760_000_000),
+                },
+                BackupCandidate {
+                    name: OsString::from("fstab.bak"),
+                    size_bytes: 345,
+                    modified_unix_secs: Some(1_760_000_900),
+                },
+            ]
+        );
+
+        // A directory with nothing beside the target is an empty listing, not
+        // a malformed one.
+        assert_eq!(
+            interpret_list_output(Path::new("/etc"), Some(0), b"", b"")
+                .expect("an empty listing must be accepted"),
+            Vec::new()
+        );
+    }
+
+    /// A file name is bytes, and every byte but `/` and NUL is legal in one -
+    /// so none of these may be decoded, split, trimmed or lost, least of all
+    /// the one holding a newline, which must stay a single candidate.
+    #[test]
+    fn adversarial_file_names_survive_a_host_listing_as_bytes() {
+        let names: Vec<&[u8]> = vec![
+            b"fstab.rustab-backup.0000000001.000000002",
+            b"fstab.with space",
+            b"-n",
+            b"fstab.*",
+            b"fstab.!",
+            b"fstab.(x)",
+            b"fstab.\\040odd",
+            b"fstab.odd\nname",
+        ];
+        let stdout: Vec<u8> = names.iter().flat_map(|name| record("1 2", name)).collect();
+
+        let listed = interpret_list_output(Path::new("/etc"), Some(0), &stdout, b"")
+            .expect("awkward names are still well-formed records");
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|candidate| candidate.name.clone())
+                .collect::<Vec<_>>(),
+            names
+                .iter()
+                .map(|name| OsString::from_vec(name.to_vec()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            listed.len(),
+            names.len(),
+            "the name holding a newline must stay one candidate: {listed:?}"
+        );
+    }
+
+    /// Every malformed reply is an error for the whole call: a guessed row
+    /// here would offer a restore of a file nobody looked at, and a dropped
+    /// row would read as "that backup is gone".
+    #[test]
+    fn a_malformed_host_listing_is_an_error_rather_than_a_guessed_row() {
+        let mut unterminated = record("1 2", b"fstab.bak");
+        unterminated.pop();
+
+        for (what, stdout) in [
+            ("no NUL after the last record", unterminated),
+            ("three header fields", record("1 2 3", b"fstab.bak")),
+            ("a non-numeric header", record("a b", b"fstab.bak")),
+            ("a negative size", record("-1 2", b"fstab.bak")),
+            ("an empty header field", record(" 2", b"fstab.bak")),
+            ("an empty name", record("1 2", b"")),
+            (
+                "a name with a path separator",
+                record("1 2", b"../fstab.bak"),
+            ),
+            ("no newline in the record", b"12\0".to_vec()),
+        ] {
+            let error = interpret_list_output(Path::new("/etc"), Some(0), &stdout, b"")
+                .expect_err("a malformed listing must fail");
+            assert_ne!(
+                error.kind(),
+                io::ErrorKind::NotFound,
+                "{what} is not a missing directory"
+            );
+            assert!(
+                error.to_string().contains("/etc"),
+                "the message must name the directory ({what}): {error}"
+            );
+        }
+
+        // A denied portal must stay distinguishable from "the directory is
+        // not there", for `interpret_read_output`'s reason.
+        let denied = interpret_list_output(
+            Path::new("/etc"),
+            Some(1),
+            b"",
+            b"Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown\n",
+        )
+        .expect_err("a portal failure must fail");
+        assert_ne!(denied.kind(), io::ErrorKind::NotFound);
+        assert!(denied.to_string().contains("Portal call failed"));
+
+        let missing = interpret_list_output(Path::new("/etc"), Some(MISSING_EXIT), b"", b"")
+            .expect_err("the sentinel must fail");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(missing.to_string().contains("/etc"));
+
+        let signalled = interpret_list_output(Path::new("/etc"), None, b"", b"")
+            .expect_err("a killed listing must fail");
+        assert_ne!(signalled.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_direct_listing_reports_only_the_prefixed_regular_files() {
+        let dir = TempDir::new("host-direct-list");
+        seed_listing_dir(dir.path());
+
+        let listed = DirectFs
+            .list_backup_candidates(&dir.join("fstab"))
+            .expect("the directory is readable");
+
+        assert_eq!(sorted_names(&listed), expected_candidate_names());
+        for candidate in &listed {
+            let on_disk = fs::metadata(dir.path().join(&candidate.name)).expect("stat");
+            assert_eq!(candidate.size_bytes, on_disk.len());
+            assert!(candidate.size_bytes > 0);
+            assert!(
+                candidate.modified_unix_secs.is_some(),
+                "a file on a local filesystem has a modification time: {candidate:?}"
+            );
+        }
+    }
+
+    /// The directory's own absence is the one failure this method reports,
+    /// and it has to be `NotFound`; a target with no file name has no
+    /// siblings rather than an error.
+    #[test]
+    fn a_direct_listing_fails_only_on_the_directory_itself() {
+        let dir = TempDir::new("host-direct-list-missing");
+
+        let error = DirectFs
+            .list_backup_candidates(&dir.join("nowhere/fstab"))
+            .expect_err("a missing directory must fail");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+        assert_eq!(
+            DirectFs
+                .list_backup_candidates(Path::new("/"))
+                .expect("a path with no file name is not a failure"),
+            Vec::new()
+        );
+    }
+
+    /// The test that keeps the two implementations honest: [`LIST_SCRIPT`]
+    /// is run by a real local `sh` against a real directory (no
+    /// `flatpak-spawn` involved - this exercises the shell code, which is
+    /// the half unit tests otherwise never execute) and its output, parsed
+    /// by [`interpret_list_output`], must equal what [`DirectFs`] reports
+    /// for the same directory.
+    #[test]
+    fn the_list_script_and_the_direct_listing_agree_on_one_directory() {
+        let dir = TempDir::new("host-list-script");
+        seed_listing_dir(dir.path());
+
+        let output = Command::new(SH)
+            .arg("-c")
+            .arg(LIST_SCRIPT)
+            .arg(SH)
+            .arg(dir.path())
+            .arg("fstab")
+            .output()
+            .expect("sh and stat exist on a development machine");
+        let mut from_script = interpret_list_output(
+            dir.path(),
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        )
+        .expect("the script's own output must be well-formed");
+        let mut direct = DirectFs
+            .list_backup_candidates(&dir.join("fstab"))
+            .expect("the directory is readable");
+
+        for candidates in [&mut from_script, &mut direct] {
+            candidates.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        assert_eq!(from_script, direct);
+        assert_eq!(sorted_names(&from_script), expected_candidate_names());
+        assert!(
+            from_script
+                .iter()
+                .any(|candidate| candidate.name.as_bytes().contains(&b'\n')),
+            "the name holding a newline must come back from the script too: {from_script:?}"
+        );
+
+        // An absent directory is the sentinel, from the script itself.
+        let missing = Command::new(SH)
+            .arg("-c")
+            .arg(LIST_SCRIPT)
+            .arg(SH)
+            .arg(dir.join("nowhere"))
+            .arg("fstab")
+            .output()
+            .expect("sh exists");
+        assert_eq!(missing.status.code(), Some(MISSING_EXIT));
+    }
+
     #[test]
     fn the_unsandboxed_elevation_plan_is_pkexec_on_this_binary() {
-        let plan = elevated_self_plan_with(
+        let plan = elevated_plan_with(
             false,
             || Ok(PathBuf::from("/usr/bin/rustab")),
-            || panic!("the host binary must not be looked for outside a sandbox"),
+            || panic!("the host helper must not be looked for outside a sandbox"),
             "--internal-privileged-write",
         )
         .expect("the plan must be buildable");
@@ -891,14 +2029,17 @@ mod tests {
         );
     }
 
+    /// The sandboxed shape, literally: the **helper** on the host, and no
+    /// flag - `rustab-helper` refuses any argument, so passing the GUI's
+    /// hidden flag would make every elevated operation fail.
     #[test]
-    fn the_sandboxed_elevation_plan_host_spawns_pkexec_on_the_host_binary() {
-        let plan = elevated_self_plan_with(
+    fn the_sandboxed_elevation_plan_host_spawns_pkexec_on_the_host_helper() {
+        let plan = elevated_plan_with(
             true,
             || panic!("current_exe is meaningless inside the sandbox and must not be consulted"),
             || {
                 Ok(PathBuf::from(
-                    "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab",
+                    "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper",
                 ))
             },
             "--internal-privileged-write",
@@ -908,17 +2049,16 @@ mod tests {
         assert_eq!(
             plan.to_string(),
             "flatpak-spawn --host pkexec \
-             /var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab \
-             --internal-privileged-write"
+             /var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
         );
     }
 
     #[test]
-    fn an_unfindable_host_binary_fails_the_plan_rather_than_guessing() {
-        let error = elevated_self_plan_with(
+    fn an_unfindable_host_helper_fails_the_plan_rather_than_guessing() {
+        let error = elevated_plan_with(
             true,
             || panic!("not consulted"),
-            || host_binary(None, None, &|_| Ok(false)),
+            || host_helper_binary(None, None, &|_| Ok(false)),
             "--internal-privileged-write",
         )
         .expect_err("a plan that cannot name a real binary must fail");
@@ -926,8 +2066,14 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains(SYSTEM_INSTALLATION));
         assert!(
-            error.to_string().contains("no Rustab executable was found"),
-            "the message must say the installation is missing: {error}"
+            error
+                .to_string()
+                .contains("no rustab-helper executable was found"),
+            "the message must name the helper that is missing: {error}"
+        );
+        assert!(
+            error.to_string().contains("bin/rustab-helper"),
+            "the message must name the paths that were tried: {error}"
         );
     }
 
@@ -938,7 +2084,7 @@ mod tests {
     /// missing installation.
     #[test]
     fn a_probe_that_cannot_reach_the_host_is_not_reported_as_a_missing_binary() {
-        let error = host_binary(None, None, &|_| {
+        let error = host_helper_binary(None, None, &|_| {
             Err(io::Error::other("Portal call failed: ServiceUnknown"))
         })
         .expect_err("an unanswerable probe must fail");
@@ -955,10 +2101,10 @@ mod tests {
     #[test]
     fn a_single_failed_probe_does_not_hide_a_candidate_that_does_exist() {
         let home = OsString::from("/home/u");
-        let candidates = host_binary_candidates(Some(SANDBOX_INFO), Some(&home));
+        let candidates = host_helper_candidates(Some(SANDBOX_INFO), Some(&home));
         let system_install = candidates[2].clone();
 
-        let picked = host_binary(Some(SANDBOX_INFO.to_string()), Some(home), &|candidate| {
+        let picked = host_helper_binary(Some(SANDBOX_INFO.to_string()), Some(home), &|candidate| {
             if candidate == system_install {
                 Ok(true)
             } else {
@@ -970,37 +2116,107 @@ mod tests {
         assert_eq!(picked, system_install);
     }
 
+    /// The batched shape, literally: one script, then every path as a
+    /// positional argument after the `$0` filler - never one spawn per path.
+    #[test]
+    fn the_batched_existence_plan_passes_every_path_to_one_flatpak_spawn() {
+        let plan = exists_batch_plan(&["/boot", "/mnt/My Disk", "/opt"]);
+
+        assert_eq!(
+            plan.to_string(),
+            "flatpak-spawn --host sh -c ".to_string()
+                + EXISTS_BATCH_SCRIPT
+                + " sh /boot /mnt/My Disk /opt"
+        );
+        // A path with a space is one argument, whatever the Display joining
+        // above looks like.
+        assert_eq!(plan.args.len(), 8);
+        assert_eq!(plan.args[6], OsString::from("/mnt/My Disk"));
+    }
+
+    #[test]
+    fn a_batched_existence_answer_is_one_verdict_per_path_in_order() {
+        let paths = ["/etc/fstab", "/nope", "/boot"];
+
+        assert_eq!(
+            interpret_exists_batch_output(&paths, Some(0), b"101", b"")
+                .expect("a well-formed answer must be accepted"),
+            vec![true, false, true]
+        );
+    }
+
+    /// Every malformed reply is an error rather than a guessed verdict: a
+    /// wrong answer here becomes a confident "this mount point does not
+    /// exist" warning about a path nobody looked at.
+    #[test]
+    fn a_malformed_batched_existence_answer_is_an_error() {
+        let paths = ["/etc/fstab", "/nope"];
+
+        for (code, stdout, stderr) in [
+            (Some(0), &b"1"[..], &b""[..]),
+            (Some(0), &b"111"[..], &b""[..]),
+            (Some(0), &b"1x"[..], &b""[..]),
+            (Some(0), &b""[..], &b""[..]),
+            (Some(1), &b"10"[..], &b"Portal call failed\n"[..]),
+            (None, &b""[..], &b""[..]),
+        ] {
+            let error = interpret_exists_batch_output(&paths, code, stdout, stderr)
+                .expect_err("a malformed answer must fail");
+            assert!(
+                error.to_string().contains("host"),
+                "the message must say who could not answer: {error}"
+            );
+        }
+
+        let denied = interpret_exists_batch_output(&paths, Some(1), b"", b"Portal call failed\n")
+            .expect_err("a denied portal must fail");
+        assert!(denied.to_string().contains("Portal call failed"));
+    }
+
+    /// Nothing to ask means nothing is spawned - asserted on the real
+    /// [`HostSpawn`], since an empty list is the one input it can be given
+    /// outside a sandbox without reaching for `flatpak-spawn`.
+    #[test]
+    fn an_empty_batched_existence_query_spawns_nothing() {
+        assert_eq!(
+            HostSpawn.paths_exist(&[]).expect("nothing to answer"),
+            Vec::<bool>::new()
+        );
+    }
+
     #[test]
     fn the_host_existence_plan_is_a_flatpak_spawn_of_the_existence_script() {
-        let plan = exists_plan(Path::new("/var/lib/flatpak/app/x/files/bin/rustab"));
+        let plan = exists_plan(Path::new("/var/lib/flatpak/app/x/files/bin/rustab-helper"));
 
         assert_eq!(
             plan.to_string(),
             "flatpak-spawn --host sh -c ".to_string()
                 + EXISTS_SCRIPT
-                + " sh /var/lib/flatpak/app/x/files/bin/rustab"
+                + " sh /var/lib/flatpak/app/x/files/bin/rustab-helper"
         );
     }
 
     #[test]
     fn the_app_path_from_flatpak_info_is_the_first_candidate() {
-        let candidates = host_binary_candidates(Some(SANDBOX_INFO), Some(OsStr::new("/home/u")));
+        let candidates = host_helper_candidates(Some(SANDBOX_INFO), Some(OsStr::new("/home/u")));
 
         assert_eq!(
             candidates[0],
             PathBuf::from(
-                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/x86_64/test/abc/files/bin/rustab"
+                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/x86_64/test/abc/files/bin/rustab-helper"
             )
         );
         assert_eq!(
             candidates[1],
             PathBuf::from(
-                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )
         );
         assert_eq!(
             candidates[2],
-            PathBuf::from("/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab")
+            PathBuf::from(
+                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
+            )
         );
     }
 
@@ -1009,15 +2225,15 @@ mod tests {
     #[test]
     fn the_system_install_is_always_a_candidate() {
         assert_eq!(
-            host_binary_candidates(None, None),
+            host_helper_candidates(None, None),
             vec![PathBuf::from(
-                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )]
         );
         assert_eq!(
-            host_binary_candidates(Some("[Application]\nname=x\n"), Some(OsStr::new(""))),
+            host_helper_candidates(Some("[Application]\nname=x\n"), Some(OsStr::new(""))),
             vec![PathBuf::from(
-                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/var/lib/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )]
         );
     }
@@ -1041,10 +2257,10 @@ mod tests {
     #[test]
     fn the_first_candidate_that_exists_is_used() {
         let home = OsString::from("/home/u");
-        let candidates = host_binary_candidates(Some("app-path=/nowhere/files\n"), Some(&home));
+        let candidates = host_helper_candidates(Some("app-path=/nowhere/files\n"), Some(&home));
         let user_install = candidates[1].clone();
 
-        let picked = host_binary(
+        let picked = host_helper_binary(
             Some("app-path=/nowhere/files\n".to_string()),
             Some(home),
             &|candidate| Ok(candidate == user_install),
@@ -1055,7 +2271,7 @@ mod tests {
         assert_eq!(
             picked,
             PathBuf::from(
-                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab"
+                "/home/u/.local/share/flatpak/app/dev.tomsk.Rustab/current/active/files/bin/rustab-helper"
             )
         );
     }

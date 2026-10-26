@@ -1090,7 +1090,13 @@ pub fn app_shell() -> Html {
     let on_backup_delete = {
         let backup_delete_target = backup_delete_target.clone();
         let backup_delete_error = backup_delete_error.clone();
+        let backups = backups.clone();
         Callback::from(move |idx: usize| {
+            // Defensive: `BackupListItem` never wires Delete to a
+            // non-deletable row, but don't trust the index blindly either.
+            if !backups.get(idx).is_some_and(|b| b.deletable) {
+                return;
+            }
             backup_delete_error.set(None);
             backup_delete_target.set(Some(idx));
         })
@@ -1389,8 +1395,15 @@ pub fn app_shell() -> Html {
         .and_then(|t| t.real_target_backup_fallback_dir.clone())
         .map(AttrValue::from);
 
+    // The webview's native Back/Forward/Stop/Reload menu has no use here -
+    // suppressed app-wide, leaving only the entry row's own custom menu.
+    let suppress_native_context_menu = Callback::from(|event: MouseEvent| event.prevent_default());
+
     html! {
-        <div class="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100">
+        <div
+            class="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100"
+            oncontextmenu={suppress_native_context_menu}
+        >
             if let Some(info) = &*target {
                 <TargetBanner
                     path={AttrValue::from(info.path.clone())}

@@ -38,20 +38,27 @@
 //!
 //! ## Where the real file's manual backups live
 //!
-//! A third, layered decision: a process that can't enumerate `/etc/` (a
-//! Flatpak sandbox, which sees only the runtime's `/etc`) keeps the real
-//! `/etc/fstab`'s manually managed backups in a per-user fallback
-//! directory instead (see [`crate::backup_location`]).
-//! [`backup_target_path`] points every backup command at a mirror file in
-//! that directory, redirecting all of them with no change to the
-//! functions doing the work, and [`backups_are_elevated`] then answers
-//! `false`, since that directory needs no `pkexec`.
+//! A third, layered decision: a process that can't create or unlink files
+//! in `/etc/` (a Flatpak sandbox, whose in-process `/etc` is the
+//! runtime's) keeps the real `/etc/fstab`'s *manually* created backups in
+//! a per-user fallback directory instead (see
+//! [`crate::backup_location`]). [`backup_target_path`] points every
+//! backup command at a mirror file in that directory, redirecting all of
+//! them with no change to the functions doing the work, and
+//! [`backups_are_elevated`] then answers `false`, since that directory
+//! needs no `pkexec`.
 //!
 //! Nothing about *writing* changes: a save still writes the real
 //! `/etc/fstab` through the elevated helper and leaves its automatic
-//! backup beside it in `/etc/`. Those automatic backups just aren't
-//! visible in a fallback-mode [`list_backups`] - spelled out in
-//! [`crate::backup_location`]'s docs and surfaced via
+//! backup beside it in `/etc/`. Those automatic backups are listed too,
+//! not just written: [`list_backups_for`] merges the fallback directory's
+//! rows with a host-side listing of the real file's own directory
+//! ([`crate::host_backups`], through the same [`crate::host`] seam every
+//! read of the real file uses), and [`restore_backup`]/[`read_backup`]
+//! resolve against both ([`resolve_backup`]). Only creating and deleting
+//! stay fallback-directory-only, so the `/etc/` rows are marked
+//! [`BackupInfoDto::deletable`]`== false`; the directory this session's
+//! own backups go to is surfaced via
 //! [`TargetInfoDto::real_target_backup_fallback_dir`].
 //!
 //! ## How the real file is read, and how the elevated helper starts
@@ -69,6 +76,15 @@
 //! `flatpak-spawn`. The elevated write path's own change lives in
 //! [`crate::privileged`] and [`crate::host`]; this module's dispatch is unaffected.
 //!
+//! The same applies to the two system tools `fstab-core` shells out to:
+//! `findmnt --verify` and `lsblk` only describe the machine their own
+//! process can see, so every command here that triggers one
+//! ([`validate_candidate`], [`discover_devices`], and
+//! [`save_document_with`]'s non-elevated branch) passes
+//! [`crate::host::command_runner`] to `fstab-core`'s runner-taking entry
+//! point. Inside a sandbox they run on the host; everywhere else, in this
+//! process, exactly as before.
+//!
 //! ## Why every command is `#[tauri::command(async)]`
 //!
 //! Several do blocking work: `lsblk`, `findmnt`, file I/O, and a `pkexec`
@@ -85,7 +101,7 @@
 //! snake_case keeps the whole payload consistent.
 
 use crate::backup_location::{self, BackupLocation};
-use crate::backups;
+use crate::backups::{self, BackupError};
 use crate::dto::{
     BackupInfoDto, CommandErrorDto, CommandErrorKindDto, CreateBackupErrorDto,
     CreateBackupErrorKindDto, CreateBackupOutcomeDto, DeleteBackupErrorDto,
@@ -93,8 +109,9 @@ use crate::dto::{
     TargetInfoDto, ValidationReportDto, WriteErrorDto, WriteErrorKindDto, WriteOutcomeDto,
 };
 use crate::host::{self, RealFileReader};
+use crate::host_backups;
 use crate::privileged;
-use crate::target::{self, ActiveTarget, TargetSource};
+use crate::target::{self, ActiveTarget, ExternalChangeGuardExt, TargetSource};
 use fstab_core::model::Document;
 use fstab_core::{discovery, parser, validate, writer};
 use std::fs;
@@ -128,6 +145,11 @@ pub fn get_target_info() -> Result<TargetInfoDto, CommandErrorDto> {
 /// `exists: false` with empty text and no lines, which is the correct
 /// starting state for a first-ever save.
 ///
+/// Routes through the injected [`RealFileReader`] for
+/// [`TargetSource::Environment`] only: that target can be `/etc/fstab`
+/// itself, which a bare `fs::read` can't see in a Flatpak sandbox
+/// (`docs/FLATPAK.md` §3.1). The draft target stays a plain `fs::read`.
+///
 /// # Errors
 ///
 /// [`CommandErrorKindDto::TargetResolution`] if the target could not be
@@ -136,10 +158,28 @@ pub fn get_target_info() -> Result<TargetInfoDto, CommandErrorDto> {
 /// UTF-8.
 #[tauri::command(async)]
 pub fn list_entries() -> Result<DocumentViewDto, CommandErrorDto> {
-    let target = resolve_target()?;
-    let info = describe_target(&target, backup_location::real_target_location());
+    list_entries_with(
+        &resolve_target()?,
+        host::real_file_reader(),
+        backup_location::real_target_location(),
+    )
+}
 
-    let (exists, text) = match fs::read(&target.path) {
+/// Testable body of [`list_entries`]: takes the reader as a parameter so a
+/// test can exercise the `Environment` branch without a sandbox.
+fn list_entries_with(
+    target: &ActiveTarget,
+    real_reader: &dyn RealFileReader,
+    location: &BackupLocation,
+) -> Result<DocumentViewDto, CommandErrorDto> {
+    let info = describe_target(target, location);
+
+    let read_result = match target.source {
+        TargetSource::Environment => real_reader.read(&target.path),
+        TargetSource::SandboxDefault => fs::read(&target.path),
+    };
+
+    let (exists, text) = match read_result {
         Ok(bytes) => {
             // Deliberately *not* `from_utf8_lossy`. A lossy read would show
             // the user a file with U+FFFD where their bytes were, and a save
@@ -216,14 +256,17 @@ pub fn resync_external_change() -> Result<DocumentViewDto, CommandErrorDto> {
 
 /// Validates a candidate document without writing anything.
 ///
-/// Runs the identical [`validate::validate`] call a save runs, so the
-/// findings shown in the form are the findings that will block (or not block)
-/// the save. Nothing on disk is touched: the semantic `findmnt --verify`
-/// check inside `validate` renders the candidate to its own throwaway temp
-/// file, never to the target.
+/// Runs the identical validation a save runs, so the findings shown in the
+/// form are the findings that will block (or not block) the save. Nothing
+/// on disk is touched: the semantic `findmnt --verify` check inside
+/// `validate_with` renders the candidate to its own throwaway temp file,
+/// never to the target.
 #[tauri::command(async, rename_all = "snake_case")]
 pub fn validate_candidate(candidate: DocumentDto) -> ValidationReportDto {
-    ValidationReportDto::from(&validate::validate(&Document::from(candidate)))
+    ValidationReportDto::from(&validate::validate_with(
+        &Document::from(candidate),
+        host::command_runner(),
+    ))
 }
 
 /// Renders a candidate document to the exact text a save would write.
@@ -289,30 +332,32 @@ pub fn save(
 /// Needs no privilege escalation either way, since `/etc/` and the
 /// backups in it are world-readable.
 ///
-/// A session that can't enumerate `/etc/` (a Flatpak sandbox) lists the
-/// real file's backups from the fallback directory instead
-/// ([`crate::backup_location`]), so it does **not** list the automatic
-/// backups each save leaves beside `/etc/fstab` - those are confirmed to
-/// still be written by the elevated writer, just invisible from here. The
-/// frontend says so via [`TargetInfoDto::real_target_backup_fallback_dir`].
-///
-/// This is also the one backup operation that stayed unprivileged-only
-/// rather than moving into `/etc/` for a sandboxed session: it calls
-/// [`writer::list_backups`] in-process, where the `/etc` it would
-/// enumerate is the runtime's. See [`crate::backup_location`]'s docs for
-/// the full decision.
+/// A session that can't *manage* files in `/etc/` (a Flatpak sandbox,
+/// which sees the runtime's `/etc` in-process) keeps its own manual
+/// backups in the fallback directory ([`crate::backup_location`]) and
+/// lists **both** sources: that directory, plus the automatic backups each
+/// elevated save leaves beside the real `/etc/fstab`, enumerated on the
+/// host through [`crate::host_backups`]. The two are merged into one
+/// newest-first list by [`list_backups_for`]; the `/etc/` rows carry
+/// [`BackupInfoDto::deletable`]`== false`, since this session can restore
+/// and show them but not unlink them. The frontend says which directory
+/// its own backups go to via
+/// [`TargetInfoDto::real_target_backup_fallback_dir`].
 ///
 /// # Errors
 ///
 /// [`CommandErrorKindDto::TargetResolution`] if the target could not be
 /// determined, [`CommandErrorKindDto::ListBackups`] if the backup-owning
-/// directory could not be read.
+/// directory could not be read - or, in fallback mode, if the real file's
+/// directory could not be listed on the host, which fails the command
+/// rather than returning the half of the list that worked.
 #[tauri::command(async)]
 pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
     let target = resolve_target()?;
     list_backups_for(
         &target,
         real_fstab(),
+        host::real_file_reader(),
         backup_location::real_target_location(),
     )
 }
@@ -334,9 +379,11 @@ pub fn list_backups() -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
 /// inherits the dual write with no write code of its own: on a default
 /// launch, restoring writes the real `/etc/fstab` and mirrors it into
 /// the working draft, exactly as a save does. `backup_path` resolves
-/// against [`backup_target_path`]'s list, so on a default launch the
-/// backup being restored is always one of the real `/etc/fstab`'s - the
-/// same list [`list_backups`] offers the user.
+/// against exactly the list [`list_backups`] offered the user
+/// ([`resolve_backup`]) - the real `/etc/fstab`'s own backups on a
+/// default launch, and in fallback mode either one of those, read off the
+/// host, or one from the fallback directory. Which side it came from
+/// changes only how it is read; the write is the same elevated one.
 ///
 /// # Errors
 ///
@@ -370,8 +417,10 @@ pub fn restore_backup(
 /// Returns a backup's raw text, for the backup-diff view.
 ///
 /// `backup_path` must be one of the paths [`list_backups`] returned for
-/// the current target, resolved against [`backup_target_path`]'s backup
-/// list exactly as [`restore_backup`] resolves it (see [`crate::backups`]).
+/// the current target, resolved exactly as [`restore_backup`] resolves it
+/// ([`resolve_backup`]) - which in fallback mode includes the real
+/// `/etc/fstab`'s own backups, read off the host so the diff view works
+/// for them too.
 ///
 /// Writes nothing and needs no privilege escalation, since `/etc/fstab`
 /// and its backups are world-readable. Pair the returned text with
@@ -390,6 +439,7 @@ pub fn read_backup(backup_path: String) -> Result<String, CommandErrorDto> {
     read_backup_of(
         &target,
         real_fstab(),
+        host::real_file_reader(),
         backup_location::real_target_location(),
         &backup_path,
     )
@@ -468,7 +518,7 @@ pub fn create_backup() -> Result<BackupInfoDto, CreateBackupErrorDto> {
 /// (`docs/SPEC.md` §8).
 #[tauri::command(async)]
 pub fn discover_devices() -> DeviceDiscoveryDto {
-    DeviceDiscoveryDto::from(&discovery::discover_devices())
+    DeviceDiscoveryDto::from(&discovery::discover_devices_with(host::command_runner()))
 }
 
 /// Opens the directory holding this session's backups in the host file
@@ -689,7 +739,7 @@ fn refresh_backup_mirror(
 /// rendered for display, so the notice shown and the directory the
 /// backup commands act on are one answer, not two that could disagree.
 fn describe_target(target: &ActiveTarget, location: &BackupLocation) -> TargetInfoDto {
-    TargetInfoDto::describe(target, backup_fallback_dir(target, location))
+    target::describe(target, backup_fallback_dir(target, location))
 }
 
 /// Whether *mutating* this session's backups needs the elevated helper.
@@ -719,24 +769,96 @@ fn describe_target(target: &ActiveTarget, location: &BackupLocation) -> TargetIn
 /// Note what this does *not* gate: [`list_backups`], [`read_backup`] and
 /// [`open_backup_location`] never consult it, because `/etc/` and the backups
 /// in it are world-readable - only creating and unlinking a file there needs
-/// root.
+/// root. That is also why a fallback-mode session can list and read the real
+/// file's own backups in `/etc/` at all (through [`crate::host_backups`]),
+/// while this predicate still keeps its create/delete out of that directory.
 fn backups_are_elevated(target: &ActiveTarget, location: &BackupLocation) -> bool {
     backups_belong_to_the_real_fstab(target) && backup_fallback_dir(target, location).is_none()
 }
 
-/// The body of [`list_backups`], with the target, real-file path, and
-/// backup location passed in (see [`backup_target_path`]).
+/// The body of [`list_backups`], with the target, real-file path, host
+/// reader and backup location passed in (see [`backup_target_path`]).
 ///
 /// Doesn't refresh the fallback directory's mirror file: listing
 /// enumerates files already there, and the mirror isn't one of them
 /// (see [`refresh_backup_mirror`]).
+///
+/// ## The two sources in fallback mode
+///
+/// Colocated mode has exactly one source, [`backups::list`] on the
+/// backup-owning path, and this function is the one-line delegation it
+/// always was. In fallback mode there are two directories holding backups
+/// of the same file, and the panel shows both:
+///
+/// - the fallback directory, listed in-process - the backups this session
+///   created itself, every row `deletable: true`;
+/// - the real file's own directory in the host's `/etc/`, listed through
+///   `real_reader` ([`crate::host_backups`]) - the automatic backups each
+///   elevated save leaves there, every row `deletable: false`, since this
+///   process can read them but not unlink them.
+///
+/// The merged list is sorted by age rather than by source, so a restore
+/// point is found where its timestamp says it is - see [`newest_first`]
+/// for the exact order, including what happens to two backups taken in the
+/// same second. A stable sort, so rows that compare equal keep the order
+/// their own source listed them in.
+///
+/// A failed host listing fails the whole command instead of returning the
+/// half that worked: "these are your restore points" and "these are the
+/// restore points we could see" are different claims, and silently making
+/// the second look like the first is how a user restores an older backup
+/// than the one they wanted.
 fn list_backups_for(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
 ) -> Result<Vec<BackupInfoDto>, CommandErrorDto> {
-    backups::list(&backup_target_path(target, real_fstab, location))
-        .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::ListBackups, err.to_string()))
+    let mut rows = backups::list(&backup_target_path(target, real_fstab, location))
+        .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::ListBackups, err.to_string()))?;
+
+    if backup_fallback_dir(target, location).is_some() {
+        let real = colocated_backup_target_path(target, real_fstab);
+        let host_rows = host_backups::list(&real, real_reader).map_err(|err| {
+            CommandErrorDto::new(
+                CommandErrorKindDto::ListBackups,
+                format!(
+                    "could not list the backups beside {} on the host: {err}",
+                    real.display()
+                ),
+            )
+        })?;
+        rows.extend(host_rows);
+        rows.sort_by(newest_first);
+    }
+
+    Ok(rows)
+}
+
+/// Orders two backup rows newest first: by `created_unix_secs`
+/// descending, an absent timestamp last, `path` descending as the tiebreak.
+///
+/// Only used for the merged two-source list in fallback mode; each source
+/// on its own already reports newest first, and a single-source listing is
+/// left exactly as that source ordered it.
+///
+/// The timestamps are whole seconds (that is all a host-side `stat` is
+/// asked for), so two backups taken in the same second need a tiebreak
+/// that is both deterministic and not visibly wrong. Descending *path* is
+/// both: a backup's name ends in `.<secs>.<nanos>`, zero-padded by
+/// `fstab_core::writer` precisely so names sort chronologically, so for
+/// two rows from the same directory this is the sub-second order, and the
+/// merged list agrees with what colocated mode shows for the same files.
+/// Across the two directories it is arbitrary - there is nothing finer to
+/// compare - but still stable from one listing to the next.
+fn newest_first(left: &BackupInfoDto, right: &BackupInfoDto) -> std::cmp::Ordering {
+    match (left.created_unix_secs, right.created_unix_secs) {
+        (Some(left_secs), Some(right_secs)) => right_secs.cmp(&left_secs),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| right.path.cmp(&left.path))
 }
 
 /// The body of [`resync_external_change`], with the real-file path
@@ -830,18 +952,113 @@ fn resync_external_change_with(
     })
 }
 
+/// One of the active session's backups, together with which side of the
+/// sandbox boundary it was found on - the two cases
+/// [`list_backups_for`]'s rows come from.
+///
+/// Carries the distinction rather than re-deriving it from the path,
+/// because reading the two is not the same operation: a `Host` backup has
+/// to go through the [`RealFileReader`] seam, which a plain `fs::read` of
+/// the identical path would silently get wrong inside a sandbox (it would
+/// read the runtime's `/etc/`, or nothing at all).
+enum ResolvedBackup {
+    /// In a directory this process can read itself - the target's own in
+    /// colocated mode, the fallback directory in fallback mode. Always
+    /// `deletable` in the list it came from.
+    Local(PathBuf),
+    /// Beside the real `/etc/fstab` on the host, listed through
+    /// [`crate::host_backups`] in fallback mode only. Restorable and
+    /// readable, never deletable from here.
+    Host(PathBuf),
+}
+
+impl ResolvedBackup {
+    /// The resolved path, which in both cases came from a listing this
+    /// process took - never from the frontend's argument.
+    fn path(&self) -> &Path {
+        match self {
+            ResolvedBackup::Local(path) | ResolvedBackup::Host(path) => path,
+        }
+    }
+
+    /// How to name this backup in a failure message: the path, plus where
+    /// it was being read from when the host seam was involved, since
+    /// "could not read X" is a confusing report for a path the user can
+    /// `cat` outside the sandbox.
+    fn describe(&self) -> String {
+        match self {
+            ResolvedBackup::Local(path) => path.display().to_string(),
+            ResolvedBackup::Host(path) => format!("{} on the host", path.display()),
+        }
+    }
+}
+
+/// Resolves a frontend-supplied `requested` path against the backups this
+/// session actually listed - the shared first step of [`restore_backup`]
+/// and [`read_backup`].
+///
+/// Tries the local list first ([`backups::resolve_requested`] on
+/// [`backup_target_path`], the only list there is in colocated mode), and
+/// **only in fallback mode** falls back to the host-side list of the real
+/// file's own backups ([`host_backups::resolve_requested`]). That order
+/// matters: the local check is a `stat`-based identity comparison, the
+/// host one literal path equality, so a path that can be matched without
+/// crossing the sandbox boundary is.
+///
+/// Both halves refuse anything they did not list, so this function never
+/// turns a frontend string into a path it would otherwise not touch - the
+/// property both [`crate::backups`]' and [`crate::host_backups`]' module
+/// docs spell out. A listing that could not be taken at all propagates as
+/// [`BackupError::List`] rather than becoming "not a backup of this
+/// target": the caller reports both as one kind, but the message has to
+/// say which happened.
+fn resolve_backup(
+    target: &ActiveTarget,
+    real_fstab: &Path,
+    location: &BackupLocation,
+    real_reader: &dyn RealFileReader,
+    requested: &str,
+) -> Result<ResolvedBackup, BackupError> {
+    let owner = backup_target_path(target, real_fstab, location);
+    match backups::resolve_requested(&owner, requested) {
+        Ok(backup) => Ok(ResolvedBackup::Local(backup)),
+        Err(BackupError::NotABackupOfTarget { .. })
+            if backup_fallback_dir(target, location).is_some() =>
+        {
+            let real = colocated_backup_target_path(target, real_fstab);
+            host_backups::resolve_requested(&real, requested, real_reader).map(ResolvedBackup::Host)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Reads a backup [`resolve_backup`] resolved, through whichever of the two
+/// readers its side of the boundary needs.
+///
+/// # Errors
+///
+/// The underlying [`io::Error`], including [`io::ErrorKind::InvalidData`]
+/// for content that is not valid UTF-8 - the same refusal, with the same
+/// wording, from either source.
+fn read_resolved(backup: &ResolvedBackup, real_reader: &dyn RealFileReader) -> io::Result<String> {
+    match backup {
+        ResolvedBackup::Local(path) => backups::read_text(path),
+        ResolvedBackup::Host(path) => host_backups::read_text(path, real_reader),
+    }
+}
+
 /// The body of [`restore_backup`], with the real-file path and the
 /// elevated half of the save injectable.
 ///
-/// Two steps: resolve `backup_path` against [`backup_target_path`]'s
-/// backup list (the real `/etc/fstab`'s, for a default launch, or the
-/// fallback directory's list when that's what [`list_backups`] offered),
-/// then hand the backup's parsed text to [`save_document_with`]
-/// unchanged - that's where the dual write and the external-change check
-/// live, so a restore inherits both with no write code of its own. Where
-/// a backup is *stored* says nothing about where restoring it writes:
-/// step two still writes the real `/etc/fstab` through the same single
-/// elevated call.
+/// Two steps: resolve `backup_path` against the list [`list_backups`]
+/// offered ([`resolve_backup`] - the fallback directory's backups *and*
+/// the real file's own, in fallback mode), then hand the backup's parsed
+/// text to [`save_document_with`] unchanged - that's where the dual write
+/// and the external-change check live, so a restore inherits both with no
+/// write code of its own. Where a backup is *stored* says nothing about
+/// where restoring it writes: step two still writes the real `/etc/fstab`
+/// through the same single elevated call, including for a backup read off
+/// the host beside it.
 fn restore_backup_with(
     target: &ActiveTarget,
     real_fstab: &Path,
@@ -855,28 +1072,27 @@ fn restore_backup_with(
         &target::ExternalChangeGuard,
     ) -> Result<WriteOutcomeDto, WriteErrorDto>,
 ) -> Result<WriteOutcomeDto, WriteErrorDto> {
-    let owner = backup_target_path(target, real_fstab, location);
-
     // Both "list unreadable" and "path not in it" report as `InvalidBackup`:
     // same frontend situation (unusable, nothing written), message says which.
-    let backup = backups::resolve_requested(&owner, backup_path).map_err(|err| {
-        WriteErrorDto::new(
-            WriteErrorKindDto::InvalidBackup,
-            true,
-            format!("{err}; nothing was restored"),
-        )
-    })?;
+    let backup =
+        resolve_backup(target, real_fstab, location, real_reader, backup_path).map_err(|err| {
+            WriteErrorDto::new(
+                WriteErrorKindDto::InvalidBackup,
+                true,
+                format!("{err}; nothing was restored"),
+            )
+        })?;
 
-    let text = backups::read_text(&backup).map_err(|err| {
+    let text = read_resolved(&backup, real_reader).map_err(|err| {
         WriteErrorDto::new(
             WriteErrorKindDto::ReadBackup,
             true,
             format!(
                 "could not read the backup {}: {err}; nothing was restored",
-                backup.display()
+                backup.describe()
             ),
         )
-        .with_path(&backup)
+        .with_path(backup.path())
     })?;
 
     save_document_with(
@@ -1031,25 +1247,32 @@ fn save_document_with(
             candidate,
             &target::ExternalChangeGuard::unchecked(),
         ),
-        TargetSource::Environment => writer::write_document(&target.path, candidate)
-            .map(|outcome| WriteOutcomeDto::from_outcome(&outcome, false))
-            .map_err(|err| WriteErrorDto::from(&err)),
+        TargetSource::Environment => {
+            writer::write_document_with_runner(&target.path, candidate, host::command_runner())
+                .map(|outcome| WriteOutcomeDto::from_outcome(&outcome, false))
+                .map_err(|err| WriteErrorDto::from(&err))
+        }
     }
 }
 
-/// The body of [`read_backup`], with the target and the real-file path
-/// passed in, for the same reason as [`save_document`].
+/// The body of [`read_backup`], with the target, the real-file path and
+/// the host reader passed in, for the same reason as [`save_document`].
+///
+/// Resolves and reads through [`resolve_backup`]/[`read_resolved`], the
+/// same pair [`restore_backup_with`] uses, so the diff view can show any
+/// row the panel listed - including, in fallback mode, one of the real
+/// file's own backups read off the host.
 fn read_backup_of(
     target: &ActiveTarget,
     real_fstab: &Path,
+    real_reader: &dyn RealFileReader,
     location: &BackupLocation,
     backup_path: &str,
 ) -> Result<String, CommandErrorDto> {
-    let owner = backup_target_path(target, real_fstab, location);
-    let backup = backups::resolve_requested(&owner, backup_path)
+    let backup = resolve_backup(target, real_fstab, location, real_reader, backup_path)
         .map_err(|err| CommandErrorDto::new(CommandErrorKindDto::InvalidBackup, err.to_string()))?;
 
-    backups::read_text(&backup).map_err(|err| {
+    read_resolved(&backup, real_reader).map_err(|err| {
         // `InvalidData` is the not-valid-UTF-8 case, already a kind of its
         // own the frontend handles for the target; reuse it here too.
         let kind = if err.kind() == io::ErrorKind::InvalidData {
@@ -1059,7 +1282,7 @@ fn read_backup_of(
         };
         CommandErrorDto::new(
             kind,
-            format!("could not read the backup {}: {err}", backup.display()),
+            format!("could not read the backup {}: {err}", backup.describe()),
         )
     })
 }
@@ -1474,6 +1697,71 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         }
     }
 
+    /// T41: an `Environment` target unreachable by a bare `fs::read` (e.g.
+    /// `/etc/fstab` under Flatpak) must still load, through the reader.
+    #[test]
+    fn list_entries_for_an_environment_target_reads_through_the_host_reader() {
+        let dir = TempDir::new("list-entries-environment-host-read");
+        let unreachable = dir.join("not-on-this-disk/fstab");
+        let target = override_target(unreachable.clone());
+        let content = "# only reachable through the host reader\n";
+        let reader = StubReader::serving(content.as_bytes());
+
+        let view = list_entries_with(&target, &reader, colocated())
+            .expect("a reachable-through-the-host target must load");
+
+        assert!(
+            view.exists,
+            "a bare fs::read on this path would wrongly report false"
+        );
+        assert_eq!(view.text, content);
+        assert_eq!(reader.asked(), vec![unreachable]);
+    }
+
+    /// The draft target is always sandbox-visible, so it must keep using a
+    /// plain `fs::read` - proven by a reader that panics if ever consulted.
+    #[test]
+    fn list_entries_for_the_default_draft_never_consults_the_host_reader() {
+        struct PanicIfAsked;
+        impl RealFileReader for PanicIfAsked {
+            fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+                panic!("the default draft target must never go through the host reader")
+            }
+
+            fn list_backup_candidates(
+                &self,
+                _target: &Path,
+            ) -> io::Result<Vec<crate::host::BackupCandidate>> {
+                panic!("listing entries must never list anything's backups")
+            }
+        }
+
+        let dir = TempDir::new("list-entries-draft-no-host-read");
+        let draft = dir.join("fstab.draft");
+        fs::write(&draft, "# the draft, read directly\n").expect("seed draft");
+        let target = default_draft_target(draft);
+
+        let view = list_entries_with(&target, &PanicIfAsked, colocated())
+            .expect("the draft must load through a plain fs::read");
+
+        assert!(view.exists);
+        assert_eq!(view.text, "# the draft, read directly\n");
+    }
+
+    /// A missing `Environment` target must still report `exists: false`,
+    /// not an error, through the reader's `NotFound` branch.
+    #[test]
+    fn list_entries_for_a_missing_environment_target_reports_not_found_not_an_error() {
+        let target = override_target(PathBuf::from("/nonexistent/rustab-tests/fstab"));
+        let gone = StubReader::failing(io::ErrorKind::NotFound, "no such file");
+
+        let view = list_entries_with(&target, &gone, colocated())
+            .expect("a missing target is not an error");
+
+        assert!(!view.exists);
+        assert_eq!(view.text, "");
+    }
+
     /// An elevate stand-in that records what it was asked to write - path,
     /// document and, since T36, the [`target::ExternalChangeGuard`] it was
     /// handed to pass on to the elevated side - and reports the success the
@@ -1777,13 +2065,25 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let oldest = &listed[listed.len() - 1];
 
         assert_eq!(
-            read_backup_of(&target, unused_real_fstab(), colocated(), &oldest.path)
-                .expect("a real backup must be readable"),
+            read_backup_of(
+                &target,
+                unused_real_fstab(),
+                &DirectFs,
+                colocated(),
+                &oldest.path
+            )
+            .expect("a real backup must be readable"),
             ORIGINAL
         );
         assert_eq!(
-            read_backup_of(&target, unused_real_fstab(), colocated(), &listed[0].path)
-                .expect("a real backup must be readable"),
+            read_backup_of(
+                &target,
+                unused_real_fstab(),
+                &DirectFs,
+                colocated(),
+                &listed[0].path
+            )
+            .expect("a real backup must be readable"),
             valid_candidate("/mnt/save-0").to_string()
         );
         // Reading does not change anything: the target and the backup list are
@@ -1834,8 +2134,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
 
         for requested in &refused {
-            let error = read_backup_of(&target, unused_real_fstab(), colocated(), requested)
-                .expect_err("only this target's own backups may be read");
+            let error = read_backup_of(
+                &target,
+                unused_real_fstab(),
+                &DirectFs,
+                colocated(),
+                requested,
+            )
+            .expect_err("only this target's own backups may be read");
             assert_eq!(
                 error.kind,
                 CommandErrorKindDto::InvalidBackup,
@@ -1861,6 +2167,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = read_backup_of(
             &target,
             unused_real_fstab(),
+            &DirectFs,
             colocated(),
             &backup.to_string_lossy(),
         )
@@ -2456,7 +2763,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         seed_backups(&real, 3);
         let target = default_draft_target(draft.clone());
 
-        let listed = list_backups_for(&target, &real, colocated()).expect("listing must succeed");
+        let listed =
+            list_backups_for(&target, &real, &DirectFs, colocated()).expect("listing must succeed");
 
         assert_eq!(
             listed,
@@ -2469,6 +2777,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
                 info.target_path,
                 real.to_string_lossy(),
                 "every row must name the real file as its target: {info:?}"
+            );
+            assert!(
+                info.deletable,
+                "colocated mode has one source and every row is this session's to delete: {info:?}"
             );
         }
         assert_eq!(
@@ -2491,7 +2803,8 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         seed_backups(&real, 3);
         let target = override_target(draft.clone());
 
-        let listed = list_backups_for(&target, &real, colocated()).expect("listing must succeed");
+        let listed =
+            list_backups_for(&target, &real, &DirectFs, colocated()).expect("listing must succeed");
 
         assert_eq!(listed, backups::list(&draft).expect("the draft's listing"));
         assert_eq!(listed.len(), 2);
@@ -2822,14 +3135,14 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
         let real_backup = backups::list(&real).expect("listing")[0].path.clone();
         assert_eq!(
-            read_backup_of(&target, &real, colocated(), &real_backup)
+            read_backup_of(&target, &real, &DirectFs, colocated(), &real_backup)
                 .expect("a real backup must be readable"),
             ORIGINAL,
             "the real file's backup holds the content it had before its save"
         );
 
         let draft_backup = backups::list(&draft).expect("listing")[0].path.clone();
-        let error = read_backup_of(&target, &real, colocated(), &draft_backup)
+        let error = read_backup_of(&target, &real, &DirectFs, colocated(), &draft_backup)
             .expect_err("the draft's backups are not this session's backups any more");
         assert_eq!(error.kind, CommandErrorKindDto::InvalidBackup);
     }
@@ -2987,7 +3300,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
     }
 
-    // -- T39: where the real file's manual backups live ---------------------
+    // -- Fallback mode: where the real file's backups live and come from ----
     //
     // Every test here uses the same `draft_and_real_stand_in` fixture as the
     // T35 section above, plus a third directory standing in for the fallback
@@ -2996,7 +3309,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     // (`crate::backup_location::detect`) is tested in its own module, against
     // its own temp directories; what is asserted *here* is what each command
     // does once the answer is known - which is the half that could silently
-    // elevate, or act on the wrong directory.
+    // elevate, act on the wrong directory, or show an incomplete list.
+    //
+    // The real file's own directory doubles as the host's `/etc/`, read and
+    // listed by the same injected reader production routes through the host.
 
     /// The fallback directory for these tests, in a third directory distinct
     /// from both the draft's and the real file's, so "which directory did this
@@ -3122,28 +3438,49 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         );
     }
 
-    /// Listing in fallback mode reports exactly the fallback directory's
-    /// backups - and, the accepted trade-off T39 makes, **not** the automatic
-    /// backups the elevated writer leaves beside the real `/etc/fstab`, which
-    /// this process cannot enumerate. Asserted explicitly, because it is a
-    /// deliberate consequence the user is told about rather than a bug.
+    /// Stamps `path`'s modification time to `secs` whole seconds since the
+    /// Unix epoch.
+    ///
+    /// The merged listing is ordered by that timestamp, which is reported in
+    /// whole seconds - so every backup a test writes in the same second
+    /// would otherwise be ordered by the path tiebreak, and an ordering
+    /// assertion would be testing the directory names rather than the sort.
+    fn set_mtime(path: &Path, secs: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open the backup to stamp it")
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .expect("stamp the backup's modification time");
+    }
+
+    /// Listing in fallback mode reports **both** sources: this session's own
+    /// backups from the fallback directory, deletable, and the automatic ones
+    /// the elevated writer leaves beside the real `/etc/fstab`, listed
+    /// through the host reader and restore-only.
+    ///
+    /// The draft's own backups are still not listed - "whose backups am I
+    /// looking at" is unchanged by the host listing, only "which
+    /// directories do they live in" is.
     #[test]
-    fn a_fallback_launch_lists_the_fallback_directorys_backups_and_not_the_real_files() {
+    fn a_fallback_launch_lists_the_real_files_backups_alongside_the_fallback_directorys() {
         let dir = TempDir::new("fallback-list");
         let (draft, real) = draft_and_real_stand_in(&dir);
         let fallback = fallback_dir_in(&dir);
         let location = fallback_to(&fallback);
         let target = default_draft_target(draft.clone());
         // Two automatic backups beside the real file (what saves leave there)
-        // and one backup beside the draft, none of which may be listed.
+        // and one beside the draft, which is nobody's business here.
         seed_backups(&real, 2);
         seed_backups(&draft, 1);
 
-        assert!(
-            list_backups_for(&target, &real, &location)
-                .expect("listing an empty fallback directory must succeed")
-                .is_empty(),
-            "nothing has been created in the fallback directory yet"
+        let before = list_backups_for(&target, &real, &DirectFs, &location)
+            .expect("listing an empty fallback directory must succeed");
+        assert_eq!(
+            before.len(),
+            2,
+            "the real file's own backups are listed even with an empty fallback directory: \
+             {before:?}"
         );
 
         let created = create_backup_with(&target, &real, &DirectFs, &location, |_| {
@@ -3151,21 +3488,169 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         })
         .expect("creating a backup must succeed");
 
-        let listed = list_backups_for(&target, &real, &location).expect("listing must succeed");
-        assert_eq!(listed, vec![created.clone()]);
+        let listed =
+            list_backups_for(&target, &real, &DirectFs, &location).expect("listing must succeed");
+
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        let (host_rows, own_rows): (Vec<&BackupInfoDto>, Vec<&BackupInfoDto>) =
+            listed.iter().partition(|row| !row.deletable);
+
         assert_eq!(
-            listed[0].path, created.path,
-            "the row must be the backup that was just created"
+            own_rows,
+            vec![&created],
+            "the session's own row is the one it just created"
         );
-        // And the ones that exist elsewhere are still there, just invisible.
-        assert_eq!(backups::list(&real).expect("listing").len(), 2);
-        assert_eq!(backups::list(&draft).expect("listing").len(), 1);
+        assert_eq!(host_rows.len(), 2, "{listed:?}");
+        for row in &host_rows {
+            assert_eq!(
+                row.target_path,
+                real.to_string_lossy(),
+                "a host row belongs to the real file, not the mirror: {row:?}"
+            );
+            assert_eq!(
+                Path::new(&row.path).parent(),
+                real.parent(),
+                "and sits in the real file's own directory: {row:?}"
+            );
+            assert!(
+                !row.is_manual,
+                "these are the automatic backups saves leave behind: {row:?}"
+            );
+        }
+        assert_eq!(
+            host_rows
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            backups::list(&real)
+                .expect("the real stand-in's own listing")
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            "the host rows must be exactly the real file's backups, newest first"
+        );
+
+        // The rows are in one merged order, not source by source.
+        assert!(
+            listed
+                .windows(2)
+                .all(|pair| newest_first(&pair[0], &pair[1]) != std::cmp::Ordering::Greater),
+            "the merged list must be sorted newest first: {listed:?}"
+        );
+
+        assert_eq!(
+            backups::list(&draft).expect("listing").len(),
+            1,
+            "the draft's own backup exists and is still not listed"
+        );
+    }
+
+    /// Age, not source, decides the order: an automatic backup in `/etc/`
+    /// taken between two manual ones appears between them, so a user reading
+    /// the panel top-down is reading a timeline.
+    ///
+    /// Timestamps are stamped explicitly, since every file here would
+    /// otherwise be written within the same second the list is ordered by.
+    #[test]
+    fn a_fallback_launch_orders_both_sources_by_age_not_by_directory() {
+        let dir = TempDir::new("fallback-list-order");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft);
+        seed_backups(&real, 2);
+
+        let own = create_backup_with(&target, &real, &DirectFs, &location, |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect("creating a backup must succeed");
+
+        let host_backups = backups::list(&real).expect("the real stand-in's own listing");
+        assert_eq!(host_backups.len(), 2);
+        // Oldest to newest: a host backup, this session's own, a host backup.
+        set_mtime(Path::new(&host_backups[1].path), 1_700_000_100);
+        set_mtime(Path::new(&own.path), 1_700_000_200);
+        set_mtime(Path::new(&host_backups[0].path), 1_700_000_300);
+
+        let listed =
+            list_backups_for(&target, &real, &DirectFs, &location).expect("listing must succeed");
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| (row.path.clone(), row.created_unix_secs, row.deletable))
+                .collect::<Vec<_>>(),
+            vec![
+                (host_backups[0].path.clone(), Some(1_700_000_300), false),
+                (own.path.clone(), Some(1_700_000_200), true),
+                (host_backups[1].path.clone(), Some(1_700_000_100), false),
+            ],
+            "newest first, interleaved across the two directories"
+        );
+    }
+
+    /// A host listing that could not be taken - no `flatpak-spawn`, a revoked
+    /// talk name, a denied portal call - fails the command outright instead of
+    /// quietly returning the fallback directory's half of the list. An
+    /// incomplete list of restore points is worse than none, because nothing
+    /// on screen says it is incomplete.
+    #[test]
+    fn a_fallback_launch_fails_the_listing_when_the_host_cannot_be_listed() {
+        /// A reader that cannot list anything and must never be asked to
+        /// read: listing is the only thing under test here.
+        struct ListingDenied;
+        impl RealFileReader for ListingDenied {
+            fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+                panic!("a failed listing must not lead to a read")
+            }
+
+            fn list_backup_candidates(
+                &self,
+                _target: &Path,
+            ) -> io::Result<Vec<crate::host::BackupCandidate>> {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Portal call failed: org.freedesktop.Flatpak not available",
+                ))
+            }
+        }
+
+        let dir = TempDir::new("fallback-list-host-failure");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft);
+
+        let created = create_backup_with(&target, &real, &DirectFs, &location, |_| {
+            panic!("fallback mode must never elevate")
+        })
+        .expect("creating a backup must succeed");
+
+        let error = list_backups_for(&target, &real, &ListingDenied, &location)
+            .expect_err("a host listing failure must fail the whole listing");
+
+        assert_eq!(error.kind, CommandErrorKindDto::ListBackups);
+        assert!(
+            error.message.contains(&real.to_string_lossy().to_string())
+                && error.message.contains("on the host")
+                && error
+                    .message
+                    .contains("org.freedesktop.Flatpak not available"),
+            "the message must name the directory and the cause: {}",
+            error.message
+        );
+        assert!(
+            Path::new(&created.path).exists(),
+            "a failed listing changes nothing"
+        );
     }
 
     /// Deleting in fallback mode unlinks the file in-process, with no
-    /// `pkexec` prompt - and refuses anything that is not in the list
-    /// `list_backups` offered, including one of the real file's own backups,
-    /// before any dispatch.
+    /// `pkexec` prompt - and refuses one of the real file's own backups
+    /// before any dispatch, even though the real file's backups are now
+    /// *listed*: a row the panel renders restore-only must fail closed
+    /// here if a frontend ever asks for it anyway, unlinking nothing and
+    /// escalating nothing.
     #[test]
     fn a_fallback_launch_deletes_a_fallback_backup_in_process_and_refuses_the_real_files() {
         let dir = TempDir::new("fallback-delete");
@@ -3186,9 +3671,18 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         let error = delete_backup_with(&target, &real, &location, &real_backup, |_, _| {
             panic!("a path outside the fallback directory must not escalate")
         })
-        .expect_err("only the fallback directory's backups are this session's");
+        .expect_err("only the fallback directory's backups are this session's to delete");
         assert_eq!(error.kind, DeleteBackupErrorKindDto::InvalidBackup);
         assert!(Path::new(&real_backup).exists());
+        // And it is listed, as a row the frontend renders without a Delete
+        // button - which is what the refusal above backs up.
+        let listed =
+            list_backups_for(&target, &real, &DirectFs, &location).expect("listing must succeed");
+        let host_row = listed
+            .iter()
+            .find(|row| row.path == real_backup)
+            .expect("the real file's backup must be listed");
+        assert!(!host_row.deletable);
 
         delete_backup_with(&target, &real, &location, &created.path, |_, _| {
             panic!("a backup in the user's own directory must never ask for a password")
@@ -3196,20 +3690,27 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         .expect("deleting a fallback backup must succeed");
 
         assert!(!Path::new(&created.path).exists());
-        assert!(list_backups_for(&target, &real, &location)
-            .expect("listing")
-            .is_empty());
+        assert_eq!(
+            list_backups_for(&target, &real, &DirectFs, &location)
+                .expect("listing")
+                .iter()
+                .map(|row| (row.path.clone(), row.deletable))
+                .collect::<Vec<_>>(),
+            vec![(real_backup.clone(), false)],
+            "only the restore-only row beside the real file is left"
+        );
         assert!(
             backup_location::mirror_path(&fallback).exists(),
             "the mirror itself is not a backup and must not be deleted"
         );
     }
 
-    /// The three operations above are the *only* ones that stop elevating.
-    /// A restore still writes the real `/etc/fstab`, so it still goes through
-    /// the single elevated write - the backup it restores just comes from the
-    /// fallback directory now. This is the test that would fail if fallback
-    /// mode had been allowed to leak into the write path.
+    /// Creating and deleting in the fallback directory are the *only*
+    /// operations that stop elevating. A restore still writes the real
+    /// `/etc/fstab`, so it still goes through the single elevated write - the
+    /// backup it restores just comes from the fallback directory now. This is
+    /// the test that would fail if fallback mode had been allowed to leak
+    /// into the write path.
     #[test]
     fn a_fallback_launch_still_elevates_a_restore_of_a_fallback_backup() {
         let dir = TempDir::new("fallback-restore");
@@ -3249,10 +3750,11 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         assert!(outcome.elevated);
     }
 
-    /// `open_backup_location` opens the directory whose backups were just
-    /// listed - the fallback one, not `/etc/`, which in fallback mode holds
-    /// none of the rows on screen (and which the file manager could not show
-    /// the user's own backups in anyway).
+    /// `open_backup_location` opens the directory this session's *own*
+    /// backups go to - the fallback one, unchanged by the merged list,
+    /// which now has rows from `/etc/` too, but only one directory can be
+    /// opened, and this is the one whose contents the user can actually
+    /// manage.
     #[test]
     fn a_fallback_launch_opens_the_fallback_directory() {
         let dir = TempDir::new("fallback-open");
@@ -3270,11 +3772,50 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         assert_eq!(calls.into_inner(), vec![fallback]);
     }
 
-    /// `read_backup` follows the same list as everything else: a backup in the
-    /// fallback directory is readable, one beside the real file is refused
-    /// before being used as a path.
+    /// A [`RealFileReader`] that reads and lists exactly as [`DirectFs`]
+    /// does, and records what it was asked for.
+    ///
+    /// What it proves is that a path went *through the seam*: the tests
+    /// below point it at real temp files, so the answers are genuine, but a
+    /// plain in-process `fs::read` of the same path - which inside a sandbox
+    /// would read the runtime's `/etc/` or nothing at all - would leave the
+    /// recording empty.
+    struct RecordingFs {
+        read: std::cell::RefCell<Vec<PathBuf>>,
+        listed: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl RecordingFs {
+        fn new() -> Self {
+            RecordingFs {
+                read: std::cell::RefCell::new(Vec::new()),
+                listed: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RealFileReader for RecordingFs {
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            self.read.borrow_mut().push(path.to_path_buf());
+            DirectFs.read(path)
+        }
+
+        fn list_backup_candidates(
+            &self,
+            target: &Path,
+        ) -> io::Result<Vec<crate::host::BackupCandidate>> {
+            self.listed.borrow_mut().push(target.to_path_buf());
+            DirectFs.list_backup_candidates(target)
+        }
+    }
+
+    /// `read_backup` follows the same merged list as everything else: both a
+    /// backup in the fallback directory and one beside the real file are
+    /// readable - the latter through the host reader, so the diff view works
+    /// for the automatic backups too - while a path that is in neither list
+    /// is refused before being used as a path at all.
     #[test]
-    fn a_fallback_launch_reads_the_fallback_directorys_backups_only() {
+    fn a_fallback_launch_reads_both_its_own_and_the_real_files_backups() {
         let dir = TempDir::new("fallback-read");
         let (draft, real) = draft_and_real_stand_in(&dir);
         let fallback = fallback_dir_in(&dir);
@@ -3291,14 +3832,109 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
         })
         .expect("creating a backup must succeed");
 
+        let reader = RecordingFs::new();
         assert_eq!(
-            read_backup_of(&target, &real, &location, &created.path)
+            read_backup_of(&target, &real, &reader, &location, &created.path)
                 .expect("a fallback backup must be readable"),
             real_now
         );
-        let error = read_backup_of(&target, &real, &location, &real_backup)
-            .expect_err("a backup beside the real file is not in this session's list");
-        assert_eq!(error.kind, CommandErrorKindDto::InvalidBackup);
+        assert!(
+            reader.read.borrow().is_empty(),
+            "a backup in this process's own directory needs no host read: {:?}",
+            reader.read.borrow()
+        );
+
+        assert_eq!(
+            read_backup_of(&target, &real, &reader, &location, &real_backup)
+                .expect("a backup beside the real file must be readable too"),
+            ORIGINAL,
+            "the automatic backup holds what the real file held before the save"
+        );
+        assert_eq!(
+            reader.read.into_inner(),
+            vec![PathBuf::from(&real_backup)],
+            "and it must have been read through the host seam, not with a plain fs::read"
+        );
+
+        // Near misses in the real file's own directory: listed by neither
+        // half, so refused rather than read.
+        let etc = real.parent().expect("the real stand-in has a directory");
+        for requested in [
+            etc.join("fstab.rustab-backup.1.2"),
+            etc.join("fstab.bak"),
+            real.clone(),
+        ] {
+            let error = read_backup_of(
+                &target,
+                &real,
+                &DirectFs,
+                &location,
+                &requested.to_string_lossy(),
+            )
+            .expect_err("only a listed backup may be read");
+            assert_eq!(
+                error.kind,
+                CommandErrorKindDto::InvalidBackup,
+                "unexpected answer for {}: {}",
+                requested.display(),
+                error.message
+            );
+        }
+    }
+
+    /// Restoring one of the real file's own backups in fallback mode: its
+    /// content is read through the host seam, and the write is the same
+    /// single elevated one aimed at the real file - the point of listing
+    /// them being that the automatic backups became restorable, not that
+    /// restoring changed.
+    #[test]
+    fn a_fallback_launch_restores_a_host_backup_through_the_reader_and_still_elevates_once() {
+        let dir = TempDir::new("fallback-restore-host");
+        let (draft, real) = draft_and_real_stand_in(&dir);
+        let fallback = fallback_dir_in(&dir);
+        let location = fallback_to(&fallback);
+        let target = default_draft_target(draft.clone());
+        // One automatic backup beside the real file, holding ORIGINAL; the
+        // real file itself has moved on since.
+        seed_backups(&real, 1);
+        let real_backup = backups::list(&real).expect("listing")[0].path.clone();
+
+        let reader = RecordingFs::new();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = restore_backup_with(
+            &target,
+            &real,
+            &reader,
+            &location,
+            &real_backup,
+            true,
+            recording_elevate(&calls),
+        )
+        .expect("restoring one of the real file's own backups must succeed");
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "exactly one elevated write");
+        assert_eq!(
+            calls[0].0, real,
+            "the elevated write must be aimed at the real file"
+        );
+        assert_eq!(
+            calls[0].1,
+            parser::parse(ORIGINAL),
+            "and must carry the content read off the host"
+        );
+        assert!(outcome.elevated);
+
+        assert!(
+            reader.read.borrow().contains(&PathBuf::from(&real_backup)),
+            "the backup must have been read through the host seam: {:?}",
+            reader.read.borrow()
+        );
+        assert_eq!(
+            reader.listed.into_inner(),
+            vec![real.clone()],
+            "and resolved against a host listing of the real file's directory"
+        );
     }
 
     /// An explicit `RUSTAB_TARGET_PATH=/etc/fstab` is the second half of
@@ -3379,14 +4015,16 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
             .expect("creating a backup must succeed");
         assert_eq!(PathBuf::from(&created.path).parent(), path.parent());
         assert_eq!(
-            list_backups_for(&target, unused_real_fstab(), &location).expect("listing"),
+            list_backups_for(&target, unused_real_fstab(), &DirectFs, &location).expect("listing"),
             vec![created.clone()]
         );
         delete_backup_from(&target, unused_real_fstab(), &location, &created.path)
             .expect("deleting must succeed");
-        assert!(list_backups_for(&target, unused_real_fstab(), &location)
-            .expect("listing")
-            .is_empty());
+        assert!(
+            list_backups_for(&target, unused_real_fstab(), &DirectFs, &location)
+                .expect("listing")
+                .is_empty()
+        );
 
         assert!(
             !poison.exists(),

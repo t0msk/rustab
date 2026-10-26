@@ -260,6 +260,8 @@ This command automatically starts Trunk's dev server (which watches `frontend/sr
 
 The workspace layout:
 - `crates/fstab-core/` - pure Rust parser, validator, writer (zero GUI dependencies)
+- `crates/rustab-privileged/` - GUI-free half shared by both binaries: the IPC DTOs and the elevated stdin/stdout protocol
+- `crates/rustab-helper/` - the `rustab-helper` binary, statically linkable, run as root under `pkexec` by the Flatpak build (an ordinary install re-execs the GUI binary instead)
 - `src-tauri/` - Tauri 2 application shell, command IPC layer, privilege escalation
 - `frontend/` - Yew/WASM user interface (compiled via Trunk, not a workspace member due to target conflicts)
 
@@ -303,9 +305,10 @@ The repository includes an automated test suite covering the parser, validator, 
 cargo test --workspace
 ```
 
-Runs 325 tests across:
-- `crates/fstab-core`: 160 unit tests + 4 fixture-based integration tests
-- `src-tauri/rustab_lib`: 161 command and privilege-escalation tests
+Runs 392 tests across:
+- `crates/fstab-core`: 175 unit tests + 4 fixture-based integration tests
+- `crates/rustab-privileged`: 47 DTO, backup-resolution and elevated-protocol tests
+- `src-tauri/rustab_lib`: 166 command and privilege-escalation tests
 
 **Frontend (Yew/WASM):**
 
@@ -313,9 +316,9 @@ Runs 325 tests across:
 cd frontend && cargo test
 ```
 
-Runs 74 tests for components and diff logic (native Rust target, not WASM, so tests run on the host).
+Runs 81 tests for components and diff logic (native Rust target, not WASM, so tests run on the host).
 
-**Total:** 399 automated tests, all passing.
+**Total:** 473 automated tests, all passing.
 
 Run `cargo fmt --check` and `cargo clippy -- -D warnings` locally to catch style issues before committing. Both are gated in CI.
 
@@ -325,7 +328,7 @@ Rustab is dual-licensed under the MIT License or the Apache License 2.0 - your c
 
 ## AI Use Disclosure
 
-Rustab's development made use of AI code assistance (Claude Code) to accelerate initial implementation. This is disclosed openly: the maintainer is a senior software developer with 10+ years of production experience, and personally code-reviewed and tested every change before merging. The codebase is backed by a comprehensive automated test suite (399 tests, all passing) in addition to manual review and repeated live testing of the real application through its documented entrypoint (`cargo tauri dev`). AI assistance was a development tool, not a replacement for professional engineering judgment or testing discipline.
+Rustab's development made use of AI code assistance (Claude Code) to accelerate initial implementation. This is disclosed openly: the maintainer is a senior software developer with 10+ years of production experience, and personally code-reviewed and tested every change before merging. The codebase is backed by a comprehensive automated test suite (473 tests, all passing) in addition to manual review and repeated live testing of the real application through its documented entrypoint (`cargo tauri dev`). AI assistance was a development tool, not a replacement for professional engineering judgment or testing discipline.
 
 ## Contributing
 

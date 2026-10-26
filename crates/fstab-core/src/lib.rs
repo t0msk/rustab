@@ -8,6 +8,7 @@
 //! crate implements.
 
 pub mod discovery;
+pub mod exec;
 pub mod model;
 pub mod parser;
 pub mod validate;

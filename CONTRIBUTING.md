@@ -51,7 +51,8 @@ cargo tauri dev
 This automatically:
 1. Runs `trunk serve` for the frontend (hot-reload dev server on `http://localhost:8080`).
 2. Launches the Tauri window connected to that dev server.
-3. Watches Rust source files in `src-tauri/` and `crates/fstab-core/` for changes.
+3. Watches Rust source files in `src-tauri/` and `crates/` (`fstab-core`,
+   `rustab-privileged`, `rustab-helper`) for changes.
 
 **Read "Safety-first contribution notes" below before you run this and click
 Save.** Unlike before T34, an unscoped `cargo tauri dev` is no longer a safe

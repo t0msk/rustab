@@ -245,6 +245,20 @@ there (e.g. if the system changed in between). Treat a `validation` error from
 Note: `findmnt` is an external process, so this is not free. Debounce it;
 don't call it per keystroke.
 
+Inside a Flatpak sandbox, `findmnt --verify` runs on the host via
+`flatpak-spawn --host` - the candidate is staged in a temp file on the
+host, because a sandboxed `findmnt` cannot see the host's devices or
+mount points and reports nearly every entry, including `/`, as
+unreachable. The advisory "mount point does not currently exist on disk"
+check runs on the host for the same reason (the `/` a sandboxed process
+sees is the runtime's, so `/boot`, `/opt` and every `/run/media/…` the
+host has would be reported missing), in a **single** batched
+`flatpak-spawn --host` call per validation that asks about all of the
+document's mount points at once - not one call per entry. If the host
+cannot be asked at all, that check emits no findings rather than
+guessing. The validation results reflect the host's state regardless
+of where the app runs.
+
 ### 3.4 `render_candidate`
 
 ```
@@ -383,6 +397,12 @@ with `create_backup` (§3.11), `false` for one a save took on its own. Do not
 infer this from `file_name` - the backend owns the naming scheme and reports
 the answer.
 
+`deletable` is `true` for every row this session's `delete_backup` command
+accepts, `false` only for a backup of the real `/etc/fstab` listed from the
+host in fallback mode. The frontend must not infer this from `path` or
+`target_path`. For a non-deletable row, render a non-interactive status pill
+instead of a Delete button (§7 and `docs/UI_DESIGN.md` §7).
+
 At most 10 **automatic** backups are kept per target
 (`fstab_core::writer::MAX_BACKUPS`); older ones are pruned by a save, which
 reports them in `WriteOutcomeDto.pruned_backups`. Manual backups are exempt:
@@ -412,78 +432,46 @@ Error kinds: `target_resolution`, `list_backups`.
 > `writes_real_file` confirmation checkbox a save has (`docs/UI_DESIGN.md` §2).
 > Listing and reading stayed unprivileged - `/etc/` is world-readable.
 
-> **T39/T40: when `/etc/` cannot be *enumerated*, the real file's manual
-> backups move.** Flatpak reserves the whole `/etc` path space: the `/etc` a
+> **T39/T40/T42: fallback-mode listing now includes the real /etc/fstab's own
+> backups.** Flatpak reserves the whole `/etc` path space: the `/etc` a
 > sandboxed process sees is the runtime's own, and **no `--filesystem=` grant
 > under `/etc` is honoured at all** - neither `/etc:rw` (which Flathub's linter
 > rejects anyway) nor the single-file `/etc/fstab:rw`, which the sandbox
 > refuses outright (`Path "/etc" is reserved by Flatpak`). So a sandboxed
-> Rustab cannot list `/etc/`, and cannot create a file beside the real
-> `/etc/fstab` in-process.
->
-> **The T39-era open question is resolved (T40), and the answer is "yes,
-> writing works - but not for the reason T39 gave".** T39 assumed the `pkexec`
-> re-exec "runs unsandboxed as root". It does not: `pkexec` changes a
-> process's UID, not its mount namespace, so a `pkexec` child of a sandboxed
-> process is root *inside the same sandbox* and cannot touch the host's
-> `/etc/fstab` either. T40 replaced that mechanism with the one that does
-> work, confirmed end-to-end against a real build: the unprivileged side reads
-> the real file with `flatpak-spawn --host`, and the elevated helper is started
-> with `flatpak-spawn --host pkexec <host path of the binary>`, which runs it
-> as a genuine **host** root process outside every sandbox (needs only
-> `--talk-name=org.freedesktop.Flatpak`, no `--filesystem=` at all). So under
-> the Flatpak build a save really does write the real `/etc/fstab`, and
-> `write_document`'s **automatic** backup and atomic-rename temp file really
-> are created in the host's `/etc/` - the colocation property those backups
-> exist for is intact.
->
-> What stays exactly as T39 built it, and why: the three **manual-management**
-> operations move together into a per-user fallback directory
+> Rustab cannot list `/etc/` in-process, and cannot create a file beside the
+> real `/etc/fstab` there either. The solution remains as T39 built it: the three
+> **manual-management operations** (`create_backup`, `delete_backup`,
+> `open_backup_location`) are anchored to a per-user fallback directory
 > (`$XDG_DATA_HOME/rustab/etc-fstab-backups/`, which under Flatpak is
 > `~/.var/app/dev.tomsk.Rustab/data/rustab/etc-fstab-backups/`), reported by
-> `real_target_backup_fallback_dir` (§6). This command lists that directory,
-> `create_backup` (§3.11) copies the real file's current content into it,
-> `delete_backup` (§3.10) unlinks from it, and neither of the latter two
-> escalates, because that directory belongs to the user. `restore_backup`
-> (§3.7) resolves its `backup_path` against that same list but is otherwise
+> `real_target_backup_fallback_dir` (§6). `create_backup` copies the real file's
+> current content into it, `delete_backup` unlinks from it, and neither
+> escalates, because that directory belongs to the user. `restore_backup` (§3.7)
+> resolves its `backup_path` against the merged list (see below) but is otherwise
 > untouched: it still writes `/etc/fstab`, so it still elevates.
 >
-> The reason they stay there even though creating and deleting *could* now
-> happen in the host's `/etc/` (both already go through the elevated helper) is
-> **this command**: `list_backups` is deliberately unprivileged - `/etc/` is
-> world-readable, and prompting for a password to read a directory would be
-> absurd - so it runs in the sandboxed GUI process and enumerates the
-> directory *there*, where `/etc` is the runtime's. Moving creation and
-> deletion without it would mean a backup the user just created never appearing
-> in the list it was created from, which is worse than a consistent fallback.
-> The alternative - a second, never-elevated internal re-exec flag that
-> host-spawns this binary just to list, read and resolve backups in the host's
-> `/etc/` - was considered and rejected; `src-tauri/src/backup_location.rs`'s
-> module docs carry the full reasoning (it is not one flag but a second
-> request/response protocol covering `list_backups`, `read_backup` and the
-> `backup_path` resolution all three path-taking commands depend on, and it
-> would put the most fragile mechanism in the app - executing the
-> runtime-linked binary on the host - on a routine read path).
->
-> **The accepted consequence, which the frontend states plainly rather than
-> implying** (`docs/UI_DESIGN.md` §7): in fallback mode this command does
-> **not** report the automatic backups each save leaves beside `/etc/fstab`.
-> Since T40 those are confirmed to be getting written; a sandboxed process
-> simply cannot enumerate them. They remain recoverable from a rescue
-> environment, which is the property they exist for - the in-app list just
-> cannot prove they are there. Rows in fallback mode therefore all describe the
-> fallback directory, and their `target_path` is the mirror file inside it
-> (`<fallback dir>/fstab`, a byte-for-byte copy of `/etc/fstab` as of the
-> moment the backup was taken) rather than `/etc/fstab` itself - the file name,
-> timestamp and `is_manual` flag follow the usual scheme, so such a file can be
-> copied back into `/etc/` by hand and is still recognized as a backup of the
-> real file.
->
-> Fallback mode is also what a sandbox with **no** host access falls back to
-> (no `flatpak-spawn` in the runtime, the `org.freedesktop.Flatpak` talk-name
-> missing or revoked): such a session cannot read or save the real `/etc/fstab`
-> at all, but it can still take, list and restore manual backups in a directory
-> it owns.
+> **What changed in T42: listing now reports both sources.** `list_backups` in
+> fallback mode returns BOTH the fallback directory's rows AND a listing of the
+> real `/etc/fstab`'s own backups fetched from the host through an unprivileged
+> call. The host listing is made via one `flatpak-spawn --host sh -c '<script>'`
+> invocation whose script changes into the real `/etc` directory, globs
+> `fstab.*`, and prints each matching regular file as `<size> <mtime>\n<name>\0`
+> records via `stat`. The sandboxed side parses those NUL-terminated records
+> strictly (any malformed record fails the whole call) and applies
+> `fstab_core::writer::list_backups_among` to the names - the same lightweight
+> inline-script pattern the unprivileged file-read already uses, not a re-exec.
+> The merged list is sorted newest first. The two key consequences for the UI
+> (stated plainly in `docs/UI_DESIGN.md` §7): (1) the fallback directory's own
+> rows remain creatable and deletable here, with no password prompt; (2) the real
+> `/etc/fstab`'s automatic backups and any manual ones an non-sandboxed install left
+> there are now listed and restorable, but marked non-deletable (`deletable:
+> false`, §9) because the sandboxed session has no authority to unlink them. If
+> the host listing fails (portal denied, `flatpak-spawn` missing, or any I/O
+> error), `list_backups` rejects with kind `list_backups`, naming the host
+> directory and the cause - a loud failure rather than silently omitting the
+> host rows; the consequence that a sandbox with no host access loses its ability
+> to list the real file's backups is accepted (such a session can't read or save
+> the real file either).
 
 ### 3.7 `restore_backup`
 
@@ -501,6 +489,14 @@ opening the Backups panel and clicking Restore is the identical hazard through
 the identical code path, so a restore rejects with `kind: "external_change"`
 in exactly the same situations a save does, and is repeated with `true` after
 the user has seen the diff and confirmed.
+
+In fallback mode, `backup_path` is resolved against the merged list
+(fallback directory first, then host backups) and a host-resolved backup is
+read through the host reader (`flatpak-spawn --host cat`), never through
+`fs::read`. Matching against host rows uses literal path equality (the
+sandbox cannot stat those files), so the frontend must send back the exact
+`path` string from the row. For a host row, `target_path` is `/etc/fstab`
+itself, not a mirror file.
 
 A restore is not a copy and not a shortcut. The backup's text is parsed and
 then goes through *the same* save path as `save`: it is validated, the content
@@ -550,6 +546,10 @@ and the UI must keep manual entry fully available (`docs/SPEC.md` §8). Show
 "device discovery unavailable", not "no devices found", when
 `lsblk_available` is `false`.
 
+Inside a Flatpak sandbox, `lsblk` likewise runs on the host via
+`flatpak-spawn --host`, since a sandboxed `lsblk` exits successfully but
+reports no UUIDs or labels at all.
+
 ### 3.9 `read_backup`
 
 ```
@@ -562,6 +562,10 @@ is resolved the same way `restore_backup` resolves it (§3.7): matched against
 the real backup list before it is ever used as a path, so `/etc/shadow`,
 `../../etc/fstab`, a different target's backup and a near-miss file name all
 fail closed with `invalid_backup` - nothing is read.
+
+In fallback mode, a host-resolved backup is read through the host reader
+(`flatpak-spawn --host cat`), never through `fs::read` or the local
+filesystem.
 
 Intended for a backup-diff view: diff this against `list_entries`'s `text` to
 show what restoring this backup would change. There is no `render_candidate`
@@ -611,14 +615,14 @@ paths fail closed with `invalid_backup` and nothing is removed.
   in-process with no prompt. The frontend's delete confirmation is gated on
   that same predicate, so a default launch's delete now carries the explicit
   acknowledgement checkbox too (`docs/UI_DESIGN.md` §2).
-- **T39's one exception to that:** when `real_target_backup_fallback_dir` (§6)
-  is set, the real file's backups are not in `/etc/` but in a directory inside
-  the user's own data directory, so the unlink happens in-process with **no**
-  prompt - there is no root-owned file involved to need one. The backup being
-  deleted is one of that directory's own; anything else, including a backup
-  sitting beside the real `/etc/fstab`, is not in §3.6's list for that session
-  and fails closed with `invalid_backup` exactly as any other foreign path
-  does.
+- **In fallback mode, the fallback directory's own rows are deletable with no
+  prompt, but a host row's path handed to `delete_backup` fails closed with
+  `invalid_backup` and nothing is removed** - never reaching the elevated
+  dispatch. This is the maintainer's explicit scoping decision: listing and
+  restoring host rows are now supported; deleting them is not, with the
+  pragmatic benefit that a manual backup the user creates stays creatable and
+  deletable here in the fallback directory, with symmetry and no password
+  prompt.
 - Resolution happens *before* the dispatch in both branches, so a
   `backup_path` that cannot work is refused without costing the user a
   password prompt. That is a courtesy only: the elevated process re-resolves
@@ -670,16 +674,16 @@ copy of the draft could not be.
   the same single `pkexec` re-exec - see §4, and the same `is_real || source
   == sandbox_default` predicate as §3.10. Only an explicit override naming
   some other, user-owned file is copied in-process with no prompt.
-- **T39: and, now, a real file whose backups are not in `/etc/`.** When
-  `real_target_backup_fallback_dir` (§6) is set, this command reads the real
-  `/etc/fstab`'s current bytes, stages them in that directory's mirror file and
-  copies *that* to a new manual backup there - all in-process, with no prompt,
-  because the directory is the user's own. The resulting backup is therefore
+- **In fallback mode, creating a backup remains anchored to the fallback
+  directory only.** No privilege escalation, in-process, no password prompt.
+  The user creates a backup of the real `/etc/fstab`'s current content by
+  reading it (via `flatpak-spawn --host cat` on the sandboxed side) and
+  copying that to a new manual backup in the fallback directory - which is
   still a snapshot of `/etc/fstab` as it is at the moment the button is
-  pressed, which is the only thing that would make the button honest. If the
-  real file cannot be read at all, the rejection is the usual
-  `target_missing` (it does not exist) or `backup` (any other I/O failure),
-  and nothing is created.
+  pressed, the only thing that would make the button honest. Nothing in
+  `/etc/` is ever created by the sandboxed GUI. If the real file cannot be
+  read at all, the rejection is the usual `target_missing` (it does not exist)
+  or `backup` (any other I/O failure), and nothing is created.
 - **A target that does not exist yet is an error, not a no-op.** The kind is
   `target_missing`, and the UI should say what the message says: there is no
   file to back up yet, save once first. An explicit "back this up now" must
@@ -712,7 +716,9 @@ listed actually are, rather than the working draft's own directory, which
 holds none of them. An explicit `RUSTAB_TARGET_PATH` opens that path's own
 directory, unchanged. By the same rule, since T39 a session whose
 `real_target_backup_fallback_dir` (§6) is set opens *that* directory - it is
-still "where the rows on screen are".
+still "where the rows this session can *manage* are", even though fallback
+mode now also lists the real file's backups from `/etc/` (§3.6): those rows
+cannot be deleted from here, so the fallback directory stays the one opened.
 
 **No privilege escalation, for either case.** `/etc/` is world-readable and
 world-executable, the same reasoning §3.9 already gives for reading a
@@ -884,11 +890,22 @@ file escalates nothing.
 | `delete_backup` | `delete_backup` (§3.10) | Resolve the requested path against the target's real backup list, then one `remove_file`. |
 | `create_backup` | `create_backup` (§3.11) | One `fstab_core::writer::create_backup` call: copy the target to a new `.manual` backup beside it and `fsync` the copy. The target is only read. |
 
-They share a **single** hidden re-exec flag. Which operation is being asked
-for is a field of the request, not a second flag, so there is exactly one
-branch in the whole program that can turn Rustab into a root process, and the
-"no Tauri runtime, webview, plugin or logger is ever initialized as root"
-property stays a one-flag check.
+Which operation is being asked for is a **field of the request**, not a
+second flag or a second binary. One build produces two executables that can
+run as root, and each has exactly one way in:
+
+- `rustab`, the GUI, enters elevated mode only through the single hidden
+  flag `--internal-privileged-write`, checked as the first statement of
+  `main`. That keeps the "no Tauri runtime, webview, plugin or logger is
+  ever initialized as root" property a one-flag check.
+- `rustab-helper`, used by the Flatpak (§4.3 step 2, §4.5), *is* that
+  branch and nothing else: its whole `main` is the argv refusal plus the one
+  dispatch call, and it links no GUI library at all.
+
+So adding the second and third operations added no entry point to either -
+each is one `match` arm behind the same dispatch - and the elevated surface
+is still one function, compiled once, in the shared `rustab-privileged`
+crate.
 
 ### 4.3 The mechanism
 
@@ -905,30 +922,42 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    pre-check, since its request carries no path but the target. None of these
    write anything and none is **the safety net** (see §4.6) - each has a
    counterpart inside the elevated process, which is the one that decides.
-2. It re-executes **its own binary** as
-   `pkexec <rustab> --internal-privileged-write`, with stdin, stdout and
-   stderr piped. (The flag's name is historical - it predates the two backup
-   operations and now carries any of them. It is deliberately unchanged: the
-   point is that there is exactly one such string.)
+2. It starts the elevated process, with stdin, stdout and stderr piped.
+   *Which* process, and *where* it runs, is the only part of this mechanism
+   that is environment-dependent:
 
-   Which `<rustab>` and *where* that `pkexec` runs depends on one thing, and
-   it is the only part of this mechanism that is environment-dependent (T40):
-
-   - **ordinary install**: `std::env::current_exe()`, `pkexec` run directly;
+   - **ordinary install**: it re-executes **its own binary** as
+     `pkexec <rustab> --internal-privileged-write`, `pkexec` run directly,
+     `<rustab>` being `std::env::current_exe()`. (The flag's name is
+     historical - it predates the two backup operations and now carries any
+     of them. It is deliberately unchanged: the point is that there is
+     exactly one such string.)
    - **inside a Flatpak sandbox** (detected by `/.flatpak-info`):
-     `flatpak-spawn --host pkexec <host path of this binary>
-     --internal-privileged-write`. `pkexec` alone would not do: it changes a
-     process's UID, not its mount namespace, so a `pkexec` child of a
-     sandboxed process is root *inside the same sandbox*, where `/etc` is the
-     runtime's own and the host's `/etc/fstab` is unreachable by any path
-     (Flatpak reserves `/etc` and refuses even `--filesystem=/etc/fstab:rw`).
-     `flatpak-spawn --host` is what puts the process on the host; `pkexec`
-     behind it is what makes it root. The host path is resolved from the
-     `app-path` key Flatpak itself writes into the sandbox's `/.flatpak-info`,
-     falling back to the user and system Flatpak installation layouts, and the
-     operation fails with a `privilege_escalation` error naming those paths if
-     none of them exists - it never guesses. Needs
-     `--talk-name=org.freedesktop.Flatpak` in the manifest and nothing else.
+     `flatpak-spawn --host pkexec <host app-path>/bin/rustab-helper`, with
+     **no flag** - `rustab-helper` reads one request on stdin and refuses
+     any argument.
+
+     Two things make that shape necessary rather than merely different.
+     `pkexec` alone would not do: it changes a process's UID, not its mount
+     namespace, so a `pkexec` child of a sandboxed process is root *inside
+     the same sandbox*, where `/etc` is the runtime's own and the host's
+     `/etc/fstab` is unreachable by any path (Flatpak reserves `/etc` and
+     refuses even `--filesystem=/etc/fstab:rw`). `flatpak-spawn --host` is
+     what puts the process on the host; `pkexec` behind it is what makes it
+     root. And the process that lands on the host runs with the *host's*
+     libraries, not the runtime's - so it cannot be the GUI binary, which is
+     dynamically linked against the runtime's GTK, WebKitGTK and glibc; it
+     is `rustab-helper`, the same elevated code built as a self-contained
+     static binary (§4.5).
+
+     The helper's host path is resolved from the `app-path` key Flatpak
+     itself writes into the sandbox's `/.flatpak-info`, falling back to the
+     user and system Flatpak installation layouts, and the operation fails
+     with a `privilege_escalation` error naming every `…/bin/rustab-helper`
+     path it tried if none of them exists - it never guesses. Existence is
+     checked **on the host**, since none of those paths is visible from
+     inside the sandbox. Needs `--talk-name=org.freedesktop.Flatpak` in the
+     manifest and nothing else.
 
    Everything in steps 3-6 below is identical either way: `flatpak-spawn
    --host` passes stdio through and exits with the child's status, and the
@@ -950,11 +979,14 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    protocol is one build talking to itself, and a missing field defaulting to
    "no record" would be a fail-open default on the one check that exists to
    fail closed.
-4. The elevated process, in `main()`, sees `--internal-privileged-write` as
-   `argv[1]` **before anything else starts** - no Tauri runtime, no webview,
-   no plugins, no logger are ever initialized in a root process. It reads
-   stdin to EOF exactly once, refuses any `target` other than `/etc/fstab`
-   (for either operation), and then:
+4. The elevated process dispatches **before anything else starts** - no
+   Tauri runtime, no webview, no plugins, no logger are ever initialized in
+   a root process. In the GUI binary that is `main()` seeing
+   `--internal-privileged-write` as `argv[1]`, as its first statement; in
+   `rustab-helper` there is nothing to branch on, because refusing argv and
+   dispatching is all its `main` contains. Either way it reads stdin to EOF
+   exactly once, refuses any `target` other than `/etc/fstab` (for every
+   operation), and then:
    - `write`: unless `allow_external_change` is `true`, re-reads the verified
      target **in this process** and compares it with
      `last_known_real_content`; if they differ it answers
@@ -998,7 +1030,12 @@ When `save` or `restore_backup` takes an elevated case of §3.5's dispatch, or
    Exit codes: `0` success, `1` the operation was attempted and failed (a JSON
    error body is present), `2` the request itself was unusable (a JSON error
    body is still present; nothing was written and nothing was deleted).
-   Diagnostics go to stderr, never stdout.
+   Exit `2` **always** carries a body, including the one case that happens
+   before stdin is read at all - a stray argument - and that holds for both
+   binaries: the GUI's flag branch and `rustab-helper` each print the same
+   write-shaped error object (`kind: "internal"`, `target_unchanged: true`)
+   on stdout alongside their human-readable line on stderr. Diagnostics go
+   to stderr, never stdout.
 6. The unprivileged side parses that object. A parsable response always wins
    over the exit code - it is the helper's own account of what it did. A
    response that answers a *different* operation is not an account of this
@@ -1014,10 +1051,11 @@ elevated side reconstructs the identical document the user was shown and lets
 chain whose output could differ from the first one's.
 
 This stdin/stdout protocol is internal, undocumented as an interface and
-unstable by design (§11): nothing but this binary ever speaks it, to itself,
-in a single build. It is described here because it is the mechanism the
-`privilege_escalation` error kinds refer to, not because anything else may
-use it.
+unstable by design (§11): nothing but Rustab's own two executables ever
+speaks it, to each other, and both are compiled from one build out of one
+shared crate - so there is no version skew for it to survive. It is
+described here because it is the mechanism the `privilege_escalation` error
+kinds refer to, not because anything else may use it.
 
 ### 4.4 Why a write does the *entire* atomic operation as root
 
@@ -1037,8 +1075,11 @@ By construction, not by convention:
   target holds either its complete old content or its complete new content -
   because `write_document` is the only thing that ever touched the disk.
 - It is the *same* audited code: not a copy, not a port, not a
-  reimplementation. The elevated path calls the identical function compiled
-  from the identical source in the same build.
+  reimplementation. Both elevated binaries link the same
+  `rustab-privileged` crate and call the identical function compiled from
+  the identical source in the same build - the only difference between them
+  is what starts it (a flag branch in the GUI's `main`, or `rustab-helper`'s
+  entire `main`).
 
 None of this applies to the two backup operations, and none of it is needed
 there: neither touches the target file (a `create_backup` only *reads* it),
@@ -1049,28 +1090,68 @@ rename, no verification pass in either. Their guarantee is narrower and
 simpler: either the named backup is gone / the new backup exists, or nothing
 changed.
 
-### 4.5 Why a re-exec and not a separate helper binary
+### 4.5 Why an ordinary install re-execs, and why the Flatpak uses a separate static helper
 
-A dedicated `rustab-helper` executable is the textbook answer. It was
-rejected deliberately:
+A dedicated `rustab-helper` executable is the textbook answer, and this
+document used to reject it outright. It now exists - but only because the
+Flatpak forced the issue, and the ordinary install still re-execs. The
+honest version of both halves of that decision:
 
-- **One artifact to build, package and sign.** A second binary has to be
-  added to the bundle, installed at a known absolute path, kept
-  version-locked with the GUI, and signed separately in formats that sign
-  executables. `docs/SPEC.md` §13/§14 describe a single-binary bundle.
-- **A helper can drift; a re-exec cannot.** A stale helper speaking an older
-  request format while the GUI speaks a newer one is a real hazard for a tool
-  that writes `/etc/fstab`. There is no "the helper's copy of the write
-  logic" here, because there is no copy.
-- **No security benefit is given up.** A helper's advantage would be a
-  smaller elevated code surface, but the elevated surface here is already
-  minimal and provably so: the flag is checked as the first statement of
-  `main`, matched as `argv[1]` exactly, extra arguments are refused, and the
-  elevated process reads stdin, performs one of three operations, prints JSON
-  and exits. Adding the second and third operations did not add entry points -
-  each added one `match` arm behind the same single flag (§4.2).
+**Why the ordinary install still re-execs.** On a machine where the GUI
+binary was built and installed, re-exec'ing it costs nothing and gives up
+nothing:
+
+- **Fewer artifacts to install at a known path.** The re-exec names
+  `std::env::current_exe()`, so there is no second path to get right, no
+  "the helper is not where the GUI expected it" failure mode, and nothing
+  extra for a distro package to place. (This is also why the ordinary path
+  deliberately does *not* go looking for a sibling `rustab-helper`:
+  shipping the helper everywhere is a packaging decision, not an
+  implementation detail, and it has not been taken.)
+- **No security benefit is given up.** The elevated surface of the re-exec
+  is already minimal and provably so: the flag is checked as the first
+  statement of `main`, matched as `argv[1]` exactly, extra arguments are
+  refused, and the elevated process reads stdin, performs one of three
+  operations, prints JSON and exits (§4.2).
 - **The authorization cost is identical.** `pkexec` prompts per invocation
   either way, so nothing improves for the user.
+
+**Why the Flatpak cannot re-exec, and what replaced it.** Under Flatpak the
+`pkexec` must happen on the **host** (§4.3 step 2, `docs/FLATPAK.md` §3),
+and a process started there runs against the host's libraries. The GUI
+binary is dynamically linked against the *runtime's* GTK, WebKitGTK and
+glibc, so re-exec'ing it on the host works only on a host that happens to
+satisfy all of them, and on one that does not it fails at `exec` - before
+reading a byte of its request, after the user has already typed a password.
+That is not a failure mode a tool that writes `/etc/fstab` should carry for
+packaging convenience. So the Flatpak ships `rustab-helper`: the same
+elevated code in a binary that depends on nothing but
+`rustab-privileged`/`fstab-core`/`serde`, built as a static (`static-pie`,
+musl) executable, which therefore consults no host library at all.
+
+The two objections this document previously raised against a helper are
+answered, not ignored:
+
+- **"A helper can drift; a re-exec cannot."** Still a real hazard - but
+  drift is prevented here by *sharing the implementation*, not by avoiding
+  the binary. There is no "the helper's copy of the write logic": both
+  executables link the one `rustab-privileged` crate, are produced by the
+  same build from the same workspace, and are installed together into the
+  same `/app/bin` by the same manifest step. A stale helper beside a newer
+  GUI is not a state this packaging can reach.
+- **"A second artifact to build, package and sign."** True, and accepted
+  for the Flatpak only, where it is one extra `cargo build` and one extra
+  `install` in `flatpak/dev.tomsk.Rustab.yml`, and where Flatpak signs the
+  whole bundle rather than individual executables. The `.deb`/`.rpm`/
+  `.AppImage` bundles of `docs/SPEC.md` §13 still carry the GUI binary
+  alone, and nothing in them needs the helper.
+
+The one claim that has to be *reversed* rather than defended: a separate
+helper does not widen the elevated surface here - it narrows it. The
+re-exec'd GUI binary is a root process that happens to have Tauri, a
+webview, plugins and a logger linked into it and is trusted not to
+initialize them; `rustab-helper` has none of them linked at all, and its
+`main` contains nothing but the argv refusal and the one dispatch call.
 
 ### 4.6 Why the target path is sent as data, and re-checked
 
@@ -1299,22 +1380,27 @@ session can read or save the real `/etc/fstab`. A Flatpak session reports a
 fallback directory here *and* reads and writes the real file normally, through
 `flatpak-spawn --host` (§3.6, §4). The field answers one narrow question -
 "where are this session's manual backups of `/etc/fstab`?" - and nothing
-broader.
+broader. Since T42 it also indicates that `list_backups` will fetch the real
+file's backup list from the host and include those rows too, merged with the
+fallback directory's, and that `restore_backup`/`read_backup` can resolve
+against host rows.
 
-When it is a string, that directory is exactly where `list_backups` (§3.6),
-`create_backup` (§3.11) and `delete_backup` (§3.10) act, and what
-`open_backup_location` (§3.12) opens - and two things are true that the UI has
-to state plainly rather than imply (`docs/UI_DESIGN.md` §7):
+When it is a string, that directory is exactly where `create_backup` (§3.11)
+and `delete_backup` (§3.10) *create and destroy* their own rows - `open_backup_location`
+(§3.12) opens it - and three things are true that the UI has to state plainly
+rather than imply (`docs/UI_DESIGN.md` §7):
 
-- backups the user creates explicitly land in that directory, not in `/etc/`,
-  and need no password prompt at all;
+- backups the user creates here land in that directory, not in `/etc/`, and
+  need no password prompt at all;
 - the automatic backups each save takes are **still written beside the real
   `/etc/fstab`** by the elevated writer - which since T40 is a verified fact
   rather than an assumption, because that writer now runs as a real host root
-  process (§3.6) - and are **not listed**, because this process cannot
-  enumerate that directory. They are not lost: they remain recoverable from a
-  rescue environment, which is the whole reason they are put there - the
-  in-app list simply cannot prove they exist.
+  process (§3.6) - and `list_backups` now lists them too, merged newest-first
+  with the fallback directory's own rows. They are marked non-deletable
+  (`deletable: false` in §9) - the sandboxed session can restore or view them,
+  but cannot delete them;
+- if the host listing fails for any reason, `list_backups` rejects loudly
+  (kind `list_backups`) rather than silently omitting the host rows.
 
 Treat it as display text. No command accepts a directory, and the three
 commands that do take a path (§3.7, §3.9, §3.10) match what they are given
@@ -1547,7 +1633,7 @@ already uses, never `write_document`.
 | `target_resolution` | The active target could not be determined | every read-side command |
 | `read_target` | The target exists but could not be read | `list_entries` |
 | `not_utf8` | The bytes read are not valid UTF-8 and are refused rather than mangled | `list_entries` (the target), `read_backup` (a backup), `resync_external_change` (the real `/etc/fstab`) |
-| `list_backups` | The target's directory could not be listed | `list_backups` |
+| `list_backups` | The target's directory could not be listed, or (in fallback mode) the host listing failed | `list_backups` |
 | `invalid_backup` | The requested backup is not one of this target's backups, or the list could not be read. Nothing was read. | `read_backup` |
 | `read_backup` | The backup is a genuine one but could not be read (permissions, I/O) | `read_backup` |
 | `open_location` | The host file manager could not be launched | `open_backup_location` |
@@ -1609,7 +1695,8 @@ message say it.
   "target_path": "/etc/fstab",
   "size_bytes": 1842,
   "created_unix_secs": 1760000000,
-  "is_manual": false }
+  "is_manual": false,
+  "deletable": true }
 ```
 
 `path` is the exact string to hand back to `restore_backup` (§3.7),
@@ -1627,6 +1714,16 @@ naming scheme the distinction is encoded in and reports it here; the frontend
 must not parse `file_name` to work it out. The practical difference is
 retention: automatic backups are pruned past 10 per target, manual ones never
 are (§3.6).
+
+`deletable` is `true` for every row that `delete_backup` (§3.10) accepts in
+this session - all rows outside fallback mode, and (in fallback mode) the
+fallback directory's own rows. It is `false` **only** for a backup listed from
+the real `/etc/fstab` in fallback mode: the automatic backups the elevated
+writer deposits there, and any manual backups an non-sandboxed install left beside
+the real file. The frontend must not infer this from `path` or `target_path` -
+read the field directly. For a non-deletable row, the UI renders a
+non-interactive status pill in place of a Delete button (§7 and
+`docs/UI_DESIGN.md` §7).
 
 ### `DeviceDiscoveryDto` / `DeviceInfoDto`
 
@@ -1662,7 +1759,7 @@ These exact strings are asserted by unit tests in `src-tauri/src/dto.rs`:
 {"kind":"external_change","message":"m","target_unchanged":true,"report":null,"path":null,"backup":null,"external_change":{"last_known_content":"# old\n","current_content":"# new\n"}}
 {"kind":"not_utf8","message":"m"}
 {"kind":"invalid_backup","message":"m"}
-{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true}
+{"path":"/p.b","file_name":"p.b","target_path":"/p","size_bytes":12,"created_unix_secs":1760000000,"is_manual":true,"deletable":true}
 {"target":"/p","backup":"/p.b","pruned_backups":[],"notes":["n"]}
 {"kind":"target_missing","message":"m"}
 {"devices":[{"path":"/dev/sda1","uuid":"u","label":null,"partuuid":null,"partlabel":null,"fs_type":"ext4"}],"lsblk_available":true}
@@ -1742,10 +1839,11 @@ individually by `dto::tests::every_validation_field_spelling_is_exactly_as_docum
   The same applies to a deletion: a backup deleted while a save is pruning
   old backups can produce an `invalid_backup` from either side, which means
   "it is already gone", not "something is wrong".
-- **The internal flag is not a public CLI.** `rustab
-  --internal-privileged-write` and its stdin/stdout protocol (all three
-  operations of it) are an implementation detail of §4, unstable by design,
-  and must not be invoked by anything but the escalation path.
+- **Neither elevated entry point is a public CLI.** `rustab
+  --internal-privileged-write`, the `rustab-helper` binary, and the
+  stdin/stdout protocol both of them speak (all three operations of it) are
+  an implementation detail of §4, unstable by design, and must not be
+  invoked by anything but the escalation path.
 - **Manual smoke test of the elevated paths** (deliberately not automated -
   they need a password prompt and touch the real file and its backups; run
   them by hand on a machine you can afford to fix, and check
