@@ -20,8 +20,11 @@ use std::time::{Duration, Instant};
 /// How long the hardware-render probe child is watched before
 /// [`relaunch_supervised`] accepts it as the real app. Margin over the
 /// ~2.5-2.8s the one reproduced crash took (Nvidia + Wayland: a GDK
-/// Wayland protocol-error abort, exit code 1).
-const PROBE_WINDOW: Duration = Duration::from_millis(5000);
+/// Wayland protocol-error abort, exit code 1), generous enough to also
+/// cover a slow cold start (disk-bound library loading) reaching that same
+/// crash later than it did here - the window is counted from process
+/// start, not from when rendering is actually attempted.
+const PROBE_WINDOW: Duration = Duration::from_millis(10_000);
 
 /// Set on every child this module spawns, so that child skips supervising
 /// itself and builds the real app directly.
