@@ -72,30 +72,30 @@ All screenshots below show Rustab pointed at a throwaway test file via `RUSTAB_T
 </td>
 <td width="50%">
 
-![Edit entry](docs/screenshots/edit-entry.png)
-<sub>**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options.</sub>
+![Entry detail](docs/screenshots/entry-detail.png)
+<sub>**Row detail** - click any row to expand its full source, mount point, options, and description untruncated, in place.</sub>
 
 </td>
 </tr>
 <tr>
+<td width="50%">
+
+![Edit entry](docs/screenshots/edit-entry.png)
+<sub>**Editing an entry** - structured fields for every fstab column, with a device/mount-point picker and a tag-input for options.</sub>
+
+</td>
 <td width="50%">
 
 ![Add entry](docs/screenshots/add-entry.png)
 <sub>**Adding an entry, with inline validation** - feedback (here, a mount point that doesn't exist yet) appears as you type, before you ever try to save.</sub>
 
 </td>
-<td width="50%">
-
-![Device picker](docs/screenshots/device-picker.png)
-<sub>**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand.</sub>
-
-</td>
 </tr>
 <tr>
 <td width="50%">
 
-![Pending changes](docs/screenshots/pending-changes.png)
-<sub>**Pending changes bar** - nothing is written until you review it; `Discard changes` reverts everything staged in one click.</sub>
+![Device picker](docs/screenshots/device-picker.png)
+<sub>**Device picker** - pick a real, currently-attached device instead of typing a UUID by hand.</sub>
 
 </td>
 <td width="50%">
@@ -113,9 +113,6 @@ All screenshots below show Rustab pointed at a throwaway test file via `RUSTAB_T
 
 </td>
 <td width="50%">
-
-![Backups](docs/screenshots/backups.png)
-<sub>**Backups panel** - every save is backed up automatically; restore, diff, or delete any previous version.</sub>
 
 </td>
 </tr>
