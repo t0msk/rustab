@@ -859,6 +859,39 @@ identical - show the message in `ExternalChangeDialog`'s existing error slot
 and leave Cancel/Write-anyway/Reload all available - so a second kind would
 describe a distinction nothing branches on.
 
+### 3.16 `pick_directory`
+
+```
+pick_directory() -> string | null   (rejects with CommandErrorDto)
+```
+
+Opens a native directory chooser for `MountPointField`'s "Browse..." button
+(bind mounts, where the target directory already exists on the host) and
+resolves with the path the user picked, or `null` if they cancelled - a
+cancellation is success, not a rejection, the same as every other
+dialog-launching command in this contract.
+
+Talks to `org.freedesktop.portal.FileChooser` directly rather than through a
+native GTK dialog. This is load-bearing, not a style choice: the Flatpak
+manifest grants no `--filesystem=` access at all, so a GTK
+`GtkFileChooserNative`'s own portal integration resolves a chosen folder to
+the Document Portal's ephemeral per-session path
+(`/run/user/$UID/doc/<id>/<name>`) rather than the real host path - writing
+that into `/etc/fstab` would name a mount point that exists nowhere outside
+this one sandboxed session, let alone at the boot time the kernel actually
+reads `/etc/fstab`. The portal's own D-Bus response does not have this
+problem: its `uris` carry the real host path directly, which is what this
+command reads.
+
+**No privilege escalation.** Same reasoning as §3.12-§3.14: launching a
+portal dialog needs no elevated access, and the returned path is not
+written anywhere by this command - the frontend only stores it as the Mount
+point field's pending (unsaved) value.
+
+Error kinds: `pick_directory`, reported only if the portal request itself
+could not be sent or answered (no portal running, D-Bus error) - never for
+the user cancelling.
+
 ---
 
 ## 4. Privilege escalation

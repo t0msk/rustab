@@ -298,10 +298,10 @@ Field order, top to bottom, each with a `text-sm font-medium` label above it and
      shows `"No devices discovered - enter a value manually"` and the manual field stays
      usable; it is never a blocking state.
 3. **Mount point** - text input (`font-mono`) + a `Browse…` button opening a native
-   directory picker via `tauri-plugin-dialog`'s `open` command with `directory: true`,
-   setting this field to the chosen path on success and leaving it untouched on
-   cancel. While the source type is `None` and this field is still empty, it shows a
-   `"none"` placeholder hint
+   directory picker via the backend's `pick_directory` command (API_CONTRACT.md
+   §3.16), setting this field to the chosen path on success and leaving it
+   untouched on cancel. While the source type is `None` and this field is
+   still empty, it shows a `"none"` placeholder hint
    (the conventional real-fstab value for a swap entry's mount point, e.g.
    `/dev/sda2 none swap sw 0 0`) - a visual hint only, never written into the value
    unless the user actually types it.

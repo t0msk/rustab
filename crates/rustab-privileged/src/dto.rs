@@ -872,6 +872,12 @@ pub enum CommandErrorKindDto {
     /// successfully but publishing it onto the draft and its last-known-real
     /// marker failed.
     Resync,
+    /// `commands::pick_directory`'s own kind - the
+    /// `org.freedesktop.portal.FileChooser` request could not be sent or
+    /// answered (no portal running, D-Bus error, or similar). The user
+    /// cancelling the dialog is not this kind - it is a successful `None`,
+    /// the same as a cancelled native dialog always was.
+    PickDirectory,
 }
 
 /// A failed read-only command.
@@ -1463,6 +1469,7 @@ mod tests {
             (CommandErrorKindDto::OpenExternalLink, "open_external_link"),
             (CommandErrorKindDto::OpenPath, "open_path"),
             (CommandErrorKindDto::Resync, "resync"),
+            (CommandErrorKindDto::PickDirectory, "pick_directory"),
         ];
         for (kind, spelling) in command_kinds {
             assert_eq!(
