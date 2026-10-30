@@ -602,36 +602,23 @@ pub fn open_path_in_file_manager(path: String) -> Result<(), CommandErrorDto> {
 }
 
 /// `pick_directory() -> string | null` (API_CONTRACT.md §3.16). Opens a
-/// native directory chooser for `MountPointField`'s "Browse..." button
-/// (bind mounts, where the target directory already exists on the host)
-/// and returns the path the user picked, or `null` if they cancelled.
+/// native directory chooser for `MountPointField`'s "Browse..." button;
+/// `null` means cancelled.
 ///
-/// Talks to `org.freedesktop.portal.FileChooser` directly via `ashpd`
-/// rather than through a GTK dialog (`tauri-plugin-dialog`, used until
-/// this command existed): under Flatpak, with no `--filesystem=` grant in
-/// the manifest, a GTK `GtkFileChooserNative` resolves a chosen folder to
-/// the Document Portal's ephemeral per-session FUSE path
-/// (`/run/user/$UID/doc/<id>/<name>`) via `g_file_get_path()`, not the
-/// real host path - writing that into `/etc/fstab` would name a mount
-/// point that does not exist outside this one sandboxed session, let
-/// alone at boot, when the kernel reads `/etc/fstab` with no Flatpak
-/// runtime involved at all. The portal's own D-Bus response is not
-/// wrapped this way: its `uris` carry the real host path directly (see
-/// [`uri_to_path`]), which is what this command reads instead.
+/// Talks to the FileChooser portal directly via `ashpd` rather than a GTK
+/// dialog: under Flatpak, GTK's own portal integration resolves a picked
+/// folder to the Document Portal's ephemeral path, not the real host path
+/// `/etc/fstab` needs - `ashpd`'s raw `uris` give the real one instead
+/// (see [`uri_to_path`]).
 ///
-/// The only command in this module that is a genuine `async fn` rather
-/// than a blocking `fn` tagged `(async)` (see the module docs' "Why every
-/// command is `#[tauri::command(async)]`") - the portal round trip is a
-/// real `.await`, not blocking work to move off the main thread. That
-/// also means, unlike every other command here, it cannot be called
-/// directly from a `cargo test` with no Tauri runtime; only the pure
-/// [`uri_to_path`] half is unit-tested.
+/// A genuine `async fn`, unlike every other command here (see the module
+/// docs) - so it has no `cargo test` coverage of its own; only
+/// [`uri_to_path`] is unit-tested.
 ///
 /// # Errors
 ///
-/// [`CommandErrorKindDto::PickDirectory`] if the portal request itself
-/// could not be sent or answered - never for the user cancelling, which
-/// is `Ok(None)`.
+/// [`CommandErrorKindDto::PickDirectory`] if the portal request failed -
+/// never for a user cancelling, which is `Ok(None)`.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn pick_directory() -> Result<Option<String>, CommandErrorDto> {
     use ashpd::desktop::file_chooser::OpenFileRequest;
@@ -669,12 +656,9 @@ fn pick_directory_error(err: ashpd::Error) -> CommandErrorDto {
 }
 
 /// The pure half of [`pick_directory`]: a portal `file://` URI to the
-/// absolute host path it names, or `None` for anything else - a URI
-/// `url::Url` cannot parse at all, or a non-`file` scheme. The latter is
-/// checked explicitly: `Url::to_file_path` does not itself reject other
-/// schemes that merely happen to carry a plausible-looking path (verified
-/// by a `trash://` URI resolving to a path otherwise). Percent-decoding
-/// is still `to_file_path`'s job.
+/// absolute path it names, or `None` otherwise. Scheme is checked
+/// explicitly - `Url::to_file_path` alone does not reject a non-`file`
+/// URI that merely looks path-like (confirmed with a `trash://` one).
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let url = url::Url::parse(uri).ok()?;
     if url.scheme() != "file" {
@@ -2346,8 +2330,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     // Octal-escape decoding itself is tested once, where it now lives:
     // `fstab_core::model::decode_escaped_whitespace`'s own test module.
 
-    // -- pick_directory (uri_to_path only - see its own doc comment for why
-    // the portal round trip itself has no test here) ------------------------
+    // -- pick_directory (uri_to_path only; the portal call itself is untested) --
 
     /// The common case: a plain `file://` URI with no special characters
     /// resolves to the exact path it names.

@@ -23,12 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.2.4", features = [] }
 tauri-plugin-log = "2.0.0-rc"
-# Linux-only directory picker for the Mount point field's "Browse..."
-# button, talking to org.freedesktop.portal.FileChooser directly instead of
-# going through a native GTK dialog (see pick_directory in commands.rs for
-# why: under Flatpak, GTK's own portal-backed chooser resolves a picked
-# folder to the ephemeral Document Portal path, not the real host path
-# that belongs in /etc/fstab). `file_chooser` is the only feature needed;
-# `tokio` (default) matches Tauri's own async runtime.
+# Directory picker for the Mount point field's "Browse..." button - talks
+# to the FileChooser portal directly (see pick_directory in commands.rs).
 ashpd = { version = "0.13.13", features = ["file_chooser"] }
 url = "2.5"

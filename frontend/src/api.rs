@@ -397,11 +397,8 @@ pub async fn open_path_in_file_manager(path: &str) -> Result<(), String> {
 }
 
 /// `pick_directory() -> string | null` (API_CONTRACT.md §3.16). Opens a
-/// native directory chooser via `org.freedesktop.portal.FileChooser`.
-/// `Ok(None)` means the user cancelled (expected, not an error);
-/// `Ok(Some(path))` means they picked a directory - already the real host
-/// path, not the Flatpak sandbox's own view. Never escalates privilege,
-/// never writes.
+/// native directory chooser; `Ok(None)` means cancelled, `Ok(Some(path))`
+/// is the real host path. Never escalates privilege, never writes.
 pub async fn pick_directory() -> Result<Option<String>, String> {
     invoke("pick_directory", &EmptyArgs {}).await
 }
