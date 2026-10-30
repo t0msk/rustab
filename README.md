@@ -264,7 +264,9 @@ The workspace layout:
 
 #### Troubleshooting: blank/white window on launch
 
-If `cargo tauri dev` (or the built binary) opens a completely blank or white window instead of the UI, this is a known WebKitGTK issue on some GPU/driver combinations (common under certain Nvidia drivers, Wayland sessions, and virtual machines) - WebKitGTK's hardware compositing/DMA-BUF renderer fails silently instead of falling back. Force software rendering by setting these two environment variables before launching:
+**If the window flashes or the app seems to briefly restart when it launches, that's expected** on a machine where GPU-accelerated rendering doesn't work. Rustab tries hardware rendering first, every launch; if that fails, it relaunches itself once with WebKitGTK's software renderer and keeps running from there (see `src-tauri/src/render_env.rs` for the mechanism and the known upstream issues behind it). On an unaffected machine this costs nothing - the first launch already *is* the real, GPU-accelerated app, no relaunch at all.
+
+If that fallback doesn't trigger but you still get a blank/white window - a GPU/driver failure mode this mechanism doesn't catch - force the same workaround by hand:
 
 ```bash
 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
@@ -275,6 +277,8 @@ If you're on a pure Wayland session and the window fails to open at all (rather 
 ```bash
 GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 ```
+
+Any variable you set yourself always wins over the fallback. Two escape hatches cover the rest: `RUSTAB_FORCE_SOFTWARE_RENDER=1` applies the workaround unconditionally, skipping the probe (for a failure mode probing wouldn't catch anyway), and `RUSTAB_SKIP_RENDER_DETECTION=1` disables this mechanism entirely, running hardware rendering with no safety net (if you want to confirm a problem yourself, or need the pre-fallback behavior back for some other reason).
 
 ### Release Build
 

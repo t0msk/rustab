@@ -187,45 +187,96 @@ of the earlier scope boundary that already ruled it out for this session.
 
 ### 1.5 Known WebKitGTK rendering issue (blank window / choppy scrolling) and its fix
 
-On some GPU/driver combinations (seen directly during this project's own
-development - certain Nvidia drivers, Wayland sessions, and VMs are the
-common pattern), WebKitGTK's hardware-compositing/DMA-BUF renderer fails
-silently instead of falling back, producing a completely blank white
-window instead of the UI. The documented fix (see `README.md`'s own
-"Troubleshooting: blank/white window on launch" section, which this
-mirrors for the Flatpak case) is forcing software rendering via two
-environment variables:
+On some GPU/driver combinations, WebKitGTK's hardware-compositing/DMA-BUF
+renderer fails instead of falling back, producing a blank or unusable
+window instead of the UI. Related upstream reports: WebKit #258834,
+tauri-apps/tauri#9304 (a Mesa ≥24 instance of this same fragility on
+Wayland, on GNOME 46+/Plasma 6/Fedora 40+); this app's own reproduction
+was Nvidia's proprietary driver on Wayland, a different GPU/driver pairing
+hitting the same general class of bug.
+
+**This is now detected and fixed automatically, at runtime, without
+guessing from the GPU** - in the app's own code (`src-tauri/src/render_env.rs`,
+called first thing in `src-tauri/src/lib.rs::run`), not just documented as
+a manual env var. An earlier version of this fix tried to *predict* the
+bug from the GPU alone (any Nvidia proprietary driver present, or any VM)
+and forced software rendering preemptively on that guess. That was wrong
+in practice: most Nvidia users never hit this bug, so it cost all of them
+real scrolling/repaint performance for nothing.
+
+The mechanism instead tries hardware rendering first, on every launch, by
+re-executing this same binary as a watched child. If that child fails
+within the first few seconds, that's hardware rendering failing on *this*
+machine - the one failure actually reproduced while building this fix
+(Nvidia's proprietary driver + a Wayland session, current driver at the
+time) was not a silent blank window but a reliable, fast crash:
 
 ```
-WEBKIT_DISABLE_COMPOSITING_MODE=1
+Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.
+```
+
+...about 2.5-2.8s after launch, exit code 1, every time. On a failure like
+that, the child is relaunched exactly once, with the same environment
+variables `README.md`'s "Troubleshooting: blank/white window on launch"
+section used to ask the user to set by hand:
+
+```
+WEBKIT_DISABLE_HARDWARE_ACCELERATION=1
 WEBKIT_DISABLE_DMABUF_RENDERER=1
+WEBKIT_DISABLE_COMPOSITING_MODE=1
+LIBGL_ALWAYS_SOFTWARE=1
 ```
 
-**The tradeoff**: this fixes the blank window, but software-rendered
+plus `GDK_BACKEND=x11` if the session is Wayland (Nvidia's EGL/Wayland path
+is the one reproduced broken; X11/XWayland sidesteps it, at the cost of
+XWayland's fuzzier HiDPI scaling). Each one is only added where the user
+hasn't already set it themselves, so an explicit value - the user's own,
+or the Flatpak override below - always wins. These variables are stripped
+back out before this app spawns `xdg-open` (opening a backup's folder, or
+a link in the browser/mail client), so an unrelated program never
+inherits a software-rendering override meant for Rustab's own WebKitGTK
+instance.
+
+A machine that was never affected pays essentially nothing for this: the
+first (probe) child *is* the real, already-visible app for the entire
+watch window, hardware-accelerated throughout - there's no second,
+separate "real" launch hiding behind it. Only a machine where hardware
+rendering actually fails pays the one-time cost of a visible relaunch,
+followed by the software-render tradeoff described next.
+
+**The tradeoff, once software rendering is actually in effect**:
 WebKitGTK scrolls/repaints noticeably slower than GPU-accelerated
 rendering - more visible with a longer entries table (a real `/etc/fstab`
 has far more DOM content per row than a short practice file) or a large
-raw-text view. This is inherent to forcing software rendering on an
-affected system, not something fixable in the app's own code.
+raw-text view. This is inherent to software rendering on an affected
+system, not something fixable in the app's own code - which is exactly why
+this mechanism only pays that cost where hardware rendering was actually
+observed to fail, not on a guess.
 
-**This is deliberately not baked into the manifest/`finish-args` as an
-always-on default** - most users will never hit the underlying GPU bug,
-and forcing software rendering unconditionally would make the app
-artificially slower for everyone else for no benefit. Instead, a user who
-actually hits the blank-window symptom applies the fix themselves, the
-Flatpak-native way (equivalent to setting the env vars before launching a
-plain binary, but persists across launches including from a GUI
-launcher - no need to open a terminal every time):
+If a GPU/driver combination fails in some other way - not an early crash
+this re-exec-and-watch approach would catch - two escape hatches exist,
+settable the Flatpak-native way (persists across launches, including from
+a GUI launcher - no terminal needed each time):
 
 ```bash
+# Force the software-render workaround unconditionally, skipping the probe:
+flatpak override --user --env=RUSTAB_FORCE_SOFTWARE_RENDER=1 dev.tomsk.Rustab
+
+# Or disable this mechanism entirely and run hardware rendering with no
+# safety net (e.g. to confirm a problem yourself, or go back to the
+# pre-fallback behaviour):
+flatpak override --user --env=RUSTAB_SKIP_RENDER_DETECTION=1 dev.tomsk.Rustab
+
+# Or set any of the individual WebKit/GDK/LIBGL variables above directly -
+# an explicit value always overrides what the fallback would have chosen:
 flatpak override --user \
   --env=WEBKIT_DISABLE_COMPOSITING_MODE=1 \
   --env=WEBKIT_DISABLE_DMABUF_RENDERER=1 \
   dev.tomsk.Rustab
 ```
 
-To undo it: `flatpak override --user --reset dev.tomsk.Rustab` (or
-`--unset-env` for just these two keys).
+To undo any of these: `flatpak override --user --reset dev.tomsk.Rustab`
+(or `--unset-env` for just the keys you set).
 
 ---
 
