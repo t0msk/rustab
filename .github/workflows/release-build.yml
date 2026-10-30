@@ -254,16 +254,10 @@ jobs:
             esac
           done < <(find "$appdir_name" -type l -print0)
 
-          # linuxdeploy's wrapped binary (AppRun.wrapped) came off this
-          # runner at mode 750 - owner/group rwx, nothing for "other" -
-          # which squashfs bakes verbatim into the AppImage (confirmed on
-          # the published v0.2.0 asset). A sandbox that runs the AppImage
-          # as neither that owning user nor group (e.g. AppImageHub's
-          # firejail-based test bot) then hits only the "other" bits and
-          # gets "Permission denied" on exec, even though the file runs
-          # fine for whoever built it. `a+rX` adds world-read everywhere
-          # and world-execute only where some owner/group x bit already
-          # exists, so it can't turn a data file into an executable one.
+          # AppRun.wrapped came off this runner at mode 750 (no "other"
+          # execute), which squashfs bakes in verbatim - a sandbox running
+          # as a different user/group then gets "Permission denied" on
+          # exec (confirmed on the published v0.2.0 asset).
           chmod -R a+rX "$appdir_name"
 
           rm -f "$appimage_name"
