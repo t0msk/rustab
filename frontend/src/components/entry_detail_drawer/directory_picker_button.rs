@@ -2,9 +2,9 @@
 //!
 //! A plain presentational button that takes an `on_click` callback and
 //! nothing else. `MountPointField` wires that callback to open a native
-//! directory chooser via `tauri-plugin-dialog`'s `plugin:dialog|open`
-//! command and feed the chosen path back into the Mount point field on
-//! success (a cancelled chooser leaves the field untouched).
+//! directory chooser via the backend's `pick_directory` command
+//! (API_CONTRACT.md §3.16) and feed the chosen path back into the Mount
+//! point field on success (a cancelled chooser leaves the field untouched).
 
 use yew::prelude::*;
 

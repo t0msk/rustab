@@ -66,7 +66,6 @@ pub fn run() {
             }
             Ok(())
         })
-        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_target_info,
             commands::list_entries,
@@ -83,6 +82,7 @@ pub fn run() {
             commands::open_backup_location,
             commands::open_external_link,
             commands::open_path_in_file_manager,
+            commands::pick_directory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

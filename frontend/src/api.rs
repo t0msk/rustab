@@ -379,16 +379,6 @@ pub async fn open_external_link(link: ExternalLink) -> Result<(), String> {
     invoke("open_external_link", &OpenExternalLinkArgs { link }).await
 }
 
-#[derive(Serialize)]
-struct PickDirectoryOptions {
-    directory: bool,
-}
-
-#[derive(Serialize)]
-struct PickDirectoryArgs {
-    options: PickDirectoryOptions,
-}
-
 /// `open_path_in_file_manager(path: string) -> null` (API_CONTRACT.md §3.14).
 /// Opens an arbitrary frontend-supplied path - today, always an entry's own
 /// Mount point value already visible in the table - in the host file
@@ -406,16 +396,12 @@ pub async fn open_path_in_file_manager(path: &str) -> Result<(), String> {
     .await
 }
 
-/// `plugin:dialog|open` (tauri-plugin-dialog) - opens a native directory
-/// chooser. `Ok(None)` means the user cancelled (expected, not an error);
-/// `Ok(Some(path))` means they picked a directory. Never escalates
-/// privilege, never writes.
+/// `pick_directory() -> string | null` (API_CONTRACT.md §3.16). Opens a
+/// native directory chooser via `org.freedesktop.portal.FileChooser`.
+/// `Ok(None)` means the user cancelled (expected, not an error);
+/// `Ok(Some(path))` means they picked a directory - already the real host
+/// path, not the Flatpak sandbox's own view. Never escalates privilege,
+/// never writes.
 pub async fn pick_directory() -> Result<Option<String>, String> {
-    invoke(
-        "plugin:dialog|open",
-        &PickDirectoryArgs {
-            options: PickDirectoryOptions { directory: true },
-        },
-    )
-    .await
+    invoke("pick_directory", &EmptyArgs {}).await
 }

@@ -601,6 +601,88 @@ pub fn open_path_in_file_manager(path: String) -> Result<(), CommandErrorDto> {
     open_path_in_file_manager_with(Path::new(&decoded), open_in_file_manager)
 }
 
+/// `pick_directory() -> string | null` (API_CONTRACT.md §3.16). Opens a
+/// native directory chooser for `MountPointField`'s "Browse..." button
+/// (bind mounts, where the target directory already exists on the host)
+/// and returns the path the user picked, or `null` if they cancelled.
+///
+/// Talks to `org.freedesktop.portal.FileChooser` directly via `ashpd`
+/// rather than through a GTK dialog (`tauri-plugin-dialog`, used until
+/// this command existed): under Flatpak, with no `--filesystem=` grant in
+/// the manifest, a GTK `GtkFileChooserNative` resolves a chosen folder to
+/// the Document Portal's ephemeral per-session FUSE path
+/// (`/run/user/$UID/doc/<id>/<name>`) via `g_file_get_path()`, not the
+/// real host path - writing that into `/etc/fstab` would name a mount
+/// point that does not exist outside this one sandboxed session, let
+/// alone at boot, when the kernel reads `/etc/fstab` with no Flatpak
+/// runtime involved at all. The portal's own D-Bus response is not
+/// wrapped this way: its `uris` carry the real host path directly (see
+/// [`uri_to_path`]), which is what this command reads instead.
+///
+/// The only command in this module that is a genuine `async fn` rather
+/// than a blocking `fn` tagged `(async)` (see the module docs' "Why every
+/// command is `#[tauri::command(async)]`") - the portal round trip is a
+/// real `.await`, not blocking work to move off the main thread. That
+/// also means, unlike every other command here, it cannot be called
+/// directly from a `cargo test` with no Tauri runtime; only the pure
+/// [`uri_to_path`] half is unit-tested.
+///
+/// # Errors
+///
+/// [`CommandErrorKindDto::PickDirectory`] if the portal request itself
+/// could not be sent or answered - never for the user cancelling, which
+/// is `Ok(None)`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn pick_directory() -> Result<Option<String>, CommandErrorDto> {
+    use ashpd::desktop::file_chooser::OpenFileRequest;
+    use ashpd::desktop::ResponseError;
+
+    let request = OpenFileRequest::default()
+        .title("Select a directory")
+        .directory(true)
+        .modal(true)
+        .send()
+        .await;
+
+    let files = match request {
+        Ok(request) => match request.response() {
+            Ok(files) => files,
+            Err(ashpd::Error::Response(ResponseError::Cancelled)) => return Ok(None),
+            Err(err) => return Err(pick_directory_error(err)),
+        },
+        Err(ashpd::Error::Response(ResponseError::Cancelled)) => return Ok(None),
+        Err(err) => return Err(pick_directory_error(err)),
+    };
+
+    Ok(files
+        .uris()
+        .first()
+        .and_then(|uri| uri_to_path(uri.as_str()))
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+fn pick_directory_error(err: ashpd::Error) -> CommandErrorDto {
+    CommandErrorDto::new(
+        CommandErrorKindDto::PickDirectory,
+        format!("could not open the directory picker: {err}"),
+    )
+}
+
+/// The pure half of [`pick_directory`]: a portal `file://` URI to the
+/// absolute host path it names, or `None` for anything else - a URI
+/// `url::Url` cannot parse at all, or a non-`file` scheme. The latter is
+/// checked explicitly: `Url::to_file_path` does not itself reject other
+/// schemes that merely happen to carry a plausible-looking path (verified
+/// by a `trash://` URI resolving to a path otherwise). Percent-decoding
+/// is still `to_file_path`'s job.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Shared internals
 // ---------------------------------------------------------------------------
@@ -2263,6 +2345,44 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     // Octal-escape decoding itself is tested once, where it now lives:
     // `fstab_core::model::decode_escaped_whitespace`'s own test module.
+
+    // -- pick_directory (uri_to_path only - see its own doc comment for why
+    // the portal round trip itself has no test here) ------------------------
+
+    /// The common case: a plain `file://` URI with no special characters
+    /// resolves to the exact path it names.
+    #[test]
+    fn uri_to_path_resolves_a_plain_file_uri() {
+        assert_eq!(
+            uri_to_path("file:///mnt/data/backups"),
+            Some(PathBuf::from("/mnt/data/backups"))
+        );
+    }
+
+    /// A path containing a space comes back percent-encoded on the wire
+    /// (`%20`) - `url::Url::to_file_path` must decode it, not leave the
+    /// escape sequence in the path handed to the Mount point field.
+    #[test]
+    fn uri_to_path_percent_decodes_special_characters() {
+        assert_eq!(
+            uri_to_path("file:///mnt/My%20Backups"),
+            Some(PathBuf::from("/mnt/My Backups"))
+        );
+    }
+
+    /// A non-`file` scheme (e.g. the portal falling back to something this
+    /// command cannot use) must not be mistaken for a path.
+    #[test]
+    fn uri_to_path_rejects_a_non_file_scheme() {
+        assert_eq!(uri_to_path("trash:///mnt/data"), None);
+    }
+
+    /// A string that is not a URI at all must not panic - `None`, same as
+    /// any other unusable response.
+    #[test]
+    fn uri_to_path_rejects_an_unparseable_string() {
+        assert_eq!(uri_to_path("not a uri"), None);
+    }
 
     // -- open_external_link --------------------------------------------------
 
