@@ -25,5 +25,5 @@ tauri = { version = "2.2.4", features = [] }
 tauri-plugin-log = "2.0.0-rc"
 # Directory picker for the Mount point field's "Browse..." button - talks
 # to the FileChooser portal directly (see pick_directory in commands.rs).
-ashpd = { version = "0.13.13", features = ["file_chooser"] }
+ashpd = { version = "0.13.13", features = ["file_chooser", "documents"] }
 url = "2.5"

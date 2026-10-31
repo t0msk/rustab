@@ -606,14 +606,19 @@ pub fn open_path_in_file_manager(path: String) -> Result<(), CommandErrorDto> {
 /// `null` means cancelled.
 ///
 /// Talks to the FileChooser portal directly via `ashpd` rather than a GTK
-/// dialog: under Flatpak, GTK's own portal integration resolves a picked
-/// folder to the Document Portal's ephemeral path, not the real host path
-/// `/etc/fstab` needs - `ashpd`'s raw `uris` give the real one instead
-/// (see [`uri_to_path`]).
+/// dialog - but under Flatpak, the FileChooser portal itself always routes
+/// a sandboxed caller's result through the Document Portal (this happens
+/// in the portal daemon, identically for a raw `ashpd` call and a GTK
+/// dialog's own wrapper), so [`uri_to_path`] still comes back with that
+/// portal's ephemeral `/run/user/$UID/doc/<id>/...` path, not the real host
+/// one `/etc/fstab` needs. [`resolve_document_portal_path`] resolves it the
+/// rest of the way via `org.freedesktop.portal.Documents.GetHostPaths`
+/// (confirmed live with `gdbus` against a real pick: the doc ID from that
+/// FUSE path maps straight back to e.g. `/run/media/tomsk/Games`).
 ///
 /// A genuine `async fn`, unlike every other command here (see the module
 /// docs) - so it has no `cargo test` coverage of its own; only
-/// [`uri_to_path`] is unit-tested.
+/// [`uri_to_path`] and [`document_portal_doc_id`] are unit-tested.
 ///
 /// # Errors
 ///
@@ -641,11 +646,41 @@ pub async fn pick_directory() -> Result<Option<String>, CommandErrorDto> {
         Err(err) => return Err(pick_directory_error(err)),
     };
 
-    Ok(files
-        .uris()
-        .first()
-        .and_then(|uri| uri_to_path(uri.as_str()))
-        .map(|path| path.to_string_lossy().into_owned()))
+    let Some(path) = files.uris().first().and_then(|uri| uri_to_path(uri.as_str())) else {
+        return Ok(None);
+    };
+
+    let resolved = resolve_document_portal_path(&path).await.unwrap_or(path);
+    Ok(Some(resolved.to_string_lossy().into_owned()))
+}
+
+/// If `path` is a Document Portal FUSE path, resolves it to the real host
+/// path via `org.freedesktop.portal.Documents.GetHostPaths`; `None` if it
+/// isn't one, or the portal call fails (caller falls back to the FUSE path
+/// rather than failing the whole pick over this).
+async fn resolve_document_portal_path(path: &Path) -> Option<PathBuf> {
+    let doc_id = document_portal_doc_id(path)?;
+    let documents = ashpd::documents::Documents::new().await.ok()?;
+    let mut hosts = documents
+        .host_paths(&[ashpd::documents::DocumentID::from(doc_id)])
+        .await
+        .ok()?;
+    let host_path = hosts.remove(&ashpd::documents::DocumentID::from(doc_id))?;
+    Some(host_path.as_ref().to_path_buf())
+}
+
+/// Extracts `<id>` from a Document Portal FUSE path
+/// (`/run/user/<uid>/doc/<id>/...`); `None` if `path` doesn't match that
+/// shape.
+fn document_portal_doc_id(path: &Path) -> Option<&str> {
+    let rest = path.to_str()?.strip_prefix("/run/user/")?;
+    let mut segments = rest.splitn(3, '/');
+    let _uid = segments.next()?;
+    if segments.next()? != "doc" {
+        return None;
+    }
+    let id = segments.next()?.split('/').next()?;
+    (!id.is_empty()).then_some(id)
 }
 
 fn pick_directory_error(err: ashpd::Error) -> CommandErrorDto {
@@ -2331,6 +2366,30 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
 
     // Octal-escape decoding itself is tested once, where it now lives:
     // `fstab_core::model::decode_escaped_whitespace`'s own test module.
+
+    // -- pick_directory (uri_to_path/document_portal_doc_id only; the portal
+    // calls themselves are untested) --
+
+    /// The exact case this fix exists for: a picked directory's doc-portal
+    /// path resolves to its document ID.
+    #[test]
+    fn document_portal_doc_id_extracts_the_id() {
+        assert_eq!(
+            document_portal_doc_id(Path::new(
+                "/run/user/1000/doc/V1riv4MgDQ0gwnsrECtEXw/Games"
+            )),
+            Some("V1riv4MgDQ0gwnsrECtEXw")
+        );
+    }
+
+    /// A real host path (not under the Document Portal at all) must not be
+    /// mistaken for one - this is what makes the fallback in
+    /// [`resolve_document_portal_path`] safe to use unconditionally.
+    #[test]
+    fn document_portal_doc_id_rejects_a_real_host_path() {
+        assert_eq!(document_portal_doc_id(Path::new("/mnt/data/backups")), None);
+        assert_eq!(document_portal_doc_id(Path::new("/run/user/1000/other")), None);
+    }
 
     // -- pick_directory (uri_to_path only; the portal call itself is untested) --
 
