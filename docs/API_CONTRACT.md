@@ -872,16 +872,17 @@ cancellation is success, not a rejection, the same as every other
 dialog-launching command in this contract.
 
 Talks to `org.freedesktop.portal.FileChooser` directly rather than through a
-native GTK dialog. This is load-bearing, not a style choice: the Flatpak
-manifest grants no `--filesystem=` access at all, so a GTK
-`GtkFileChooserNative`'s own portal integration resolves a chosen folder to
-the Document Portal's ephemeral per-session path
-(`/run/user/$UID/doc/<id>/<name>`) rather than the real host path - writing
-that into `/etc/fstab` would name a mount point that exists nowhere outside
-this one sandboxed session, let alone at the boot time the kernel actually
-reads `/etc/fstab`. The portal's own D-Bus response does not have this
-problem: its `uris` carry the real host path directly, which is what this
-command reads.
+native GTK dialog, but under Flatpak the FileChooser portal always routes a
+sandboxed caller's result through the Document Portal - this happens in the
+portal daemon itself, identically for a raw `ashpd` call and for a GTK
+dialog's own wrapper. Either way the returned `uris` name the Document
+Portal's ephemeral per-session path (`/run/user/$UID/doc/<id>/<name>`), not
+the real host path - writing that into `/etc/fstab` would name a mount
+point that exists nowhere outside this one sandboxed session, let alone at
+the boot time the kernel actually reads `/etc/fstab`. This command resolves
+the rest of the way with a second portal call,
+`org.freedesktop.portal.Documents.GetHostPaths`, which maps that `<id>`
+back to the real host path.
 
 **No privilege escalation.** Same reasoning as §3.12-§3.14: launching a
 portal dialog needs no elevated access, and the returned path is not
