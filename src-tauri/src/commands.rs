@@ -646,7 +646,11 @@ pub async fn pick_directory() -> Result<Option<String>, CommandErrorDto> {
         Err(err) => return Err(pick_directory_error(err)),
     };
 
-    let Some(path) = files.uris().first().and_then(|uri| uri_to_path(uri.as_str())) else {
+    let Some(path) = files
+        .uris()
+        .first()
+        .and_then(|uri| uri_to_path(uri.as_str()))
+    else {
         return Ok(None);
     };
 
@@ -2375,9 +2379,7 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn document_portal_doc_id_extracts_the_id() {
         assert_eq!(
-            document_portal_doc_id(Path::new(
-                "/run/user/1000/doc/V1riv4MgDQ0gwnsrECtEXw/Games"
-            )),
+            document_portal_doc_id(Path::new("/run/user/1000/doc/V1riv4MgDQ0gwnsrECtEXw/Games")),
             Some("V1riv4MgDQ0gwnsrECtEXw")
         );
     }
@@ -2388,7 +2390,10 @@ LABEL=data   /mnt/data   xfs   defaults,nofail   0   2 # a trailing note";
     #[test]
     fn document_portal_doc_id_rejects_a_real_host_path() {
         assert_eq!(document_portal_doc_id(Path::new("/mnt/data/backups")), None);
-        assert_eq!(document_portal_doc_id(Path::new("/run/user/1000/other")), None);
+        assert_eq!(
+            document_portal_doc_id(Path::new("/run/user/1000/other")),
+            None
+        );
     }
 
     // -- pick_directory (uri_to_path only; the portal call itself is untested) --
